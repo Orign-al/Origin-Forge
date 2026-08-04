@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /usr/local/lib/h100-platform/h100-platform-common.sh
+
+if [[ "${1:-}" == --help || $# -ne 1 ]]; then
+  printf 'Usage: sudo h100-container-stop USER\n'
+  [[ "${1:-}" == --help ]] && exit 0 || exit 2
+fi
+
+readonly user_name=$1
+h100_require_root
+h100_validate_username "${user_name}"
+h100_acquire_lock
+h100_install_audit_trap container-stop "${user_name}"
+h100_require_managed_user "${user_name}"
+h100_require_managed_compose "${user_name}"
+h100_require_slurm_drained
+
+container="$(h100_container_name "${user_name}")"
+docker container inspect "${container}" >/dev/null 2>&1 \
+  || h100_fail "container does not exist: ${container}"
+docker stop --time 30 "${container}" >/dev/null
+[[ "$(docker inspect --format '{{.State.Status}}' "${container}")" == exited ]] \
+  || h100_fail "container did not stop cleanly: ${container}"
+printf 'STOPPED %s; user data preserved\n' "${container}"
+h100_mark_success

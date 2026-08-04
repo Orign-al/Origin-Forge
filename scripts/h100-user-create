@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /usr/local/lib/h100-platform/h100-platform-common.sh
+
+usage() {
+  printf '%s\n' \
+    'Usage: sudo h100-user-create USER PROJECT_ID PUBLIC_KEY_FILE --confirm-create' \
+    '' \
+    'Creates one disabled-password host account and a 300GB managed data project.' \
+    'It never grants sudo, docker, or gpu-platform-admin membership.'
+}
+
+if [[ "${1:-}" == --help ]]; then
+  usage
+  exit 0
+fi
+if (($# != 4)) || [[ "$4" != --confirm-create ]]; then
+  usage >&2
+  exit 2
+fi
+
+readonly user_name=$1
+readonly project_id=$2
+readonly public_key_input=$3
+readonly project_name="h100_${user_name}"
+readonly user_root="${H100_DATA_ROOT}/users/${user_name}"
+
+h100_require_root
+h100_validate_username "${user_name}"
+[[ "${project_id}" =~ ^[0-9]+$ ]] || h100_fail 'project ID must be numeric'
+((project_id >= 10002 && project_id <= 999999)) \
+  || h100_fail 'project ID must be between 10002 and 999999'
+h100_acquire_lock
+h100_install_audit_trap user-create "${user_name}"
+h100_require_slurm_drained
+
+getent passwd "${user_name}" >/dev/null \
+  && h100_fail "host user already exists: ${user_name}"
+getent group "${user_name}" >/dev/null \
+  && h100_fail "host group already exists: ${user_name}"
+[[ ! -e "${user_root}" ]] || h100_fail 'managed user data path already exists'
+grep -q "^${project_name}:" /etc/projid \
+  && h100_fail 'project name already exists'
+grep -Eq ":${project_id}[[:space:]]*$" /etc/projid \
+  && h100_fail 'project ID already exists in /etc/projid'
+grep -Eq "^${project_id}:" /etc/projects \
+  && h100_fail 'project ID already exists in /etc/projects'
+
+public_key_file="$(realpath -e "${public_key_input}")"
+[[ -f "${public_key_file}" && ! -L "${public_key_input}" ]] \
+  || h100_fail 'public key must be a regular non-symlink file'
+if find "${public_key_file}" -maxdepth 0 -perm /022 | grep -q .; then
+  h100_fail 'public key file must not be group- or world-writable'
+fi
+awk '
+  /^[[:space:]]*($|#)/ { next }
+  $1 ~ /^(ssh-ed25519|sk-ssh-ed25519@openssh.com|ssh-rsa)$/ { valid++; next }
+  { invalid++ }
+  END { exit !(valid == 1 && invalid == 0) }
+' "${public_key_file}" || h100_fail 'public key file must contain exactly one supported public key'
+ssh-keygen -lf "${public_key_file}" >/dev/null \
+  || h100_fail 'public key fingerprint validation failed'
+
+stamp="$(date +%Y%m%d-%H%M%S-%N)"
+backup_dir="${H100_PLATFORM_ROOT}/backups/user-create-${user_name}-${stamp}"
+report_file="${H100_PLATFORM_ROOT}/reports/user-create-${user_name}-${stamp}.md"
+install -d -o root -g gpu-platform-admin -m 0750 "${backup_dir}"
+cp -a /etc/projects "${backup_dir}/projects.before"
+cp -a /etc/projid "${backup_dir}/projid.before"
+
+temp_dir="$(mktemp -d /tmp/h100-user-create.XXXXXX)"
+trap 'rc=$?; case "${temp_dir}" in /tmp/h100-user-create.*) rm -rf -- "${temp_dir}" ;; esac; trap - EXIT; h100_audit "${H100_AUDIT_ACTION}" "${H100_AUDIT_TARGET}" "${H100_AUDIT_OUTCOME}" "${rc}"; exit "${rc}"' EXIT
+sed -e '$a\' /etc/projects >"${temp_dir}/projects"
+printf '%s:%s\n' "${project_id}" "${user_root}" >>"${temp_dir}/projects"
+sed -e '$a\' /etc/projid >"${temp_dir}/projid"
+printf '%s:%s\n' "${project_name}" "${project_id}" >>"${temp_dir}/projid"
+
+adduser --disabled-password --gecos '' "${user_name}"
+user_uid="$(id -u "${user_name}")"
+user_gid="$(id -g "${user_name}")"
+
+install -d -o "${user_name}" -g "${user_name}" -m 0700 "/home/${user_name}/.ssh"
+install -o "${user_name}" -g "${user_name}" -m 0600 \
+  "${public_key_file}" \
+  "/home/${user_name}/.ssh/authorized_keys"
+install -d -o "${user_name}" -g "${user_name}" -m 0710 "${user_root}"
+install -d -o "${user_name}" -g "${user_name}" -m 0700 \
+  "${user_root}/home" \
+  "${user_root}/home/.ssh"
+install -d -o "${user_name}" -g "${user_name}" -m 0750 \
+  "${user_root}/workspace" \
+  "${user_root}/shared"
+install -o "${user_name}" -g "${user_name}" -m 0600 \
+  "${public_key_file}" \
+  "${user_root}/home/.ssh/authorized_keys"
+install -d -o root -g root -m 0700 \
+  "${H100_DATA_ROOT}/container-data/${user_name}" \
+  "${H100_DATA_ROOT}/container-data/${user_name}/ssh-host-keys"
+
+install -o root -g root -m 0644 "${temp_dir}/projects" /etc/projects
+install -o root -g root -m 0644 "${temp_dir}/projid" /etc/projid
+xfs_quota -x -c "project -s ${project_name}" "${H100_DATA_ROOT}"
+xfs_quota -x -c "limit -p bhard=300g ${project_name}" "${H100_DATA_ROOT}"
+xfs_quota -x -c 'report -p -h' "${H100_DATA_ROOT}" \
+  | grep -E "^${project_name}[[:space:]]" \
+  | grep -q '300G' \
+  || h100_fail '300GB project quota validation failed'
+
+for forbidden_group in sudo docker gpu-platform-admin; do
+  if id -nG "${user_name}" | tr ' ' '\n' | grep -qx "${forbidden_group}"; then
+    h100_fail "new user unexpectedly belongs to ${forbidden_group}"
+  fi
+done
+
+fingerprint="$(ssh-keygen -lf "${public_key_file}")"
+{
+  printf '# Managed H100 user creation\n\n'
+  printf -- '- User: `%s`\n' "${user_name}"
+  printf -- '- UID:GID: `%s:%s`\n' "${user_uid}" "${user_gid}"
+  printf -- '- Password: disabled\n'
+  printf -- '- Public-key fingerprint: `%s`\n' "${fingerprint}"
+  printf -- '- Project: `%s` (`%s`)\n' "${project_name}" "${project_id}"
+  printf -- '- Hard quota: `300GB`\n'
+  printf -- '- Host sudo/docker/admin groups: not granted\n'
+  printf -- '- Backups: `%s`\n' "${backup_dir}"
+} >"${report_file}"
+
+printf 'CREATED USER %s uid=%s gid=%s project=%s quota=300GB\n' \
+  "${user_name}" "${user_uid}" "${user_gid}" "${project_id}"
+h100_mark_success

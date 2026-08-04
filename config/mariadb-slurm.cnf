@@ -1,0 +1,7 @@
+# SchedMD 25.11 accounting database recommendations.
+# This single-node deployment uses the documented minimum 4 GiB buffer pool.
+[mysqld]
+innodb_buffer_pool_size=4G
+innodb_log_file_size=1G
+innodb_lock_wait_timeout=900
+max_allowed_packet=16M

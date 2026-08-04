@@ -1,0 +1,15 @@
+{
+  "data-root": "/var/lib/docker",
+  "log-driver": "local",
+  "log-opts": {
+    "max-size": "100m",
+    "max-file": "5"
+  },
+  "live-restore": true,
+  "runtimes": {
+    "nvidia": {
+      "args": [],
+      "path": "nvidia-container-runtime"
+    }
+  }
+}

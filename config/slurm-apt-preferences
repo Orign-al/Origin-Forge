@@ -1,0 +1,7 @@
+Package: slurm-smd slurm-smd-client slurm-smd-dev slurm-smd-slurmctld slurm-smd-slurmd slurm-smd-slurmdbd
+Pin: version 25.11.7-1h100.1
+Pin-Priority: 1001
+
+Package: slurm-wlm slurm-wlm-basic-plugins slurm-wlm-basic-plugins-dev slurmctld slurmd slurmdbd libslurm-dev
+Pin: version *
+Pin-Priority: -1

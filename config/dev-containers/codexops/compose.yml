@@ -1,0 +1,43 @@
+name: h100-dev-codexops
+
+services:
+  dev:
+    image: h100-local/dev-container:ubuntu24.04-codexops-20260804
+    pull_policy: never
+    container_name: gpu-dev-codexops
+    hostname: gpu-dev-codexops
+    init: true
+    restart: unless-stopped
+    ports:
+      - target: 22
+        published: "22022"
+        host_ip: 10.82.36.1
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: /srv/gpu-platform/users/codexops/home
+        target: /home/codexops
+        bind:
+          propagation: rprivate
+      - type: bind
+        source: /srv/gpu-platform/users/codexops/workspace
+        target: /workspace
+        bind:
+          propagation: rprivate
+      - type: bind
+        source: /srv/gpu-platform/users/codexops/shared
+        target: /shared
+        bind:
+          propagation: rprivate
+      - type: bind
+        source: /srv/gpu-platform/container-data/codexops/ssh-host-keys
+        target: /etc/ssh/persistent
+        bind:
+          propagation: rprivate
+    environment:
+      TZ: Asia/Shanghai
+    cpus: 8.0
+    mem_limit: 32g
+    pids_limit: 4096
+    shm_size: 8g
+    stop_grace_period: 30s

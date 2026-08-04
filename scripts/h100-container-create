@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /usr/local/lib/h100-platform/h100-platform-common.sh
+
+usage() {
+  printf '%s\n' \
+    'Usage: sudo h100-container-create USER SSH_PORT [PINNED_LOCAL_IMAGE]' \
+    '' \
+    'Without an image argument, a per-user image is built from the approved template.' \
+    'A custom local image must carry matching h100.dev.user/uid/gid labels.'
+}
+
+if [[ "${1:-}" == --help ]]; then
+  usage
+  exit 0
+fi
+if (($# < 2 || $# > 3)); then
+  usage >&2
+  exit 2
+fi
+
+readonly user_name=$1
+readonly ssh_port=$2
+requested_image=${3:-}
+
+h100_require_root
+h100_validate_username "${user_name}"
+h100_validate_port "${ssh_port}"
+h100_acquire_lock
+h100_install_audit_trap container-create "${user_name}"
+h100_require_managed_user "${user_name}"
+h100_require_slurm_drained
+
+container="$(h100_container_name "${user_name}")"
+config_dir="$(h100_config_dir "${user_name}")"
+compose_file="$(h100_compose_file "${user_name}")"
+user_uid="$(id -u "${user_name}")"
+user_gid="$(id -g "${user_name}")"
+
+[[ ! -e "${compose_file}" ]] || h100_fail 'managed Compose file already exists'
+docker container inspect "${container}" >/dev/null 2>&1 \
+  && h100_fail "container already exists: ${container}"
+if ss -H -lnt "sport = :${ssh_port}" | grep -q .; then
+  h100_fail "SSH port is already in use: ${ssh_port}"
+fi
+ip -br addr | grep -Eq "^[^[:space:]]+[[:space:]]+UP[[:space:]]+.*${H100_MANAGEMENT_IP}/" \
+  || h100_fail "management IP is not active: ${H100_MANAGEMENT_IP}"
+if id -nG "${user_name}" | tr ' ' '\n' | grep -qx docker; then
+  h100_fail 'managed user must not belong to the host docker group'
+fi
+
+if [[ -z "${requested_image}" ]]; then
+  image="h100-local/dev-container:ubuntu24.04-${user_name}-20260804"
+  h100_validate_image_ref "${image}"
+  if ! docker image inspect "${image}" >/dev/null 2>&1; then
+    build_log="${H100_PLATFORM_ROOT}/logs/dev-image-${user_name}-$(date +%Y%m%d-%H%M%S-%N).log"
+    docker build \
+      --pull=false \
+      --progress=plain \
+      --build-arg 'BASE_IMAGE=public.ecr.aws/ubuntu/ubuntu:24.04@sha256:019e8eb29a85e74d64925745884f2ec79aa27e3feab36353d24656f4d6b89467' \
+      --build-arg "DEV_USER=${user_name}" \
+      --build-arg "DEV_UID=${user_uid}" \
+      --build-arg "DEV_GID=${user_gid}" \
+      --tag "${image}" \
+      "${H100_PLATFORM_ROOT}/templates/dev-container" \
+      >"${build_log}" 2>&1 \
+      || { tail -100 "${build_log}" >&2; h100_fail 'per-user image build failed'; }
+  fi
+else
+  image=${requested_image}
+  h100_validate_image_ref "${image}"
+  docker image inspect "${image}" >/dev/null \
+    || h100_fail 'requested image is not present locally; automatic pulls are forbidden'
+fi
+
+docker image inspect "${image}" \
+  | jq -e \
+      --arg user_name "${user_name}" \
+      --arg user_uid "${user_uid}" \
+      --arg user_gid "${user_gid}" '
+        .[0].Config.Labels["h100.dev.user"] == $user_name
+        and .[0].Config.Labels["h100.dev.uid"] == $user_uid
+        and .[0].Config.Labels["h100.dev.gid"] == $user_gid
+      ' >/dev/null \
+  || h100_fail 'image identity labels do not match the managed user'
+
+host_key_dir="${H100_DATA_ROOT}/container-data/${user_name}/ssh-host-keys"
+test -d "${host_key_dir}" || h100_fail 'managed SSH host-key directory is missing'
+
+stamp="$(date +%Y%m%d-%H%M%S-%N)"
+backup_dir="${H100_PLATFORM_ROOT}/backups/container-create-${user_name}-${stamp}"
+report_file="${H100_PLATFORM_ROOT}/reports/container-create-${user_name}-${stamp}.md"
+install -d -o root -g gpu-platform-admin -m 0750 "${backup_dir}"
+printf 'Compose target and container were absent before creation.\n' \
+  >"${backup_dir}/state"
+
+temp_dir="$(mktemp -d /tmp/h100-container-create.XXXXXX)"
+trap 'rc=$?; case "${temp_dir}" in /tmp/h100-container-create.*) rm -rf -- "${temp_dir}" ;; esac; trap - EXIT; h100_audit "${H100_AUDIT_ACTION}" "${H100_AUDIT_TARGET}" "${H100_AUDIT_OUTCOME}" "${rc}"; exit "${rc}"' EXIT
+generated_compose="${temp_dir}/compose.yml"
+cat >"${generated_compose}" <<EOF
+name: h100-dev-${user_name}
+
+services:
+  dev:
+    image: ${image}
+    pull_policy: never
+    container_name: ${container}
+    hostname: ${container}
+    init: true
+    restart: unless-stopped
+    ports:
+      - target: 22
+        published: "${ssh_port}"
+        host_ip: ${H100_MANAGEMENT_IP}
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: ${H100_DATA_ROOT}/users/${user_name}/home
+        target: /home/${user_name}
+        bind:
+          propagation: rprivate
+      - type: bind
+        source: ${H100_DATA_ROOT}/users/${user_name}/workspace
+        target: /workspace
+        bind:
+          propagation: rprivate
+      - type: bind
+        source: ${H100_DATA_ROOT}/users/${user_name}/shared
+        target: /shared
+        bind:
+          propagation: rprivate
+      - type: bind
+        source: ${host_key_dir}
+        target: /etc/ssh/persistent
+        bind:
+          propagation: rprivate
+    environment:
+      TZ: Asia/Shanghai
+    cpus: 8.0
+    mem_limit: 32g
+    pids_limit: 4096
+    shm_size: 8g
+    stop_grace_period: 30s
+EOF
+
+install -d -o root -g gpu-platform-admin -m 0750 "${config_dir}"
+install -o root -g gpu-platform-admin -m 0640 \
+  "${generated_compose}" \
+  "${compose_file}"
+docker compose \
+  --project-directory "${config_dir}" \
+  --file "${compose_file}" \
+  config --quiet
+docker compose \
+  --project-directory "${config_dir}" \
+  --file "${compose_file}" \
+  up --detach --no-build
+h100_wait_healthy "${container}" 120 \
+  || { docker logs --tail 100 "${container}" >&2 || true; h100_fail 'container did not become healthy'; }
+
+docker inspect "${container}" | jq -e \
+  --arg host_ip "${H100_MANAGEMENT_IP}" \
+  --arg host_port "${ssh_port}" '
+    .[0] as $c
+    | $c.HostConfig.Privileged == false
+    and $c.HostConfig.NetworkMode != "host"
+    and $c.HostConfig.PidMode != "host"
+    and $c.HostConfig.IpcMode != "host"
+    and (($c.HostConfig.DeviceRequests // []) | length == 0)
+    and (($c.HostConfig.Devices // []) | length == 0)
+    and $c.HostConfig.NanoCpus == 8000000000
+    and $c.HostConfig.Memory == 34359738368
+    and $c.HostConfig.PidsLimit == 4096
+    and $c.HostConfig.PortBindings["22/tcp"][0].HostIp == $host_ip
+    and $c.HostConfig.PortBindings["22/tcp"][0].HostPort == $host_port
+  ' >/dev/null || h100_fail 'created container failed isolation/resource validation'
+
+fingerprint="$(ssh-keygen -lf "${host_key_dir}/ssh_host_ed25519_key.pub")"
+{
+  printf '# Managed development container creation\n\n'
+  printf -- '- User: `%s` (`%s:%s`)\n' "${user_name}" "${user_uid}" "${user_gid}"
+  printf -- '- Container: `%s`\n' "${container}"
+  printf -- '- Image: `%s`\n' "${image}"
+  printf -- '- SSH: `%s:%s`\n' "${H100_MANAGEMENT_IP}" "${ssh_port}"
+  printf -- '- SSH host-key fingerprint: `%s`\n' "${fingerprint}"
+  printf -- '- Privileged/host network/host PID/host IPC: disabled\n'
+  printf -- '- GPU device request: none\n'
+  printf -- '- Docker Socket: not mounted\n'
+  printf -- '- CPU/RAM/PIDs: `8 / 32GiB / 4096`\n'
+  printf -- '- Compose: `%s`\n' "${compose_file}"
+} >"${report_file}"
+
+printf 'CREATED CONTAINER %s ssh=%s:%s\n' \
+  "${container}" "${H100_MANAGEMENT_IP}" "${ssh_port}"
+printf 'SSH host-key fingerprint: %s\n' "${fingerprint}"
+h100_mark_success

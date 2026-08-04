@@ -1,0 +1,33 @@
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+
+HostKey /etc/ssh/persistent/ssh_host_ed25519_key
+HostKey /etc/ssh/persistent/ssh_host_rsa_key
+
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+AuthorizedKeysFile .ssh/authorized_keys
+StrictModes yes
+PermitEmptyPasswords no
+UsePAM yes
+
+AllowAgentForwarding yes
+AllowTcpForwarding yes
+GatewayPorts no
+X11Forwarding no
+PermitTunnel no
+PermitUserEnvironment no
+
+ClientAliveInterval 60
+ClientAliveCountMax 3
+LoginGraceTime 60
+MaxAuthTries 6
+UseDNS no
+PrintMotd no
+LogLevel INFO
+
+Subsystem sftp internal-sftp

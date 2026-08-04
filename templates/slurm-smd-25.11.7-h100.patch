@@ -1,0 +1,15 @@
+--- a/debian/control
++++ b/debian/control
+@@ -5,6 +5,7 @@
+ Uploaders: Tim Mcmullan <mcmullan@schedmd.com>
+ Build-Depends:
+  bash-completion,
++ cuda-nvml-dev-13-1,
+  debhelper (>= 12),
+  dh-exec,
+  hdf5-helpers,
+--- a/debian/rules
++++ b/debian/rules
+@@ -23 +23 @@
+-	dh_auto_configure -- --sysconfdir=/etc/slurm --disable-debug --with-mysql_config --with-slurmrestd --with-pmix --enable-pam --with-pam_dir=/usr/lib/$(DEB_HOST_MULTIARCH)/security --with-systemdsystemunitdir=/lib/systemd/system/ SUCMD=/bin/su SLEEP_CMD=/bin/sleep
++	dh_auto_configure -- --sysconfdir=/etc/slurm --disable-debug --with-mysql_config --with-slurmrestd --with-pmix --with-nvml=/usr/local/cuda-13.1 --enable-pam --with-pam_dir=/usr/lib/$(DEB_HOST_MULTIARCH)/security --with-systemdsystemunitdir=/lib/systemd/system/ SUCMD=/bin/su SLEEP_CMD=/bin/sleep

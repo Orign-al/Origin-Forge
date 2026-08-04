@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /usr/local/lib/h100-platform/h100-platform-common.sh
+
+if [[ "${1:-}" == --help || $# -ne 1 ]]; then
+  printf 'Usage: sudo h100-quota-show USER\n'
+  [[ "${1:-}" == --help ]] && exit 0 || exit 2
+fi
+
+readonly user_name=$1
+h100_require_root
+h100_validate_username "${user_name}"
+h100_acquire_lock shared
+h100_install_audit_trap quota-show "${user_name}"
+h100_require_managed_user "${user_name}"
+
+project_name="h100_${user_name}"
+grep -q "^${project_name}:" /etc/projid \
+  || h100_fail "project mapping is missing: ${project_name}"
+xfs_quota -x -c 'report -p -h' "${H100_DATA_ROOT}" \
+  | awk -v project="${project_name}" '
+      NR <= 4 || $1 == project { print }
+    '
+h100_mark_success

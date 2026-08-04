@@ -1,0 +1,89 @@
+name: h100-monitoring
+
+services:
+  prometheus:
+    image: quay.io/prometheus/prometheus@sha256:1147c92841726a6fef55fe6124491d6f85480f8de204f7d420304ca5bbd0a8f7
+    pull_policy: never
+    container_name: h100-prometheus
+    network_mode: host
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --storage.tsdb.retention.size=100GB
+      - --web.listen-address=127.0.0.1:9090
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./data/prometheus:/prometheus
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: "65534:65534"
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: 2
+    restart: unless-stopped
+
+  grafana:
+    image: h100-local/grafana-oss:13.1.1-1
+    pull_policy: never
+    container_name: h100-grafana
+    network_mode: host
+    env_file:
+      - ../secrets/monitoring.env
+    environment:
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+    volumes:
+      - ./data/grafana:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: "472:0"
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: 2
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter@sha256:b4df763de9558e5b3f1f1d79bc65b772fcf65b8a9c3664ea7173e47153112b4a
+    pull_policy: never
+    container_name: h100-dcgm-exporter
+    network_mode: host
+    entrypoint:
+      - /usr/bin/dcgm-exporter
+    command:
+      - --disable-startup-validate
+      - --address=127.0.0.1:9400
+      - --remote-hostengine-info=localhost:5555
+      - --collectors=/etc/dcgm-exporter/h100-counters.csv
+      - --collect-interval=15000
+    volumes:
+      - ./dcgm-counters.csv:/etc/dcgm-exporter/h100-counters.csv:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: "65534:65534"
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 1
+    restart: unless-stopped

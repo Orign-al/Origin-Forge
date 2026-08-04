@@ -1,0 +1,33 @@
+# Long-lived Docker template and codexops test acceptance
+
+- Run ID: `20260804-050357`
+- Result: `LONG-LIVED DOCKER TEMPLATE PASSED`
+- Image: `h100-local/dev-container:ubuntu24.04-codexops-20260804`
+- Image ID: `sha256:0003a26a1bfc1f4109440039e91bb9d28603f8ff1bc56946eed3bfd4cda75577`
+- Base: Canonical Ubuntu 24.04 LTS, digest pinned
+- Container: `gpu-dev-codexops`
+- Initial SSH login: passed
+- Post-recreate SSH login: passed
+- SSH host-key fingerprint preserved: `SHA256:yRu3313H6tVLbL2itjFqMbF6+7NSrvxQmPocRfJMyIM`
+- Persistence SHA-256 preserved: `729f35a9bbb4cd50319b3898db29c7433e5318dba621004dd93111134cec425e`
+- Container user: `codexops` (`1001:1001`)
+- Container sudo: passed (`uid=0`)
+- CPU limit: `8`
+- Memory limit: `32GiB`
+- PIDs limit: `4096`
+- Shared memory: `8GiB`
+- XFS project quota: `300GB`
+- Privileged: `false`
+- Network mode: `h100-dev-codexops_default` (not host)
+- Host PID/IPC: disabled
+- AppArmor profile: `docker-default`
+- GPU DeviceRequest: none
+- `nvidia-smi`: unavailable as expected
+- Docker CLI: unavailable as expected
+- Docker Socket: absent
+- Host SSH bind: `10.82.36.1:22022`
+- Restart policy: `unless-stopped`
+- User data was not deleted during recreate
+- Slurm node remained DRAIN
+- MIG was not modified
+- Firewall was not modified

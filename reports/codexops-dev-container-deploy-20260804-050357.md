@@ -1,0 +1,24 @@
+# codexops long-lived development container deployment
+
+- Run ID: `20260804-050357`
+- Result: `CODEXOPS DEV CONTAINER DEPLOY PASSED`
+- Container: `gpu-dev-codexops`
+- Image: `h100-local/dev-container:ubuntu24.04-codexops-20260804`
+- Image ID: `sha256:0003a26a1bfc1f4109440039e91bb9d28603f8ff1bc56946eed3bfd4cda75577`
+- SSH listener: `10.82.36.1:22022`
+- SSH host-key fingerprint: `256 SHA256:yRu3313H6tVLbL2itjFqMbF6+7NSrvxQmPocRfJMyIM root@gpu-dev-codexops (ED25519)`
+- CPU limit: `8`
+- Memory limit: `32GiB`
+- PIDs limit: `4096`
+- Project quota: `300GB`
+- Privileged: `false`
+- Host network/PID/IPC: disabled
+- GPU device requests: none
+- Docker socket: not mounted
+- Docker CLI/daemon: not installed
+- Host NVIDIA driver tools: not installed
+- Compose file: `/srv/gpu-platform/platform/config/dev-containers/codexops/compose.yml` (`root:gpu-platform-admin`, mode `0640`)
+- Backup record: `/srv/gpu-platform/platform/backups/codexops-dev-container-20260805-000204-439786235`
+- Slurm node remained DRAIN
+- MIG was not modified
+- Firewall was not modified

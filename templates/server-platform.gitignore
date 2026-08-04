@@ -1,0 +1,34 @@
+secrets/
+.env
+.env.*
+*.password
+*.token
+*.key
+*.pem
+*.log
+slurmdbd.conf
+munge.key
+authorized_keys
+
+# Local runtime and generated secret-bearing state
+credentials/
+private/
+backups/
+monitoring.env
+*.pid
+*.sock
+*.sql
+*.sql.gz
+*.lock
+
+# Generated source trees and Debian build products
+build/
+artifacts/
+reports/*.d/
+reports/*.txt
+*.deb
+*.ddeb
+*.buildinfo
+*.changes
+*.dsc
+*.orig.tar.*

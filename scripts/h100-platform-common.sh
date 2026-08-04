@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly H100_PLATFORM_ROOT=/srv/gpu-platform/platform
+readonly H100_DATA_ROOT=/srv/gpu-platform
+readonly H100_MANAGEMENT_IP=10.82.36.1
+readonly H100_AUDIT_LOG=/var/log/h100-platform-audit.log
+readonly H100_LOCK_FILE=/run/lock/h100-platform.lock
+
+h100_fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+h100_require_root() {
+  [[ "$(id -u)" == 0 ]] || h100_fail 'run this command with sudo'
+}
+
+h100_validate_username() {
+  local candidate_username=${1:-}
+  [[ "${candidate_username}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] \
+    || h100_fail 'invalid username'
+  [[ "${candidate_username}" != *..* ]] || h100_fail 'invalid username'
+}
+
+h100_validate_port() {
+  local candidate_port=${1:-}
+  [[ "${candidate_port}" =~ ^[0-9]+$ ]] || h100_fail 'port must be numeric'
+  ((candidate_port >= 1024 && candidate_port <= 65535)) \
+    || h100_fail 'port must be between 1024 and 65535'
+}
+
+h100_validate_image_ref() {
+  local candidate_image=${1:-}
+  local image_leaf
+  [[ -n "${candidate_image}" && "${candidate_image}" =~ ^[A-Za-z0-9._/@:+-]+$ ]] \
+    || h100_fail 'invalid image reference'
+  if [[ "${candidate_image}" == *@sha256:* ]]; then
+    return 0
+  fi
+  image_leaf=${candidate_image##*/}
+  [[ "${image_leaf}" == *:* ]] \
+    || h100_fail 'image reference must contain a fixed tag or digest'
+  [[ "${image_leaf##*:}" != latest ]] || h100_fail 'latest image tag is forbidden'
+}
+
+h100_acquire_lock() {
+  local mode=${1:-exclusive}
+  exec 9>"${H100_LOCK_FILE}"
+  if [[ "${mode}" == shared ]]; then
+    flock -s 9
+  else
+    flock -x 9
+  fi
+}
+
+h100_audit() {
+  local action=$1
+  local target=$2
+  local outcome=$3
+  local rc=$4
+  local actor=${SUDO_USER:-root}
+  printf '%s actor=%s action=%s target=%s outcome=%s rc=%s\n' \
+    "$(date --iso-8601=seconds)" \
+    "${actor}" \
+    "${action}" \
+    "${target}" \
+    "${outcome}" \
+    "${rc}" \
+    >>"${H100_AUDIT_LOG}"
+}
+
+h100_install_audit_trap() {
+  H100_AUDIT_ACTION=$1
+  H100_AUDIT_TARGET=$2
+  H100_AUDIT_OUTCOME=FAILED
+  trap 'rc=$?; trap - EXIT; h100_audit "${H100_AUDIT_ACTION}" "${H100_AUDIT_TARGET}" "${H100_AUDIT_OUTCOME}" "${rc}"; exit "${rc}"' EXIT
+}
+
+h100_mark_success() {
+  H100_AUDIT_OUTCOME=SUCCESS
+}
+
+h100_container_name() {
+  printf 'gpu-dev-%s\n' "$1"
+}
+
+h100_config_dir() {
+  printf '%s/config/dev-containers/%s\n' "${H100_PLATFORM_ROOT}" "$1"
+}
+
+h100_compose_file() {
+  printf '%s/compose.yml\n' "$(h100_config_dir "$1")"
+}
+
+h100_require_managed_user() {
+  local managed_username=$1
+  getent passwd "${managed_username}" >/dev/null \
+    || h100_fail "host user does not exist: ${managed_username}"
+  [[ -d "${H100_DATA_ROOT}/users/${managed_username}/home" ]] \
+    || h100_fail "managed home is missing: ${managed_username}"
+  [[ -d "${H100_DATA_ROOT}/users/${managed_username}/workspace" ]] \
+    || h100_fail "managed workspace is missing: ${managed_username}"
+  [[ -d "${H100_DATA_ROOT}/users/${managed_username}/shared" ]] \
+    || h100_fail "managed shared directory is missing: ${managed_username}"
+}
+
+h100_require_managed_compose() {
+  local managed_username=$1
+  local managed_compose
+  local compose_metadata
+  managed_compose="$(h100_compose_file "${managed_username}")"
+  [[ -f "${managed_compose}" && ! -L "${managed_compose}" ]] \
+    || h100_fail "managed Compose file is missing: ${managed_username}"
+  compose_metadata="$(stat -c '%U:%G:%a' "${managed_compose}")"
+  [[ "${compose_metadata}" == 'root:gpu-platform-admin:640' ]] \
+    || h100_fail "managed Compose ownership or mode is invalid: ${managed_username}"
+}
+
+h100_wait_healthy() {
+  local target_container=$1
+  local health_attempts=${2:-120}
+  local health_state
+  local attempt
+  for attempt in $(seq 1 "${health_attempts}"); do
+    health_state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${target_container}")"
+    if [[ "${health_state}" == healthy ]]; then
+      return 0
+    fi
+    if [[ "${health_state}" == exited || "${health_state}" == dead ]]; then
+      return 1
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+h100_require_slurm_drained() {
+  local state
+  mapfile -t h100_slurm_states < <(sinfo -h -N -o '%T')
+  ((${#h100_slurm_states[@]} > 0)) || h100_fail 'Slurm returned no node state'
+  for state in "${h100_slurm_states[@]}"; do
+    [[ "${state}" == drain* ]] || h100_fail "Slurm node is not drained: ${state}"
+  done
+}

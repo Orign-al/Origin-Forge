@@ -1,0 +1,14 @@
+# Generated from scratch for Slurm 25.11.7.
+# The deployed /etc/slurm/slurmdbd.conf is owner slurm:slurm, mode 0600.
+AuthType=auth/munge
+DbdHost=<ACTUAL_HOSTNAME>
+SlurmUser=slurm
+DebugLevel=info
+LogFile=/var/log/slurm/slurmdbd.log
+PidFile=/run/slurmdbd/slurmdbd.pid
+StorageType=accounting_storage/mysql
+StorageHost=localhost
+StoragePort=3306
+StorageLoc=slurm_acct_db
+StorageUser=slurm
+StoragePass=<SECRET>

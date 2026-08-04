@@ -1,0 +1,7 @@
+slurm-smd (25.11.7-1h100.1) resolute; urgency=medium
+
+  * Build the official SchedMD 25.11.7 source for the H100 platform.
+  * Use the Debian packaging shipped inside the verified SchedMD archive.
+  * Keep all Slurm binaries, plugins, libraries, and headers on one revision.
+
+ -- H100 Platform Automation <codexops@localhost>  @BUILD_DATE@

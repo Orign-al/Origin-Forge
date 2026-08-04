@@ -1,0 +1,49 @@
+# 长期 Docker 到 Slurm 的安全提交通道
+
+状态：仅设计，当前不实施批量用户提交。
+
+## 边界与不变量
+
+- 长期个人 Docker 默认无 GPU；GPU 计算只能由 Slurm 分配。
+- 不向个人 Docker 挂载 MUNGE socket、`munge.key`、Slurm 管理 secret、Docker Socket 或宿主管理员 SSH 私钥。
+- 不把 `codexops` 管理私钥复制到任何普通用户容器。
+- 用户身份必须在提交入口重新认证，并映射到自己的 Slurm association、Account 与 QOS。
+- 个人容器内的 root 只代表该容器内 root；它不是宿主机或 Slurm 管理员身份。
+- 当前节点保持 DRAIN；任何生产 RESUME 仍需管理员明确批准。
+
+## 方案比较
+
+| 方案 | 身份与凭据 | 优点 | 主要风险与控制 | 当前建议 |
+|---|---|---|---|---|
+| A：个人容器通过 SSH 连接宿主提交入口 | 用户自己的 SSH 密钥；不得使用管理员密钥 | 用户可从 VS Code/容器工作流直接提交；沿用 sshd 审计和 Unix 身份 | 用户私钥位于其持久化 home，容器 root 可读取；必须使用个人密钥、严格 known_hosts、禁用 agent 共享管理员身份，并限制宿主登录权限 | 可作为后续便利方案，先做单用户原型和威胁评审 |
+| B：`slurmrestd` + JWT | 短期、最小权限 JWT；服务端 JWT signing key 不进入个人容器 | API 友好，便于门户和自动化；可与未来 JumpServer/内部服务集成 | 需 TLS、密钥轮换、token 过期/撤销、请求审计、限流和 Slurm 版本兼容；错误配置会扩大控制面暴露 | 当前不部署；待有集中身份系统和 secret 生命周期管理后评估 |
+| C：用户直接 SSH 登录宿主后提交 | 用户个人 SSH 公钥，由宿主 sshd 认证 | 边界最简单；无需把 MUNGE/JWT/管理员凭据放入容器；Slurm CLI 与 Unix 用户天然一致 | 用户需要在宿主 shell 提交；需控制宿主软件和目录权限，并为每个用户建立 Slurm association | 当前推荐方案 |
+
+## 推荐的当前流程（方案 C）
+
+1. 管理员经批准后创建员工宿主账号，只安装该员工的个人公钥，不授予宿主 sudo 或 docker 组权限。
+2. 为该用户建立 Slurm association、Account 与 QOS；默认遵守每用户 GPU 上限。
+3. 用户通过宿主 SSH 登录，在持久化工作区准备作业脚本，通过 `srun`/`sbatch` 提交。
+4. GPU 作业用 Pyxis/Enroot 的固定镜像引用运行；Slurm cgroup v2 与 `ConstrainDevices` 控制可见 GPU。
+5. 审计关联 Unix 用户、SSH 登录、Slurm Job ID、Account/QOS 与容器镜像引用。
+
+## 方案 A 的安全原型条件
+
+- 只能使用该普通用户自己的 SSH 密钥；密钥由用户自行管理，不由平台复制管理员密钥。
+- 容器内维护专用、严格校验的宿主 known_hosts；禁止 `StrictHostKeyChecking=no`。
+- 不使用 SSH agent 转发管理员 agent；若启用用户 agent，必须明确其可见密钥范围。
+- 宿主 sshd 继续按 Unix 用户认证；容器不能直接访问 MUNGE socket。
+- 提交入口只接受 Slurm CLI/受控命令；不授予 docker、sudo 或任意宿主挂载能力。
+- 先对一个非管理员测试用户做原型；当前 `codexops` 管理身份不用于模拟普通用户模型。
+
+## 方案 B 上线前的最低条件
+
+- 使用当前 Slurm 版本官方支持的 `slurmrestd` 与 JWT 配置，固定接口版本。
+- JWT signing key 仅保存在 root-only 服务端路径，不进入镜像、Compose、Git 或日志。
+- token 必须短期、可轮换、可撤销，并绑定用户/Account；禁止共享管理员 token。
+- 在受控反向代理后启用 TLS、认证、限流和完整审计；默认只监听 localhost，外部开放需单独审批。
+- 完成故障模式、权限绕过、token 泄漏与重放测试后再考虑生产。
+
+## 当前结论
+
+当前采用方案 C 作为人工提交路径；方案 A 仅保留为后续单用户原型，方案 B 延后到集中身份与 secret 管理成熟后。当前不修改个人 Docker 挂载、不部署 `slurmrestd`、不创建其他员工账号，也不改变 Slurm DRAIN 状态。

@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /usr/local/lib/h100-platform/h100-platform-common.sh
+
+usage() {
+  printf '%s\n' \
+    'Usage:' \
+    '  sudo h100-container-delete USER' \
+    '  sudo h100-container-delete USER --delete-data --confirm-delete-data USER' \
+    '' \
+    'Default behavior removes only the container/network and preserves all data.' \
+    'Data deletion additionally requires an interactive typed confirmation.'
+}
+
+if [[ "${1:-}" == --help ]]; then
+  usage
+  exit 0
+fi
+if (($# != 1 && $# != 4)); then
+  usage >&2
+  exit 2
+fi
+
+readonly user_name=$1
+delete_data=no
+if (($# == 4)); then
+  [[ "$2" == --delete-data && "$3" == --confirm-delete-data && "$4" == "${user_name}" ]] \
+    || h100_fail 'invalid or incomplete data-deletion confirmation arguments'
+  delete_data=yes
+fi
+
+h100_require_root
+h100_validate_username "${user_name}"
+h100_acquire_lock
+h100_install_audit_trap container-delete "${user_name}"
+h100_require_managed_user "${user_name}"
+h100_require_managed_compose "${user_name}"
+h100_require_slurm_drained
+
+container="$(h100_container_name "${user_name}")"
+compose_file="$(h100_compose_file "${user_name}")"
+config_dir="$(h100_config_dir "${user_name}")"
+
+if [[ "${delete_data}" == yes ]]; then
+  [[ -t 0 ]] || h100_fail 'data deletion requires an interactive terminal'
+  printf 'Type DELETE-DATA-%s to permanently delete this user data: ' "${user_name}" >&2
+  read -r confirmation
+  [[ "${confirmation}" == "DELETE-DATA-${user_name}" ]] \
+    || h100_fail 'interactive data-deletion confirmation did not match'
+fi
+
+if docker container inspect "${container}" >/dev/null 2>&1; then
+  docker compose \
+    --project-directory "${config_dir}" \
+    --file "${compose_file}" \
+    down --remove-orphans
+fi
+
+if [[ "${delete_data}" == no ]]; then
+  printf 'DELETED container %s; user data and Compose configuration preserved\n' \
+    "${container}"
+  h100_mark_success
+  exit 0
+fi
+
+user_root="${H100_DATA_ROOT}/users/${user_name}"
+host_key_root="${H100_DATA_ROOT}/container-data/${user_name}"
+[[ ! -L "${user_root}" && "$(realpath -e "${user_root}")" == "${user_root}" ]] \
+  || h100_fail 'user data path validation failed'
+[[ "${user_root}" == /srv/gpu-platform/users/"${user_name}" ]] \
+  || h100_fail 'user data path escaped approved root'
+[[ ! -L "${host_key_root}" && "$(realpath -e "${host_key_root}")" == "${host_key_root}" ]] \
+  || h100_fail 'container-data path validation failed'
+[[ "${host_key_root}" == /srv/gpu-platform/container-data/"${user_name}" ]] \
+  || h100_fail 'container-data path escaped approved root'
+
+project_name="h100_${user_name}"
+project_id="$(awk -F: -v name="${project_name}" '$1 == name {print $2}' /etc/projid)"
+[[ "${project_id}" =~ ^[0-9]+$ ]] || h100_fail 'project ID mapping is invalid'
+grep -Fxq "${project_id}:${user_root}" /etc/projects \
+  || h100_fail 'project path mapping is invalid'
+
+stamp="$(date +%Y%m%d-%H%M%S-%N)"
+backup_dir="${H100_PLATFORM_ROOT}/backups/container-delete-${user_name}-${stamp}"
+install -d -o root -g gpu-platform-admin -m 0750 "${backup_dir}"
+cp -a /etc/projects "${backup_dir}/projects.before"
+cp -a /etc/projid "${backup_dir}/projid.before"
+cp -a "${compose_file}" "${backup_dir}/compose.yml"
+
+temp_dir="$(mktemp -d /tmp/h100-delete-data.XXXXXX)"
+trap 'rc=$?; case "${temp_dir}" in /tmp/h100-delete-data.*) rm -rf -- "${temp_dir}" ;; esac; trap - EXIT; h100_audit "${H100_AUDIT_ACTION}" "${H100_AUDIT_TARGET}" "${H100_AUDIT_OUTCOME}" "${rc}"; exit "${rc}"' EXIT
+awk -F: -v id="${project_id}" '$1 != id' /etc/projects >"${temp_dir}/projects"
+awk -F: -v name="${project_name}" '$1 != name' /etc/projid >"${temp_dir}/projid"
+
+rm -rf --one-file-system -- "${user_root}"
+rm -rf --one-file-system -- "${host_key_root}"
+install -o root -g root -m 0644 "${temp_dir}/projects" /etc/projects
+install -o root -g root -m 0644 "${temp_dir}/projid" /etc/projid
+
+printf 'DELETED container and data for %s; host account and backed-up Compose remain\n' \
+  "${user_name}"
+h100_mark_success

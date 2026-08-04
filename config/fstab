@@ -1,0 +1,18 @@
+# /etc/fstab: static file system information.
+#
+# Use 'blkid' to print the universally unique identifier for a
+# device; this may be used with UUID= as a more robust way to name devices
+# that works even if disks are added and removed. See fstab(5).
+#
+# <file system> <mount point>   <type>  <options>       <dump>  <pass>
+# / was on /dev/sdb2 during curtin installation
+/dev/disk/by-uuid/04b9a73b-3113-4d61-81be-3df7a213ad1f / ext4 defaults 0 1
+# /boot was on /dev/sdb3 during curtin installation
+/dev/disk/by-uuid/7d6af13d-5b02-4c31-91c9-44745eb59c0f /boot ext4 defaults 0 1
+/dev/disk/by-id/dm-uuid-LVM-Amj1q0SixJGE1Q8fQ3EUhVWYH7vpiJd7LAUsnOogAuj5lId6z0cCYNfZRyLRGhfO none swap sw 0 0
+# /var/lib/docker was on /dev/vg_h100/lv_docker during curtin installation
+/dev/disk/by-id/dm-uuid-LVM-Amj1q0SixJGE1Q8fQ3EUhVWYH7vpiJd7fLNjhI6YTMM07NFfmlV4zXighIGrfReH /var/lib/docker xfs defaults,noatime,prjquota 0 1
+# /srv/gpu-platform was on /dev/vg_h100/lv_platform during curtin installation
+/dev/disk/by-id/dm-uuid-LVM-Amj1q0SixJGE1Q8fQ3EUhVWYH7vpiJd7jSx9TcgbfJ0Jach6vs6M3oJdfTgI1edM /srv/gpu-platform xfs defaults,noatime,prjquota 0 1
+# /boot/efi was on /dev/sdb1 during curtin installation
+/dev/disk/by-uuid/E1E7-8B00 /boot/efi vfat defaults 0 1
