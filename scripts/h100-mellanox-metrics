@@ -2,6 +2,7 @@
 set -euo pipefail
 
 export LC_ALL=C
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 umask 022
 
 readonly interface="${H100_MLX_IF:-ens1f0np0}"

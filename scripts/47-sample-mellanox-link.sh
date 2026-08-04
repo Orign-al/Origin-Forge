@@ -6,8 +6,9 @@ readonly run_id="${RUN_ID:?RUN_ID is required}"
 readonly sample_count="${SAMPLE_COUNT:-6}"
 readonly interval_seconds="${INTERVAL_SECONDS:-60}"
 readonly platform_root=/srv/gpu-platform/platform
-readonly report_dir="${platform_root}/reports/network-${run_id}"
-readonly stamp="$(date +%Y%m%d-%H%M%S)"
+readonly report_dir="${REPORT_DIR:-${platform_root}/reports/network-${run_id}}"
+stamp="$(date +%Y%m%d-%H%M%S)"
+readonly stamp
 readonly snapshot_dir="${report_dir}/mellanox-samples-${stamp}.d"
 readonly samples_csv="${report_dir}/mellanox-samples-${stamp}.csv"
 readonly intervals_csv="${report_dir}/mellanox-intervals-${stamp}.csv"
@@ -25,6 +26,8 @@ sudo -n true || fail 'passwordless sudo is unavailable'
 [[ "${interval_seconds}" =~ ^[0-9]+$ ]] || fail 'INTERVAL_SECONDS must be an integer'
 ((sample_count >= 2)) || fail 'at least two samples are required'
 ((interval_seconds >= 1)) || fail 'interval must be positive'
+[[ "${report_dir}" == "${platform_root}/reports/"* ]] \
+  || fail 'REPORT_DIR must be below the platform reports directory'
 [[ -d "${report_dir}" ]] || fail "missing report directory ${report_dir}"
 
 exec 9>"${lock_file}"
@@ -57,17 +60,24 @@ ethtool_value() {
         exit
       }
     }
-    END {if (!found) print 0}
+    END {if (!found) print "NA"}
   ' "${file}"
 }
 
 sysfs_value() {
   local name=$1
   local path="/sys/class/net/${interface}/statistics/${name}"
+  [[ -r "${path}" ]] || fail "missing required interface statistic: ${name}"
+  tr -d '[:space:]' <"${path}"
+}
+
+optional_sysfs_value() {
+  local name=$1
+  local path="/sys/class/net/${interface}/statistics/${name}"
   if [[ -r "${path}" ]]; then
     tr -d '[:space:]' <"${path}"
   else
-    printf '0\n'
+    printf 'NA\n'
   fi
 }
 
@@ -100,7 +110,7 @@ for ((sample=0; sample<sample_count; sample++)); do
   stats_file="${snapshot_dir}/sample-${sample}-ethtool.txt"
   ip_file="${snapshot_dir}/sample-${sample}-ip-link.txt"
 
-  sudo ethtool -S "${interface}" >"${stats_file}"
+  sudo ethtool -S "${interface}" | tee "${stats_file}" >/dev/null
   ip -s link show "${interface}" >"${ip_file}"
 
   rx_bytes="$(sysfs_value rx_bytes)"
@@ -121,7 +131,7 @@ for ((sample=0; sample<sample_count; sample++)); do
     "$(sysfs_value rx_errors)" "$(sysfs_value tx_errors)" \
     "$(sysfs_value rx_missed_errors)" "$(sysfs_value rx_length_errors)" \
     "$(sysfs_value rx_frame_errors)" "$(sysfs_value rx_over_errors)" \
-    "$(sysfs_value carrier_changes)" \
+    "$(optional_sysfs_value carrier_changes)" \
     >>"${samples_csv}"
 
   printf 'sample=%s/%s epoch=%s iso=%s crc=%s symbol=%s rx_bytes=%s\n' \
@@ -134,6 +144,13 @@ for ((sample=0; sample<sample_count; sample++)); do
 done
 
 awk -F, '
+  function numeric(value) {
+    return value ~ /^[0-9]+$/
+  }
+  function counter_delta(current, prior) {
+    if (numeric(current) && numeric(prior)) return current-prior
+    return "NA"
+  }
   BEGIN {
     OFS=","
     print "interval,start_iso,end_iso,seconds,rx_bytes_delta,tx_bytes_delta,crc_delta,symbol_delta,rx_discard_delta,tx_discard_delta,discard_delta,link_down_delta,corrected_bits_delta,uncorrected_delta,module_unplug_delta,carrier_changes_delta,crc_per_second,symbol_per_second,crc_per_GB_received"
@@ -147,24 +164,28 @@ awk -F, '
     seconds=$2-previous[2]
     rx_delta=$4-previous[4]
     tx_delta=$5-previous[5]
-    crc_delta=$6-previous[6]
-    symbol_delta=$7-previous[7]
-    rx_discard_delta=$10-previous[10]
-    tx_discard_delta=$11-previous[11]
-    discard_delta=rx_discard_delta+tx_discard_delta
-    link_down_delta=$12-previous[12]
-    corrected_delta=$8-previous[8]
-    uncorrected_delta=$9-previous[9]
-    module_unplug_delta=$13-previous[13]
-    carrier_delta=$20-previous[20]
-    if (seconds > 0) {
+    crc_delta=counter_delta($6, previous[6])
+    symbol_delta=counter_delta($7, previous[7])
+    rx_discard_delta=counter_delta($10, previous[10])
+    tx_discard_delta=counter_delta($11, previous[11])
+    if (numeric(rx_discard_delta) && numeric(tx_discard_delta)) {
+      discard_delta=rx_discard_delta+tx_discard_delta
+    } else {
+      discard_delta="NA"
+    }
+    link_down_delta=counter_delta($12, previous[12])
+    corrected_delta=counter_delta($8, previous[8])
+    uncorrected_delta=counter_delta($9, previous[9])
+    module_unplug_delta=counter_delta($13, previous[13])
+    carrier_delta=counter_delta($20, previous[20])
+    if (seconds > 0 && numeric(crc_delta) && numeric(symbol_delta)) {
       crc_rate=sprintf("%.6f", crc_delta/seconds)
       symbol_rate=sprintf("%.6f", symbol_delta/seconds)
     } else {
       crc_rate="NA"
       symbol_rate="NA"
     }
-    if (rx_delta > 0) {
+    if (rx_delta > 0 && numeric(crc_delta)) {
       crc_per_gb=sprintf("%.6f", crc_delta*1000000000/rx_delta)
     } else {
       crc_per_gb="NA"
@@ -175,7 +196,17 @@ awk -F, '
 ' "${samples_csv}" >"${intervals_csv}"
 
 read -r total_crc total_symbol total_link < <(
-  awk -F, 'NR > 1 {crc+=$7; symbol+=$8; link+=$12} END {print crc+0, symbol+0, link+0}' \
+  awk -F, '
+    function numeric(value) {return value ~ /^[0-9]+$/}
+    NR > 1 {
+      if (numeric($7)) {crc+=$7; crc_seen=1}
+      if (numeric($8)) {symbol+=$8; symbol_seen=1}
+      if (numeric($12)) {link+=$12; link_seen=1}
+    }
+    END {
+      print crc_seen ? crc : "NA", symbol_seen ? symbol : "NA", link_seen ? link : "NA"
+    }
+  ' \
     "${intervals_csv}"
 )
 
@@ -188,8 +219,11 @@ printf 'total_crc_delta=%s\n' "${total_crc}"
 printf 'total_symbol_delta=%s\n' "${total_symbol}"
 printf 'total_link_down_delta=%s\n' "${total_link}"
 
-if ((total_crc > 0 || total_symbol > 0)); then
+if [[ "${total_crc}" =~ ^[0-9]+$ && "${total_symbol}" =~ ^[0-9]+$ ]] \
+  && ((total_crc > 0 || total_symbol > 0)); then
   printf 'PHYSICAL LINK ERROR CONFIRMED\n'
-else
+elif [[ "${total_crc}" == 0 && "${total_symbol}" == 0 ]]; then
   printf 'PHYSICAL LINK ERROR NOT REPRODUCED\n'
+else
+  printf 'PHYSICAL LINK SAMPLING INCOMPLETE: required counters unavailable\n'
 fi
