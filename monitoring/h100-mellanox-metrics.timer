@@ -1,0 +1,12 @@
+[Unit]
+Description=Collect H100 Mellanox physical counters every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=h100-mellanox-metrics.service
+
+[Install]
+WantedBy=timers.target

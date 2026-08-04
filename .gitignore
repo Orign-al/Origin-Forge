@@ -32,6 +32,8 @@ artifacts/
 monitoring/data/
 reports/*.d/
 reports/*.txt
+# Per-run raw network evidence stays on the server; commit the reviewed summary.
+reports/network-*/
 *.pid
 *.sock
 *.tmp

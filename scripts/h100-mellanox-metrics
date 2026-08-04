@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export LC_ALL=C
+umask 022
+
+readonly interface="${H100_MLX_IF:-ens1f0np0}"
+readonly textfile_dir="${H100_TEXTFILE_DIR:-/var/lib/node_exporter/textfile_collector}"
+readonly output_file="${textfile_dir}/h100_mellanox.prom"
+readonly lock_file="${H100_MLX_LOCK_FILE:-/run/lock/h100-mellanox-metrics.lock}"
+
+stats_file=''
+metrics_file=''
+
+cleanup() {
+  [[ -z "${stats_file}" ]] || rm -f -- "${stats_file}"
+  [[ -z "${metrics_file}" ]] || rm -f -- "${metrics_file}"
+}
+trap cleanup EXIT
+
+fail() {
+  printf 'h100-mellanox-metrics: %s\n' "$*" >&2
+  exit 1
+}
+
+((EUID == 0)) || fail 'must run as root'
+[[ "${interface}" =~ ^[A-Za-z0-9_.:-]+$ ]] || fail 'invalid interface name'
+[[ -d "${textfile_dir}" ]] || fail "missing textfile directory: ${textfile_dir}"
+[[ -e "/sys/class/net/${interface}" ]] || fail "interface does not exist: ${interface}"
+
+exec 9>"${lock_file}"
+if ! flock -n 9; then
+  exit 0
+fi
+
+stats_file="$(mktemp "${textfile_dir}/.h100-mellanox-stats.XXXXXX")"
+metrics_file="$(mktemp "${textfile_dir}/.h100-mellanox-prom.XXXXXX")"
+
+if ! timeout 10 /usr/sbin/ethtool -S "${interface}" >"${stats_file}"; then
+  fail 'ethtool statistics read failed or timed out'
+fi
+
+readonly -a counter_names=(
+  rx_crc_errors_phy
+  rx_symbol_err_phy
+  link_down_events_phy
+  rx_discards_phy
+  tx_discards_phy
+)
+readonly -a metric_names=(
+  h100_mellanox_rx_crc_errors_phy_total
+  h100_mellanox_rx_symbol_err_phy_total
+  h100_mellanox_link_down_events_phy_total
+  h100_mellanox_rx_discards_phy_total
+  h100_mellanox_tx_discards_phy_total
+)
+readonly -a metric_help=(
+  'Mellanox physical receive CRC errors reported by ethtool.'
+  'Mellanox physical receive symbol errors reported by ethtool.'
+  'Mellanox physical link-down events reported by ethtool.'
+  'Mellanox physical receive discards reported by ethtool.'
+  'Mellanox physical transmit discards reported by ethtool.'
+)
+
+for index in "${!counter_names[@]}"; do
+  counter="${counter_names[index]}"
+  metric="${metric_names[index]}"
+  value="$({
+    awk -F: -v wanted="${counter}" '
+      {
+        name=$1
+        number=$2
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", number)
+        if (name == wanted && number ~ /^[0-9]+$/) {
+          print number
+          exit
+        }
+      }
+    ' "${stats_file}"
+  })"
+  [[ "${value}" =~ ^[0-9]+$ ]] || fail "missing or invalid counter: ${counter}"
+  {
+    printf '# HELP %s %s\n' "${metric}" "${metric_help[index]}"
+    printf '# TYPE %s counter\n' "${metric}"
+    printf '%s{interface="%s"} %s\n' "${metric}" "${interface}" "${value}"
+  } >>"${metrics_file}"
+done
+
+chmod 0644 "${metrics_file}"
+mv -f -- "${metrics_file}" "${output_file}"
+metrics_file=''
