@@ -1,0 +1,40 @@
+# Secrets and runtime state
+.env
+.env.*
+!*.example
+portal.env
+*.token
+*.session
+!requirements.lock
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Node and Next.js
+node_modules/
+.next/
+out/
+coverage/
+playwright-report/
+test-results/
+blob-report/
+apps/web/.auth/
+*.tsbuildinfo
+
+# Runtime databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/

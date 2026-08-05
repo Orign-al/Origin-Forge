@@ -1,0 +1,31 @@
+[Unit]
+Description=H100 Portal fixed-operation root worker
+Documentation=file:/opt/h100-portal/docs/root-worker-api.md
+Requires=h100-portal-worker.socket
+After=h100-portal-worker.socket docker.service slurmd.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/h100-portal
+ExecStart=/opt/h100-portal/venv/bin/h100-portal-worker
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=no
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+ReadWritePaths=/run/h100-portal /var/lib/h100-portal /var/log/h100-portal
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

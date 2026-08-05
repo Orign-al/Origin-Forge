@@ -1,0 +1,47 @@
+from enum import StrEnum
+
+
+class AccountState(StrEnum):
+    INVITED = "INVITED"
+    ACTIVE = "ACTIVE"
+    SUSPENDED = "SUSPENDED"
+    LOCKED = "LOCKED"
+    DECOMMISSIONED = "DECOMMISSIONED"
+
+
+class PasswordState(StrEnum):
+    SETUP_REQUIRED = "SETUP_REQUIRED"
+    SET = "SET"
+    RESET_REQUIRED = "RESET_REQUIRED"
+    DISABLED = "DISABLED"
+
+
+class OnboardingState(StrEnum):
+    NOT_ENROLLED = "NOT_ENROLLED"
+    DRAFT = "DRAFT"
+    STAGED = "STAGED"
+    READY_FOR_ACTIVATION = "READY_FOR_ACTIVATION"
+    ACTIVE = "ACTIVE"
+    SUSPENDED = "SUSPENDED"
+    FAILED = "FAILED"
+
+
+class OperationStatus(StrEnum):
+    DRAFT = "DRAFT"
+    PENDING_APPROVAL = "PENDING_APPROVAL"
+    APPROVED = "APPROVED"
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    ROLLING_BACK = "ROLLING_BACK"
+    ROLLED_BACK = "ROLLED_BACK"
+    CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
+
+
+class RiskLevel(StrEnum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"

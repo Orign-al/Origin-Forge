@@ -1,0 +1,141 @@
+from typing import Any
+
+from fastapi import APIRouter, Depends
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from h100_portal_api.auth import AuthContext
+from h100_portal_api.database import get_db
+from h100_portal_api.dependencies import permission_dependency
+from h100_portal_api.models import (
+    PortalManagedUser,
+    PortalOperation,
+    PortalSystemSnapshot,
+    PortalUser,
+    utcnow,
+)
+from h100_portal_api.worker_client import WorkerClientError, call_worker
+
+router = APIRouter(prefix="/platform", tags=["platform"])
+
+
+def adapter(
+    operation: str, context: AuthContext, payload: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    try:
+        value = call_worker(operation, payload=payload, requested_by=context.user.normalized_login)
+        if value.get("status") not in {"OK", "PARTIAL", "DRY_RUN"}:
+            return {"status": "UNKNOWN", "error": value.get("error", {"code": "ADAPTER_FAILED"})}
+        return value
+    except WorkerClientError as exc:
+        return {"status": "UNKNOWN", "error": {"code": exc.code, "message": str(exc)}}
+
+
+@router.get("/overview")
+def overview(
+    context: AuthContext = Depends(permission_dependency("platform.read")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    value = adapter("platform.health.read", context)
+    extras = {
+        "containers": adapter("containers.list", context),
+        "storage": adapter("storage.summary.read", context),
+        "registries": adapter("registry.status.read", context),
+        "alerts": adapter("monitoring.alerts.read", context),
+    }
+    portal_states: dict[str, int] = {
+        str(state): count
+        for state, count in db.execute(
+            select(PortalUser.account_state, func.count()).group_by(PortalUser.account_state)
+        ).tuples()
+    }
+    onboarding_states: dict[str, int] = {
+        str(state): count
+        for state, count in db.execute(
+            select(PortalManagedUser.onboarding_state, func.count()).group_by(
+                PortalManagedUser.onboarding_state
+            )
+        ).tuples()
+    }
+    operation_states: dict[str, int] = {
+        str(state): count
+        for state, count in db.execute(
+            select(PortalOperation.status, func.count()).group_by(PortalOperation.status)
+        ).tuples()
+    }
+    identity = {
+        "status": "OK",
+        "portal_users": sum(portal_states.values()),
+        "managed_linux_users": sum(onboarding_states.values()),
+        "account_states": portal_states,
+        "onboarding_states": onboarding_states,
+    }
+    tasks = {
+        "status": "OK",
+        "pending_approval": operation_states.get("PENDING_APPROVAL", 0),
+        "failed": operation_states.get("FAILED", 0),
+        "total": sum(operation_states.values()),
+    }
+    snapshot = {"platform": value, **extras, "identity": identity, "tasks": tasks}
+    overall = (
+        "OK"
+        if all(item.get("status") in {"OK", "PARTIAL"} for item in snapshot.values())
+        else "PARTIAL"
+    )
+    db.add(
+        PortalSystemSnapshot(
+            snapshot_type="overview", status=overall, payload=snapshot, captured_at=utcnow()
+        )
+    )
+    db.commit()
+    return {"status": overall, **snapshot}
+
+
+@router.get("/gpus")
+def gpus(context: AuthContext = Depends(permission_dependency("gpu.read"))) -> dict[str, Any]:
+    return adapter("gpu.list", context)
+
+
+@router.get("/gpu-health")
+def gpu_health(context: AuthContext = Depends(permission_dependency("gpu.read"))) -> dict[str, Any]:
+    return adapter("gpu.health.read", context)
+
+
+@router.get("/systemd-failed")
+def systemd_failed(
+    context: AuthContext = Depends(permission_dependency("platform.read")),
+) -> dict[str, Any]:
+    return adapter("systemd.failed.read", context)
+
+
+@router.get("/isolation")
+def isolation(
+    context: AuthContext = Depends(permission_dependency("platform.read")),
+) -> dict[str, Any]:
+    return adapter("gpu_isolation.status.read", context)
+
+
+@router.get("/storage")
+def storage(
+    context: AuthContext = Depends(permission_dependency("storage.read")),
+) -> dict[str, Any]:
+    return adapter("storage.summary.read", context)
+
+
+@router.get("/quotas")
+def quotas(context: AuthContext = Depends(permission_dependency("storage.read"))) -> dict[str, Any]:
+    return adapter("quotas.list", context)
+
+
+@router.get("/registries")
+def registries(
+    context: AuthContext = Depends(permission_dependency("images.read")),
+) -> dict[str, Any]:
+    return adapter("registry.status.read", context)
+
+
+@router.get("/alerts")
+def alerts(
+    context: AuthContext = Depends(permission_dependency("monitoring.read")),
+) -> dict[str, Any]:
+    return adapter("monitoring.alerts.read", context)

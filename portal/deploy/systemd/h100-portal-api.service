@@ -1,0 +1,38 @@
+[Unit]
+Description=H100 Portal management API
+Documentation=file:/opt/h100-portal/docs/architecture.md
+Requires=h100-portal-worker.socket
+Wants=postgresql.service
+After=network.target postgresql.service h100-portal-worker.socket
+
+[Service]
+Type=exec
+User=h100-portal-api
+Group=h100-portal-api
+WorkingDirectory=/opt/h100-portal
+EnvironmentFile=/etc/h100-portal/portal.env
+ExecStart=/opt/h100-portal/venv/bin/uvicorn h100_portal_api.main:app --host 127.0.0.1 --port 18081 --workers 1 --no-access-log --no-proxy-headers
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools==83.0.0", "wheel==0.47.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "h100-portal"
+version = "0.1.0"
+description = "Local-only management portal for the single-node H100 platform"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+  "alembic==1.19.0",
+  "argon2-cffi==25.1.0",
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "psycopg[binary]==3.3.4",
+  "pydantic==2.13.4",
+  "pydantic-settings==2.14.2",
+  "SQLAlchemy==2.0.51",
+  "uvicorn[standard]==0.52.1",
+]
+
+[project.optional-dependencies]
+test = [
+  "mypy==2.3.0",
+  "pytest==9.1.1",
+  "pytest-cov==7.1.0",
+  "ruff==0.16.1",
+]
+
+[project.scripts]
+h100-portal-admin = "h100_portal_api.cli:main"
+h100-portal-worker = "h100_portal_worker.server:main"
+
+[tool.setuptools.packages.find]
+where = ["apps/api/src", "apps/worker/src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["apps/api/tests", "apps/worker/tests", "tests"]
+pythonpath = ["apps/api/src", "apps/worker/src"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+extend-exclude = ["apps/api/alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "SIM", "RUF"]
+ignore = [
+  "B008",   # FastAPI's dependency injection intentionally uses Depends in defaults.
+  "E501",   # Ruff formatter owns line wrapping; Chinese UI strings remain readable.
+  "RUF001", # Full-width Chinese punctuation is intentional user-facing copy.
+  "S101",   # Assertions are required by pytest.
+  "S603",   # Worker subprocess argv is selected from an internal absolute-path allowlist.
+  "UP022",  # Explicit stdout/stderr pipes make truncation and timeout handling auditable.
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S105", "S106"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy", "sqlalchemy.ext.mypy.plugin"]
+mypy_path = ["apps/api/src", "apps/worker/src"]
+exclude = ["apps/api/alembic/versions"]
+
+[[tool.mypy.overrides]]
+module = ["argon2.*"]
+ignore_missing_imports = true

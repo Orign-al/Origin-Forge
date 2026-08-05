@@ -1,0 +1,9 @@
+packages:
+  - "apps/web"
+  - "packages/*"
+
+allowBuilds:
+  "@tailwindcss/oxide": true
+  esbuild: true
+  sharp: true
+  unrs-resolver: true

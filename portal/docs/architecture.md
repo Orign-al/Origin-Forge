@@ -1,0 +1,74 @@
+# H100 Portal 架构
+
+## 部署边界
+
+Portal-0/1 是单节点、仅本机监听的管理控制面。管理员通过 SSH Tunnel 访问
+`http://127.0.0.1:18080`。Web 监听 `127.0.0.1:18080`，API 监听
+`127.0.0.1:18081`，PostgreSQL 仅使用本机 Unix Socket。Portal 不修改防火墙，
+不提供公网入口，也不把当前 HTTP 模式描述为公开生产 HTTPS。
+
+```text
+浏览器（SSH Tunnel）
+        |
+        v
+Next.js Web :18080 -- /api/* --> FastAPI :18081
+                                      |
+                   +------------------+------------------+
+                   |                                     |
+                   v                                     v
+       PostgreSQL Unix Socket                 worker.sock (0660)
+                                                         |
+                                                         v
+                                               Root Worker (root)
+                                                         |
+                         +-------------------------------+----------------+
+                         |                               |                |
+                   固定只读适配器                 固定 dry-run handler   既有受控脚本
+```
+
+## 组件职责
+
+- `apps/web`：中文控制台、表格、筛选、表单和任务状态轮询。它不执行宿主命令。
+- `apps/api`：认证、会话、CSRF、RBAC、审批状态机、审计、数据库事务以及 Worker
+  客户端。API 以非 root 系统账号运行，不能访问 Docker Socket、MUNGE key、
+  Linux shadow 或 SlurmDBD 密码。
+- `apps/worker`：唯一 root 组件。它通过 systemd 管理的 Unix Domain Socket 接收
+  限长、定版 JSON；使用对端凭据校验 API UID；重新验证固定 schema；只分派固定
+  operation type。
+- PostgreSQL：独立的 `h100_portal` 数据库和 `h100_portal` 数据库角色，与 SlurmDBD
+  MariaDB 和 Grafana 完全分离。
+
+## 运行身份
+
+`h100-portal-web`、`h100-portal-api`、`h100-portal-worker` 均为无密码、无交互 shell
+的系统账号，不加入 `docker`、`sudo`、`video`、`render` 或
+`gpu-platform-admin`。Worker unit 因宿主查询需要以 `root:root` 运行；
+`h100-portal-worker` 账号仅用于明确保留组件身份，不授予权限。
+
+## 数据读取
+
+Worker 优先调用结构化接口：Slurm JSON/parsable2、`nvidia-smi --query-gpu` CSV、
+Docker JSON inspect 的字段白名单、LVM JSON 及 Prometheus localhost API。每次调用
+均有固定绝对路径、固定 argv、固定 PATH、超时、最大输出和结构化错误码。异常返回
+`UNKNOWN` 或 partial failure，不以 `0` 冒充健康状态。
+
+GPU 数据同时保留 NVML index、UUID、PCI Bus ID、Linux minor 与 device path。minor
+来自 NVIDIA 驱动 `/proc/driver/nvidia/gpus/*/information`，按 PCI Bus 合并并复核 UUID；
+任何代码都不得推断 NVML index 等于 Linux minor。
+
+## 写操作
+
+HTTP 请求只创建 Operation，不等待宿主操作完成。危险操作需要对象名二次确认、
+最近十分钟重新认证和审批。API 通过 Worker Socket 提交已审批任务；Worker 再检查
+对象、参数、当前状态、脚本 owner/mode/hash 与幂等键。
+
+Portal-0/1 的写 handler 仅返回 dry-run 计划。`user.stage`、`user.activate`、
+`quota.update`、`slurm.resume` 和真实用户创建均不会执行。Slurm 保持 DRAIN。
+
+## 现阶段基础设施约束
+
+- 单节点；无 NFS、无第二节点、无跨节点 NCCL。
+- MIG Disabled，Portal 不提供 MIG 或 GPU reset 操作。
+- Docker Hub 为 DEFERRED/RESTRICTED；不依赖其运行时可用性。
+- Mellanox 物理网络 P0 由管理员接受为单节点 Pilot 风险。
+- PCI DOE 为 P1 观察项。
