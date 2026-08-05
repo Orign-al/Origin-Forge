@@ -1,6 +1,6 @@
 # 长期 Docker 到 Slurm 的安全提交通道
 
-状态：Pilot-1 技术 Gate 未通过；禁止创建 Pilot 用户或恢复调度，等待提交入口整改审批。
+状态：Pilot-1B `user.slice` 方案验证未通过；禁止创建 Pilot 用户或恢复调度，等待 GPU 作业内设备授权整改审批。
 
 ## 边界与不变量
 
@@ -71,3 +71,11 @@
 ## 当前结论
 
 方案 C 的宿主通用 shell 已被实测证明存在直接 GPU 绕过，不能用于 Pilot。当前不修改设备权限、PAM、sshd、个人 Docker 挂载或 secret 管理，不部署 `slurmrestd`，不创建其他员工账号，并保持 Slurm DRAIN。完成上述任一技术控制后，必须重新执行提交入口与 GPU 绕过 Gate，再由管理员明确批准 RESUME 和用户创建。
+
+## Pilot-1B `user.slice` 试验结果（2026-08-05）
+
+systemd 259 + unified cgroup v2 的层级前提成立：SSH 会话在 `user.slice`，`slurmd`、`slurmstepd.scope`、Docker、DCGM 和监控在 `system.slice`。Transient `DevicePolicy=closed` canary 通过，普通 shell/PTY/DNS/HTTPS 也通过；运行时策略下新 SSH 会话和 `nobody` 的所有 NVIDIA 节点 open 均被 `EPERM` 拒绝，管理员 system.slice transient 能看到 4 卡并通过 DCGM。
+
+但是，临时 RESUME 后单 GPU Pyxis 作业虽能用 `nvidia-smi` 看到已分配的一张卡，精确的 `os.open(O_RDWR)` 等价 Perl `sysopen(O_RDWR)` 对作业内 `/dev/nvidia0` 返回 `EPERM`，Job 10 为 `FAILED 1:0`。因此未创建持久 drop-in、Guard 或管理员辅助脚本；已执行自动 DRAIN 和回滚，当前 `DevicePolicy=auto`，作业外直接 GPU 访问恢复为可用。
+
+结论：`user.slice DevicePolicy=closed` 目前只能作为未完成实验，不能宣称 Slurm-only GPU access 已实现。下一轮必须先解决 Slurm 分配设备的精确 open/CUDA 授权（并用 Python `os.open(O_RDWR)` 与真实 CUDA 程序验证），再重新通过全部 CPU/单卡/双卡/并发 Gate。

@@ -1,6 +1,6 @@
 # H100 受控单机 Pilot 管理员手册
 
-状态：Pilot-1 提交入口 Gate 未通过，节点已重新 DRAIN。禁止创建 Pilot 用户或再次 RESUME，直到作业外 GPU 访问得到技术阻断并经管理员重新批准。
+状态：Pilot-1B `user.slice` 试验未通过，节点已重新 DRAIN。禁止创建 Pilot 用户或再次 RESUME，直到作业外 GPU 访问被阻断且 Slurm 分配 GPU 的精确 open/CUDA 验收通过并经管理员重新批准。
 
 ## 不变量
 
@@ -22,6 +22,18 @@
 3. 引入独立登录节点，计算节点启用 `pam_slurm_adopt` 与 `PrologFlags=contain`，拒绝无 allocation 会话。
 
 验收必须同时证明作业外身份无法枚举/打开 GPU，1-GPU job 只见一张，2-GPU job 只见两张，作业退出后访问撤销。不要用 `chmod` 临时值、隐藏二进制、组策略或用户承诺代替技术控制。
+
+### Pilot-1B 试验记录
+
+本轮只在 DRAIN 节点做了 runtime 试验，没有写入持久 drop-in：
+
+- systemd 259、cgroup v2 层级符合预期；SSH 在 `user.slice`，Slurm/Docker/DCGM 在 `system.slice`。
+- transient `DevicePolicy=closed` canary、普通命令兼容性、新 SSH/PTY、作业外 `nvidia-smi`/设备拒绝、system.slice 管理员通道均通过。
+- CPU Job 8 通过，作业 cgroup 为 `/system.slice/slurmstepd.scope/job_8/step_0/user/task_0`。
+- 单 GPU Job 10 的 `nvidia-smi` 只见分配 GPU，但 Perl `sysopen(O_RDWR)` 对作业内 `/dev/nvidia0` 返回 `EPERM`，作业 `FAILED 1:0`。
+- 已按失败路径 DRAIN，运行时策略恢复 `auto`，持久 `/etc/systemd/system/user.slice.d/50-h100-gpu-isolation.conf` 不存在；两个 transient rollback units 已停止。
+
+因此当前状态必须保持 `DIRECT GPU BYPASS STILL POSSIBLE`。不要部署 Guard 或声称已完成隔离；下一轮先调查 Slurm cgroup 的 NVIDIA 设备允许掩码/容器设备映射，并以精确 `os.open(O_RDWR)` 与真实 CUDA context 作为验收条件。
 
 ## 日常状态检查
 
@@ -125,4 +137,4 @@ sudo h100-container-delete USER
 
 每名用户分别验证 CPU job、单 GPU Pyxis job、两 GPU 超额申请被 QOS 拒绝/保持 Pending 后取消、sacct Account/QOS 正确、GPU 释放、目录隔离、无 sudo/docker 高权组、容器无 GPU/敏感 socket。最终复核 4 GPU、MIG Disabled、DCGM Pass、无 Xid/AER、队列、systemd、监控、quota、监听端口及 Git secret 扫描。
 
-只有提交入口技术 Gate 和上述验收全部通过，且管理员再次明确批准后，才可打印 `CONTROLLED SINGLE-NODE PILOT STARTED`。这不代表平台全面生产就绪。
+只有提交入口技术 Gate、作业外拒绝、作业内 open/CUDA、上述验收全部通过，且管理员再次明确批准后，才可打印 `CONTROLLED SINGLE-NODE PILOT STARTED`。这不代表平台全面生产就绪。
