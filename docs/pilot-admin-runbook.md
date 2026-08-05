@@ -1,6 +1,6 @@
 # H100 受控单机 Pilot 管理员手册
 
-状态：Pilot-1B `user.slice` 试验未通过，节点已重新 DRAIN。禁止创建 Pilot 用户或再次 RESUME，直到作业外 GPU 访问被阻断且 Slurm 分配 GPU 的精确 open/CUDA 验收通过并经管理员重新批准。
+状态：Pilot-1C 已完成专属 `user-<UID>.slice` 瞬时验证并纠正 Pilot-1B 的设备编号假阴性；策略已按要求回滚为 `auto`，节点保持 DRAIN。禁止创建 Pilot 用户或 RESUME，等待 per-user 持久策略明确审批。
 
 ## 不变量
 
@@ -17,9 +17,10 @@
 
 单独审批并实现以下一种方案后再复测：
 
-1. 不授予计算节点通用 shell，建立逐用户认证、强制命令、禁转发、完整审计的 Slurm 提交网关。
-2. 部署经 TLS、短期 per-user JWT、撤销、限流和审计验证的 `slurmrestd`。
-3. 引入独立登录节点，计算节点启用 `pam_slurm_adopt` 与 `PrologFlags=contain`，拒绝无 allocation 会话。
+1. 单节点 Pilot 候选：只为每个获批 Pilot UID 部署独立的 `user-<UID>.slice DevicePolicy=closed`，并让用户创建脚本负责 drop-in、daemon-reload、验证、Guard 指标和逐 UID 回滚。Pilot-1C 只验证了 runtime 策略，持久化尚未获批。
+2. 不授予计算节点通用 shell，建立逐用户认证、强制命令、禁转发、完整审计的 Slurm 提交网关。
+3. 部署经 TLS、短期 per-user JWT、撤销、限流和审计验证的 `slurmrestd`。
+4. 引入独立登录节点，计算节点启用 `pam_slurm_adopt` 与 `PrologFlags=contain`，拒绝无 allocation 会话。
 
 验收必须同时证明作业外身份无法枚举/打开 GPU，1-GPU job 只见一张，2-GPU job 只见两张，作业退出后访问撤销。不要用 `chmod` 临时值、隐藏二进制、组策略或用户承诺代替技术控制。
 
@@ -30,10 +31,23 @@
 - systemd 259、cgroup v2 层级符合预期；SSH 在 `user.slice`，Slurm/Docker/DCGM 在 `system.slice`。
 - transient `DevicePolicy=closed` canary、普通命令兼容性、新 SSH/PTY、作业外 `nvidia-smi`/设备拒绝、system.slice 管理员通道均通过。
 - CPU Job 8 通过，作业 cgroup 为 `/system.slice/slurmstepd.scope/job_8/step_0/user/task_0`。
-- 单 GPU Job 10 的 `nvidia-smi` 只见分配 GPU，但 Perl `sysopen(O_RDWR)` 对作业内 `/dev/nvidia0` 返回 `EPERM`，作业 `FAILED 1:0`。
+- 单 GPU Job 10 的 `nvidia-smi` 只见 UUID `GPU-c8377945-df2c-5761-8798-66385611808b`，但探针固定测试 `/dev/nvidia0`；该轮没有记录 UUID 对应 minor，因此当时的 allocated-device 结论不可证明。
 - 已按失败路径 DRAIN，运行时策略恢复 `auto`，持久 `/etc/systemd/system/user.slice.d/50-h100-gpu-isolation.conf` 不存在；两个 transient rollback units 已停止。
 
-因此当前状态必须保持 `DIRECT GPU BYPASS STILL POSSIBLE`。不要部署 Guard 或声称已完成隔离；下一轮先调查 Slurm cgroup 的 NVIDIA 设备允许掩码/容器设备映射，并以精确 `os.open(O_RDWR)` 与真实 CUDA context 作为验收条件。
+Pilot-1C 已完成该调查并证明 `/dev/nvidia0` 是 Job 10 的 unallocated GPU；旧报告保留并通过独立勘误纠正。
+
+### Pilot-1C 设备映射与 per-user slice 记录
+
+- 宿主 NVML 0/1/2/3 分别映射到 Linux minors 1/0/3/2；Job 10 的 UUID 实际对应 `/dev/nvidia1`，所以旧 `/dev/nvidia0` 的 `EPERM` 是预期隔离。
+- `DevicePolicy=auto` 下，裸 Job 11、Pyxis Job 12、四并发 Jobs 13～16 均做到 allocated minor 可 `O_RDWR`、其余三张 `EPERM`、真实 CUDA context 成功。
+- Job 17 的 task 位于 `/system.slice/slurmstepd.scope/job_17/...`；Slurm BPF 程序 ID 1492 对 char major 195 精确允许 minor 1、拒绝 0/3/2，strace 相符。
+- `user-1001.slice DevicePolicy=closed` 瞬时策略下，新 SSH/PTY 可用，作业外四个 GPU open 全拒绝且 `cuInit` 为 `CUDA_ERROR_NO_DEVICE`；裸 Job 18、Pyxis Job 19、四并发 Jobs 20～23 全部通过。
+- 四并发作业运行期间，受限 SSH 仍不能打开任何 per-GPU 节点或建立 CUDA context。
+- root-only 自动回滚成功；最终 `user-1001.slice DevicePolicy=auto`，无全局/per-UID 持久 drop-in，无 Guard，无 Pilot 用户。节点 Reason 为 `gpu device mapping and transient isolation validation complete`。
+
+因此当前运行态仍是 `DIRECT GPU BYPASS STILL POSSIBLE`，因为测试策略已按授权回滚；这不否定瞬时方案通过。不要在未批准前手工写 drop-in、部署 Guard、创建用户或 RESUME。
+
+建议持久化方案：为每个获批 Pilot 用户生成独立 `user-<UID>.slice.d/50-h100-gpu-isolation.conf`，不修改全局 `user.slice`；逐 UID 验证、逐 UID 回滚，并在独立登录节点上线后迁移到 `pam_slurm_adopt`。下一审批语句为：`允许将GPU隔离改为Pilot用户专属user-UID.slice持久策略，并更新用户创建脚本`。
 
 ## 日常状态检查
 
