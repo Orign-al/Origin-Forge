@@ -1,0 +1,13 @@
+network:
+  version: 2
+  ethernets:
+    ens1f1np1:
+      optional: true
+    ens27f0:
+      optional: true
+    ens27f1:
+      optional: true
+    ens27f2:
+      optional: true
+    ens27f3:
+      optional: true

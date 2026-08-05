@@ -1,0 +1,29 @@
+groups:
+  - name: h100-mellanox-physical-link
+    rules:
+      - alert: H100MellanoxRxCrcErrors
+        expr: increase(h100_mellanox_rx_crc_errors_phy_total[5m]) > 0
+        labels:
+          severity: critical
+          component: physical-network
+        annotations:
+          summary: "Mellanox CRC errors increased on {{ $labels.interface }}"
+          description: "The Mellanox physical receive CRC counter increased during the last 5 minutes. Physical remediation remains deferred by the administrator."
+
+      - alert: H100MellanoxRxSymbolErrors
+        expr: increase(h100_mellanox_rx_symbol_err_phy_total[5m]) > 0
+        labels:
+          severity: critical
+          component: physical-network
+        annotations:
+          summary: "Mellanox symbol errors increased on {{ $labels.interface }}"
+          description: "The Mellanox physical receive symbol-error counter increased during the last 5 minutes. Physical remediation remains deferred by the administrator."
+
+      - alert: H100MellanoxLinkDownEvents
+        expr: increase(h100_mellanox_link_down_events_phy_total[5m]) > 0
+        labels:
+          severity: critical
+          component: physical-network
+        annotations:
+          summary: "Mellanox link-down events increased on {{ $labels.interface }}"
+          description: "The Mellanox physical link-down counter increased during the last 5 minutes. Check management connectivity and coordinate field remediation."

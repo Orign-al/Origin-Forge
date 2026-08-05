@@ -1,6 +1,6 @@
 # Mellanox PHY Prometheus textfile collector 设计
 
-状态：**设计、shellcheck、手动采集、promtool 和 unit 解析均已通过；未安装。**
+状态：**已部署并通过运行态验收。**
 
 ## 文件与生产默认值
 
@@ -25,24 +25,25 @@
 - `h100_mellanox_rx_discards_phy_total`
 - `h100_mellanox_tx_discards_phy_total`
 
-## 安装审批 Gate
+## 已部署状态
 
-安装会产生以下系统变更，因此当前未执行：
+管理员已明确批准生产部署。已完成：
 
 1. 创建 `/var/lib/node_exporter/textfile_collector`；
 2. 安装 `/usr/local/sbin/h100-mellanox-metrics`；
-3. 安装 service/timer；
-4. 为现有 Node Exporter 增加 textfile collector 参数并重启 Node Exporter；
-5. 启用 timer。
+3. 安装 `h100-mellanox-metrics.service` 和每分钟 timer；
+4. 为 Node Exporter 增加 textfile collector 参数并完成重启；
+5. 把三条规则加载到 Prometheus。
 
-正式安装前必须：
+运行态验证结果：
 
-- 时间戳备份现有 Node Exporter unit 和所有同名目标文件；
-- `bash -n` 和 `shellcheck` 均通过；
-- 在临时目录手动运行并验证 Prometheus text format；
-- 确认 `/metrics` 出现全部五个指标；
-- 确认现有 Prometheus target、Grafana、DCGM Exporter 未退化；
-- 获得管理员明确批准。
+- `bash -n`、ShellCheck、`systemd-analyze verify` 和 `promtool` 均通过；
+- timer 为 enabled/active，最近一次 oneshot `Result=success`、退出码 0；
+- Node Exporter 仍只监听 `127.0.0.1:9100`；
+- `/metrics` 暴露全部五个 `h100_mellanox_*` 指标；
+- Prometheus 的 node-exporter、dcgm-exporter、prometheus targets 均为 up；
+- CRC 与 symbol 规则因当前已知物理故障进入 firing；link-down 规则为 inactive/healthy；
+- 回滚备份位于 `backups/p0b-20260805-032025/collector-20260805-120700/`。
 
 Phase P0-B 已经管理员授权，从 Ubuntu 26.04 `resolute/universe` 官方仓库安装 `shellcheck 0.11.0-2`。以下预部署检查已通过：
 
@@ -53,9 +54,7 @@ Phase P0-B 已经管理员授权，从 Ubuntu 26.04 `resolute/universe` 官方�
 - Node Exporter 1.12.1 支持 `--collector.textfile.directory`；
 - 候选 service/timer 的 `systemd-analyze verify`。
 
-剩余未满足条件只有管理员明确批准生产部署。当前 Node Exporter ExecStart 未改变，生产 `/metrics` 中没有 `h100_mellanox_*`，所有系统安装目标均不存在。
-
-## 建议告警（确认指标存在后再部署）
+## 已部署告警
 
 ```promql
 increase(h100_mellanox_rx_crc_errors_phy_total[5m]) > 0
@@ -63,4 +62,4 @@ increase(h100_mellanox_rx_symbol_err_phy_total[5m]) > 0
 increase(h100_mellanox_link_down_events_phy_total[5m]) > 0
 ```
 
-不应在指标首次出现前部署这些规则；重启或 NIC 计数复位也需结合 `resets()` 区分。
+规则文件为 `monitoring/rules/h100-mellanox-alerts.yml`。重启或 NIC 计数复位仍需结合 `resets()` 和现场记录解释，不能把计数器复位误判为物理修复。

@@ -89,7 +89,20 @@ cp -a /etc/projid "${backup_dir}/projid.before"
 cp -a "${compose_file}" "${backup_dir}/compose.yml"
 
 temp_dir="$(mktemp -d /tmp/h100-delete-data.XXXXXX)"
-trap 'rc=$?; case "${temp_dir}" in /tmp/h100-delete-data.*) rm -rf -- "${temp_dir}" ;; esac; trap - EXIT; h100_audit "${H100_AUDIT_ACTION}" "${H100_AUDIT_TARGET}" "${H100_AUDIT_OUTCOME}" "${rc}"; exit "${rc}"' EXIT
+cleanup_container_delete() {
+  local exit_status=${1:?}
+  case "${temp_dir}" in
+    /tmp/h100-delete-data.*) rm -rf -- "${temp_dir}" ;;
+  esac
+  trap - EXIT
+  h100_audit \
+    "${H100_AUDIT_ACTION}" \
+    "${H100_AUDIT_TARGET}" \
+    "${H100_AUDIT_OUTCOME}" \
+    "${exit_status}"
+  exit "${exit_status}"
+}
+trap 'cleanup_container_delete "$?"' EXIT
 awk -F: -v id="${project_id}" '$1 != id' /etc/projects >"${temp_dir}/projects"
 awk -F: -v name="${project_name}" '$1 != name' /etc/projid >"${temp_dir}/projid"
 

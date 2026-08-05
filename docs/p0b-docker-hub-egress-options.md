@@ -1,10 +1,12 @@
 # Phase P0-B Docker Hub 正式出口方案
 
-状态：**尚未选择或部署任何方案。**
+状态：**DEFERRED — ALTERNATIVE REGISTRIES REQUIRED。**
 
 当前系统 DNS 为 `114.114.114.114`、`223.5.5.5`。10 轮当前路径查询中，正确的 `production.cloudfront.docker.com` 得到 CloudFront CNAME 和 AWS 地址；Registry、Auth、docker.io、hub.docker.com 则得到可疑且随测试变化的地址。Registry/Auth 的 IPv4 TCP/TLS 超时，而 CloudFront TCP 与 TLS 1.3 可达。按 Phase P0-B 证据标准，管理员尚未提供 Resolver B，因此只能记录为高度可疑，不能最终打印 `DNS PATH CONFIRMED AS ROOT CAUSE`。
 
-不得同时部署多个方案。先完成可信 Resolver B 的非持久对比，再由管理员选择。
+管理员已接受 Docker Hub 暂不可用的单机 Pilot 限制。本阶段不部署 DNS、代理或缓存方案，也不把 Docker Hub 关闭为已解决问题。Pilot 镜像依次优先使用已缓存的本地镜像、NVIDIA NGC、GHCR、Quay，以及管理员离线导入并记录 digest 的 OCI/Docker archive。
+
+不得同时部署多个正式出口方案。进入后续整改时，先完成可信 Resolver B 的非持久对比，再由管理员选择。
 
 ## 方案 A：公司批准的干净 DNS
 
@@ -41,13 +43,22 @@
 
 管理员需提供内部 Registry FQDN、证书/CA 管理方式、认证方法、proxy-cache project/命名规则、HA/SLA 和运维责任人，之后再制定 H100 侧最小变更。
 
-## 当前决策顺序
+## 延期期间的镜像准入
 
-1. 现场按单变量完成 Mellanox 整改；
-2. 提供批准的 Resolver B；
-3. 用 `dig` UDP/TCP 和 `curl --resolve` 区分 DNS 与 ACL/SNI；
-4. 根据结果只选择 A、B、C 中一个；
-5. 输出 diff 并取得相应明确批准；
-6. 按 DNS → TCP → TLS → Registry 401 → Auth → manifest → blob/CDN → 固定 digest pull/run 完成验收。
+- 不反复拉取 Docker Hub 大镜像；
+- 不依赖 Docker Hub 实时拉取启动 Pilot 作业；
+- 每个准入镜像记录 registry、repository、tag、digest、导入时间和上传用户；
+- tag 不能替代 digest；
+- 不使用未知 mirror、insecure registry、`/etc/hosts` 固定 CDN IP、个人代理、VPN 或 SSH 隧道；
+- 如果本地镜像的上游当前不可达，管理员必须先验证本地 digest，再允许作业使用。
+
+## 后续正式整改顺序
+
+1. 提供批准的 Resolver B；
+2. 用 `dig` UDP/TCP 和 `curl --resolve` 区分 DNS 与 ACL/SNI；
+3. 根据结果只选择 A、B、C 中一个；
+4. 输出 diff 并取得相应明确批准；
+5. 按 DNS → TCP → TLS → Registry 401 → Auth → manifest → blob/CDN → 固定 digest pull/run 完成验收；
+6. 在 Phase Final-Network 中结合物理链路整改结果再次回归。
 
 禁止 `/etc/hosts` 固定 IP、未知公共 DNS/DoH、个人 VPN/代理、`--insecure`、insecure registry、未知 mirror、盲改 MTU或全局禁用 IPv6。

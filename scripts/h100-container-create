@@ -96,7 +96,20 @@ printf 'Compose target and container were absent before creation.\n' \
   >"${backup_dir}/state"
 
 temp_dir="$(mktemp -d /tmp/h100-container-create.XXXXXX)"
-trap 'rc=$?; case "${temp_dir}" in /tmp/h100-container-create.*) rm -rf -- "${temp_dir}" ;; esac; trap - EXIT; h100_audit "${H100_AUDIT_ACTION}" "${H100_AUDIT_TARGET}" "${H100_AUDIT_OUTCOME}" "${rc}"; exit "${rc}"' EXIT
+cleanup_container_create() {
+  local exit_status=${1:?}
+  case "${temp_dir}" in
+    /tmp/h100-container-create.*) rm -rf -- "${temp_dir}" ;;
+  esac
+  trap - EXIT
+  h100_audit \
+    "${H100_AUDIT_ACTION}" \
+    "${H100_AUDIT_TARGET}" \
+    "${H100_AUDIT_OUTCOME}" \
+    "${exit_status}"
+  exit "${exit_status}"
+}
+trap 'cleanup_container_create "$?"' EXIT
 generated_compose="${temp_dir}/compose.yml"
 cat >"${generated_compose}" <<EOF
 name: h100-dev-${user_name}

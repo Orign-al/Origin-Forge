@@ -70,7 +70,20 @@ cp -a /etc/projects "${backup_dir}/projects.before"
 cp -a /etc/projid "${backup_dir}/projid.before"
 
 temp_dir="$(mktemp -d /tmp/h100-user-create.XXXXXX)"
-trap 'rc=$?; case "${temp_dir}" in /tmp/h100-user-create.*) rm -rf -- "${temp_dir}" ;; esac; trap - EXIT; h100_audit "${H100_AUDIT_ACTION}" "${H100_AUDIT_TARGET}" "${H100_AUDIT_OUTCOME}" "${rc}"; exit "${rc}"' EXIT
+cleanup_user_create() {
+  local exit_status=${1:?}
+  case "${temp_dir}" in
+    /tmp/h100-user-create.*) rm -rf -- "${temp_dir}" ;;
+  esac
+  trap - EXIT
+  h100_audit \
+    "${H100_AUDIT_ACTION}" \
+    "${H100_AUDIT_TARGET}" \
+    "${H100_AUDIT_OUTCOME}" \
+    "${exit_status}"
+  exit "${exit_status}"
+}
+trap 'cleanup_user_create "$?"' EXIT
 sed -e '$a\' /etc/projects >"${temp_dir}/projects"
 printf '%s:%s\n' "${project_id}" "${user_root}" >>"${temp_dir}/projects"
 sed -e '$a\' /etc/projid >"${temp_dir}/projid"
