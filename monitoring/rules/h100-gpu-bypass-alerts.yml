@@ -1,0 +1,42 @@
+groups:
+  - name: h100-gpu-bypass-guard
+    rules:
+      - alert: H100GpuBypassGuardFailed
+        expr: h100_gpu_bypass_guard_last_success == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: gpu-isolation
+        annotations:
+          summary: "H100 GPU bypass guard failed"
+          description: "The per-user GPU isolation guard reported a failure. The Slurm node must remain drained until the exact cause is resolved."
+
+      - alert: H100PilotUserGpuIsolationFailed
+        expr: h100_gpu_user_isolation_success == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: gpu-isolation
+        annotations:
+          summary: "Pilot user GPU isolation failed for {{ $labels.username }}"
+          description: "The exact user-UID.slice policy or its device/CUDA probe failed for this managed Pilot user."
+
+      - alert: H100GpuCountMismatch
+        expr: h100_gpu_bypass_guard_nvidia_gpu_count != h100_gpu_bypass_guard_slurm_gpu_count
+        for: 1m
+        labels:
+          severity: critical
+          component: gpu-isolation
+        annotations:
+          summary: "NVIDIA and Slurm GPU counts differ"
+          description: "The host NVIDIA GPU count and Slurm configured GRES GPU count do not match."
+
+      - alert: H100SlurmDeviceConstraintDisabled
+        expr: h100_gpu_bypass_guard_slurm_constrain_devices != 1
+        for: 1m
+        labels:
+          severity: critical
+          component: gpu-isolation
+        annotations:
+          summary: "Slurm ConstrainDevices is disabled"
+          description: "Slurm task/cgroup no longer reports ConstrainDevices=yes."

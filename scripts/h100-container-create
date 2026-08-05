@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Markdown report format strings intentionally contain literal backticks.
+# shellcheck disable=SC2016
 set -euo pipefail
 
 source /usr/local/lib/h100-platform/h100-platform-common.sh
@@ -31,6 +33,7 @@ h100_acquire_lock
 h100_install_audit_trap container-create "${user_name}"
 h100_require_managed_user "${user_name}"
 h100_require_slurm_drained
+h100_require_pilot_gpu_isolation_if_managed "${user_name}"
 
 container="$(h100_container_name "${user_name}")"
 config_dir="$(h100_config_dir "${user_name}")"

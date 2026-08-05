@@ -1,6 +1,6 @@
 # H100 受控单机 Pilot 用户指南
 
-状态：**尚未开放给 Pilot 用户**。当前提交入口的作业外 GPU 隔离 Gate 未通过，且 `user.slice` 试验尚未通过 Slurm 作业内设备 open 验收，Slurm 节点保持 DRAIN。本指南用于整改通过后的受控上线，不构成账号或资源授权。
+状态：**尚未开放给 Pilot 用户**。精确 per-UID GPU 隔离框架已安装，但当前没有 Pilot 用户、没有活动用户策略，Slurm 节点保持 DRAIN并等待用户清单审批。本指南不构成账号或资源授权。
 
 ## 平台边界与已知风险
 
@@ -55,7 +55,7 @@ Host h100-pilot-container
 
 长期容器用于编辑、依赖准备和轻量 CPU 开发，默认 8 CPU、32GiB RAM、4096 PIDs，实际值以分配清单为准。
 
-- 容器默认无 GPU；其中 `nvidia-smi` 不可用是预期行为。
+- 容器默认无 GPU；其中 `nvidia-smi` 和直接 CUDA context 不可用是预期行为。
 - 容器内可 `sudo` 成为**容器内 root**，不代表宿主权限。
 - 不提供 Docker Socket、MUNGE socket/key、host network、host PID/IPC 或 privileged。
 - 禁止在容器中寻找或构造绕过 Slurm 的 GPU 通道。
@@ -101,6 +101,8 @@ srun --partition=notebook --gres=gpu:h100:1 \
 - 默认 QOS 为 `general`，每用户最多 1 张 GPU；两卡必须单独审批。
 - 每个作业必须设置合理时间限制，不允许无限期交互式 GPU Job。
 - 作业应在容器输出中只看到 Slurm 分配的 GPU。
+- 宿主登录会话中的 `nvidia-smi` 失败、打开 `/dev/nvidia*` 返回权限错误、CUDA 报 `CUDA_ERROR_NO_DEVICE` 都是预期安全行为；GPU 只在 Slurm 分配的作业内可用。
+- `CUDA_VISIBLE_DEVICES=0` 是作业内逻辑编号，不证明宿主设备是 `/dev/nvidia0`。平台使用 GPU UUID 与 Linux minor 做物理身份关联，用户不得按 NVML index 猜设备节点。
 
 取消作业和查看历史：
 
@@ -118,7 +120,8 @@ sacct -S today -u "$USER" \
 - 避免大规模外网下载；公共模型和数据集由管理员统一管理，避免每用户重复复制。
 - 不得使用宿主 Docker、加入 `docker` 组、访问 Docker Socket或控制其他用户容器。
 - 不得在 Slurm 作业外访问 GPU，也不得申请未获批准的 QOS/GPU 数量。
-- 在最终隔离方案通过后，宿主 SSH 中 `nvidia-smi` 失败将是预期行为；当前方案尚未启用，用户不得把现状当作安全边界。
+- ACTIVE 用户的宿主 SSH 中 `nvidia-smi` 和直接 CUDA 失败是预期行为；不要请求管理员通过 GPU/video/render/docker 组或设备 chmod 放开访问。
+- 不得尝试直接打开 NVIDIA device node、绕过 Slurm cgroup、在长期 Docker 中添加 GPU，或把 `CUDA_VISIBLE_DEVICES` 当成安全边界。
 - 网络中断、GPU 异常、作业异常、文件传输错误或数据损坏迹象应立即报告。
 - 重要结果应在作业完成后及时归档。
 

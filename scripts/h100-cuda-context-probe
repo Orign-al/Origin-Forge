@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Create a real CUDA Driver API context or prove that creation is denied."""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import ctypes.util
+import os
+import sys
+import time
+from pathlib import Path
+
+
+CUDA_SUCCESS = 0
+CUDA_DENIAL_CODES = {100, 201, 202, 209, 999}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Create and destroy a real CUDA Driver API context."
+    )
+    expectation = parser.add_mutually_exclusive_group()
+    expectation.add_argument("--expect-denied", action="store_true")
+    expectation.add_argument("--expect-success", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--hold-seconds", type=float, default=0.5)
+    args = parser.parse_args()
+    if not 0.0 <= args.hold_seconds <= 3.0:
+        parser.error("--hold-seconds must be between 0 and 3")
+    return args
+
+
+def cgroup_text() -> str:
+    try:
+        return Path("/proc/self/cgroup").read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return f"ERROR errno={exc.errno} {exc.strerror}"
+
+
+class Driver:
+    def __init__(self) -> None:
+        self.library_name = ctypes.util.find_library("cuda") or "libcuda.so.1"
+        self.lib = ctypes.CDLL(self.library_name)
+        self.lib.cuInit.argtypes = [ctypes.c_uint]
+        self.lib.cuInit.restype = ctypes.c_int
+        self.lib.cuDeviceGetCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        self.lib.cuDeviceGetCount.restype = ctypes.c_int
+        self.lib.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        self.lib.cuDeviceGet.restype = ctypes.c_int
+        self.lib.cuDeviceGetName.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        self.lib.cuDeviceGetName.restype = ctypes.c_int
+        self.lib.cuCtxSynchronize.argtypes = []
+        self.lib.cuCtxSynchronize.restype = ctypes.c_int
+        self.ctx_create_name, self.ctx_create = self._symbol(
+            ("cuCtxCreate_v2", "cuCtxCreate")
+        )
+        self.ctx_create.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint,
+            ctypes.c_int,
+        ]
+        self.ctx_create.restype = ctypes.c_int
+        self.ctx_destroy_name, self.ctx_destroy = self._symbol(
+            ("cuCtxDestroy_v2", "cuCtxDestroy")
+        )
+        self.ctx_destroy.argtypes = [ctypes.c_void_p]
+        self.ctx_destroy.restype = ctypes.c_int
+        self.get_error_name = getattr(self.lib, "cuGetErrorName", None)
+        if self.get_error_name is not None:
+            self.get_error_name.argtypes = [
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_char_p),
+            ]
+            self.get_error_name.restype = ctypes.c_int
+
+    def _symbol(self, names: tuple[str, ...]):
+        for name in names:
+            value = getattr(self.lib, name, None)
+            if value is not None:
+                return name, value
+        raise RuntimeError(f"required CUDA symbols are absent: {','.join(names)}")
+
+    def describe(self, code: int) -> str:
+        result = f"code={code}"
+        if self.get_error_name is not None:
+            value = ctypes.c_char_p()
+            if self.get_error_name(code, ctypes.byref(value)) == 0 and value.value:
+                result += f" name={value.value.decode(errors='replace')}"
+        return result
+
+
+def main() -> int:
+    args = parse_args()
+    messages: list[str] = [
+        f"PID={os.getpid()} UID={os.getuid()} GID={os.getgid()}",
+        f"CGROUP={cgroup_text()}",
+    ]
+    context = ctypes.c_void_p()
+    context_created = False
+    denial_observed = False
+    internal_error = False
+    failure_stage = ""
+    failure_code: int | None = None
+    driver: Driver | None = None
+
+    try:
+        driver = Driver()
+        messages.extend(
+            [
+                f"CUDA_LIBRARY={driver.library_name}",
+                f"CUDA_CTX_CREATE_SYMBOL={driver.ctx_create_name}",
+                f"CUDA_CTX_DESTROY_SYMBOL={driver.ctx_destroy_name}",
+            ]
+        )
+        code = driver.lib.cuInit(0)
+        messages.append(f"CUINIT={driver.describe(code)}")
+        if code != CUDA_SUCCESS:
+            failure_stage = "cuInit"
+            failure_code = code
+            denial_observed = code in CUDA_DENIAL_CODES
+        else:
+            count = ctypes.c_int()
+            code = driver.lib.cuDeviceGetCount(ctypes.byref(count))
+            messages.append(
+                f"CUDEVICEGETCOUNT={driver.describe(code)} count={count.value}"
+            )
+            if code != CUDA_SUCCESS:
+                failure_stage = "cuDeviceGetCount"
+                failure_code = code
+                denial_observed = code in CUDA_DENIAL_CODES
+            elif count.value < 1:
+                failure_stage = "cuDeviceGetCount"
+                failure_code = CUDA_SUCCESS
+                denial_observed = True
+            else:
+                device = ctypes.c_int()
+                code = driver.lib.cuDeviceGet(ctypes.byref(device), 0)
+                messages.append(f"CUDEVICEGET={driver.describe(code)} device={device.value}")
+                if code != CUDA_SUCCESS:
+                    failure_stage = "cuDeviceGet"
+                    failure_code = code
+                    denial_observed = code in CUDA_DENIAL_CODES
+                else:
+                    name = ctypes.create_string_buffer(256)
+                    code = driver.lib.cuDeviceGetName(name, len(name), device.value)
+                    messages.append(
+                        f"CUDEVICEGETNAME={driver.describe(code)} "
+                        f"name={name.value.decode(errors='replace')}"
+                    )
+                    if code != CUDA_SUCCESS:
+                        failure_stage = "cuDeviceGetName"
+                        failure_code = code
+                    else:
+                        code = driver.ctx_create(ctypes.byref(context), 0, device.value)
+                        messages.append(f"CUCTXCREATE={driver.describe(code)}")
+                        if code != CUDA_SUCCESS:
+                            failure_stage = driver.ctx_create_name
+                            failure_code = code
+                            denial_observed = code in CUDA_DENIAL_CODES
+                        else:
+                            context_created = True
+                            code = driver.lib.cuCtxSynchronize()
+                            messages.append(f"CUCTXSYNCHRONIZE={driver.describe(code)}")
+                            if code != CUDA_SUCCESS:
+                                failure_stage = "cuCtxSynchronize"
+                                failure_code = code
+                            else:
+                                time.sleep(args.hold_seconds)
+    except (OSError, RuntimeError) as exc:
+        internal_error = True
+        failure_stage = "driver_load_or_symbol"
+        messages.append(f"INTERNAL_ERROR={exc}")
+    finally:
+        if context_created and driver is not None:
+            destroy_code = driver.ctx_destroy(context)
+            messages.append(f"CUCTXDESTROY={driver.describe(destroy_code)}")
+            if destroy_code != CUDA_SUCCESS and not failure_stage:
+                failure_stage = driver.ctx_destroy_name
+                failure_code = destroy_code
+
+    context_success = context_created and not failure_stage and not internal_error
+    if args.expect_success:
+        passed = context_success
+        expectation = "success"
+    elif args.expect_denied:
+        passed = denial_observed and not context_created and not internal_error
+        expectation = "denied"
+    else:
+        passed = not internal_error
+        expectation = "observe"
+
+    messages.append(f"EXPECTATION={expectation}")
+    messages.append(
+        "CUDA_CONTEXT_RESULT="
+        f"{'PASSED' if context_success else 'DENIED' if denial_observed else 'BLOCKED'} "
+        f"stage={failure_stage or 'complete'} code={failure_code}"
+    )
+    messages.append(f"CUDA_CONTEXT_PROBE={'PASSED' if passed else 'FAILED'}")
+    if args.quiet:
+        print(messages[-1])
+    else:
+        print("\n".join(messages))
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

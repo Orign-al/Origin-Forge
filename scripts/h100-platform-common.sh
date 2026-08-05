@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Constants in this sourced library are consumed by its callers.
+# shellcheck disable=SC2034
 set -euo pipefail
 
 readonly H100_PLATFORM_ROOT=/srv/gpu-platform/platform
@@ -6,6 +8,8 @@ readonly H100_DATA_ROOT=/srv/gpu-platform
 readonly H100_MANAGEMENT_IP=10.82.36.1
 readonly H100_AUDIT_LOG=/var/log/h100-platform-audit.log
 readonly H100_LOCK_FILE=/run/lock/h100-platform.lock
+readonly H100_GPU_ISOLATION_REGISTRY=/etc/h100-platform/gpu-isolated-users
+readonly H100_GPU_ISOLATION_TOOL=/usr/local/sbin/h100-user-gpu-isolation
 
 h100_fail() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -46,12 +50,18 @@ h100_validate_image_ref() {
 
 h100_acquire_lock() {
   local mode=${1:-exclusive}
+  if [[ "${H100_PLATFORM_LOCK_HELD:-0}" == 1 ]]; then
+    flock -n 9 >/dev/null 2>&1 \
+      || h100_fail 'inherited platform lock marker has no valid lock descriptor'
+    return 0
+  fi
   exec 9>"${H100_LOCK_FILE}"
   if [[ "${mode}" == shared ]]; then
     flock -s 9
   else
     flock -x 9
   fi
+  export H100_PLATFORM_LOCK_HELD=1
 }
 
 h100_audit() {
@@ -105,6 +115,34 @@ h100_require_managed_user() {
     || h100_fail "managed shared directory is missing: ${managed_username}"
 }
 
+h100_require_pilot_gpu_isolation_if_managed() {
+  local managed_username=$1
+  local managed_uid
+  local pilot_state_file="/etc/h100-platform/users/${managed_username}.state"
+  managed_uid="$(id -u "${managed_username}")"
+  if [[ ! -f "${H100_GPU_ISOLATION_REGISTRY}" ]]; then
+    [[ ! -e "${pilot_state_file}" ]] \
+      || h100_fail 'Pilot state exists but GPU isolation registry is missing'
+    return 0
+  fi
+  if awk -v name="${managed_username}" -v uid="${managed_uid}" '
+      $0 !~ /^[[:space:]]*(#|$)/ && $1 == name && $2 == uid { found=1 }
+      END { exit found ? 0 : 1 }
+    ' "${H100_GPU_ISOLATION_REGISTRY}"; then
+    [[ -x "${H100_GPU_ISOLATION_TOOL}" ]] \
+      || h100_fail 'Pilot GPU isolation verifier is unavailable'
+    "${H100_GPU_ISOLATION_TOOL}" verify "${managed_username}"
+    return 0
+  fi
+  if [[ -e "${pilot_state_file}" ]] \
+    || awk -v name="${managed_username}" -v uid="${managed_uid}" '
+      $0 !~ /^[[:space:]]*(#|$)/ && ($1 == name || $2 == uid) { found=1 }
+      END { exit found ? 0 : 1 }
+    ' "${H100_GPU_ISOLATION_REGISTRY}"; then
+    h100_fail 'Pilot user GPU isolation registry mapping is absent or inconsistent'
+  fi
+}
+
 h100_require_managed_compose() {
   local managed_username=$1
   local managed_compose
@@ -121,8 +159,8 @@ h100_wait_healthy() {
   local target_container=$1
   local health_attempts=${2:-120}
   local health_state
-  local attempt
-  for attempt in $(seq 1 "${health_attempts}"); do
+  local _attempt
+  for _attempt in $(seq 1 "${health_attempts}"); do
     health_state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${target_container}")"
     if [[ "${health_state}" == healthy ]]; then
       return 0

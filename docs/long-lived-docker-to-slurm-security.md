@@ -1,6 +1,6 @@
 # 长期 Docker 到 Slurm 的安全提交通道
 
-状态：Pilot-1C 已证明 Pilot 用户专属 `user-<UID>.slice DevicePolicy=closed` 的瞬时方案可同时阻断作业外 GPU、保留 Slurm/Pyxis 精确分配；本轮已按要求回滚为 `auto`，节点保持 DRAIN，等待持久化方案明确审批。
+状态：Pilot-1D 已获批并安装 Pilot 用户专属持久 GPU 隔离框架；当前没有 Pilot 用户、没有活动的 per-UID 策略，Guard timer 保持 disabled/inactive，Slurm 保持 DRAIN，等待最多 3 名用户清单审批。
 
 ## 边界与不变量
 
@@ -17,7 +17,7 @@
 |---|---|---|---|---|
 | A：个人容器通过 SSH 连接宿主提交入口 | 用户自己的 SSH 密钥；不得使用管理员密钥 | 用户可从 VS Code/容器工作流直接提交；沿用 sshd 审计和 Unix 身份 | 用户私钥位于其持久化 home，容器 root 可读取；必须使用个人密钥、严格 known_hosts、禁用 agent 共享管理员身份，并限制宿主登录权限 | 可作为后续便利方案，先做单用户原型和威胁评审 |
 | B：`slurmrestd` + JWT | 短期、最小权限 JWT；服务端 JWT signing key 不进入个人容器 | API 友好，便于门户和自动化；可与未来 JumpServer/内部服务集成 | 需 TLS、密钥轮换、token 过期/撤销、请求审计、限流和 Slurm 版本兼容；错误配置会扩大控制面暴露 | 当前不部署；待有集中身份系统和 secret 生命周期管理后评估 |
-| C：用户直接 SSH 登录宿主后提交 | 用户个人 SSH 公钥，由宿主 sshd 认证 | 无需把 MUNGE/JWT/管理员凭据放入容器；Slurm CLI 与 Unix 用户天然一致 | `DevicePolicy=auto` 时普通会话可绕过 Slurm；必须为每个获批 Pilot UID 部署并验证独立的 `DevicePolicy=closed` | 瞬时技术验证通过；持久策略未获批、未部署，当前仍阻断 |
+| C：用户直接 SSH 登录宿主后提交 | 用户个人 SSH 公钥，由宿主 sshd 认证 | 无需把 MUNGE/JWT/管理员凭据放入容器；Slurm CLI 与 Unix 用户天然一致 | `DevicePolicy=auto` 时普通会话可绕过 Slurm；必须在首次登录前为该获批 UID 部署并验证独立的 `DevicePolicy=closed` | Pilot-1D 已安装框架；须逐用户 stage/activate，当前无用户策略 |
 
 ## Pilot-1 实测 Gate（2026-08-05）
 
@@ -35,7 +35,7 @@
 
 在创建任何 Pilot 用户前，管理员应单独审批并实现一种可验证的技术控制：
 
-1. 单节点 Pilot 的已验证候选：只为每个获批 Pilot UID 创建独立的 `user-<UID>.slice` 持久 drop-in，设置 `DevicePolicy=closed`；用户创建脚本必须同时生成、验证和支持逐 UID 回滚，启动后 Guard 必须证明作业外 open/CUDA 被拒绝且 Slurm GRES 数量一致。此方案仍需管理员明确批准，当前未部署。
+1. 单节点 Pilot 的已批准控制：只为每个获批 Pilot UID 创建独立的 `user-<UID>.slice` 持久 drop-in，设置 `DevicePolicy=closed`；两阶段用户脚本负责首次登录前生成、验证和逐 UID 回滚，Guard 证明作业外 open/CUDA 被拒绝且 Slurm GRES 数量一致。框架已部署，但当前没有登记用户，所以没有活动策略。
 2. 更强边界：普通用户不获得计算节点通用 shell，只通过按 Unix 用户重新认证的受控提交网关调用 `sbatch`、`srun`、`squeue`、`sacct` 和 `scancel`。网关必须拒绝任意宿主命令、端口/agent/X11 转发，并保留用户与 Job ID 审计。
 3. 可选：部署经 TLS、短期 per-user token、撤销和审计验证的 `slurmrestd` 提交入口；JWT signing key 仅保存在 root-only 服务端路径。
 4. 多节点阶段的标准方案：设置独立登录节点；计算节点使用 `pam_slurm_adopt`/`PrologFlags=contain`，拒绝无作业 SSH 会话并将有作业会话纳入对应 job cgroup。
@@ -71,7 +71,7 @@
 
 ## 当前结论
 
-方案 C 在 `DevicePolicy=auto` 时仍存在直接 GPU 绕过；Pilot-1C 只完成了专属 per-user slice 的瞬时技术验证，并已按测试要求回滚。当前不修改设备权限、PAM、sshd、个人 Docker 挂载或 secret 管理，不部署 Guard，不创建其他员工账号，并保持 Slurm DRAIN。只有管理员明确批准持久化设计、部署后重新通过启动与用户 Gate，才可请求 RESUME 和用户创建。
+Pilot-1D 已把方案 C 实现为精确 per-UID 框架，但没有为 `origin-al`、`codexops`、任何系统账号或不存在 UID 写入持久策略。当前不修改设备权限、PAM、sshd、个人 Docker 挂载或 secret 管理，不创建员工账号，并保持 Slurm DRAIN。下一 Gate 是管理员提供并批准最多 3 名 Pilot 用户清单；只有每个用户完成 STAGED、隔离 self-test、单独 ACTIVATE 和用户本人验收后，才能另行请求 RESUME。
 
 ## Pilot-1B `user.slice` 试验结果（2026-08-05）
 
@@ -96,4 +96,40 @@ Pilot-1C 使用 UUID、PCI Bus ID、NVML index、procfs `Device Minor` 和设备
 
 建议把单节点 Pilot 的 GPU 隔离从全局 `user.slice` 改为每个获批 Pilot 用户独立的 `user-<UID>.slice DevicePolicy=closed`，并由既有用户创建脚本生成、验证和逐 UID 回滚。这样不会改变 `origin-al`，管理员账户也可独立管理；Slurm 作业继续位于 `system.slice/slurmstepd.scope`。未来独立登录节点上线后，计算节点仍应迁移到 `pam_slurm_adopt`/`PrologFlags=contain`。
 
-下一审批 Gate：`允许将GPU隔离改为Pilot用户专属user-UID.slice持久策略，并更新用户创建脚本`。未收到该批准前，不写 drop-in、不部署 Guard、不创建用户、不 RESUME 节点。
+该持久化审批已在 Pilot-1D 收到并落实为框架。当前下一审批语句为：`允许创建清单中的Pilot用户，并为每个用户应用专属user-UID.slice GPU隔离策略`。未收到该语句前，不创建用户、不创建真实 UID drop-in、不启用 Guard timer、不创建用户容器、不 RESUME 节点。
+
+## Pilot-1D 精确 per-UID 持久设计
+
+每个获批 Pilot 用户只使用数字 UID 生成以下唯一目标：
+
+```text
+/etc/systemd/system/user-<NUMERIC_UID>.slice.d/50-h100-gpu-isolation.conf
+```
+
+文件内容只能是：
+
+```ini
+[Slice]
+DevicePolicy=closed
+```
+
+不写任何 `DeviceAllow`。特别禁止 `/etc/systemd/system/user.slice.d/50-h100-gpu-isolation.conf` 和 `/etc/systemd/system/user-.slice.d/50-h100-gpu-isolation.conf`：前者会影响管理员和所有登录用户，后者会隐式覆盖所有 UID 模板实例，二者都不满足逐用户审批和逐用户回滚。用户名只用于管理员界面；unit 和路径永远由 `getent passwd` 返回的数字 UID 生成。
+
+SSH 会话位于 `/user.slice/user-<UID>.slice/...`，因此继承该 device BPF；Slurm 作业仍由 `slurmd/slurmstepd` 创建在 `/system.slice/slurmstepd.scope/...`，不会继承登录 slice 的拒绝策略，并继续由 `task/cgroup` 与 `ConstrainDevices=yes` 精确放行 allocated GPU。Docker、DCGM、Prometheus、Grafana 和 Node Exporter 继续位于 `system.slice`。GPU 的 NVML index、UUID 和 Linux minor 不是同一编号；作业内设备身份必须用 UUID/procfs minor 关联，不能把逻辑 GPU 0 当作 `/dev/nvidia0`。
+
+## 首次登录前事务
+
+`h100-user-create` 不再默认一次完成全部动作：
+
+1. `--plan` 只验证候选 UID/GID、project ID、端口、Slurm account/QOS 和公钥，不修改系统。
+2. `--stage` 创建锁定密码且 shell 为 `/usr/sbin/nologin` 的账号，不安装 `authorized_keys`；先应用精确 UID 策略并执行 device-open/CUDA transient self-test，再创建 quota、Slurm association 和默认无 GPU 的长期容器。
+3. Stage 任一步失败时保持账号不可登录、停止容器、回滚 association、project 映射和本工具创建的精确策略；数据目录不被静默删除。
+4. `--activate` 需要独立重复审批；再次验证策略、高权限组和容器无 GPU，先在不可登录状态安装公钥并启动 Guard，再启容器，最后才切换到 `/bin/bash`。失败则回到 STAGED、移走公钥、停止容器，同时保留数据和 GPU 策略。
+
+## Guard、自动 DRAIN 与回滚
+
+受管用户登记位于 `/etc/h100-platform/gpu-isolated-users`，只保存安全用户名与数字 UID，使用 flock、备份、同目录临时文件和原子 rename。Guard 必须由 `h100-gpu-bypass-guard.service` 在 `system.slice` 运行；它通过 `systemd-run --system --slice=user-<UID>.slice --uid=<UID>` 执行最终 open/CUDA 探针并验证实际 cgroup 路径，同时检查 `ConstrainDevices=yes`、4 张 NVIDIA GPU、4 个 Slurm GRES 和 MIG Disabled。失败只会 DRAIN，永不自动 RESUME，也不自动删除策略或终止用户进程。
+
+第一个用户完成 ACTIVATE 前，timer 必须保持 disabled/inactive。没有受管用户时，手工 Guard 成功表示框架和全局 GPU/Slurm 计数正常，但明确输出 `NO MANAGED PILOT USERS`，不能声称任何真实用户已通过隔离。回滚只操作本工具管理的精确文件；全局 slice、NVIDIA 节点权限和未知 drop-in 不动。
+
+独立登录节点上线后，应把计算节点迁移到 `pam_slurm_adopt`/`PrologFlags=contain`，拒绝无 allocation 的计算节点 SSH 并将获准会话纳入 job cgroup。当前方案是单节点 Pilot 的 GPU 设备边界，不是完整 CPU、内存、网络或宿主多租户沙箱。

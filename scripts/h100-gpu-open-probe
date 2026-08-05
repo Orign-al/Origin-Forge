@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Safely probe NVIDIA character-device access.
+
+The probe never assumes that an NVML index equals a Linux device minor.
+For Slurm assertions it correlates visible GPU UUIDs with NVIDIA procfs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import glob
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+DENIED_ERRNOS = {errno.EACCES, errno.EPERM}
+REQUIRED_GPU_PATHS = [f"/dev/nvidia{minor}" for minor in range(4)]
+SHARED_PATHS = [
+    "/dev/nvidiactl",
+    "/dev/nvidia-uvm",
+    "/dev/nvidia-uvm-tools",
+    "/dev/nvidia-modeset",
+]
+PSEUDO_PATHS = [
+    "/dev/null",
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Probe NVIDIA device access without generating GPU load."
+    )
+    expectation = parser.add_mutually_exclusive_group()
+    expectation.add_argument("--expect-denied-all", action="store_true")
+    expectation.add_argument("--expect-allocated-only", action="store_true")
+    parser.add_argument("--json", action="store_true", dest="as_json")
+    parser.add_argument("--quiet", action="store_true")
+    return parser.parse_args()
+
+
+def read_cgroup() -> str:
+    try:
+        return Path("/proc/self/cgroup").read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return f"ERROR errno={exc.errno} {exc.strerror}"
+
+
+def proc_uuid_minor_map() -> dict[str, int]:
+    mapping: dict[str, int] = {}
+    for info_name in sorted(glob.glob("/proc/driver/nvidia/gpus/*/information")):
+        fields: dict[str, str] = {}
+        try:
+            with open(info_name, encoding="utf-8", errors="replace") as handle:
+                for raw_line in handle:
+                    if ":" not in raw_line:
+                        continue
+                    key, value = raw_line.split(":", 1)
+                    fields[key.strip()] = value.strip()
+        except OSError:
+            continue
+        uuid = fields.get("GPU UUID", "")
+        minor_text = fields.get("Device Minor", "")
+        if uuid and minor_text.isdecimal():
+            mapping[uuid] = int(minor_text, 10)
+    return mapping
+
+
+def visible_gpu_uuids() -> tuple[int, list[str], str]:
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=uuid",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return 127, [], str(exc)
+    uuids = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    return completed.returncode, uuids, completed.stderr.strip()
+
+
+def nvidia_paths() -> list[tuple[str, str, bool]]:
+    paths: list[tuple[str, str, bool]] = [
+        (path, "PER_GPU", True) for path in REQUIRED_GPU_PATHS
+    ]
+    paths.extend((path, "SHARED", False) for path in SHARED_PATHS)
+    cap_paths = sorted(
+        glob.glob("/dev/nvidia-caps/*"),
+        key=lambda value: [
+            int(part) if part.isdecimal() else part
+            for part in re.split(r"([0-9]+)", value)
+        ],
+    )
+    paths.extend((path, "CAPS", False) for path in cap_paths)
+    return paths
+
+
+def probe_path(path: str, role: str, required: bool) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "path": path,
+        "role": role,
+        "required": required,
+        "major": None,
+        "minor": None,
+        "result": "MISSING",
+        "errno": errno.ENOENT,
+        "error": os.strerror(errno.ENOENT),
+    }
+    try:
+        metadata = os.stat(path)
+    except OSError as exc:
+        record.update(errno=exc.errno, error=exc.strerror or "unknown error")
+        return record
+    if not stat.S_ISCHR(metadata.st_mode):
+        record.update(
+            result="ERROR",
+            errno=errno.ENODEV,
+            error="not a character device",
+        )
+        return record
+    record["major"] = os.major(metadata.st_rdev)
+    record["minor"] = os.minor(metadata.st_rdev)
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOCTTY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        record.update(
+            result="DENIED" if exc.errno in DENIED_ERRNOS else "ERROR",
+            errno=exc.errno,
+            error=exc.strerror or "unknown error",
+        )
+        return record
+    os.close(descriptor)
+    record.update(result="OPENED", errno=0, error="OK")
+    return record
+
+
+def main() -> int:
+    args = parse_args()
+    cgroup = read_cgroup()
+    expectation = "observe"
+    if args.expect_denied_all:
+        expectation = "denied-all"
+    elif args.expect_allocated_only:
+        expectation = "allocated-only"
+
+    allocated_minors: set[int] = set()
+    visible_uuids: list[str] = []
+    smi_rc: int | None = None
+    smi_error = ""
+    failures: list[str] = []
+    if args.expect_allocated_only:
+        if not os.environ.get("SLURM_JOB_ID"):
+            failures.append("SLURM_JOB_ID is absent")
+        smi_rc, visible_uuids, smi_error = visible_gpu_uuids()
+        if smi_rc != 0:
+            failures.append(f"nvidia-smi UUID query failed rc={smi_rc}")
+        uuid_to_minor = proc_uuid_minor_map()
+        for uuid in visible_uuids:
+            if uuid not in uuid_to_minor:
+                failures.append(f"visible UUID has no procfs minor mapping: {uuid}")
+            else:
+                allocated_minors.add(uuid_to_minor[uuid])
+        if not allocated_minors:
+            failures.append("no allocated Linux minor was proven")
+
+    pseudo_results = [probe_path(path, "PSEUDO", True) for path in PSEUDO_PATHS]
+    for item in pseudo_results:
+        if item["result"] != "OPENED":
+            failures.append(f"standard pseudo-device unavailable: {item['path']}")
+
+    device_results: list[dict[str, Any]] = []
+    for path, generic_role, required in nvidia_paths():
+        role = generic_role
+        if generic_role == "PER_GPU":
+            linux_minor = int(path.removeprefix("/dev/nvidia"))
+            if args.expect_allocated_only:
+                role = "ALLOCATED" if linux_minor in allocated_minors else "UNALLOCATED"
+        item = probe_path(path, role, required)
+        device_results.append(item)
+        if required and item["result"] == "MISSING":
+            failures.append(f"required GPU device node is missing: {path}")
+
+    if args.expect_denied_all:
+        for item in device_results:
+            if item["result"] == "MISSING" and not item["required"]:
+                continue
+            if item["result"] != "DENIED":
+                failures.append(
+                    f"NVIDIA device was not denied: {item['path']}={item['result']}"
+                )
+    elif args.expect_allocated_only:
+        for item in device_results:
+            if item["role"] == "ALLOCATED" and item["result"] != "OPENED":
+                failures.append(
+                    f"allocated GPU was not opened: {item['path']}={item['result']}"
+                )
+            elif item["role"] == "UNALLOCATED" and item["result"] != "DENIED":
+                failures.append(
+                    f"unallocated GPU was not denied: {item['path']}={item['result']}"
+                )
+
+    passed = not failures
+    document: dict[str, Any] = {
+        "probe": "h100-gpu-open-probe",
+        "pid": os.getpid(),
+        "uid": os.getuid(),
+        "gid": os.getgid(),
+        "cgroup": cgroup,
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID", ""),
+        "slurm_job_gpus": os.environ.get("SLURM_JOB_GPUS", ""),
+        "slurm_step_gpus": os.environ.get("SLURM_STEP_GPUS", ""),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "expectation": expectation,
+        "visible_gpu_uuids": visible_uuids,
+        "allocated_linux_minors": sorted(allocated_minors),
+        "nvidia_smi_rc": smi_rc,
+        "nvidia_smi_error": smi_error,
+        "pseudo_devices": pseudo_results,
+        "nvidia_devices": device_results,
+        "passed": passed,
+        "failures": failures,
+    }
+
+    if args.as_json:
+        print(json.dumps(document, sort_keys=True, separators=(",", ":")))
+    elif args.quiet:
+        print(f"GPU_OPEN_PROBE_RESULT={'PASSED' if passed else 'FAILED'}")
+    else:
+        print(f"PID={document['pid']} UID={document['uid']} GID={document['gid']}")
+        print(f"CGROUP={cgroup}")
+        print(f"EXPECTATION={expectation}")
+        for item in pseudo_results + device_results:
+            print(
+                "DEVICE_OPEN "
+                f"path={item['path']} role={item['role']} "
+                f"major={item['major']} minor={item['minor']} "
+                f"result={item['result']} errno={item['errno']}"
+            )
+        for failure in failures:
+            print(f"ASSERTION_FAILURE={failure}")
+        print(f"GPU_OPEN_PROBE_RESULT={'PASSED' if passed else 'FAILED'}")
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

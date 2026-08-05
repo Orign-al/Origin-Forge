@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly REGISTRY_FILE=/etc/h100-platform/gpu-isolated-users
+readonly DROPIN_NAME=50-h100-gpu-isolation.conf
+readonly GPU_OPEN_PROBE=/usr/local/libexec/h100-gpu-open-probe
+readonly CUDA_PROBE=/usr/local/libexec/h100-cuda-context-probe
+readonly METRIC_DIR=/var/lib/node_exporter/textfile_collector
+readonly METRIC_FILE=${METRIC_DIR}/h100_gpu_bypass_guard.prom
+readonly AUDIT_LOG=/var/log/h100-platform-audit.log
+readonly LOCK_FILE=/run/lock/h100-gpu-bypass-guard.lock
+readonly PILOT_UID_MIN=20000
+readonly PILOT_UID_MAX=60000
+
+TEST_MODE=0
+DO_NOT_DRAIN=0
+TEST_UID=
+managed_users=0
+users_verified=0
+policy_errors=0
+device_open_failures=0
+cuda_context_failures=0
+constrain_devices=0
+nvidia_gpu_count=0
+slurm_gpu_count=0
+guard_success=1
+declare -a usernames=()
+declare -a user_uids=()
+declare -a user_results=()
+declare -a error_codes=()
+
+usage() {
+  printf '%s\n' \
+    'Usage:' \
+    '  sudo h100-gpu-bypass-guard' \
+    '  sudo h100-gpu-bypass-guard --test-uid 1001 --do-not-drain'
+}
+
+record_error() {
+  local code=$1
+  guard_success=0
+  error_codes+=("${code}")
+  printf 'GUARD ERROR code=%s\n' "${code}" >&2
+}
+
+audit_line() {
+  printf '%s actor=%s action=gpu-bypass-guard %s\n' \
+    "$(date --iso-8601=seconds)" \
+    "${SUDO_USER:-root}" \
+    "$*" >>"${AUDIT_LOG}"
+}
+
+safe_username() {
+  [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+}
+
+registry_metadata_valid() {
+  [[ -f "${REGISTRY_FILE}" && ! -L "${REGISTRY_FILE}" ]] || return 1
+  [[ "$(stat -c '%U:%G:%a' "${REGISTRY_FILE}")" == \
+    'root:gpu-platform-admin:640' ]]
+}
+
+load_registry() {
+  if ! registry_metadata_valid; then
+    ((policy_errors += 1))
+    record_error registry-metadata
+    return
+  fi
+  local raw username uid extra mapped_name mapped_uid forbidden_group
+  local -A seen_names=()
+  local -A seen_uids=()
+  while IFS= read -r raw || [[ -n "${raw}" ]]; do
+    [[ "${raw}" =~ ^[[:space:]]*($|#) ]] && continue
+    read -r username uid extra <<<"${raw}"
+    if [[ -z "${username:-}" || -z "${uid:-}" || -n "${extra:-}" ]] \
+      || ! safe_username "${username}" \
+      || [[ ! "${uid}" =~ ^[0-9]+$ ]] \
+      || ((uid < PILOT_UID_MIN || uid > PILOT_UID_MAX)); then
+      ((policy_errors += 1))
+      record_error registry-line
+      continue
+    fi
+    if [[ -n "${seen_names[${username}]+present}" \
+      || -n "${seen_uids[${uid}]+present}" ]]; then
+      ((policy_errors += 1))
+      record_error registry-duplicate
+      continue
+    fi
+    seen_names[${username}]=1
+    seen_uids[${uid}]=1
+    case "${username}:${uid}" in
+      root:*|origin-al:*|codexops:*|nobody:*|*:0|*:1000|*:1001|*:65534)
+        ((policy_errors += 1))
+        record_error registry-protected-identity
+        continue
+        ;;
+    esac
+    mapped_name="$(getent passwd "${uid}" | cut -d: -f1 || true)"
+    mapped_uid="$(id -u "${username}" 2>/dev/null || true)"
+    if [[ "${mapped_name}" != "${username}" || "${mapped_uid}" != "${uid}" ]]; then
+      ((policy_errors += 1))
+      record_error "identity-${uid}"
+      continue
+    fi
+    forbidden_group=
+    for group_name in docker sudo video render gpu-platform-admin; do
+      if id -nG "${username}" | tr ' ' '\n' | grep -Fxq "${group_name}"; then
+        forbidden_group=${group_name}
+        break
+      fi
+    done
+    if [[ -n "${forbidden_group}" ]]; then
+      ((policy_errors += 1))
+      record_error "forbidden-group-${uid}"
+      continue
+    fi
+    usernames+=("${username}")
+    user_uids+=("${uid}")
+  done <"${REGISTRY_FILE}"
+  managed_users=${#usernames[@]}
+}
+
+check_global_slurm_gpu_state() {
+  if grep -Eiq \
+    '^[[:space:]]*ConstrainDevices[[:space:]]*=[[:space:]]*yes[[:space:]]*$' \
+    /etc/slurm/cgroup.conf; then
+    constrain_devices=1
+  else
+    record_error slurm-constrain-devices
+  fi
+
+  local uuid_output mig_output node_output
+  if uuid_output="$(nvidia-smi \
+    --query-gpu=uuid \
+    --format=csv,noheader,nounits 2>/dev/null)"; then
+    nvidia_gpu_count="$(grep -c '^GPU-' <<<"${uuid_output}" || true)"
+  else
+    record_error nvidia-query
+  fi
+  if ((nvidia_gpu_count != 4)); then
+    record_error nvidia-count
+  fi
+
+  if mig_output="$(nvidia-smi \
+    --query-gpu=mig.mode.current \
+    --format=csv,noheader,nounits 2>/dev/null)"; then
+    if [[ "$(grep -c '^Disabled$' <<<"${mig_output}" || true)" -ne 4 ]]; then
+      record_error mig-not-disabled
+    fi
+  else
+    record_error mig-query
+  fi
+
+  if node_output="$(scontrol show node "$(hostname -s)" -o 2>/dev/null)" \
+    && [[ "${node_output}" =~ CfgTRES=[^[:space:]]*gres/gpu=([0-9]+) ]]; then
+    slurm_gpu_count=${BASH_REMATCH[1]}
+  else
+    record_error slurm-gres-query
+  fi
+  if ((slurm_gpu_count != 4)); then
+    record_error slurm-gpu-count
+  fi
+  if ((slurm_gpu_count != nvidia_gpu_count)); then
+    record_error gpu-count-mismatch
+  fi
+}
+
+static_policy_valid() {
+  local username=$1 uid=$2 test_only=$3
+  local unit="user-${uid}.slice"
+  local dropin="/etc/systemd/system/${unit}.d/${DROPIN_NAME}"
+  local cat_output policy device_allow
+  if [[ "${test_only}" == 0 ]]; then
+    [[ -f "${dropin}" && ! -L "${dropin}" ]] || return 1
+    [[ "$(stat -c '%U:%G:%a' "${dropin}")" == 'root:root:644' ]] || return 1
+    cmp -s -- "${dropin}" <(printf '[Slice]\nDevicePolicy=closed\n') || return 1
+    ! grep -Eq '^[[:space:]]*DeviceAllow[[:space:]]*=' "${dropin}" || return 1
+    cat_output="$(systemctl cat "${unit}" 2>/dev/null)" || return 1
+    grep -Fq "${dropin}" <<<"${cat_output}" || return 1
+  fi
+  policy="$(systemctl show "${unit}" -p DevicePolicy --value 2>/dev/null)" \
+    || return 1
+  [[ "${policy}" == closed ]] || return 1
+  device_allow="$(systemctl show "${unit}" -p DeviceAllow --value 2>/dev/null)" \
+    || return 1
+  if grep -Eiq '(nvidia|char-195|char-509|(^|[[:space:]])195:|(^|[[:space:]])509:)' \
+    <<<"${device_allow}"; then
+    return 1
+  fi
+  audit_line \
+    "user=${username} uid=${uid} unit=${unit} DevicePolicy=${policy} DeviceAllow_nvidia=absent"
+}
+
+probe_user() {
+  local username=$1 uid=$2 test_only=$3
+  local unit="user-${uid}.slice"
+  local nonce open_unit cuda_unit open_output cgroup
+  local user_ok=1 open_rc=0 cuda_rc=0
+  if ! static_policy_valid "${username}" "${uid}" "${test_only}"; then
+    ((policy_errors += 1))
+    record_error "policy-${uid}"
+    user_results+=(0)
+    return
+  fi
+  nonce="$(date +%s%N)"
+  open_unit="h100-guard-open-${uid}-${nonce}"
+  cuda_unit="h100-guard-cuda-${uid}-${nonce}"
+  if open_output="$(systemd-run \
+    --system \
+    --wait \
+    --pipe \
+    --collect \
+    --quiet \
+    --unit="${open_unit}" \
+    --slice="${unit}" \
+    --uid="${uid}" \
+    --property=Type=exec \
+    --property=NoNewPrivileges=yes \
+    --property=TimeoutStartSec=45 \
+    "${GPU_OPEN_PROBE}" --expect-denied-all --json)"; then
+    if ! cgroup="$(jq -er '.cgroup' <<<"${open_output}")"; then
+      open_rc=2
+      user_ok=0
+      ((device_open_failures += 1))
+      record_error "open-json-${uid}"
+    elif [[ "${cgroup}" != *"/user.slice/${unit}/"* ]]; then
+      open_rc=3
+      user_ok=0
+      ((device_open_failures += 1))
+      record_error "cgroup-${uid}"
+    fi
+  else
+    open_rc=$?
+    user_ok=0
+    ((device_open_failures += 1))
+    record_error "open-${uid}"
+  fi
+  if systemd-run \
+    --system \
+    --wait \
+    --pipe \
+    --collect \
+    --quiet \
+    --unit="${cuda_unit}" \
+    --slice="${unit}" \
+    --uid="${uid}" \
+    --property=Type=exec \
+    --property=NoNewPrivileges=yes \
+    --property=TimeoutStartSec=45 \
+    "${CUDA_PROBE}" --expect-denied --quiet; then
+    :
+  else
+    cuda_rc=$?
+    user_ok=0
+    ((cuda_context_failures += 1))
+    record_error "cuda-${uid}"
+  fi
+  if ((user_ok == 1)); then
+    ((users_verified += 1))
+    user_results+=(1)
+  else
+    user_results+=(0)
+  fi
+  audit_line \
+    "user=${username} uid=${uid} unit=${unit} open_probe_rc=${open_rc} cuda_probe_rc=${cuda_rc} isolation_success=${user_ok}"
+}
+
+write_metrics() {
+  local timestamp=$1 temp index
+  install -d -o root -g root -m 0755 "${METRIC_DIR}"
+  temp="$(mktemp "${METRIC_DIR}/.h100_gpu_bypass_guard.prom.XXXXXX")"
+  {
+    printf '# HELP h100_gpu_bypass_guard_last_success Whether the last guard run completed without policy or device errors.\n'
+    printf '# TYPE h100_gpu_bypass_guard_last_success gauge\n'
+    printf 'h100_gpu_bypass_guard_last_success %s\n' "${guard_success}"
+    printf '# TYPE h100_gpu_bypass_guard_managed_users gauge\n'
+    printf 'h100_gpu_bypass_guard_managed_users %s\n' "${managed_users}"
+    printf '# TYPE h100_gpu_bypass_guard_users_verified gauge\n'
+    printf 'h100_gpu_bypass_guard_users_verified %s\n' "${users_verified}"
+    printf '# TYPE h100_gpu_bypass_guard_policy_errors gauge\n'
+    printf 'h100_gpu_bypass_guard_policy_errors %s\n' "${policy_errors}"
+    printf '# TYPE h100_gpu_bypass_guard_device_open_failures gauge\n'
+    printf 'h100_gpu_bypass_guard_device_open_failures %s\n' "${device_open_failures}"
+    printf '# TYPE h100_gpu_bypass_guard_cuda_context_failures gauge\n'
+    printf 'h100_gpu_bypass_guard_cuda_context_failures %s\n' "${cuda_context_failures}"
+    printf '# TYPE h100_gpu_bypass_guard_slurm_constrain_devices gauge\n'
+    printf 'h100_gpu_bypass_guard_slurm_constrain_devices %s\n' "${constrain_devices}"
+    printf '# TYPE h100_gpu_bypass_guard_nvidia_gpu_count gauge\n'
+    printf 'h100_gpu_bypass_guard_nvidia_gpu_count %s\n' "${nvidia_gpu_count}"
+    printf '# TYPE h100_gpu_bypass_guard_slurm_gpu_count gauge\n'
+    printf 'h100_gpu_bypass_guard_slurm_gpu_count %s\n' "${slurm_gpu_count}"
+    printf '# TYPE h100_gpu_bypass_guard_timestamp_seconds gauge\n'
+    printf 'h100_gpu_bypass_guard_timestamp_seconds %s\n' "${timestamp}"
+    for index in "${!usernames[@]}"; do
+      printf 'h100_gpu_user_isolation_success{username="%s",uid="%s"} %s\n' \
+        "${usernames[${index}]}" "${user_uids[${index}]}" "${user_results[${index}]:-0}"
+    done
+  } >"${temp}"
+  chown root:root "${temp}"
+  chmod 0644 "${temp}"
+  sync -f "${temp}"
+  mv -f -- "${temp}" "${METRIC_FILE}"
+}
+
+drain_on_failure() {
+  ((DO_NOT_DRAIN == 0)) || return 0
+  local node node_output state short_reason jobs
+  node="$(hostname -s)"
+  node_output="$(scontrol show node "${node}" -o 2>/dev/null || true)"
+  state=
+  [[ "${node_output}" =~ State=([^[:space:]]+) ]] && state=${BASH_REMATCH[1]}
+  short_reason=${error_codes[0]:-unknown}
+  if [[ "${state}" != *DRAIN* ]]; then
+    scontrol update \
+      NodeName="${node}" \
+      State=DRAIN \
+      Reason="GPU bypass guard failure: ${short_reason}"
+    audit_line "node=${node} action=DRAIN reason=${short_reason}"
+  else
+    audit_line "node=${node} action=preserve-existing-DRAIN guard_reason=${short_reason}"
+  fi
+  jobs="$(squeue -h -w "${node}" -o '%i:%u:%T' 2>/dev/null | paste -sd, - || true)"
+  audit_line \
+    "node=${node} gpu_count=${nvidia_gpu_count} gres_count=${slurm_gpu_count} jobs=${jobs:-none}"
+}
+
+if [[ "$(id -u)" != 0 ]]; then
+  printf 'GPU BYPASS GUARD ERROR: run as root\n' >&2
+  exit 1
+fi
+if (($# == 0)); then
+  :
+elif (($# == 3)) \
+  && [[ "$1" == --test-uid && "$2" == 1001 && "$3" == --do-not-drain ]]; then
+  TEST_MODE=1
+  DO_NOT_DRAIN=1
+  TEST_UID=1001
+else
+  usage >&2
+  exit 2
+fi
+
+exec 9>"${LOCK_FILE}"
+if ! flock -n -x 9; then
+  printf 'GPU BYPASS GUARD ALREADY RUNNING\n'
+  exit 0
+fi
+
+guard_cgroup="$(< /proc/self/cgroup)"
+printf 'GUARD_CGROUP=%s\n' "${guard_cgroup}"
+if [[ "${guard_cgroup}" != *'/system.slice/'* ]]; then
+  record_error guard-not-system-slice
+fi
+
+if ((TEST_MODE == 1)); then
+  [[ "$(getent passwd "${TEST_UID}" | cut -d: -f1)" == codexops ]] \
+    || { record_error test-uid-identity; }
+  usernames=(codexops)
+  user_uids=(1001)
+  managed_users=1
+else
+  load_registry
+fi
+
+check_global_slurm_gpu_state
+for index in "${!usernames[@]}"; do
+  probe_user "${usernames[${index}]}" "${user_uids[${index}]}" "${TEST_MODE}"
+done
+
+timestamp="$(date +%s)"
+if ((TEST_MODE == 0)); then
+  if ! write_metrics "${timestamp}"; then
+    record_error metrics-write
+  fi
+fi
+
+if ((guard_success == 0)); then
+  drain_on_failure
+  audit_line \
+    "outcome=FAILED managed_users=${managed_users} users_verified=${users_verified} policy_errors=${policy_errors} device_open_failures=${device_open_failures} cuda_context_failures=${cuda_context_failures}"
+  printf 'GPU BYPASS GUARD BLOCKED errors=%s\n' "$(IFS=,; printf '%s' "${error_codes[*]}")"
+  exit 1
+fi
+
+audit_line \
+  "outcome=SUCCESS managed_users=${managed_users} users_verified=${users_verified} gpu_count=${nvidia_gpu_count} gres_count=${slurm_gpu_count}"
+if ((TEST_MODE == 1)); then
+  printf 'GPU BYPASS GUARD TEST PASSED uid=1001 drain_suppressed=yes\n'
+elif ((managed_users == 0)); then
+  printf 'NO MANAGED PILOT USERS\n'
+else
+  printf 'GPU BYPASS GUARD PASSED managed_users=%s users_verified=%s\n' \
+    "${managed_users}" "${users_verified}"
+fi

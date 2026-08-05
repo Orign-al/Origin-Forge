@@ -16,6 +16,7 @@ h100_install_audit_trap container-rebuild "${user_name}"
 h100_require_managed_user "${user_name}"
 h100_require_managed_compose "${user_name}"
 h100_require_slurm_drained
+h100_require_pilot_gpu_isolation_if_managed "${user_name}"
 
 container="$(h100_container_name "${user_name}")"
 compose_file="$(h100_compose_file "${user_name}")"

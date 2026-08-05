@@ -1,0 +1,3 @@
+# H100 Pilot users with exact per-UID GPU device isolation.
+# Format: username uid
+# This file is intentionally empty until an approved Pilot user is staged.

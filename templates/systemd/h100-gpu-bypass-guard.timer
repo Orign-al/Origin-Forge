@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the H100 Pilot user GPU bypass guard every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+RandomizedDelaySec=45s
+AccuracySec=15s
+Persistent=true
+Unit=h100-gpu-bypass-guard.service
+
+[Install]
+WantedBy=timers.target

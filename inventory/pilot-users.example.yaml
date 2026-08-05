@@ -1,0 +1,32 @@
+pilot_users:
+  - username: exampleuser
+    full_name: "Example User"
+    uid: 20001
+    gid: 20001
+
+    ssh_public_keys:
+      - "ssh-ed25519 AAAA... device-comment"
+
+    host_access:
+      enabled: true
+      gpu_isolation:
+        method: systemd-user-uid-slice
+        device_policy: closed
+
+    slurm:
+      account: company
+      qos: general
+      max_gpus: 1
+
+    quota:
+      project_id: 30001
+      hard_limit_gb: 300
+
+    container:
+      enabled: true
+      name: gpu-dev-exampleuser
+      cpus: 8
+      memory_gb: 32
+      pids_limit: 4096
+      ssh_port: 22023
+      gpu: none

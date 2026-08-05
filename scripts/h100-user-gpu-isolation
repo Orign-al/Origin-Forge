@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly CONFIG_DIR=/etc/h100-platform
+readonly REGISTRY_FILE=${CONFIG_DIR}/gpu-isolated-users
+readonly DROPIN_NAME=50-h100-gpu-isolation.conf
+readonly LOCK_FILE=/run/lock/h100-user-gpu-isolation.lock
+readonly AUDIT_LOG=/var/log/h100-platform-audit.log
+readonly BACKUP_ROOT=/srv/gpu-platform/platform/backups
+readonly PILOT_UID_MIN=20000
+readonly PILOT_UID_MAX=60000
+readonly GPU_OPEN_PROBE=/usr/local/libexec/h100-gpu-open-probe
+readonly CUDA_PROBE=/usr/local/libexec/h100-cuda-context-probe
+
+ACTION=
+TARGET=
+OUTCOME=FAILED
+ROLLBACK_MODE=
+BACKUP_DIR=
+DROPIN_PATH=
+DROPIN_DIR=
+REGISTRY_BACKUP=
+DROPIN_EXISTED=0
+
+usage() {
+  printf '%s\n' \
+    'Usage:' \
+    '  sudo h100-user-gpu-isolation plan USER' \
+    '  sudo h100-user-gpu-isolation apply USER' \
+    '  sudo h100-user-gpu-isolation verify USER' \
+    '  sudo h100-user-gpu-isolation status USER' \
+    '  sudo h100-user-gpu-isolation remove USER' \
+    '  sudo h100-user-gpu-isolation self-test USER' \
+    '  sudo h100-user-gpu-isolation list'
+}
+
+fail() {
+  printf 'GPU ISOLATION ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+audit() {
+  local rc=$1
+  printf '%s actor=%s action=%s target=%s outcome=%s rc=%s\n' \
+    "$(date --iso-8601=seconds)" \
+    "${SUDO_USER:-root}" \
+    "${ACTION:-unknown}" \
+    "${TARGET:-none}" \
+    "${OUTCOME}" \
+    "${rc}" >>"${AUDIT_LOG}"
+}
+
+rollback_change() {
+  set +e
+  if [[ -n "${REGISTRY_BACKUP}" && -f "${REGISTRY_BACKUP}" ]]; then
+    local registry_temp
+    registry_temp="$(mktemp "${CONFIG_DIR}/.gpu-isolated-users.rollback.XXXXXX")"
+    install -o root -g gpu-platform-admin -m 0640 \
+      "${REGISTRY_BACKUP}" "${registry_temp}"
+    sync -f "${registry_temp}"
+    mv -f -- "${registry_temp}" "${REGISTRY_FILE}"
+  fi
+  if [[ "${DROPIN_EXISTED}" == 1 && -f "${BACKUP_DIR}/dropin.before" ]]; then
+    install -d -o root -g root -m 0755 "${DROPIN_DIR}"
+    local dropin_temp
+    dropin_temp="$(mktemp "${DROPIN_DIR}/.${DROPIN_NAME}.rollback.XXXXXX")"
+    install -o root -g root -m 0644 \
+      "${BACKUP_DIR}/dropin.before" "${dropin_temp}"
+    sync -f "${dropin_temp}"
+    mv -f -- "${dropin_temp}" "${DROPIN_PATH}"
+  elif [[ -n "${DROPIN_PATH}" ]]; then
+    rm -f -- "${DROPIN_PATH}"
+    rmdir -- "${DROPIN_DIR}" 2>/dev/null || true
+  fi
+  systemctl daemon-reload
+  printf 'GPU ISOLATION ROLLBACK COMPLETED target=%s backup=%s\n' \
+    "${TARGET}" "${BACKUP_DIR}" >&2
+  set -e
+}
+
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  if [[ "${rc}" -ne 0 && -n "${ROLLBACK_MODE}" ]]; then
+    rollback_change
+  fi
+  audit "${rc}"
+  exit "${rc}"
+}
+trap on_exit EXIT
+
+validate_username_syntax() {
+  local value=$1
+  [[ "${value}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || fail 'invalid username'
+}
+
+resolve_candidate() {
+  local requested=$1
+  local passwd_record actual_name _password_field uid _gid _gecos _home _shell
+  validate_username_syntax "${requested}"
+  case "${requested}" in
+    root|origin-al|codexops|nobody) fail "protected account is forbidden: ${requested}" ;;
+  esac
+  passwd_record="$(getent passwd "${requested}")" \
+    || fail "account does not exist: ${requested}"
+  IFS=: read -r actual_name _password_field uid _gid _gecos _home _shell \
+    <<<"${passwd_record}"
+  [[ "${actual_name}" == "${requested}" ]] || fail 'username lookup mismatch'
+  [[ "${uid}" =~ ^[0-9]+$ ]] || fail 'resolved UID is not numeric'
+  ((uid >= PILOT_UID_MIN && uid <= PILOT_UID_MAX)) \
+    || fail "UID must be in approved Pilot range ${PILOT_UID_MIN}-${PILOT_UID_MAX}"
+  case "${uid}" in
+    0|1000|1001|65534) fail "protected UID is forbidden: ${uid}" ;;
+  esac
+  local forbidden_group
+  for forbidden_group in docker sudo video render gpu-platform-admin; do
+    if id -nG "${requested}" | tr ' ' '\n' | grep -Fxq "${forbidden_group}"; then
+      fail "account belongs to forbidden group: ${forbidden_group}"
+    fi
+  done
+  TARGET=${requested}
+  TARGET_UID=${uid}
+  TARGET_UNIT="user-${uid}.slice"
+  DROPIN_DIR="/etc/systemd/system/${TARGET_UNIT}.d"
+  DROPIN_PATH="${DROPIN_DIR}/${DROPIN_NAME}"
+}
+
+registry_validate() {
+  local allowed_missing_username=${1:-}
+  [[ -f "${REGISTRY_FILE}" && ! -L "${REGISTRY_FILE}" ]] \
+    || fail 'managed-user registry is missing or is a symlink'
+  [[ "$(stat -c '%U:%G:%a' "${REGISTRY_FILE}")" == \
+    'root:gpu-platform-admin:640' ]] \
+    || fail 'managed-user registry ownership or mode is invalid'
+  local raw username uid extra mapped_name mapped_uid
+  local -A names=()
+  local -A uids=()
+  while IFS= read -r raw || [[ -n "${raw}" ]]; do
+    [[ "${raw}" =~ ^[[:space:]]*($|#) ]] && continue
+    read -r username uid extra <<<"${raw}"
+    [[ -n "${username:-}" && -n "${uid:-}" && -z "${extra:-}" ]] \
+      || fail 'registry line must contain exactly username and UID'
+    validate_username_syntax "${username}"
+    [[ "${uid}" =~ ^[0-9]+$ ]] || fail 'registry UID is not numeric'
+    ((uid >= PILOT_UID_MIN && uid <= PILOT_UID_MAX)) \
+      || fail 'registry UID is outside the approved Pilot range'
+    [[ -z "${names[${username}]+present}" ]] \
+      || fail "duplicate registry username: ${username}"
+    [[ -z "${uids[${uid}]+present}" ]] \
+      || fail "duplicate registry UID: ${uid}"
+    names[${username}]=1
+    uids[${uid}]=1
+    mapped_name="$(getent passwd "${uid}" | cut -d: -f1 || true)"
+    mapped_uid="$(id -u "${username}" 2>/dev/null || true)"
+    if [[ "${username}" == "${allowed_missing_username}" \
+      && -z "${mapped_name}" && -z "${mapped_uid}" ]]; then
+      continue
+    fi
+    [[ -n "${mapped_name}" ]] || fail "registry UID does not exist: ${uid}"
+    [[ -n "${mapped_uid}" ]] || fail "registry username does not exist: ${username}"
+    [[ "${mapped_name}" == "${username}" && "${mapped_uid}" == "${uid}" ]] \
+      || fail "registry username/UID mismatch: ${username} ${uid}"
+    case "${username}:${uid}" in
+      root:*|origin-al:*|codexops:*|nobody:*|*:0|*:1000|*:1001|*:65534)
+        fail "protected identity is present in registry: ${username} ${uid}"
+        ;;
+    esac
+  done <"${REGISTRY_FILE}"
+}
+
+resolve_remove_target() {
+  local requested=$1 raw username uid extra matches=0
+  validate_username_syntax "${requested}"
+  case "${requested}" in
+    root|origin-al|codexops|nobody) fail "protected account is forbidden: ${requested}" ;;
+  esac
+  [[ -f "${REGISTRY_FILE}" && ! -L "${REGISTRY_FILE}" ]] \
+    || fail 'managed-user registry is missing or is a symlink'
+  while IFS= read -r raw || [[ -n "${raw}" ]]; do
+    [[ "${raw}" =~ ^[[:space:]]*($|#) ]] && continue
+    read -r username uid extra <<<"${raw}"
+    if [[ "${username:-}" == "${requested}" ]]; then
+      ((matches += 1))
+      [[ -n "${uid:-}" && -z "${extra:-}" && "${uid}" =~ ^[0-9]+$ ]] \
+        || fail 'registered removal target is malformed'
+      TARGET_UID=${uid}
+    fi
+  done <"${REGISTRY_FILE}"
+  ((matches == 1)) || fail 'remove requires exactly one managed registry entry'
+  ((TARGET_UID >= PILOT_UID_MIN && TARGET_UID <= PILOT_UID_MAX)) \
+    || fail 'registered removal UID is outside the approved Pilot range'
+  TARGET=${requested}
+  TARGET_UNIT="user-${TARGET_UID}.slice"
+  DROPIN_DIR="/etc/systemd/system/${TARGET_UNIT}.d"
+  DROPIN_PATH="${DROPIN_DIR}/${DROPIN_NAME}"
+  registry_validate "${TARGET}"
+  if getent passwd "${TARGET}" >/dev/null; then
+    [[ "$(id -u "${TARGET}")" == "${TARGET_UID}" ]] \
+      || fail 'existing removal account no longer matches registered UID'
+  else
+    ! getent passwd "${TARGET_UID}" >/dev/null \
+      || fail 'registered UID was reassigned to a different account'
+  fi
+}
+
+registry_has_target() {
+  awk -v name="${TARGET}" -v uid="${TARGET_UID}" '
+    $0 !~ /^[[:space:]]*(#|$)/ && $1 == name && $2 == uid { found=1 }
+    END { exit found ? 0 : 1 }
+  ' "${REGISTRY_FILE}"
+}
+
+write_registry_add() {
+  registry_has_target && return 0
+  if awk -v name="${TARGET}" -v uid="${TARGET_UID}" '
+      $0 !~ /^[[:space:]]*(#|$)/ && ($1 == name || $2 == uid) { found=1 }
+      END { exit found ? 0 : 1 }
+    ' "${REGISTRY_FILE}"; then
+    fail 'registry contains a conflicting username or UID'
+  fi
+  local temp
+  temp="$(mktemp "${CONFIG_DIR}/.gpu-isolated-users.XXXXXX")"
+  cp -- "${REGISTRY_FILE}" "${temp}"
+  printf '\n' >>"${temp}"
+  printf '%s %s\n' "${TARGET}" "${TARGET_UID}" >>"${temp}"
+  chown root:gpu-platform-admin "${temp}"
+  chmod 0640 "${temp}"
+  sync -f "${temp}"
+  mv -f -- "${temp}" "${REGISTRY_FILE}"
+  registry_validate "${TARGET}"
+}
+
+write_registry_remove() {
+  local temp
+  temp="$(mktemp "${CONFIG_DIR}/.gpu-isolated-users.XXXXXX")"
+  awk -v name="${TARGET}" -v uid="${TARGET_UID}" '
+    $0 ~ /^[[:space:]]*(#|$)/ || !($1 == name && $2 == uid) { print }
+  ' "${REGISTRY_FILE}" >"${temp}"
+  chown root:gpu-platform-admin "${temp}"
+  chmod 0640 "${temp}"
+  sync -f "${temp}"
+  mv -f -- "${temp}" "${REGISTRY_FILE}"
+  registry_validate
+}
+
+dropin_is_exact() {
+  [[ -f "${DROPIN_PATH}" && ! -L "${DROPIN_PATH}" ]] || return 1
+  cmp -s -- "${DROPIN_PATH}" <(printf '[Slice]\nDevicePolicy=closed\n')
+}
+
+assert_no_global_policy() {
+  [[ ! -e /etc/systemd/system/user.slice.d/50-h100-gpu-isolation.conf ]] \
+    || fail 'forbidden global user.slice GPU policy exists'
+  [[ ! -e /etc/systemd/system/user-.slice.d/50-h100-gpu-isolation.conf ]] \
+    || fail 'forbidden user-.slice GPU policy exists'
+}
+
+verify_static_and_live() {
+  dropin_is_exact || fail 'drop-in content is absent or not exact'
+  [[ "$(stat -c '%U:%G:%a' "${DROPIN_PATH}")" == 'root:root:644' ]] \
+    || fail 'drop-in ownership or mode is invalid'
+  ! grep -Eq '^[[:space:]]*DeviceAllow[[:space:]]*=' "${DROPIN_PATH}" \
+    || fail 'drop-in contains forbidden DeviceAllow'
+  registry_has_target || fail 'user is missing from managed-user registry'
+  local cat_output policy device_allow
+  cat_output="$(systemctl cat "${TARGET_UNIT}")" \
+    || fail 'systemctl cat failed for exact user slice'
+  grep -Fq "${DROPIN_PATH}" <<<"${cat_output}" \
+    || fail 'systemctl cat did not load the managed drop-in'
+  policy="$(systemctl show "${TARGET_UNIT}" -p DevicePolicy --value)"
+  [[ "${policy}" == closed ]] || fail "live DevicePolicy is not closed: ${policy}"
+  device_allow="$(systemctl show "${TARGET_UNIT}" -p DeviceAllow --value)"
+  if grep -Eiq '(nvidia|char-195|char-509|(^|[[:space:]])195:|(^|[[:space:]])509:)' \
+    <<<"${device_allow}"; then
+    fail 'live DeviceAllow contains an NVIDIA allowance'
+  fi
+}
+
+has_login_session() {
+  loginctl list-sessions --no-legend 2>/dev/null \
+    | awk -v uid="${TARGET_UID}" '$2 == uid { found=1 } END { exit found ? 0 : 1 }'
+}
+
+has_user_process() {
+  pgrep -u "${TARGET_UID}" >/dev/null 2>&1
+}
+
+assert_account_disabled_for_remove() {
+  local shell password_state
+  if ! getent passwd "${TARGET}" >/dev/null; then
+    ! getent passwd "${TARGET_UID}" >/dev/null \
+      || fail 'deleted username UID has already been reused'
+    ! has_login_session || fail 'remove requires all UID sessions to be terminated'
+    ! has_user_process || fail 'remove requires all UID processes to be terminated'
+    return 0
+  fi
+  shell="$(getent passwd "${TARGET}" | cut -d: -f7)"
+  [[ "${shell}" == /usr/sbin/nologin || "${shell}" == /bin/false ]] \
+    || fail 'remove requires a disabled login shell'
+  password_state="$(passwd -S "${TARGET}" | awk '{print $2}')"
+  [[ "${password_state}" == L ]] || fail 'remove requires a locked password'
+  ! has_login_session || fail 'remove requires all login sessions to be terminated'
+  ! has_user_process || fail 'remove requires all user processes to be terminated'
+}
+
+create_backup() {
+  local stamp
+  stamp="$(date +%Y%m%d-%H%M%S-%N)"
+  BACKUP_DIR="${BACKUP_ROOT}/gpu-isolation-${ACTION}-${TARGET}-${stamp}"
+  install -d -o root -g gpu-platform-admin -m 0750 "${BACKUP_DIR}"
+  cp -a -- "${REGISTRY_FILE}" "${BACKUP_DIR}/gpu-isolated-users.before"
+  REGISTRY_BACKUP="${BACKUP_DIR}/gpu-isolated-users.before"
+  if [[ -e "${DROPIN_PATH}" ]]; then
+    [[ -f "${DROPIN_PATH}" && ! -L "${DROPIN_PATH}" ]] \
+      || fail 'refusing a non-regular or symlink drop-in target'
+    cp -a -- "${DROPIN_PATH}" "${BACKUP_DIR}/dropin.before"
+    DROPIN_EXISTED=1
+  else
+    printf 'ABSENT\n' >"${BACKUP_DIR}/dropin.before.state"
+    DROPIN_EXISTED=0
+  fi
+}
+
+run_self_test() {
+  verify_static_and_live
+  local nonce open_unit cuda_unit open_output cgroup
+  nonce="$(date +%s%N)"
+  open_unit="h100-gpu-open-selftest-${TARGET_UID}-${nonce}"
+  cuda_unit="h100-cuda-selftest-${TARGET_UID}-${nonce}"
+  open_output="$(systemd-run \
+    --system \
+    --wait \
+    --pipe \
+    --collect \
+    --quiet \
+    --unit="${open_unit}" \
+    --slice="${TARGET_UNIT}" \
+    --uid="${TARGET_UID}" \
+    --property=Type=exec \
+    --property=NoNewPrivileges=yes \
+    --property=TimeoutStartSec=45 \
+    "${GPU_OPEN_PROBE}" --expect-denied-all --json)" \
+    || fail 'GPU open transient self-test failed'
+  cgroup="$(jq -er '.cgroup' <<<"${open_output}")" \
+    || fail 'GPU open self-test returned invalid JSON'
+  [[ "${cgroup}" == *"/user.slice/${TARGET_UNIT}/"* ]] \
+    || fail "probe ran outside exact target slice: ${cgroup}"
+  systemd-run \
+    --system \
+    --wait \
+    --pipe \
+    --collect \
+    --quiet \
+    --unit="${cuda_unit}" \
+    --slice="${TARGET_UNIT}" \
+    --uid="${TARGET_UID}" \
+    --property=Type=exec \
+    --property=NoNewPrivileges=yes \
+    --property=TimeoutStartSec=45 \
+    "${CUDA_PROBE}" --expect-denied --quiet \
+    || fail 'CUDA context transient self-test failed'
+  printf 'SELF-TEST PASSED user=%s uid=%s slice=%s cgroup=%s\n' \
+    "${TARGET}" "${TARGET_UID}" "${TARGET_UNIT}" "${cgroup}"
+}
+
+apply_policy() {
+  assert_no_global_policy
+  ! has_login_session || fail 'apply requires no active login session'
+  ! has_user_process || fail 'apply requires no existing user process'
+  registry_validate
+  create_backup
+  ROLLBACK_MODE=apply
+  install -d -o root -g root -m 0755 "${DROPIN_DIR}"
+  local temp
+  temp="$(mktemp "${DROPIN_DIR}/.${DROPIN_NAME}.XXXXXX")"
+  printf '[Slice]\nDevicePolicy=closed\n' >"${temp}"
+  chown root:root "${temp}"
+  chmod 0644 "${temp}"
+  sync -f "${temp}"
+  mv -f -- "${temp}" "${DROPIN_PATH}"
+  systemctl daemon-reload
+  write_registry_add
+  verify_static_and_live
+  ROLLBACK_MODE=
+  printf 'APPLIED user=%s uid=%s unit=%s dropin=%s backup=%s\n' \
+    "${TARGET}" "${TARGET_UID}" "${TARGET_UNIT}" "${DROPIN_PATH}" "${BACKUP_DIR}"
+}
+
+remove_policy() {
+  assert_account_disabled_for_remove
+  assert_no_global_policy
+  registry_validate "${TARGET}"
+  dropin_is_exact || fail 'remove refuses an unmanaged or modified drop-in'
+  registry_has_target || fail 'remove target is not in managed-user registry'
+  create_backup
+  ROLLBACK_MODE=remove
+  if systemctl is-active --quiet "${TARGET_UNIT}"; then
+    systemctl stop "${TARGET_UNIT}"
+  fi
+  rm -f -- "${DROPIN_PATH}"
+  rmdir -- "${DROPIN_DIR}" 2>/dev/null || true
+  write_registry_remove
+  systemctl daemon-reload
+  ROLLBACK_MODE=
+  printf 'REMOVED user=%s uid=%s exact_dropin=%s backup=%s\n' \
+    "${TARGET}" "${TARGET_UID}" "${DROPIN_PATH}" "${BACKUP_DIR}"
+}
+
+list_registry() {
+  registry_validate
+  local count=0 raw username uid extra
+  while IFS= read -r raw || [[ -n "${raw}" ]]; do
+    [[ "${raw}" =~ ^[[:space:]]*($|#) ]] && continue
+    read -r username uid extra <<<"${raw}"
+    printf 'user=%s uid=%s unit=user-%s.slice\n' "${username}" "${uid}" "${uid}"
+    ((count += 1))
+  done <"${REGISTRY_FILE}"
+  printf 'managed_users=%s\n' "${count}"
+}
+
+if (($# < 1)); then
+  usage >&2
+  exit 2
+fi
+ACTION=$1
+shift
+[[ "$(id -u)" == 0 ]] || fail 'run with sudo as root'
+install -d -o root -g root -m 0755 /run/lock
+exec 9>"${LOCK_FILE}"
+flock -x 9
+
+case "${ACTION}" in
+  list)
+    (($# == 0)) || { usage >&2; exit 2; }
+    TARGET=all
+    list_registry
+    ;;
+  plan|apply|verify|status|remove|self-test)
+    (($# == 1)) || { usage >&2; exit 2; }
+    if [[ "${ACTION}" == remove ]]; then
+      resolve_remove_target "$1"
+    else
+      resolve_candidate "$1"
+    fi
+    case "${ACTION}" in
+      plan)
+        assert_no_global_policy
+        printf 'PLAN user=%s uid=%s unit=%s dropin=%s policy=closed device_allow=none\n' \
+          "${TARGET}" "${TARGET_UID}" "${TARGET_UNIT}" "${DROPIN_PATH}"
+        ;;
+      apply) apply_policy ;;
+      verify)
+        registry_validate
+        verify_static_and_live
+        printf 'VERIFIED user=%s uid=%s policy=closed device_allow_nvidia=absent\n' \
+          "${TARGET}" "${TARGET_UID}"
+        ;;
+      status)
+        registry_validate
+        registered=no
+        registry_has_target && registered=yes
+        policy="$(systemctl show "${TARGET_UNIT}" -p DevicePolicy --value 2>/dev/null || printf unknown)"
+        printf 'user=%s uid=%s unit=%s registered=%s dropin=%s policy=%s\n' \
+          "${TARGET}" "${TARGET_UID}" "${TARGET_UNIT}" "${registered}" \
+          "$([[ -e "${DROPIN_PATH}" ]] && printf present || printf absent)" "${policy}"
+        ;;
+      remove) remove_policy ;;
+      self-test) run_self_test ;;
+    esac
+    ;;
+  --help|-h)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+OUTCOME=SUCCESS

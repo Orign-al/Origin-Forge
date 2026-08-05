@@ -16,6 +16,7 @@ h100_install_audit_trap container-start "${user_name}"
 h100_require_managed_user "${user_name}"
 h100_require_managed_compose "${user_name}"
 h100_require_slurm_drained
+h100_require_pilot_gpu_isolation_if_managed "${user_name}"
 
 container="$(h100_container_name "${user_name}")"
 docker container inspect "${container}" >/dev/null 2>&1 \

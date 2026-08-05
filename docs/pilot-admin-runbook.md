@@ -1,6 +1,6 @@
 # H100 受控单机 Pilot 管理员手册
 
-状态：Pilot-1C 已完成专属 `user-<UID>.slice` 瞬时验证并纠正 Pilot-1B 的设备编号假阴性；策略已按要求回滚为 `auto`，节点保持 DRAIN。禁止创建 Pilot 用户或 RESUME，等待 per-user 持久策略明确审批。
+状态：Pilot-1D 已安装精确 `user-<UID>.slice` 持久隔离框架、Guard 与告警；当前 managed users=0，Guard timer disabled/inactive，`user-1001.slice DevicePolicy=auto`，节点保持 DRAIN，等待最多 3 名用户清单审批。
 
 ## 不变量
 
@@ -11,13 +11,13 @@
 - Docker Hub 延期；镜像只能来自本地、NGC、批准的 GHCR/Quay 或离线 archive，并记录 digest。
 - 所有用户/容器变更使用既有 `h100-*` 管理脚本；这些脚本要求节点先 DRAIN。
 
-## 当前阻断与最小整改
+## 当前 Gate 与已实现控制
 
 2026-08-05 实测表明，无特权 `nobody` 在 Slurm 作业外能枚举全部 4 张 GPU，并能打开 `0666` 的 NVIDIA 设备节点。`ConstrainDevices=yes` 只隔离 Slurm job cgroup，宿主普通登录会话不受其保护。
 
-单独审批并实现以下一种方案后再复测：
+Pilot-1D 已获批并实现第一种方案的框架；以下仍是架构边界：
 
-1. 单节点 Pilot 候选：只为每个获批 Pilot UID 部署独立的 `user-<UID>.slice DevicePolicy=closed`，并让用户创建脚本负责 drop-in、daemon-reload、验证、Guard 指标和逐 UID 回滚。Pilot-1C 只验证了 runtime 策略，持久化尚未获批。
+1. 单节点 Pilot 当前控制：只为每个获批 Pilot UID 部署独立的 `user-<UID>.slice DevicePolicy=closed`，由两阶段用户脚本负责 drop-in、daemon-reload、验证、Guard 指标和逐 UID 回滚。当前无 Pilot 用户，所以没有真实 UID drop-in。
 2. 不授予计算节点通用 shell，建立逐用户认证、强制命令、禁转发、完整审计的 Slurm 提交网关。
 3. 部署经 TLS、短期 per-user JWT、撤销、限流和审计验证的 `slurmrestd`。
 4. 引入独立登录节点，计算节点启用 `pam_slurm_adopt` 与 `PrologFlags=contain`，拒绝无 allocation 会话。
@@ -45,9 +45,9 @@ Pilot-1C 已完成该调查并证明 `/dev/nvidia0` 是 Job 10 的 unallocated G
 - 四并发作业运行期间，受限 SSH 仍不能打开任何 per-GPU 节点或建立 CUDA context。
 - root-only 自动回滚成功；最终 `user-1001.slice DevicePolicy=auto`，无全局/per-UID 持久 drop-in，无 Guard，无 Pilot 用户。节点 Reason 为 `gpu device mapping and transient isolation validation complete`。
 
-因此当前运行态仍是 `DIRECT GPU BYPASS STILL POSSIBLE`，因为测试策略已按授权回滚；这不否定瞬时方案通过。不要在未批准前手工写 drop-in、部署 Guard、创建用户或 RESUME。
+Pilot-1D 已安装经批准框架；`codexops` 回归后仍按要求恢复 `DevicePolicy=auto`。当前没有普通 Pilot 登录身份，因此不得把管理员会话可访问 GPU 描述成已上线用户绕过；也不得声称真实用户隔离已验收。不要手工写 drop-in、创建用户或 RESUME。
 
-建议持久化方案：为每个获批 Pilot 用户生成独立 `user-<UID>.slice.d/50-h100-gpu-isolation.conf`，不修改全局 `user.slice`；逐 UID 验证、逐 UID 回滚，并在独立登录节点上线后迁移到 `pam_slurm_adopt`。下一审批语句为：`允许将GPU隔离改为Pilot用户专属user-UID.slice持久策略，并更新用户创建脚本`。
+持久框架只生成独立 `user-<UID>.slice.d/50-h100-gpu-isolation.conf`，不修改全局 `user.slice` 或 `user-.slice`；逐 UID 验证和回滚。下一审批语句为：`允许创建清单中的Pilot用户，并为每个用户应用专属user-UID.slice GPU隔离策略`。
 
 ## 日常状态检查
 
@@ -99,20 +99,65 @@ sudo scontrol update NodeName="$NODE_NAME" State=RESUME
 
 只接受最多 3 人的已批准 `inventory/pilot-users.yaml`。验证用户名、UID/GID、单条公钥格式与指纹、唯一 project ID、未占用且批准的 SSH 端口、现有 account/QOS、300GB quota 和无 secret。不得接收私钥、密码或自动猜测身份。
 
-输出创建计划并等待原文批准：`允许创建清单中的 Pilot 用户`。当前直接 GPU 绕过未关闭时，即使有名单也不得执行。
+输出创建计划并等待原文批准：`允许创建清单中的Pilot用户，并为每个用户应用专属user-UID.slice GPU隔离策略`。没有该原文批准不得 stage。
 
-## 创建用户、quota 和 association
+## 精确 GPU 隔离管理工具
+
+只通过以下工具管理策略，所有修改操作使用 sudo：
+
+```bash
+sudo h100-user-gpu-isolation plan USER
+sudo h100-user-gpu-isolation apply USER
+sudo h100-user-gpu-isolation verify USER
+sudo h100-user-gpu-isolation status USER
+sudo h100-user-gpu-isolation self-test USER
+sudo h100-user-gpu-isolation list
+sudo h100-user-gpu-isolation remove USER
+```
+
+工具从 `getent passwd` 解析 UID，自行生成 `user-<UID>.slice` 和精确 drop-in 路径；拒绝 root、origin-al、codexops、系统 UID、不存在账号和 sudo/docker/video/render/admin 组成员。唯一的不存在账号例外是已登记离职 tombstone 的最终 `remove`：必须证明登记 UID 也不存在且从未复用。`apply` 前要求无会话/进程，使用 flock、备份和原子 rename；账号仍存在时，`remove` 要求 nologin、密码锁定、无会话/进程，并且只删除内容仍为固定两行的本工具文件。不要手工创建全局 `user.slice.d`/`user-.slice.d`，不要添加任何 NVIDIA `DeviceAllow`，不要用 chmod/chown、video/render/gpu 组或 Prolog 动态 chown。
+
+核查：
+
+```bash
+sudo systemctl cat user-UID.slice
+sudo systemctl show user-UID.slice -p ControlGroup -p DevicePolicy -p DeviceAllow
+sudo h100-user-gpu-isolation self-test USER
+```
+
+## 两阶段创建用户、quota、association 和容器
 
 在维护窗口先 DRAIN 并确认队列为空。使用既有脚本，不手工并行实现：
 
 ```bash
-sudo h100-user-create USER PROJECT_ID /root-secure-path/USER.pub --confirm-create
-sudo h100-quota-show USER
+sudo h100-user-create --plan USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS /root-secure-path/USER.pub
+sudo h100-user-create --stage USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS /root-secure-path/USER.pub --confirm-stage USER
+sudo h100-user-create --status USER
 ```
 
-脚本创建禁用密码的宿主账号、私有组、authorized_keys、`/srv/gpu-platform/users/USER/{home,workspace,shared}` 和 300GB XFS project hard quota，不授予 sudo/docker/admin。公钥临时文件必须 root-only，完成后按安全政策处置，不能提交 Git。
+`--stage` 创建锁定密码、`/usr/sbin/nologin`、无 `authorized_keys` 的账号；隔离 self-test 通过后才创建 300GB quota、`general` QOS association 和默认无 GPU 的长期容器。Stage 成功只输出 STAGED，用户仍不能登录。任何失败都保持 nologin、停止容器、回滚 association/project 映射/精确策略并保留可能创建的数据供人工审计。
 
-随后用 `sacctmgr` 把用户关联到已批准 account 与 `general` QOS，并验证每用户 GPU 上限为 1；不得授予 admin/core 或 4 GPU。所有命令先用当前 Slurm 25.11 字段做只读确认，导出 association 作为回滚证据。
+独立复核 STAGED 报告和审批后才执行：
+
+```bash
+sudo h100-user-create --activate USER /root-secure-path/USER.pub --confirm-activate USER
+sudo h100-user-create --status USER
+```
+
+ACTIVATE 再次验证策略、无高权组、容器无 GPU和公钥指纹，启动 Guard 后最后才开放 `/bin/bash`。密码保持锁定。用户本人随后验证 SSH 与 Pilot Slurm 作业；管理员不得用用户私钥代测。
+
+## Guard 日常操作与失败
+
+```bash
+sudo systemctl start h100-gpu-bypass-guard.service
+sudo journalctl -u h100-gpu-bypass-guard.service --since today --no-pager
+systemctl is-enabled h100-gpu-bypass-guard.timer
+systemctl is-active h100-gpu-bypass-guard.timer
+curl -fsS http://127.0.0.1:9100/metrics | grep '^h100_gpu_'
+curl -fsS http://127.0.0.1:9090/api/v1/alerts
+```
+
+无受管用户时 timer 必须 disabled/inactive，手工 service 应输出 `NO MANAGED PILOT USERS`。首名用户 ACTIVATE 成功后脚本才 enable timer。Guard 失败会在节点尚未 DRAIN 时写精确 Reason 并 DRAIN；若已有 DRAIN，则保留原 Reason。它永不自动 RESUME、删除策略或杀用户进程。先查看 policy、registry、transient probe、GPU/GRES/MIG 和当前作业，再人工修复；不得通过放开全部 NVIDIA 设备消除告警。
 
 ## 创建和管理长期容器
 
@@ -136,14 +181,16 @@ sudo h100-container-delete USER
 
 带数据删除是不可逆的独立审批动作；必须先完成离职/保留决策和备份验证，不在日常清理中执行。
 
-## 停用、离职与回滚
+## 停用、离职、UID 迁移与回滚
 
-1. DRAIN 并阻止新作业；根据风险决定是否取消运行作业。
-2. 锁定宿主账号并移走/禁用 authorized_keys；记录时间和批准人。
-3. 停止长期容器，保留用户数据、Compose 和 SSH host key。
-4. 删除或冻结 Slurm association/QOS 前导出当前状态。
-5. 按公司保留策略决定本机数据归档、移交和最终删除；没有批准不得删除。
+1. 在 Slurm 中禁止新作业，DRAIN，`scancel` 该用户作业并导出 association。
+2. 把 shell 改为 `/usr/sbin/nologin`，锁定密码，移走/禁用 `authorized_keys`，终止登录会话。
+3. 停止长期容器；保留数据、Compose、SSH host key 和 `user-<UID>.slice` GPU 限制。
+4. 冻结/删除 association 前保留审计；完成数据归档和人工审批前不删除工作目录。
+5. 最后才删除账号。确认旧 UID 没有被任何账号复用后，再按审批精确删除本工具 drop-in/登记；UID 和 project ID 均不得立即复用。
 6. quota/QOS 调整前备份 `/etc/projects`、`/etc/projid` 和 association；验证差异、唯一性及回滚命令。
+
+UID 禁止原地改号。按迁移处理：创建新 UID 的 STAGED 账号和新的 `user-NEWUID.slice`，迁移 ownership，完整验证后禁用旧 UID；完成归档/审计和旧账号删除后才移除旧策略。任何阶段失败都保留 Slurm DRAIN。
 
 若 Pilot 变更失败，优先保持节点 DRAIN、禁用新增登录/作业并停止相关容器；恢复备份的非 secret 配置，验证 Git diff、服务、GPU、quota、监听和监控后再请求 RESUME。
 
