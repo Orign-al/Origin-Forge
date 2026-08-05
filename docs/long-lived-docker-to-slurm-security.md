@@ -1,6 +1,6 @@
 # 长期 Docker 到 Slurm 的安全提交通道
 
-状态：仅设计，当前不实施批量用户提交。
+状态：Pilot-1 技术 Gate 未通过；禁止创建 Pilot 用户或恢复调度，等待提交入口整改审批。
 
 ## 边界与不变量
 
@@ -17,9 +17,33 @@
 |---|---|---|---|---|
 | A：个人容器通过 SSH 连接宿主提交入口 | 用户自己的 SSH 密钥；不得使用管理员密钥 | 用户可从 VS Code/容器工作流直接提交；沿用 sshd 审计和 Unix 身份 | 用户私钥位于其持久化 home，容器 root 可读取；必须使用个人密钥、严格 known_hosts、禁用 agent 共享管理员身份，并限制宿主登录权限 | 可作为后续便利方案，先做单用户原型和威胁评审 |
 | B：`slurmrestd` + JWT | 短期、最小权限 JWT；服务端 JWT signing key 不进入个人容器 | API 友好，便于门户和自动化；可与未来 JumpServer/内部服务集成 | 需 TLS、密钥轮换、token 过期/撤销、请求审计、限流和 Slurm 版本兼容；错误配置会扩大控制面暴露 | 当前不部署；待有集中身份系统和 secret 生命周期管理后评估 |
-| C：用户直接 SSH 登录宿主后提交 | 用户个人 SSH 公钥，由宿主 sshd 认证 | 边界最简单；无需把 MUNGE/JWT/管理员凭据放入容器；Slurm CLI 与 Unix 用户天然一致 | 用户需要在宿主 shell 提交；需控制宿主软件和目录权限，并为每个用户建立 Slurm association | 当前推荐方案 |
+| C：用户直接 SSH 登录宿主后提交 | 用户个人 SSH 公钥，由宿主 sshd 认证 | 无需把 MUNGE/JWT/管理员凭据放入容器；Slurm CLI 与 Unix 用户天然一致 | 当前计算节点的 `/dev/nvidia*` 为 `0666`，普通登录会话能绕过 Slurm 访问全部 GPU | **当前阻断，不可用于 Pilot** |
 
-## 推荐的当前流程（方案 C）
+## Pilot-1 实测 Gate（2026-08-05）
+
+在节点完成 CPU、单 GPU、双 GPU 回归并处于空闲状态后，使用现有 `nobody` 身份做了无负载验证，没有创建测试用户：
+
+- 未发现 `pam_slurm_adopt` 或等价的 SSH 会话收容策略；`PrologFlags` 为空。
+- `/dev/nvidia0`～`3`、`/dev/nvidiactl` 和 `/dev/nvidia-uvm` 均为 `root:root 0666`。
+- 作业外的 `nobody` 能通过 NVML 枚举全部 4 张 H100。
+- 作业外的 `nobody` 能以读写方式打开 NVIDIA 设备节点；测试只打开文件描述符，没有产生 GPU 负载。
+- 既有 `gpu-dev-codexops` 容器仍无 GPU DeviceRequest、Docker Socket、MUNGE socket/key 或敏感宿主挂载；问题位于宿主登录路径，不位于长期容器模板。
+
+因此，Slurm 的 `ConstrainDevices=yes` 已正确隔离**作业内**分配，但不能限制普通宿主登录会话。节点已按 Gate 重新 DRAIN，Reason 为 `direct GPU bypass possible outside Slurm`。
+
+## 最小整改路径
+
+在创建任何 Pilot 用户前，管理员应单独审批并实现一种可验证的技术控制：
+
+1. 首选：普通用户不获得计算节点通用 shell，只通过按 Unix 用户重新认证的受控提交网关调用 `sbatch`、`srun`、`squeue`、`sacct` 和 `scancel`。网关必须拒绝任意宿主命令、端口/agent/X11 转发，并保留用户与 Job ID 审计。
+2. 可选：部署经 TLS、短期 per-user token、撤销和审计验证的 `slurmrestd` 提交入口；JWT signing key 仅保存在 root-only 服务端路径。
+3. 多节点阶段的标准方案：设置独立登录节点；计算节点使用 `pam_slurm_adopt`/`PrologFlags=contain`，拒绝无作业 SSH 会话并将有作业会话纳入对应 job cgroup。
+
+不得仅通过改为 `video`/`render` 组、临时 `chmod`、用户承诺或隐藏 `nvidia-smi` 来声称已隔离。整改验收至少要证明：作业外普通身份无法枚举或打开 GPU，单 GPU 作业内只见一张，双 GPU 作业内只见两张，作业结束后访问随之撤销。
+
+## 原方案 C 流程（当前停止）
+
+以下流程仅保留为历史设计说明；在提交入口技术 Gate 通过前不得执行：
 
 1. 管理员经批准后创建员工宿主账号，只安装该员工的个人公钥，不授予宿主 sudo 或 docker 组权限。
 2. 为该用户建立 Slurm association、Account 与 QOS；默认遵守每用户 GPU 上限。
@@ -46,4 +70,4 @@
 
 ## 当前结论
 
-当前采用方案 C 作为人工提交路径；方案 A 仅保留为后续单用户原型，方案 B 延后到集中身份与 secret 管理成熟后。当前不修改个人 Docker 挂载、不部署 `slurmrestd`、不创建其他员工账号，也不改变 Slurm DRAIN 状态。
+方案 C 的宿主通用 shell 已被实测证明存在直接 GPU 绕过，不能用于 Pilot。当前不修改设备权限、PAM、sshd、个人 Docker 挂载或 secret 管理，不部署 `slurmrestd`，不创建其他员工账号，并保持 Slurm DRAIN。完成上述任一技术控制后，必须重新执行提交入口与 GPU 绕过 Gate，再由管理员明确批准 RESUME 和用户创建。
