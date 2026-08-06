@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 
+import { ACCESS_MODE_LABEL } from "@h100-portal/config";
 import { Button, Card, Input } from "@h100-portal/ui";
 import { getCsrf, login } from "../../lib/api";
 
@@ -47,7 +48,7 @@ export default function LoginPage() {
     <div className="auth-page">
       <Card className="auth-panel">
         <div className="auth-brand">
-          <span className="local-mode">PRIVATE TUNNEL NETWORK MODE</span>
+          <span className="local-mode">{ACCESS_MODE_LABEL}</span>
           <h1>H100 管理平台</h1>
           <p>私有管理入口 · 请使用网页账号登录</p>
         </div>
@@ -92,8 +93,8 @@ export default function LoginPage() {
           </div>
         </form>
         <div className="auth-foot">
-          网页密码与 Linux/SSH 密码分离。当前入口仅绑定已批准的私有隧道地址，SSH
-          Tunnel 仍可作为回退方式。
+          网页密码与 Linux/SSH 密码分离。当前入口仅绑定已批准的虚拟网络地址；Pilot
+          阶段由管理员接受内部 HTTP，未启用 TLS。
           <br />
           <Link href="/setup-password" className="muted">
             已有一次性设置链接？

@@ -5,7 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 
-import { navigation } from "@h100-portal/config";
+import { ACCESS_MODE_LABEL, navigation } from "@h100-portal/config";
 import { Badge, Button } from "@h100-portal/ui";
 import { alerts, logout, me, recordPageAccess } from "../lib/api";
 
@@ -95,7 +95,7 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
         <header className="topbar">
           <div className="topbar-left">
             <span className="env-label">H100 单节点环境</span>
-            <span className="local-mode">PRIVATE TUNNEL NETWORK MODE</span>
+            <span className="local-mode">{ACCESS_MODE_LABEL}</span>
           </div>
           <div className="topbar-search">
             <label htmlFor="global-search" className="sr-only">

@@ -12,9 +12,10 @@
 - API：`127.0.0.1:18081`（继续仅限 loopback）
 - PostgreSQL：本机 Unix Socket，不监听 Portal TCP 端口
 
-Portal-0/1 允许经管理员批准的 `10.10.10.0/24` 私有隧道网络直接访问 Web；SSH Tunnel
-保留为回退方式。Web 不监听 `0.0.0.0`，API 不监听管理网地址。本变更不修改防火墙或公网
-监听。Slurm 必须在整个部署过程保持 `IDLE+DRAIN` 且队列为空。
+管理员已接受当前 Pilot 经 `10.10.10.0/24` 受控虚拟网络使用内部明文 HTTP 直接访问
+Web；Transport TLS 未启用且当前范围不要求启用。SSH Tunnel 仅保留为可选回退。Web 不
+监听 `0.0.0.0`，API 不监听管理网地址。本变更不修改防火墙或公网监听。Slurm 必须在整个
+部署过程保持 `IDLE+DRAIN` 且队列为空。若访问范围扩大，必须重新评估并优先启用 HTTPS。
 
 ## 前置检查
 
@@ -109,7 +110,7 @@ Web unit 的网络沙箱必须保留 `IPAddressDeny=any`，只额外允许 local
 `10.10.10.0/24`；API unit 仍只允许 localhost。以 API UID 运行
 `/opt/h100-portal/tests/worker_socket_smoke.py` 验证固定读取、dry-run 和拒绝路径。
 
-批准的私有隧道客户端直接打开 `http://10.10.10.2:18080`。如需 SSH Tunnel 回退：
+批准的虚拟网络客户端直接打开 `http://10.10.10.2:18080`。如需可选 SSH Tunnel 回退：
 
 ```bash
 ssh -L 18080:10.10.10.2:18080 h100-codex

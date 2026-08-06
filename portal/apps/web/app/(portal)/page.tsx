@@ -1,6 +1,7 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
+import { ACCESS_MODE_LABEL } from "@h100-portal/config";
 import { Card, StatusBadge } from "@h100-portal/ui";
 
 import {
@@ -96,7 +97,7 @@ export default function DashboardPage() {
       <PageHeading
         title="总览"
         description="单节点 H100 平台实时概况"
-        action={<StatusBadge value="PRIVATE TUNNEL NETWORK MODE" />}
+        action={<StatusBadge value={ACCESS_MODE_LABEL} />}
       />
       {query.isFetching ? <StaleNotice /> : null}
       <div className="grid-compact" style={{ marginTop: 14 }}>

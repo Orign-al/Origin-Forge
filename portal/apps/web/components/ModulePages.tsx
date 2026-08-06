@@ -4,6 +4,10 @@ import Link from "next/link";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 
+import {
+  ACCESS_MODE_STATUS,
+  TRANSPORT_TLS_STATUS,
+} from "@h100-portal/config";
 import { Button, Card, EmptyState, Input, StatusBadge } from "@h100-portal/ui";
 import {
   ApiError,
@@ -978,11 +982,15 @@ export function SystemModule() {
             </div>
             <div className="kv">
               <dt>访问模式</dt>
-              <dd>LOCAL SSH TUNNEL / 私有网络</dd>
+              <dd>{ACCESS_MODE_STATUS}</dd>
+            </div>
+            <div className="kv">
+              <dt>Transport TLS</dt>
+              <dd>{TRANSPORT_TLS_STATUS}</dd>
             </div>
             <div className="kv">
               <dt>写操作</dt>
-              <dd>Worker dry-run</dd>
+              <dd>Worker dry-run · 等待 Portal-3 完整批准</dd>
             </div>
             <div className="kv">
               <dt>Slurm</dt>

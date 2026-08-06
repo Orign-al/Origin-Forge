@@ -101,3 +101,15 @@
   SSH Tunnel 回退，不使用通配 Origin。
 - 不变项：Slurm DRAIN、Guard timer disabled、MIG Disabled、无 Pilot Linux 用户、无计算
   onboarding、无 NFS/第二节点变更。
+
+## Portal-2 后续管理员决策：内部 HTTP 接受
+
+- 决策日期：2026-08-06。
+- `PORTAL ACCESS MODE`：`INTERNAL HTTP ACCEPTED BY ADMINISTRATOR — VIRTUAL NETWORK ONLY`。
+- `TRANSPORT TLS`：`NOT ENABLED — NOT REQUIRED FOR CURRENT PILOT SCOPE`。
+- Web 继续只监听 `10.10.10.2:18080`；API 继续只监听 `127.0.0.1:18081`。
+- 不修改防火墙，不增加公网路由或端口映射，不声称已启用 HTTPS。
+- Cookie、登录限速、CSRF、会话超时、RBAC 和审计保持当前内部 HTTP 配置。
+- 访问扩展到其他网络、VPN 用户、办公网或公网时，必须重新评估并优先启用 HTTPS。
+- 该决策解除 transport 对未来真实写操作的阻断，但不等于 Portal-3 执行批准；收到完整
+  Portal-3 批准前，真实写操作继续禁用，Slurm 保持 DRAIN。

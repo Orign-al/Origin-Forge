@@ -30,10 +30,12 @@ sudo 或 `authorized_keys`。
 ## 会话
 
 会话 ID 使用 48 字节 CSPRNG，仅 hash 入库。Cookie 为 `HttpOnly`、`SameSite=Strict`、
-`Path=/`；批准的私有隧道网络和 SSH Tunnel HTTP 模式为 `Secure=false`，未来 HTTPS
-部署必须切换为 `Secure=true`。CSRF 只接受 `127.0.0.1:18080` 与 `10.10.10.2:18080`
-两个精确 Origin，不使用通配。会话空闲超时 30 分钟、绝对超时 12 小时；登录后建立新会话，改密后
-撤销其他会话，退出立即撤销当前会话。高风险操作要求十分钟内重新认证。
+`Path=/`。管理员已接受受控虚拟网络内的 Pilot HTTP，因此当前保持 `Secure=false`；TLS
+未启用且当前范围不要求启用。CSRF 只接受 `127.0.0.1:18080` 与
+`10.10.10.2:18080` 两个精确 Origin，不使用通配。会话空闲超时 30 分钟、绝对超时
+12 小时；登录后建立新会话，改密后撤销其他会话，退出立即撤销当前会话。高风险操作要求
+十分钟内重新认证。若访问扩展到其他网络、VPN 用户、办公网或公网，必须重新评估并优先
+启用 HTTPS，同时把 Cookie 切换为 `Secure=true`。
 
 ## CSRF 与登录保护
 
@@ -59,3 +61,6 @@ fingerprint 与截断注释。
 Portal-0/1 不创建 Linux/Pilot 用户，不创建长期用户容器，不启用 Guard timer，不修改
 现有 GPU 隔离 drop-in，不修改 MIG、GRES、Kernel、Driver、Mellanox 或防火墙，且不
 RESUME Slurm。
+
+内部 HTTP 的管理员接受仅解除 transport 对未来 Portal-3 的阻断，不构成 Portal-3 执行
+批准。收到完整 Portal-3 批准前，真实写 handler 继续禁用。

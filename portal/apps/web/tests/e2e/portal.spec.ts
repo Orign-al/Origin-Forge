@@ -446,7 +446,7 @@ test("首次密码设置后进入总览", async ({ page }) => {
   await expect(page).toHaveURL(/\/$/);
   await expect(page.getByRole("heading", { name: "总览" })).toBeVisible();
   await expect(
-    page.getByText("PRIVATE TUNNEL NETWORK MODE").first(),
+    page.getByText("INTERNAL HTTP · VIRTUAL NETWORK ONLY").first(),
   ).toBeVisible();
 });
 
@@ -497,6 +497,20 @@ test("总览加载真实状态结构并适配 1366 宽度", async ({ page }) => 
       () => document.documentElement.scrollWidth <= window.innerWidth,
     ),
   ).toBe(true);
+});
+
+test("系统页显示管理员接受的内部 HTTP 状态", async ({ page }) => {
+  await installMockApi(page, { authenticated: true });
+  await page.goto("/system");
+  await expect(
+    page.getByText(
+      "INTERNAL HTTP ACCEPTED BY ADMINISTRATOR — VIRTUAL NETWORK ONLY",
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByText("NOT ENABLED — NOT REQUIRED FOR CURRENT PILOT SCOPE"),
+  ).toBeVisible();
+  await expect(page.getByText(/HTTPS/)).toHaveCount(0);
 });
 
 test("Slurm 页面明确显示 DRAIN 和禁止 RESUME", async ({ page }) => {
