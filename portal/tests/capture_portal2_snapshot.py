@@ -67,6 +67,7 @@ def main() -> int:
     )
     from h100_portal_api.rbac import highest_role
     from h100_portal_api.routes.operations import operation_response
+    from h100_portal_api.routes.users import compute_plan_view
     from h100_portal_worker import handlers
     from sqlalchemy import select
 
@@ -117,6 +118,7 @@ def main() -> int:
         )
         user_payload = serialize_user(owner).model_dump(mode="json")
         user_payload["linux_identity"] = resource_view(owner, resource)
+        user_payload["compute_onboarding"] = compute_plan_view(owner, db)
         operations = db.scalars(
             select(PortalOperation).order_by(PortalOperation.created_at.desc()).limit(200)
         ).all()
