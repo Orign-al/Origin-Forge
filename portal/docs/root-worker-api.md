@@ -57,6 +57,11 @@ Prometheus/Grafana。GPU minor 只按 UUID + PCI Bus ID 与 NVIDIA driver procfs
 Portal-0/1 对所有非 dry-run 写请求固定返回 `WRITE_EXECUTION_DISABLED`。dry-run 只返回
 handler、已清洗参数、预期备份/验证/回滚和脚本完整性，不返回 shell 命令字符串。
 
+Portal-3A 将 `user.plan` 进一步限制为精确目标 `origin-pilot`。Worker 使用固定数据源
+生成 UID/GID、project ID、SSH 端口、Slurm、GPU isolation、Stage、Activate 和回滚的
+结构化计划，所有候选值标记为 `PROPOSED — NOT RESERVED`。它不接受任意 argv、任意
+路径或其他用户名；`origin-al` 仍是禁止的计算用户目标。
+
 ## 固定命令适配器
 
 命令只从代码内绝对路径 allowlist 选择，`shell=False`，固定 `PATH`/locale/cwd，stdin

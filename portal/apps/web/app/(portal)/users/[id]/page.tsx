@@ -3,20 +3,26 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { Card, EmptyState, StatusBadge } from "@h100-portal/ui";
+import { Button, Card, EmptyState, StatusBadge } from "@h100-portal/ui";
 import {
   ErrorBlock,
   LoadingBlock,
   PageHeading,
   SectionCard,
 } from "../../../../components/PortalShell";
-import { userDetail } from "../../../../lib/api";
+import { createOperation, userDetail } from "../../../../lib/api";
+import {
+  ObjectTable,
+  type SimpleColumnDef,
+  type SimpleRow,
+} from "../../../../components/Tables";
 
 const TABS = [
   "概览",
   "登录安全",
+  "计算资源",
   "Linux 身份",
   "GPU 隔离",
   "Slurm",
@@ -27,6 +33,37 @@ const TABS = [
   "审计日志",
 ] as const;
 
+const VALIDATION_COLUMNS: SimpleColumnDef[] = [
+  { accessorKey: "check", header: "检查项" },
+  {
+    accessorKey: "status",
+    header: "结果",
+    cell: (info) => <StatusBadge value={String(info.getValue())} />,
+  },
+  { accessorKey: "detail", header: "说明" },
+];
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function asRows(value: unknown): SimpleRow[] {
+  return Array.isArray(value)
+    ? value.filter(
+        (item): item is SimpleRow =>
+          Boolean(item) && typeof item === "object" && !Array.isArray(item),
+      )
+    : [];
+}
+
+function asStrings(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
 function Value({ children }: { children: unknown }) {
   if (children === null || children === undefined || children === "")
     return <span className="muted">—</span>;
@@ -35,7 +72,10 @@ function Value({ children }: { children: unknown }) {
 
 export default function UserDetailPage() {
   const params = useParams<{ id: string }>();
+  const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<(typeof TABS)[number]>("概览");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
   const query = useQuery({
     queryKey: ["user", params.id],
     queryFn: () => userDetail(params.id),
@@ -56,6 +96,40 @@ export default function UserDetailPage() {
     );
   const user = query.data.user;
   const linux = user.linux_identity ?? {};
+  const compute = user.compute_onboarding;
+  const plan = asRecord(compute?.plan);
+  const hostAccess = asRecord(plan.proposed_host_access);
+  const container = asRecord(plan.proposed_container);
+  const gpuPolicy = asRecord(plan.proposed_gpu_policy);
+  const validations = asRows(plan.validation_results);
+  const conflicts = asRows(plan.conflicts);
+  async function createComputePlan() {
+    setBusy(true);
+    setMessage(null);
+    try {
+      await createOperation({
+        operation_type: "user.plan",
+        target_type: "compute_identity",
+        target_id: "origin-pilot",
+        request_summary:
+          "为 Origin-al 规划独立 origin-pilot 计算身份（仅 dry-run）",
+        payload: { username: "origin-pilot" },
+        idempotency_key: `portal3a-origin-pilot-plan-${Date.now()}`,
+      });
+      setMessage(
+        "DRAFT 与 Worker dry-run 已记录；没有创建 Linux 用户或任何宿主资源。",
+      );
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["user", params.id] }),
+        queryClient.invalidateQueries({ queryKey: ["users"] }),
+        queryClient.invalidateQueries({ queryKey: ["operations"] }),
+      ]);
+    } catch {
+      setMessage("计划创建失败；宿主状态没有改变。");
+    } finally {
+      setBusy(false);
+    }
+  }
   const kv = (entries: Array<[string, unknown]>) => (
     <dl className="kv-grid">
       {entries.map(([label, value]) => (
@@ -77,7 +151,14 @@ export default function UserDetailPage() {
       />
       {user.normalized_login === "origin-al" ? (
         <div className="notice" style={{ marginBottom: 14 }}>
-          当前 Origin-al 是平台恢复/管理账号，尚未进入受控 Pilot 计算身份流程。
+          当前 Origin-al 是平台恢复/管理账号，不会被转换为
+          Pilot；独立计算身份建议为
+          <strong> origin-pilot</strong>。
+        </div>
+      ) : null}
+      {message ? (
+        <div className="notice" role="status" style={{ marginBottom: 14 }}>
+          {message}
         </div>
       ) : null}
       <div className="tabs" role="tablist" aria-label="用户详情分区">
@@ -121,6 +202,155 @@ export default function UserDetailPage() {
               <div className="notice">管理员会话撤销需要单独审批。</div>
             )}
           </>
+        ) : null}
+        {activeTab === "计算资源" ? (
+          user.normalized_login === "origin-al" ? (
+            <div className="compute-plan">
+              <div className="detail-section-heading">
+                <div>
+                  <h2>独立计算身份 Onboarding</h2>
+                  <p className="muted">
+                    管理映射 origin-al 保持不变；这里只创建数据库 DRAFT 和只读
+                    dry-run。
+                  </p>
+                </div>
+                <StatusBadge
+                  value={compute?.draft_state ?? "DRAFT NOT CREATED"}
+                />
+              </div>
+              {compute?.status !== "DRAFT" || !Object.keys(plan).length ? (
+                <div className="empty-plan">
+                  <EmptyState
+                    title="DRAFT NOT CREATED"
+                    detail="建议账号 origin-pilot；创建计划不会预留 UID、project ID 或端口"
+                  />
+                  <Button
+                    tone="primary"
+                    onClick={() => void createComputePlan()}
+                    disabled={busy}
+                  >
+                    创建计算资源草稿
+                  </Button>
+                </div>
+              ) : (
+                <>
+                  <div className="plan-status-row">
+                    <StatusBadge
+                      value={String(plan.plan_status ?? "UNKNOWN")}
+                    />
+                    <span className="mono">
+                      Operation {compute.operation_id}
+                    </span>
+                    <span>execution_enabled=false</span>
+                  </div>
+                  {kv([
+                    ["Portal owner", plan.portal_owner],
+                    ["管理 Linux 映射", "origin-al（保持不变）"],
+                    ["建议 Unix username", plan.proposed_username],
+                    ["Host access", hostAccess.enabled === true ? "enabled（Stage 后仍 nologin）" : "—"],
+                    ["计划状态", plan.proposal_state],
+                    [
+                      "UID",
+                      `${String(plan.proposed_uid ?? "—")} — NOT RESERVED`,
+                    ],
+                    [
+                      "GID",
+                      `${String(plan.proposed_gid ?? "—")} — NOT RESERVED`,
+                    ],
+                    [
+                      "Project ID",
+                      `${String(plan.proposed_project_id ?? "—")} — NOT RESERVED`,
+                    ],
+                    [
+                      "Quota",
+                      `${String(plan.proposed_quota_hard_limit_gb ?? "—")} GB hard`,
+                    ],
+                    [
+                      "Slurm",
+                      `${String(plan.proposed_slurm_account ?? "—")} / ${String(plan.proposed_qos ?? "—")}`,
+                    ],
+                    ["最大 GPU", plan.proposed_max_gpus],
+                    [
+                      "SSH 端口",
+                      `${String(plan.proposed_ssh_port ?? "—")} @ ${String(container.network_bind ?? "—")} — NOT RESERVED`,
+                    ],
+                    ["SSH key", plan.ssh_key_status],
+                  ])}
+                  <h3 className="subheading">GPU 隔离计划</h3>
+                  {kv([
+                    ["方法", gpuPolicy.method],
+                    ["Unit", gpuPolicy.unit],
+                    ["Drop-in", gpuPolicy.dropin_path],
+                    ["DevicePolicy", gpuPolicy.device_policy],
+                    ["DeviceAllow", "无"],
+                    ["全局 user.slice", "不修改"],
+                    ["user-.slice", "不修改"],
+                  ])}
+                  <h3 className="subheading">长期容器计划</h3>
+                  {kv([
+                    ["容器名", container.name],
+                    ["CPU", container.cpus],
+                    ["内存", `${String(container.memory_gb ?? "—")} GB`],
+                    ["PIDs", container.pids_limit],
+                    ["GPU", container.gpu],
+                  ])}
+                  <h3 className="subheading">冲突与验证</h3>
+                  {conflicts.length ? (
+                    <div className="error-box">
+                      {conflicts.map((item, index) => (
+                        <div key={`${String(item.code)}-${index}`}>
+                          {String(item.code)}：{String(item.message)}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="notice">
+                      未发现资源冲突；所有候选值仍为 PROPOSED — NOT RESERVED。
+                    </div>
+                  )}
+                  <ObjectTable
+                    rows={validations}
+                    columns={VALIDATION_COLUMNS}
+                  />
+                  <div className="plan-step-grid">
+                    {[
+                      ["Stage 计划", asStrings(plan.stage_steps)],
+                      ["Activate 计划", asStrings(plan.activate_steps)],
+                      ["回滚计划", asStrings(plan.rollback_steps)],
+                    ].map(([title, steps]) => (
+                      <section key={String(title)}>
+                        <h3>{String(title)}</h3>
+                        <ol>
+                          {(steps as string[]).map((step) => (
+                            <li key={step}>{step}</li>
+                          ))}
+                        </ol>
+                      </section>
+                    ))}
+                  </div>
+                  <div className="operation-actions">
+                    <Button
+                      onClick={() => void createComputePlan()}
+                      disabled={busy}
+                    >
+                      重新执行 dry-run
+                    </Button>
+                    <Button disabled>Stage 未授权</Button>
+                    <Button disabled>Activate 未授权</Button>
+                  </div>
+                  <div className="notice">
+                    SSH KEY REQUIRED BEFORE ACTIVATION。下一阶段批准前，Worker
+                    不会进入真实写模式。
+                  </div>
+                </>
+              )}
+            </div>
+          ) : (
+            <EmptyState
+              title="没有可用的计算身份计划"
+              detail="当前账号不属于 Portal-3A 目标"
+            />
+          )
         ) : null}
         {activeTab === "Linux 身份"
           ? kv([

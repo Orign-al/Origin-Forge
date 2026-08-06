@@ -104,6 +104,7 @@ class OperationResponse(ApiModel):
     approved_at: datetime | None
     started_at: datetime | None
     finished_at: datetime | None
+    dry_run_result: dict[str, Any] | None
     result_summary: str | None
     error_code: str | None
 

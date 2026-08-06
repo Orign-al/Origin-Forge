@@ -7,6 +7,8 @@ type MockState = {
   setupUsesRemaining?: number;
   denyOperations?: boolean;
   enforceCsrf?: boolean;
+  draftCreated?: boolean;
+  planConflict?: boolean;
 };
 
 const MOCK_SETUP_TOKEN = "test-only-portal-setup-token-with-forty-eight-bytes";
@@ -32,6 +34,72 @@ const owner = {
     onboarding_state: "NOT_ENROLLED",
     gpu_isolation_state: "NOT_APPLIED",
   },
+  compute_onboarding: {
+    status: "NOT_CREATED",
+    compute_username: "origin-pilot",
+    draft_state: "DRAFT NOT CREATED",
+    plan: null,
+  },
+};
+
+const originPilotPlan = {
+  status: "DRY_RUN",
+  plan_status: "READY",
+  execution_enabled: false,
+  proposal_state: "DRAFT",
+  proposed_username: "origin-pilot",
+  portal_owner: "Origin-al",
+  proposed_uid: 20001,
+  proposed_gid: 20001,
+  proposed_project_id: 30001,
+  proposed_ssh_port: 22023,
+  proposed_slurm_account: "company",
+  proposed_qos: "general",
+  proposed_max_gpus: 1,
+  proposed_quota_hard_limit_gb: 300,
+  ssh_key_status: "REQUIRED BEFORE ACTIVATION",
+  proposed_container: {
+    name: "gpu-dev-origin-pilot",
+    cpus: 8,
+    memory_gb: 32,
+    pids_limit: 4096,
+    gpu: "none",
+    network_bind: "10.82.36.1",
+  },
+  proposed_gpu_policy: {
+    method: "systemd-user-uid-slice",
+    unit: "user-20001.slice",
+    dropin_path:
+      "/etc/systemd/system/user-20001.slice.d/50-h100-gpu-isolation.conf",
+    device_policy: "closed",
+  },
+  validation_results: [
+    {
+      check: "origin_pilot_username_available",
+      status: "PASS",
+      detail: "origin-pilot 用户和同名组不存在",
+    },
+    {
+      check: "slurm_node_drained",
+      status: "PASS",
+      detail: "节点保持 DRAIN",
+    },
+  ],
+  conflicts: [],
+  stage_steps: ["创建 nologin 账号", "应用精确 UID slice", "保持 STAGED"],
+  activate_steps: ["重新验证隔离", "要求 SSH 公钥", "人工验收后 ACTIVE"],
+  rollback_steps: ["恢复精确配置备份", "保持 Slurm DRAIN"],
+};
+
+const originPilotConflictPlan = {
+  ...originPilotPlan,
+  plan_status: "CONFLICT",
+  conflicts: [
+    {
+      code: "USERNAME_CONFLICT",
+      message: "origin-pilot Linux 用户或组已存在",
+    },
+  ],
 };
 
 const managedContainer = {
@@ -347,7 +415,24 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
       return;
     }
     if (path === `/users/${owner.id}`) {
-      await json(route, { status: "OK", user: owner });
+      await json(route, {
+        status: "OK",
+        user: state.draftCreated
+          ? {
+              ...owner,
+              compute_onboarding: {
+                status: "DRAFT",
+                compute_username: "origin-pilot",
+                draft_state: "DRAFT",
+                operation_id: "00000000-0000-4000-8000-000000000020",
+                operation_status: "DRAFT",
+                plan: state.planConflict
+                  ? originPilotConflictPlan
+                  : originPilotPlan,
+              },
+            }
+          : owner,
+      });
       return;
     }
     if (path === "/containers") {
@@ -401,7 +486,40 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
         );
         return;
       }
-      await json(route, { status: "OK", operations: [] });
+      if (request.method() === "POST") {
+        const body = request.postDataJSON() as Record<string, unknown>;
+        expect(body).toMatchObject({
+          operation_type: "user.plan",
+          target_id: "origin-pilot",
+          payload: { username: "origin-pilot" },
+        });
+        state.draftCreated = true;
+        await json(route, {
+          id: "00000000-0000-4000-8000-000000000020",
+          operation_type: "user.plan",
+          target_type: "compute_identity",
+          target_id: "origin-pilot",
+          status: "DRAFT",
+          dry_run_result: originPilotPlan,
+        });
+        return;
+      }
+      await json(route, {
+        status: "OK",
+        operations: state.draftCreated
+          ? [
+              {
+                id: "00000000-0000-4000-8000-000000000020",
+                operation_type: "user.plan",
+                target_id: "origin-pilot",
+                risk_level: "MEDIUM",
+                status: "DRAFT",
+                request_summary: "独立计算身份 dry-run",
+                dry_run_result: originPilotPlan,
+              },
+            ]
+          : [],
+      });
       return;
     }
     if (path.endsWith("/submit") || path.endsWith("/approval")) {
@@ -561,6 +679,47 @@ test("用户详情按标签区分网页、Linux 与 GPU 身份", async ({ page }
   ).toBeVisible();
   await page.getByRole("tab", { name: "Slurm" }).click();
   await expect(page.getByText("NOT_ENROLLED", { exact: true })).toBeVisible();
+});
+
+test("Origin-al 计算资源页只创建 origin-pilot DRAFT 并锁定 Stage/Activate", async ({
+  page,
+}) => {
+  await installMockApi(page, { authenticated: true });
+  await page.goto(`/users/${owner.id}`);
+  await page.getByRole("tab", { name: "计算资源" }).click();
+  await expect(
+    page.getByText("DRAFT NOT CREATED", { exact: true }).first(),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "创建计算资源草稿" }).click();
+  await expect(
+    page.getByText("origin-pilot", { exact: true }).first(),
+  ).toBeVisible();
+  await expect(page.getByText(/20001 — NOT RESERVED/).first()).toBeVisible();
+  await expect(
+    page.getByText("REQUIRED BEFORE ACTIVATION", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Stage 未授权" }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Activate 未授权" }),
+  ).toBeDisabled();
+  await expect(page.getByText(/不会被转换为 Pilot/)).toBeVisible();
+});
+
+test("origin-pilot 资源冲突在计划页明确阻断", async ({ page }) => {
+  await installMockApi(page, {
+    authenticated: true,
+    draftCreated: true,
+    planConflict: true,
+  });
+  await page.goto(`/users/${owner.id}`);
+  await page.getByRole("tab", { name: "计算资源" }).click();
+  await expect(page.getByText(/USERNAME_CONFLICT/)).toBeVisible();
+  await expect(page.getByText("CONFLICT", { exact: true }).first()).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Stage 未授权" }),
+  ).toBeDisabled();
 });
 
 test("账号安全页显示会话并可撤销其他会话", async ({ page }) => {

@@ -618,6 +618,73 @@ button {
   margin: 0 0 12px;
   font-size: 15px;
 }
+.detail-section-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 12px;
+  margin-bottom: 14px;
+}
+.detail-section-heading h2 {
+  margin: 0;
+}
+.detail-section-heading p {
+  margin: 4px 0 0;
+}
+.compute-plan .subheading {
+  margin: 18px 0 9px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+}
+.empty-plan {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border: 1px dashed var(--line-strong);
+  padding: 12px;
+}
+.empty-plan .ui-empty {
+  min-height: 92px;
+  align-items: flex-start;
+  text-align: left;
+}
+.plan-status-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px 14px;
+  margin-bottom: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.plan-step-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+.plan-step-grid section {
+  border: 1px solid var(--line);
+  padding: 10px 12px;
+  background: #fbfcfd;
+}
+.plan-step-grid h3 {
+  margin: 0 0 7px;
+  font-size: 13px;
+}
+.plan-step-grid ol {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.plan-step-grid li + li {
+  margin-top: 5px;
+}
 .detail-pre {
   max-height: 280px;
   overflow: auto;
@@ -699,6 +766,16 @@ button {
     margin-top: 12px;
   }
   .kv-grid {
+    grid-template-columns: 1fr;
+  }
+  .detail-section-heading,
+  .empty-plan {
+    display: block;
+  }
+  .empty-plan .ui-button {
+    margin-top: 10px;
+  }
+  .plan-step-grid {
     grid-template-columns: 1fr;
   }
 }

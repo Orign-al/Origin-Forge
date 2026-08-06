@@ -243,7 +243,9 @@ def test_owner_sees_real_identity_counts_and_empty_image_inventory(
     assert images.json()["live_status"] == "UNKNOWN"
 
 
-def test_owner_operation_stays_draft_until_submit(client, database, origin_headers) -> None:  # type: ignore[no-untyped-def]
+def test_owner_operation_stays_draft_until_submit(
+    client, database, origin_headers, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
     active_user(database)
     login = client.post(
         "/api/v1/auth/login",
@@ -252,16 +254,27 @@ def test_owner_operation_stays_draft_until_submit(client, database, origin_heade
     )
     assert login.status_code == 200
     headers = {**origin_headers, "X-CSRF-Token": client.cookies["h100_csrf"]}
+    monkeypatch.setattr(
+        "h100_portal_api.routes.operations.call_worker",
+        lambda *_args, **_kwargs: {
+            "status": "DRY_RUN",
+            "plan_status": "READY",
+            "execution_enabled": False,
+            "proposed_username": "origin-pilot",
+            "conflicts": [],
+            "validation_results": [],
+        },
+    )
     created = client.post(
         "/api/v1/operations",
         headers=headers,
         json={
             "operation_type": "user.plan",
-            "target_type": "user",
-            "target_id": "origin-al",
-            "request_summary": "Origin-al resource plan only",
-            "payload": {"username": "origin-al"},
-            "idempotency_key": "origin-plan-draft-0001",
+            "target_type": "compute_identity",
+            "target_id": "origin-pilot",
+            "request_summary": "Origin-pilot resource plan only",
+            "payload": {"username": "origin-pilot"},
+            "idempotency_key": "origin-pilot-plan-0001",
         },
     )
     assert created.status_code == 200
@@ -270,7 +283,7 @@ def test_owner_operation_stays_draft_until_submit(client, database, origin_heade
     submitted = client.post(
         f"/api/v1/operations/{operation_id}/submit",
         headers=headers,
-        json={"confirmation": "origin-al"},
+        json={"confirmation": "origin-pilot"},
     )
     assert submitted.status_code == 200
     assert submitted.json()["status"] == OperationStatus.PENDING_APPROVAL

@@ -4,10 +4,7 @@ import Link from "next/link";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 
-import {
-  ACCESS_MODE_STATUS,
-  TRANSPORT_TLS_STATUS,
-} from "@h100-portal/config";
+import { ACCESS_MODE_STATUS, TRANSPORT_TLS_STATUS } from "@h100-portal/config";
 import { Button, Card, EmptyState, Input, StatusBadge } from "@h100-portal/ui";
 import {
   ApiError,
@@ -792,12 +789,15 @@ export function OperationsModule() {
       await createOperation({
         operation_type: "user.plan",
         target_type: "user",
-        target_id: "origin-al",
-        request_summary: "创建 Origin-al 计算资源 onboarding 草稿（不执行）",
-        payload: { username: "origin-al" },
-        idempotency_key: `portal2-user-plan-${Date.now()}`,
+        target_id: "origin-pilot",
+        request_summary:
+          "为 Origin-al 规划独立 origin-pilot 计算身份（仅 dry-run）",
+        payload: { username: "origin-pilot" },
+        idempotency_key: `portal3a-origin-pilot-plan-${Date.now()}`,
       });
-      setMessage("已创建 DRAFT；尚未创建用户、策略或容器。");
+      setMessage(
+        "已创建 origin-pilot DRAFT；尚未创建用户、策略、quota、association 或容器。",
+      );
       await queryClient.invalidateQueries({ queryKey: ["operations"] });
     } catch {
       setMessage("草稿创建失败；宿主状态未改变。");
@@ -839,7 +839,7 @@ export function OperationsModule() {
       description="DRAFT → PENDING_APPROVAL → APPROVED → QUEUED → RUNNING；Worker 仅 dry-run"
       action={
         <Button tone="primary" onClick={createPlan} disabled={busy}>
-          创建计算资源草稿
+          规划 origin-pilot 计算身份
         </Button>
       }
       query={query}

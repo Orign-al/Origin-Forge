@@ -18,6 +18,16 @@ export type User = {
   locked_until?: string | null;
   roles: Array<{ name: string; description: string }>;
   linux_identity?: Record<string, unknown>;
+  compute_onboarding?: {
+    status: string;
+    compute_username: string | null;
+    draft_state: string;
+    operation_id?: string;
+    operation_status?: string;
+    plan?: Record<string, unknown> | null;
+    result_summary?: string | null;
+    error_code?: string | null;
+  };
 };
 
 export type Overview = {

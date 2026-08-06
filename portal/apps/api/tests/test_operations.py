@@ -28,6 +28,14 @@ def test_operation_payload_rejects_arbitrary_fields_and_protected_users() -> Non
         validate_operation_payload("slurm.resume", {"node_name": "other-node"})
 
 
+def test_portal3a_plan_requires_separate_compute_username() -> None:
+    assert validate_operation_payload("user.plan", {"username": "origin-pilot"}) == {
+        "username": "origin-pilot"
+    }
+    with pytest.raises(ValueError):
+        validate_operation_payload("user.plan", {"username": "origin-al"})
+
+
 def test_quota_is_bounded() -> None:
     assert (
         validate_operation_payload(

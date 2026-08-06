@@ -77,9 +77,9 @@ def validate_payload(operation_type: str, payload: dict[str, Any]) -> dict[str, 
         username = payload.get("username")
         if not isinstance(username, str) or not SAFE_USERNAME.fullmatch(username):
             raise ValueError("invalid username")
-        if username in {"root", "origin-al", "codexops"} and not (
-            operation_type == "user.plan" and username == "origin-al"
-        ):
+        if operation_type == "user.plan" and username != "origin-pilot":
+            raise ValueError("Portal-3A user.plan is limited to origin-pilot")
+        if username in {"root", "origin-al", "codexops"}:
             raise ValueError("protected username")
         return {"username": username}
     if operation_type == "quota.update":

@@ -129,12 +129,15 @@ export default function UsersPage() {
                 await createOperation({
                   operation_type: "user.plan",
                   target_type: "user",
-                  target_id: "origin-al",
-                  request_summary: "创建计算资源 onboarding 草稿（不执行）",
-                  payload: { username: "origin-al" },
-                  idempotency_key: `users-page-plan-${Date.now()}`,
+                  target_id: "origin-pilot",
+                  request_summary:
+                    "为 Origin-al 规划独立 origin-pilot 计算身份（仅 dry-run）",
+                  payload: { username: "origin-pilot" },
+                  idempotency_key: `portal3a-origin-pilot-plan-${Date.now()}`,
                 });
-                setMessage("已创建计算资源草稿；Origin-al 仍为 NOT_ENROLLED。");
+                setMessage(
+                  "已创建 origin-pilot 计算身份 DRAFT；未创建 Linux 用户、策略、quota、association 或容器。",
+                );
                 await queryClient.invalidateQueries({
                   queryKey: ["operations"],
                 });
@@ -145,7 +148,7 @@ export default function UsersPage() {
               }
             }}
           >
-            创建计算资源草稿
+            规划 origin-pilot 计算身份
           </Button>
         }
       />
@@ -198,8 +201,8 @@ export default function UsersPage() {
         </SectionCard>
         <SectionCard title="安全边界">
           <div className="notice">
-            本阶段不创建 Linux 用户、不安装 SSH
-            key、不启动员工容器；所有写操作先形成审批任务。
+            本阶段只创建 Portal DRAFT 和 Worker dry-run 计划；不创建 Linux
+            用户、不安装 SSH key、不启动员工容器，Stage/Activate 仍未授权。
           </div>
         </SectionCard>
       </div>

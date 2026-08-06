@@ -154,6 +154,7 @@ class PortalOperation(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     worker_execution_id: Mapped[str | None] = mapped_column(String(64))
+    dry_run_result: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     result_summary: Mapped[str | None] = mapped_column(String(1000))
     error_code: Mapped[str | None] = mapped_column(String(64))
     rollback_status: Mapped[str | None] = mapped_column(String(32))

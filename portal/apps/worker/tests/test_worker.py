@@ -55,8 +55,12 @@ def test_worker_rejects_arbitrary_path_and_non_dry_write() -> None:
     assert write["error"]["code"] == "WRITE_EXECUTION_DISABLED"
 
 
-def test_origin_al_is_allowed_only_for_non_executing_user_plan() -> None:
-    assert validate_payload("user.plan", {"username": "origin-al"}) == {"username": "origin-al"}
+def test_origin_pilot_is_the_only_portal3a_plan_target() -> None:
+    assert validate_payload("user.plan", {"username": "origin-pilot"}) == {
+        "username": "origin-pilot"
+    }
+    with pytest.raises(ValueError, match="origin-pilot"):
+        validate_payload("user.plan", {"username": "origin-al"})
     with pytest.raises(ValueError, match="protected username"):
         validate_payload("user.stage", {"username": "origin-al"})
     with pytest.raises(ValueError, match="invalid node name"):
@@ -86,6 +90,64 @@ def test_dry_run_fails_closed_when_script_integrity_fails(monkeypatch) -> None: 
     assert result["status"] == "ERROR"
     assert result["error"]["code"] == "SCRIPT_INTEGRITY_FAILED"
     assert result["error"]["scripts"] == ["h100-user-create"]
+
+
+def test_origin_pilot_plan_is_structured_and_never_executes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {
+            "h100-user-create": {"integrity_ok": True},
+            "h100-user-gpu-isolation": {"integrity_ok": True},
+            "h100-container-create": {"integrity_ok": True},
+        },
+    )
+    monkeypatch.setattr(
+        handlers, "_candidate_uid_gid", lambda: (20001, [], {"legacy_ownership_scan": "PASS"})
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_candidate_project_id",
+        lambda: (30001, {"reservation": "PROPOSED — NOT RESERVED"}),
+    )
+    monkeypatch.setattr(
+        handlers, "_candidate_ssh_port", lambda: (22023, {"reservation": "PROPOSED — NOT RESERVED"})
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_slurm_plan_checks",
+        lambda _username: [
+            {"check": "slurm_node_drained", "status": "PASS", "detail": "DRAIN"},
+            {"check": "slurm_queue_empty", "status": "PASS", "detail": "empty"},
+            {"check": "slurm_account_company", "status": "PASS", "detail": "company"},
+            {"check": "slurm_qos_general_max_gpu", "status": "PASS", "detail": "one"},
+            {"check": "slurm_association_absent", "status": "PASS", "detail": "absent"},
+        ],
+    )
+
+    def fixed_result(binary, args, **_kwargs):  # type: ignore[no-untyped-def]
+        if binary == "docker":
+            return {
+                "ok": False,
+                "stdout": "",
+                "stderr": "No such container: gpu-dev-origin-pilot",
+                "exit_code": 1,
+            }
+        if binary == "systemctl":
+            state = "inactive" if args[0] == "is-active" else "disabled"
+            return {"ok": False, "stdout": f"{state}\n", "stderr": "", "exit_code": 1}
+        return {"ok": True, "stdout": "", "stderr": "", "exit_code": 0}
+
+    monkeypatch.setattr(handlers, "run_fixed", fixed_result)
+    result = handle(request("user.plan", {"username": "origin-pilot"}, dry_run=True))
+    assert result["status"] == "DRY_RUN"
+    assert result["plan_status"] == "READY"
+    assert result["execution_enabled"] is False
+    assert result["proposed_uid"] == 20001
+    assert result["proposed_project_id"] == 30001
+    assert result["proposed_ssh_port"] == 22023
+    assert result["ssh_key_status"] == "REQUIRED BEFORE ACTIVATION"
+    assert "command" not in json.dumps(result).casefold()
 
 
 def test_fixed_command_timeout(monkeypatch) -> None:  # type: ignore[no-untyped-def]

@@ -22,8 +22,9 @@ GPU 物理身份由 UUID 与 PCI Bus ID 联结 NVIDIA driver procfs 的 minor；
 ## 安全与操作语义
 
 - Origin-al 网页身份为 ACTIVE，计算资源身份保持 NOT_ENROLLED。
-- user.plan(origin-al) 只允许创建 DRAFT；user.stage、user.activate、GPU 隔离和
-  容器创建仍被 API 和 Worker 双层拒绝。
+- Portal-2 当时的 user.plan(origin-al) 草稿已由 Portal-3A 的独立
+  user.plan(origin-pilot) 设计取代；user.stage、user.activate、GPU 隔离和容器创建仍被
+  API 和 Worker 双层拒绝。
 - DRAFT 需显式提交为 PENDING_APPROVAL，审批后也只调用 dry_run=true。
 - Slurm RESUME 按钮保持禁用，Worker 的非 dry-run 写请求固定返回拒绝。
 - 页面访问、token 消费、session 创建/撤销、草稿、审批模拟和 Worker 结果进入脱敏审计。

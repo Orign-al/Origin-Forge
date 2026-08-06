@@ -9,10 +9,25 @@ from sqlalchemy.orm import Session
 from h100_portal_api.audit import record_audit
 from h100_portal_api.config import get_settings
 from h100_portal_api.database import SessionLocal
-from h100_portal_api.enums import AccountState, OnboardingState, PasswordState
-from h100_portal_api.models import PortalPasswordSetupToken, PortalRole, PortalUser, utcnow
+from h100_portal_api.enums import (
+    AccountState,
+    OnboardingState,
+    OperationStatus,
+    PasswordState,
+    RiskLevel,
+)
+from h100_portal_api.models import (
+    PortalOperation,
+    PortalOperationEvent,
+    PortalPasswordSetupToken,
+    PortalRole,
+    PortalUser,
+    utcnow,
+)
 from h100_portal_api.rbac import PERMISSIONS
-from h100_portal_api.security import digest_secret, normalize_login, random_token
+from h100_portal_api.routes.operations import enrich_user_plan_with_portal_state
+from h100_portal_api.security import digest_secret, normalize_login, random_token, safe_metadata
+from h100_portal_api.worker_client import WorkerClientError, call_worker
 
 ROLE_DESCRIPTIONS = {
     "platform_owner": "网页平台所有者",
@@ -177,6 +192,112 @@ def status_origin_al() -> int:
         return 0
 
 
+def plan_origin_pilot() -> int:
+    """Create one Portal DRAFT after a bounded, host-only Worker dry-run."""
+    if not linux_origin_al_exists():
+        return 2
+    with SessionLocal() as db:
+        user = db.scalar(select(PortalUser).where(PortalUser.normalized_login == "origin-al"))
+        if user is None:
+            print("PORTAL-3A PLAN BLOCKED — Origin-al portal account is absent", file=sys.stderr)
+            return 2
+        if user.account_state != AccountState.ACTIVE:
+            print(
+                "PORTAL-3A PLAN BLOCKED — Origin-al portal account is not ACTIVE", file=sys.stderr
+            )
+            return 2
+        if not any(role.name == "platform_owner" for role in user.roles):
+            print("PORTAL-3A PLAN BLOCKED — platform_owner role is absent", file=sys.stderr)
+            return 2
+        idempotency_key = "portal3a-origin-pilot-plan-v1"
+        existing = db.scalar(
+            select(PortalOperation).where(
+                PortalOperation.requested_by == user.id,
+                PortalOperation.idempotency_key == idempotency_key,
+            )
+        )
+        if existing is not None:
+            print("Origin-pilot Portal DRAFT already exists; no duplicate plan created.")
+            print(f"operation_status={existing.status} target=origin-pilot")
+            return 0
+        try:
+            result = call_worker(
+                "user.plan",
+                payload={"username": "origin-pilot"},
+                requested_by="origin-al",
+                approved_by="origin-al",
+                idempotency_key=idempotency_key,
+                dry_run=True,
+                timeout_seconds=25,
+            )
+        except WorkerClientError as exc:
+            result = {
+                "status": "UNKNOWN",
+                "plan_status": "CONFLICT",
+                "execution_enabled": False,
+                "conflicts": [{"code": exc.code[:64], "message": "Worker 暂不可用"}],
+            }
+        if result.get("status") == "DRY_RUN":
+            result = enrich_user_plan_with_portal_state(result, db, user.id)
+        operation = PortalOperation(
+            operation_type="user.plan",
+            target_type="compute_identity",
+            target_id="origin-pilot",
+            requested_by=user.id,
+            request_summary="为 Origin-al 规划独立 origin-pilot 计算身份（仅 dry-run）",
+            validated_payload={"username": "origin-pilot"},
+            idempotency_key=idempotency_key,
+            risk_level=RiskLevel.MEDIUM,
+            status=OperationStatus.DRAFT,
+            dry_run_result=safe_metadata(result),
+            result_summary=(
+                "user.plan dry-run 已验证；未创建任何宿主资源"
+                if result.get("status") == "DRY_RUN" and result.get("plan_status") == "READY"
+                else "user.plan dry-run 发现冲突或不可用；未执行宿主写操作"
+            ),
+            error_code=(
+                None
+                if result.get("status") == "DRY_RUN" and result.get("plan_status") == "READY"
+                else "PLAN_CONFLICT"
+            ),
+            created_at=utcnow(),
+        )
+        db.add(operation)
+        db.flush()
+        db.add(
+            PortalOperationEvent(
+                operation_id=operation.id,
+                from_status=None,
+                to_status=OperationStatus.DRAFT,
+                safe_message="Portal-3A plan draft created; no host write executed",
+                created_at=utcnow(),
+            )
+        )
+        record_audit(
+            db,
+            event_type="operation.draft",
+            actor="origin-al",
+            actor_role="platform_owner",
+            source_ip="local-console",
+            user_agent="h100-portal-admin",
+            object_type="compute_identity_plan",
+            object_id="origin-pilot",
+            result="SUCCESS" if result.get("status") == "DRY_RUN" else "FAILED",
+            metadata={"operation_type": "user.plan", "execution_mode": "dry-run"},
+            operation_id=operation.id,
+        )
+        db.commit()
+        print("Origin-pilot Portal DRAFT created; no Linux identity or host reservation created.")
+        print(
+            f"operation_status={operation.status} plan_status={result.get('plan_status', 'UNKNOWN')}"
+        )
+        for key in ("proposed_uid", "proposed_gid", "proposed_project_id", "proposed_ssh_port"):
+            value = result.get(key)
+            if value is not None:
+                print(f"{key}={value} (PROPOSED — NOT RESERVED)")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="H100 Portal administrator bootstrap")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -185,6 +306,7 @@ def main() -> int:
     bootstrap.add_argument("--base-url", default="http://10.10.10.2:18080")
     subparsers.add_parser("prepare-origin-al")
     subparsers.add_parser("status-origin-al")
+    subparsers.add_parser("plan-origin-pilot")
     args = parser.parse_args()
     if args.command == "prepare-origin-al":
         return prepare_origin_al()
@@ -192,6 +314,8 @@ def main() -> int:
         return bootstrap_origin_al(args.reset_setup_token, args.base_url)
     if args.command == "status-origin-al":
         return status_origin_al()
+    if args.command == "plan-origin-pilot":
+        return plan_origin_pilot()
     return 2
 
 

@@ -19,8 +19,9 @@ Portal-2 的成功含义是“Worker dry-run 已验证”，不是宿主变更�
 
 - payload 只允许每类 operation 的固定字段；未知字段被拒绝。
 - 用户名、容器名、节点名、job id 和 quota 在 API 与 Worker 两层验证。
-- `root`、`origin-al`、`codexops` 不能成为计算用户写操作目标；唯一例外是
-  `user.plan(origin-al)` 只生成 NOT_ENROLLED 资源草稿，Worker 仍禁止 stage/activate。
+- `root`、`origin-al`、`codexops` 不能成为计算用户写操作目标。
+- Portal-3A 仅允许 `user.plan(origin-pilot)` 为 Origin-al 生成独立计算身份 DRAFT；
+  Worker 仍禁止真实 stage/activate，且 `origin-al` 始终保持 NOT_ENROLLED。
 - 同一请求人和幂等键返回既有任务，不重复执行。
 
 ## 高风险门槛
