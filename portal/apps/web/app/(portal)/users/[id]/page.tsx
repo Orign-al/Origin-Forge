@@ -247,7 +247,12 @@ export default function UserDetailPage() {
                     ["Portal owner", plan.portal_owner],
                     ["管理 Linux 映射", "origin-al（保持不变）"],
                     ["建议 Unix username", plan.proposed_username],
-                    ["Host access", hostAccess.enabled === true ? "enabled（Stage 后仍 nologin）" : "—"],
+                    [
+                      "Host access",
+                      hostAccess.enabled === true
+                        ? "enabled（Stage 后仍 nologin）"
+                        : "—",
+                    ],
                     ["计划状态", plan.proposal_state],
                     [
                       "UID",

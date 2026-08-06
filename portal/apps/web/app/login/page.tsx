@@ -93,7 +93,8 @@ export default function LoginPage() {
           </div>
         </form>
         <div className="auth-foot">
-          网页密码与 Linux/SSH 密码分离。当前入口仅绑定已批准的虚拟网络地址；Pilot
+          网页密码与 Linux/SSH
+          密码分离。当前入口仅绑定已批准的虚拟网络地址；Pilot
           阶段由管理员接受内部 HTTP，未启用 TLS。
           <br />
           <Link href="/setup-password" className="muted">

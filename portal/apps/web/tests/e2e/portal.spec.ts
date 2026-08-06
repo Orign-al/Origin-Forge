@@ -716,7 +716,9 @@ test("origin-pilot 资源冲突在计划页明确阻断", async ({ page }) => {
   await page.goto(`/users/${owner.id}`);
   await page.getByRole("tab", { name: "计算资源" }).click();
   await expect(page.getByText(/USERNAME_CONFLICT/)).toBeVisible();
-  await expect(page.getByText("CONFLICT", { exact: true }).first()).toBeVisible();
+  await expect(
+    page.getByText("CONFLICT", { exact: true }).first(),
+  ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Stage 未授权" }),
   ).toBeDisabled();
