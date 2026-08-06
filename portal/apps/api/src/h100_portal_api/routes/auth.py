@@ -156,7 +156,7 @@ def login(
         )
         if old_session:
             revoke_session(db, old_session)
-    _session, session_raw, csrf_raw = create_session(db, user, request)
+    new_session, session_raw, csrf_raw = create_session(db, user, request)
     record_audit(
         db,
         event_type="login.success",
@@ -168,6 +168,7 @@ def login(
         object_id=str(user.id),
         metadata={"session_rotated": True},
     )
+    _record_session_created(db, request, user, new_session, reason="login")
     db.commit()
     set_session_cookies(response, session_raw, csrf_raw)
     return {"user": serialize_user(user).model_dump(mode="json"), "csrf_token": csrf_raw}
@@ -177,6 +178,28 @@ def highest_role_safe(user: PortalUser) -> str:
     from h100_portal_api.rbac import highest_role
 
     return highest_role(user)
+
+
+def _record_session_created(
+    db: Session,
+    request: Request,
+    user: PortalUser,
+    session: PortalSession,
+    *,
+    reason: str,
+) -> None:
+    """Record session creation without ever persisting the raw session secret."""
+    record_audit(
+        db,
+        event_type="session.create",
+        actor=user.normalized_login,
+        actor_role=highest_role_safe(user),
+        source_ip=client_ip(request),
+        user_agent=user_agent(request),
+        object_type="portal_session",
+        object_id=str(session.id),
+        metadata={"reason": reason},
+    )
 
 
 @router.get("/setup-status")
@@ -258,7 +281,18 @@ def setup_password(
     user.account_state = AccountState.ACTIVE
     user.activated_at = user.activated_at or now
     revoke_user_sessions(db, user.id)
-    _session, session_raw, csrf_raw = create_session(db, user, request)
+    new_session, session_raw, csrf_raw = create_session(db, user, request)
+    record_audit(
+        db,
+        event_type="token.consume",
+        actor=user.normalized_login,
+        actor_role=highest_role_safe(user),
+        source_ip=client_ip(request),
+        user_agent=user_agent(request),
+        object_type="password_setup_token",
+        object_id=str(candidate.id),
+        metadata={"single_use": True},
+    )
     record_audit(
         db,
         event_type="password.setup",
@@ -270,6 +304,7 @@ def setup_password(
         object_id=str(user.id),
         metadata={"one_time_token": True},
     )
+    _record_session_created(db, request, user, new_session, reason="password_setup")
     db.commit()
     set_session_cookies(response, session_raw, csrf_raw)
     return {"user": serialize_user(user).model_dump(mode="json"), "csrf_token": csrf_raw}
@@ -383,8 +418,12 @@ def change_password(
         ) from exc
     credential.password_hash = hash_password(body.new_password)
     credential.password_changed_at = utcnow()
-    revoke_user_sessions(db, context.user.id, except_id=context.session.id)
-    context.session.reauthenticated_at = utcnow()
+    # Revoke every pre-change session, including the current one, then issue a
+    # fresh session in the same transaction. Keeping the old current session
+    # alive would not be session rotation.
+    revoke_user_sessions(db, context.user.id)
+    new_session, session_raw, csrf_raw = create_session(db, context.user, request)
+    new_session.reauthenticated_at = utcnow()
     record_audit(
         db,
         event_type="password.change",
@@ -394,13 +433,11 @@ def change_password(
         user_agent=user_agent(request),
         object_type="portal_user",
         object_id=str(context.user.id),
+        metadata={"all_previous_sessions_revoked": True, "session_rotated": True},
     )
+    _record_session_created(db, request, context.user, new_session, reason="password_change")
     db.commit()
-    clear_session_cookies(response)
-    # Password changes rotate the current session as well.
-    _new_session, raw, csrf_raw = create_session(db, context.user, request)
-    db.commit()
-    set_session_cookies(response, raw, csrf_raw)
+    set_session_cookies(response, session_raw, csrf_raw)
     return {"changed": True}
 
 

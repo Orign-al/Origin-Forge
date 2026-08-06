@@ -17,7 +17,8 @@ import {
   type SimpleColumnDef,
   type SimpleRow,
 } from "../../../components/Tables";
-import { ApiError, users } from "../../../lib/api";
+import { ApiError, createOperation, users } from "../../../lib/api";
+import { useQueryClient } from "@tanstack/react-query";
 
 const USER_COLUMNS: SimpleColumnDef[] = [
   {
@@ -57,7 +58,10 @@ const USER_COLUMNS: SimpleColumnDef[] = [
 
 export default function UsersPage() {
   const query = useQuery({ queryKey: ["users"], queryFn: users });
+  const queryClient = useQueryClient();
   const [filter, setFilter] = useState("");
+  const [message, setMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   if (query.isPending)
     return (
       <>
@@ -115,11 +119,41 @@ export default function UsersPage() {
         title="用户"
         description="网页平台账号、Linux 映射和受控计算身份"
         action={
-          <Button tone="primary" disabled>
-            创建用户（后续审批）
+          <Button
+            tone="primary"
+            disabled={busy}
+            onClick={async () => {
+              setBusy(true);
+              setMessage(null);
+              try {
+                await createOperation({
+                  operation_type: "user.plan",
+                  target_type: "user",
+                  target_id: "origin-al",
+                  request_summary: "创建计算资源 onboarding 草稿（不执行）",
+                  payload: { username: "origin-al" },
+                  idempotency_key: `users-page-plan-${Date.now()}`,
+                });
+                setMessage("已创建计算资源草稿；Origin-al 仍为 NOT_ENROLLED。");
+                await queryClient.invalidateQueries({
+                  queryKey: ["operations"],
+                });
+              } catch {
+                setMessage("草稿创建失败；没有创建用户或宿主策略。");
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            创建计算资源草稿
           </Button>
         }
       />
+      {message ? (
+        <div className="notice" role="status">
+          {message}
+        </div>
+      ) : null}
       {origin ? (
         <div className="notice" style={{ marginBottom: 14 }}>
           Origin-al 是平台恢复/管理账号：网页身份可用后，计算身份仍为{" "}

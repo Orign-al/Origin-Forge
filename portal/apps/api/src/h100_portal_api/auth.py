@@ -173,6 +173,7 @@ def create_session(
         absolute_expires_at=now + timedelta(hours=settings.session_absolute_hours),
     )
     db.add(session)
+    db.flush()
     return session, session_raw, csrf_raw
 
 

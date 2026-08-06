@@ -37,10 +37,15 @@ Worker 不接受 `command`、`argv`、任意路径、任意 unit、任意 Docker
 只读 operation：
 
 - `platform.health.read`、`gpu.list`、`gpu.health.read`
-- `slurm.node.read`、`slurm.jobs.read`、`slurm.accounts.read`
+- `slurm.node.read`、`slurm.jobs.read`、`slurm.history.read`、`slurm.accounts.read`
 - `containers.list`、`containers.inspect`
 - `storage.summary.read`、`quotas.list`、`systemd.failed.read`
-- `monitoring.alerts.read`、`registry.status.read`、`gpu_isolation.status.read`
+- `monitoring.alerts.read`、`monitoring.summary.read`、`registry.status.read`、`images.list`、`gpu_isolation.status.read`
+
+Portal-2 的只读适配器使用固定命令、固定参数和固定 URL：作业历史来自 `sacct -P`，
+QOS/Association 来自 `sacctmgr -P`，镜像来自 Docker 的 digest 库存，监控来自 localhost
+Prometheus/Grafana。GPU minor 只按 UUID + PCI Bus ID 与 NVIDIA driver procfs 联结，禁止
+按 NVML index 猜测。
 
 写框架 operation：
 

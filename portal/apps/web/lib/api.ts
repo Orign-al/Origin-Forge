@@ -58,6 +58,9 @@ export type Overview = {
     alerts?: Array<Record<string, unknown>>;
     error?: Record<string, unknown>;
   };
+  monitoring?: Record<string, unknown>;
+  gpu_health?: Record<string, unknown>;
+  recent_audit?: Array<Record<string, unknown>>;
   identity: {
     status: string;
     portal_users: number;
@@ -117,6 +120,10 @@ export const gpuHealth = () =>
 export const slurmNodes = () =>
   apiFetch<Record<string, unknown>>("/slurm/nodes");
 export const slurmJobs = () => apiFetch<Record<string, unknown>>("/slurm/jobs");
+export const slurmHistory = () =>
+  apiFetch<Record<string, unknown>>("/slurm/history");
+export const slurmAccounts = () =>
+  apiFetch<Record<string, unknown>>("/slurm/accounts");
 export const containers = () =>
   apiFetch<Record<string, unknown>>("/containers");
 export const containerInspect = (name: string) =>
@@ -131,9 +138,16 @@ export const imageInventory = () =>
   apiFetch<Record<string, unknown>>("/images");
 export const alerts = () =>
   apiFetch<Record<string, unknown>>("/platform/alerts");
+export const monitoring = () =>
+  apiFetch<Record<string, unknown>>("/platform/monitoring");
 export const operations = () =>
   apiFetch<Record<string, unknown>>("/operations");
 export const audit = () => apiFetch<Record<string, unknown>>("/audit");
+export const recordPageAccess = (path: string) =>
+  apiFetch<void>("/audit/page-access", {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
 export const sessions = () => apiFetch<PortalSession[]>("/auth/sessions");
 export const revokeSession = (id: string) =>
   apiFetch<void>(`/auth/sessions/${encodeURIComponent(id)}`, {
@@ -152,3 +166,31 @@ export const changePassword = (payload: {
     method: "POST",
     body: JSON.stringify(payload),
   });
+export const createOperation = (payload: Record<string, unknown>) =>
+  apiFetch<Record<string, unknown>>("/operations", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+export const submitOperation = (id: string, confirmation: string) =>
+  apiFetch<Record<string, unknown>>(
+    `/operations/${encodeURIComponent(id)}/submit`,
+    {
+      method: "POST",
+      body: JSON.stringify({ confirmation }),
+    },
+  );
+export const approveOperation = (
+  id: string,
+  payload: {
+    decision: "APPROVE" | "REJECT";
+    confirmation: string;
+    comment?: string;
+  },
+) =>
+  apiFetch<Record<string, unknown>>(
+    `/operations/${encodeURIComponent(id)}/approval`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );

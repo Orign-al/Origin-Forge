@@ -69,11 +69,18 @@ export default function ContainerDetailPage() {
         <span>
           Host Network：{container.network_mode === "host" ? "是" : "否"}
         </span>
+        <span>PID limit：{display(container.pids_limit)}</span>
       </div>
       <Card className="detail-panel">
         <dl className="kv-grid">
           {[
             ["镜像", container.image],
+            ["镜像 digest", container.image_digest],
+            ["用户", container.owner],
+            ["CPU limit", container.cpu_limit],
+            ["Memory limit bytes", container.memory_limit_bytes],
+            ["PIDs limit", container.pids_limit],
+            ["SSH 端口", container.ssh_port],
             ["容器 ID", container.id],
             ["创建时间", container.created],
             ["端口", container.ports],
@@ -83,6 +90,10 @@ export default function ContainerDetailPage() {
             ["PidMode", container.pid_mode],
             ["IpcMode", container.ipc_mode],
             ["RestartPolicy", container.restart_policy],
+            [
+              "Docker Socket",
+              container.docker_socket_mounted ? "检测到" : "未挂载",
+            ],
           ].map(([label, value]) => (
             <div className="kv" key={String(label)}>
               <dt>{String(label)}</dt>

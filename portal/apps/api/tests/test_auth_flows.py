@@ -1,7 +1,8 @@
 from datetime import timedelta
 
-from h100_portal_api.enums import AccountState, OnboardingState, PasswordState
+from h100_portal_api.enums import AccountState, OnboardingState, OperationStatus, PasswordState
 from h100_portal_api.models import (
+    PortalAuditEvent,
     PortalPasswordCredential,
     PortalPasswordSetupToken,
     PortalRole,
@@ -89,6 +90,9 @@ def test_first_password_setup_activates_account_and_token_is_single_use(
     assert refreshed.password_state == PasswordState.SET
     assert refreshed.resource_onboarding_state == OnboardingState.NOT_ENROLLED
     assert client.cookies.get("h100_session")
+    audit_types = database.scalars(select(PortalAuditEvent.event_type)).all()
+    assert "token.consume" in audit_types
+    assert "session.create" in audit_types
     replay = client.post(
         "/api/v1/auth/setup-password",
         headers=csrf_headers(client, origin_headers),
@@ -190,6 +194,35 @@ def test_account_can_revoke_other_sessions_without_revoking_current(
     assert client.get("/api/v1/auth/me").status_code == 200
 
 
+def test_password_change_revokes_current_session_and_rotates_cookie(
+    client, database, origin_headers
+) -> None:  # type: ignore[no-untyped-def]
+    user = active_user(database)
+    login = client.post(
+        "/api/v1/auth/login",
+        headers=csrf_headers(client, origin_headers),
+        json={"username": "origin-al", "password": "A long portal passphrase 2026"},
+    )
+    assert login.status_code == 200
+    old_cookie = client.cookies["h100_session"]
+    response = client.post(
+        "/api/v1/auth/password",
+        headers={**origin_headers, "X-CSRF-Token": client.cookies["h100_csrf"]},
+        json={
+            "current_password": "A long portal passphrase 2026",
+            "new_password": "A newly rotated portal passphrase 2026",
+            "confirmation": "A newly rotated portal passphrase 2026",
+        },
+    )
+    assert response.status_code == 200
+    assert client.cookies["h100_session"] != old_cookie
+    sessions = database.scalars(select(PortalSession).where(PortalSession.user_id == user.id)).all()
+    # The assertion below is deliberately made from the user row, not a raw
+    # cookie, so a stale current session cannot remain usable.
+    assert sum(session.revoked_at is None for session in sessions) == 1
+    assert client.get("/api/v1/auth/me").status_code == 200
+
+
 def test_owner_sees_real_identity_counts_and_empty_image_inventory(
     client, database, origin_headers
 ) -> None:  # type: ignore[no-untyped-def]
@@ -206,4 +239,42 @@ def test_owner_sees_real_identity_counts_and_empty_image_inventory(
     assert overview.json()["identity"]["managed_linux_users"] == 0
     images = client.get("/api/v1/images")
     assert images.status_code == 200
-    assert images.json() == {"status": "OK", "count": 0, "images": []}
+    assert images.json()["images"] == []
+    assert images.json()["live_status"] == "UNKNOWN"
+
+
+def test_owner_operation_stays_draft_until_submit(client, database, origin_headers) -> None:  # type: ignore[no-untyped-def]
+    active_user(database)
+    login = client.post(
+        "/api/v1/auth/login",
+        headers=csrf_headers(client, origin_headers),
+        json={"username": "origin-al", "password": "A long portal passphrase 2026"},
+    )
+    assert login.status_code == 200
+    headers = {**origin_headers, "X-CSRF-Token": client.cookies["h100_csrf"]}
+    created = client.post(
+        "/api/v1/operations",
+        headers=headers,
+        json={
+            "operation_type": "user.plan",
+            "target_type": "user",
+            "target_id": "origin-al",
+            "request_summary": "Origin-al resource plan only",
+            "payload": {"username": "origin-al"},
+            "idempotency_key": "origin-plan-draft-0001",
+        },
+    )
+    assert created.status_code == 200
+    assert created.json()["status"] == OperationStatus.DRAFT
+    operation_id = created.json()["id"]
+    submitted = client.post(
+        f"/api/v1/operations/{operation_id}/submit",
+        headers=headers,
+        json={"confirmation": "origin-al"},
+    )
+    assert submitted.status_code == 200
+    assert submitted.json()["status"] == OperationStatus.PENDING_APPROVAL
+    database.expire_all()
+    audit_types = database.scalars(select(PortalAuditEvent.event_type)).all()
+    assert "operation.draft" in audit_types
+    assert "operation.submit" in audit_types

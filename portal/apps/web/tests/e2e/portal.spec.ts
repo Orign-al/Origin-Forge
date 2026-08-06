@@ -79,6 +79,9 @@ const gpuRows = [
   "pcie.link.gen.current": "5",
   "pcie.link.width.current": "16",
   "mig.mode.current": "Disabled",
+  dcgm_status: "Pass",
+  xid_aer_status: "CLEAR",
+  active_slurm_job_ids: [],
 }));
 
 const overview = {
@@ -110,6 +113,16 @@ const overview = {
     ],
   },
   alerts: { status: "OK", count: 1, alerts: [] },
+  monitoring: {
+    status: "OK",
+    prometheus: { status: "OK", targets: [] },
+    alerts: { status: "OK", alerts: [] },
+    metrics: [],
+    guard: { metrics: [] },
+    mellanox: { metrics: [] },
+    grafana: { status: "OK" },
+  },
+  recent_audit: [],
   identity: {
     status: "OK",
     portal_users: 1,
@@ -230,6 +243,10 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
       await json(route, { changed: true });
       return;
     }
+    if (path === "/audit/page-access") {
+      await route.fulfill({ status: 204, body: "" });
+      return;
+    }
     if (path === "/platform/overview") {
       await json(route, overview);
       return;
@@ -262,18 +279,29 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
       });
       return;
     }
+    if (path === "/platform/monitoring") {
+      await json(route, overview.monitoring);
+      return;
+    }
     if (path === "/platform/registries") {
       await json(route, overview.registries);
       return;
     }
     if (path === "/platform/storage") {
-      await json(route, { status: "OK", mounts: [], volume_groups: {} });
+      await json(route, {
+        status: "OK",
+        mounts: [],
+        volume_groups: {},
+        path_usage: {},
+        docker_usage: [],
+      });
       return;
     }
     if (path === "/platform/quotas") {
       await json(route, {
         status: "OK",
         report: "Project quota on /srv/gpu-platform",
+        projects: [],
       });
       return;
     }
@@ -299,6 +327,19 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
     }
     if (path === "/slurm/jobs") {
       await json(route, { status: "OK", jobs: [] });
+      return;
+    }
+    if (path === "/slurm/history") {
+      await json(route, { status: "OK", jobs: [] });
+      return;
+    }
+    if (path === "/slurm/accounts") {
+      await json(route, {
+        status: "OK",
+        accounts: [],
+        qos: [],
+        associations: [],
+      });
       return;
     }
     if (path === "/users") {
@@ -361,6 +402,10 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
         return;
       }
       await json(route, { status: "OK", operations: [] });
+      return;
+    }
+    if (path.endsWith("/submit") || path.endsWith("/approval")) {
+      await json(route, { status: "OK" });
       return;
     }
     await json(
@@ -469,7 +514,7 @@ test("GPU 页面展示四卡物理身份映射", async ({ page }) => {
   await expect(page.getByText("/dev/nvidia0")).toBeVisible();
   await expect(page.getByText("MIG Disabled")).toBeVisible();
   await expect(page.getByText("69.00").first()).toBeVisible();
-  await expect(page.getByText("CLEAR", { exact: true })).toBeVisible();
+  await expect(page.getByText("CLEAR", { exact: true }).first()).toBeVisible();
 });
 
 test("镜像页显示 Docker Hub deferred", async ({ page }) => {

@@ -14,6 +14,7 @@
     "typecheck": "pnpm --filter @h100-portal/web typecheck",
     "test": "pnpm --filter @h100-portal/web test",
     "test:e2e": "pnpm --filter @h100-portal/web test:e2e",
+    "test:visual": "pnpm --filter @h100-portal/web test:visual",
     "format:check": "prettier --check ."
   },
   "devDependencies": {

@@ -8,6 +8,7 @@ from h100_portal_api.auth import AuthContext
 from h100_portal_api.database import get_db
 from h100_portal_api.dependencies import permission_dependency
 from h100_portal_api.models import (
+    PortalAuditEvent,
     PortalManagedUser,
     PortalOperation,
     PortalSystemSnapshot,
@@ -42,6 +43,8 @@ def overview(
         "storage": adapter("storage.summary.read", context),
         "registries": adapter("registry.status.read", context),
         "alerts": adapter("monitoring.alerts.read", context),
+        "monitoring": adapter("monitoring.summary.read", context),
+        "gpu_health": adapter("gpu.health.read", context),
     }
     portal_states: dict[str, int] = {
         str(state): count
@@ -76,10 +79,32 @@ def overview(
         "failed": operation_states.get("FAILED", 0),
         "total": sum(operation_states.values()),
     }
-    snapshot = {"platform": value, **extras, "identity": identity, "tasks": tasks}
+    snapshot: dict[str, Any] = {
+        "platform": value,
+        **extras,
+        "identity": identity,
+        "tasks": tasks,
+    }
+    recent_audit = db.scalars(
+        select(PortalAuditEvent).order_by(PortalAuditEvent.timestamp.desc()).limit(12)
+    ).all()
+    snapshot["recent_audit"] = [
+        {
+            "event_type": event.event_type,
+            "actor": event.actor,
+            "result": event.result,
+            "timestamp": event.timestamp.isoformat(),
+            "object_type": event.object_type,
+            "object_id": event.object_id,
+        }
+        for event in recent_audit
+    ]
+    data_sections = [
+        item for item in snapshot.values() if isinstance(item, dict) and "status" in item
+    ]
     overall = (
         "OK"
-        if all(item.get("status") in {"OK", "PARTIAL"} for item in snapshot.values())
+        if all(item.get("status") in {"OK", "PARTIAL"} for item in data_sections)
         else "PARTIAL"
     )
     db.add(
@@ -93,7 +118,20 @@ def overview(
 
 @router.get("/gpus")
 def gpus(context: AuthContext = Depends(permission_dependency("gpu.read"))) -> dict[str, Any]:
-    return adapter("gpu.list", context)
+    result = adapter("gpu.list", context)
+    health = adapter("gpu.health.read", context)
+    per_gpu = {
+        str(item.get("index")): item.get("dcgm_status", "UNKNOWN")
+        for item in health.get("per_gpu", [])
+        if isinstance(item, dict)
+    }
+    if isinstance(result.get("gpus"), list):
+        for item in result["gpus"]:
+            if isinstance(item, dict):
+                item["dcgm_status"] = per_gpu.get(str(item.get("index")), "UNKNOWN")
+                item["xid_aer_status"] = health.get("kernel_errors", {}).get("status", "UNKNOWN")
+    result["health"] = health
+    return result
 
 
 @router.get("/gpu-health")
@@ -139,3 +177,10 @@ def alerts(
     context: AuthContext = Depends(permission_dependency("monitoring.read")),
 ) -> dict[str, Any]:
     return adapter("monitoring.alerts.read", context)
+
+
+@router.get("/monitoring")
+def monitoring(
+    context: AuthContext = Depends(permission_dependency("monitoring.read")),
+) -> dict[str, Any]:
+    return adapter("monitoring.summary.read", context)

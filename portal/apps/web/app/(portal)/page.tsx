@@ -227,7 +227,11 @@ export default function DashboardPage() {
                   <th>minor / device</th>
                   <th>显存</th>
                   <th>利用率</th>
+                  <th>温度 / 功耗</th>
                   <th>MIG</th>
+                  <th>DCGM</th>
+                  <th>Xid/AER</th>
+                  <th>Slurm Job</th>
                 </tr>
               </thead>
               <tbody>
@@ -245,12 +249,29 @@ export default function DashboardPage() {
                         {item["memory.total"] ?? "—"} MiB
                       </td>
                       <td>{item["utilization.gpu"] ?? "—"}%</td>
+                      <td>
+                        {item["temperature.gpu"] ?? "—"} °C /{" "}
+                        {item["power.draw"] ?? "—"} W
+                      </td>
                       <td>MIG Disabled</td>
+                      <td>
+                        <StatusBadge
+                          value={String(item.dcgm_status ?? "UNKNOWN")}
+                        />
+                      </td>
+                      <td>
+                        <StatusBadge
+                          value={String(item.xid_aer_status ?? "UNKNOWN")}
+                        />
+                      </td>
+                      <td className="mono">
+                        {String(item.active_slurm_job_ids ?? "—")}
+                      </td>
                     </tr>
                   ))
                 ) : (
                   <tr>
-                    <td colSpan={7}>
+                    <td colSpan={11}>
                       <div className="ui-empty">GPU 数据不可用</div>
                     </td>
                   </tr>
@@ -355,6 +376,57 @@ export default function DashboardPage() {
           </div>
         </SectionCard>
       </div>
+      <div className="section-grid">
+        <SectionCard title="存储摘要" subtitle="真实 df / VG / 固定目录采样">
+          <dl className="kv-grid">
+            {data.storage.mounts?.map((mount) => (
+              <div className="kv" key={String(mount.target)}>
+                <dt>{String(mount.target)}</dt>
+                <dd>
+                  {String(mount.percent ?? "—")} · {String(mount.avail ?? "—")}{" "}
+                  可用
+                </dd>
+              </div>
+            )) ?? <div className="muted">存储数据不可用</div>}
+          </dl>
+        </SectionCard>
+        <SectionCard
+          title="最近审计事件"
+          subtitle="不显示密码、token 或 Cookie"
+        >
+          <TablePreview rows={data.recent_audit ?? []} />
+        </SectionCard>
+      </div>
     </>
+  );
+}
+
+function TablePreview({ rows }: { rows: Array<Record<string, unknown>> }) {
+  if (!rows.length) return <div className="muted">暂无审计事件</div>;
+  return (
+    <div className="ui-table-wrap">
+      <table className="ui-table">
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>事件</th>
+            <th>操作者</th>
+            <th>结果</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.slice(0, 8).map((row, index) => (
+            <tr key={String(row.timestamp ?? index)}>
+              <td className="mono">{String(row.timestamp ?? "—")}</td>
+              <td>{String(row.event_type ?? "—")}</td>
+              <td>{String(row.actor ?? "—")}</td>
+              <td>
+                <StatusBadge value={String(row.result ?? "UNKNOWN")} />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }

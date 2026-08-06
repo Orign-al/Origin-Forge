@@ -22,3 +22,8 @@ def jobs(context: AuthContext = Depends(permission_dependency("jobs.read"))) -> 
 @router.get("/accounts")
 def accounts(context: AuthContext = Depends(permission_dependency("slurm.read"))) -> dict[str, Any]:
     return adapter("slurm.accounts.read", context)
+
+
+@router.get("/history")
+def history(context: AuthContext = Depends(permission_dependency("slurm.read"))) -> dict[str, Any]:
+    return adapter("slurm.history.read", context)

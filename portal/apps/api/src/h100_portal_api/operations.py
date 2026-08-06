@@ -9,13 +9,16 @@ READ_OPERATION_TYPES = {
     "slurm.node.read",
     "slurm.jobs.read",
     "slurm.accounts.read",
+    "slurm.history.read",
     "containers.list",
     "containers.inspect",
     "storage.summary.read",
     "quotas.list",
     "systemd.failed.read",
     "monitoring.alerts.read",
+    "monitoring.summary.read",
     "registry.status.read",
+    "images.list",
     "gpu_isolation.status.read",
 }
 

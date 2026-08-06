@@ -114,6 +114,10 @@ class ApprovalRequest(ApiModel):
     comment: str | None = Field(default=None, max_length=500)
 
 
+class OperationSubmitRequest(ApiModel):
+    confirmation: str = Field(min_length=1, max_length=128)
+
+
 class AuditEventResponse(ApiModel):
     event_id: uuid.UUID
     event_type: str
@@ -126,6 +130,10 @@ class AuditEventResponse(ApiModel):
     result: str
     timestamp: datetime
     safe_metadata: dict[str, Any]
+
+
+class PageAccessRequest(ApiModel):
+    path: str = Field(min_length=1, max_length=128, pattern=r"^/[A-Za-z0-9_./?=&%\-]*$")
 
 
 class WorkerEnvelope(ApiModel):

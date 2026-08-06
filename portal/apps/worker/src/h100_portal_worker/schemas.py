@@ -10,13 +10,16 @@ KNOWN_READS = {
     "slurm.node.read",
     "slurm.jobs.read",
     "slurm.accounts.read",
+    "slurm.history.read",
     "containers.list",
     "containers.inspect",
     "storage.summary.read",
     "quotas.list",
     "systemd.failed.read",
     "monitoring.alerts.read",
+    "monitoring.summary.read",
     "registry.status.read",
+    "images.list",
     "gpu_isolation.status.read",
 }
 KNOWN_WRITES = {
@@ -74,7 +77,9 @@ def validate_payload(operation_type: str, payload: dict[str, Any]) -> dict[str, 
         username = payload.get("username")
         if not isinstance(username, str) or not SAFE_USERNAME.fullmatch(username):
             raise ValueError("invalid username")
-        if username in {"root", "origin-al", "codexops"}:
+        if username in {"root", "origin-al", "codexops"} and not (
+            operation_type == "user.plan" and username == "origin-al"
+        ):
             raise ValueError("protected username")
         return {"username": username}
     if operation_type == "quota.update":
@@ -82,12 +87,14 @@ def validate_payload(operation_type: str, payload: dict[str, Any]) -> dict[str, 
         quota_bytes = payload.get("quota_bytes")
         if not isinstance(username, str) or not SAFE_USERNAME.fullmatch(username):
             raise ValueError("invalid username")
+        if username in {"root", "origin-al", "codexops"}:
+            raise ValueError("protected username")
         if not isinstance(quota_bytes, int) or not 0 < quota_bytes <= 10 * 1024**4:
             raise ValueError("invalid quota")
         return {"username": username, "quota_bytes": quota_bytes}
     if operation_type.startswith("slurm."):
         node_name = payload.get("node_name", "sagsh100server")
-        if not isinstance(node_name, str) or not SAFE_IDENTIFIER.fullmatch(node_name):
+        if node_name != "sagsh100server":
             raise ValueError("invalid node name")
         return {"node_name": node_name}
     if operation_type.startswith("container."):
@@ -99,5 +106,7 @@ def validate_payload(operation_type: str, payload: dict[str, Any]) -> dict[str, 
         username = payload.get("username")
         if not isinstance(username, str) or not SAFE_USERNAME.fullmatch(username):
             raise ValueError("invalid username")
+        if username in {"root", "origin-al", "codexops"}:
+            raise ValueError("protected username")
         return {"username": username}
     return {}

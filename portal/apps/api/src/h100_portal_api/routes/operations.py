@@ -31,7 +31,12 @@ from h100_portal_api.operations import (
     can_transition,
     risk_for,
 )
-from h100_portal_api.schemas import ApprovalRequest, OperationCreateRequest, OperationResponse
+from h100_portal_api.schemas import (
+    ApprovalRequest,
+    OperationCreateRequest,
+    OperationResponse,
+    OperationSubmitRequest,
+)
 from h100_portal_api.security import SAFE_TARGET_RE, safe_metadata, safe_target
 from h100_portal_api.worker_client import WorkerClientError, call_worker
 
@@ -82,18 +87,18 @@ def validate_operation_payload(operation_type: str, payload: dict[str, Any]) -> 
     result: dict[str, Any] = {}
     if "username" in allowed[operation_type]:
         username = payload.get("username")
+        normalized_username = username.casefold() if isinstance(username, str) else ""
+        protected = normalized_username in {"root", "origin-al", "codexops"}
         if (
             not isinstance(username, str)
             or not SAFE_TARGET_RE.fullmatch(username)
-            or username.casefold()
-            in {
-                "root",
-                "origin-al",
-                "codexops",
-            }
+            or (
+                protected
+                and not (operation_type == "user.plan" and normalized_username == "origin-al")
+            )
         ):
             raise ValueError("protected or invalid username")
-        result["username"] = username.casefold()
+        result["username"] = normalized_username
     if "name" in allowed[operation_type]:
         name = payload.get("name")
         if (
@@ -174,16 +179,58 @@ def execute_operation(operation_id: uuid.UUID, actor_login: str) -> None:
                 transition(operation, OperationStatus.SUCCEEDED, "dry-run plan validated", db)
                 operation.result_summary = "dry-run 计划已通过 Worker schema 和脚本完整性检查"
                 operation.worker_execution_id = str(result.get("request_id", "dry-run"))[:64]
+                record_audit(
+                    db,
+                    event_type="worker.execute",
+                    actor=actor_login,
+                    actor_role="platform_owner",
+                    source_ip="local-worker-socket",
+                    user_agent="h100-portal-api",
+                    object_type="operation",
+                    object_id=str(operation.id),
+                    result="DRY_RUN",
+                    metadata={"operation_type": operation.operation_type},
+                    operation_id=operation.id,
+                )
             else:
                 transition(operation, OperationStatus.FAILED, "Worker rejected dry-run", db)
                 operation.error_code = str(result.get("error", {}).get("code", "WORKER_FAILED"))[
                     :64
                 ]
                 operation.result_summary = "Worker 未执行宿主写操作"
+                record_audit(
+                    db,
+                    event_type="worker.reject",
+                    actor=actor_login,
+                    actor_role="platform_owner",
+                    source_ip="local-worker-socket",
+                    user_agent="h100-portal-api",
+                    object_type="operation",
+                    object_id=str(operation.id),
+                    result="DENIED",
+                    metadata={"operation_type": operation.operation_type},
+                    operation_id=operation.id,
+                )
         except (WorkerClientError, RuntimeError) as exc:
             transition(operation, OperationStatus.FAILED, "Worker unavailable or rejected", db)
             operation.error_code = getattr(exc, "code", "WORKER_FAILED")[:64]
             operation.result_summary = "受控 Worker 不可用；未执行宿主写操作"
+            record_audit(
+                db,
+                event_type="worker.reject",
+                actor=actor_login,
+                actor_role="platform_owner",
+                source_ip="local-worker-socket",
+                user_agent="h100-portal-api",
+                object_type="operation",
+                object_id=str(operation.id),
+                result="FAILED",
+                metadata={
+                    "operation_type": operation.operation_type,
+                    "error_code": operation.error_code,
+                },
+                operation_id=operation.id,
+            )
         operation.finished_at = utcnow()
         db.add(
             PortalOperationEvent(
@@ -240,13 +287,6 @@ def create_operation(
         raise HTTPException(
             status_code=422, detail={"code": "PAYLOAD_REJECTED", "message": str(exc)}
         ) from exc
-    if operation_type in HIGH_RISK_OPERATION_TYPES:
-        if body.confirmation != target_id:
-            raise HTTPException(
-                status_code=428,
-                detail={"code": "CONFIRMATION_REQUIRED", "message": "请输入准确的对象名确认"},
-            )
-        require_recent_reauthentication(context)
     existing = db.scalar(
         select(PortalOperation).where(
             PortalOperation.requested_by == context.user.id,
@@ -264,7 +304,7 @@ def create_operation(
         validated_payload=safe_metadata(validated),
         idempotency_key=body.idempotency_key,
         risk_level=risk_for(operation_type),
-        status=OperationStatus.PENDING_APPROVAL,
+        status=OperationStatus.DRAFT,
         created_at=utcnow(),
     )
     db.add(operation)
@@ -272,15 +312,15 @@ def create_operation(
     db.add(
         PortalOperationEvent(
             operation_id=operation.id,
-            from_status=OperationStatus.DRAFT,
-            to_status=OperationStatus.PENDING_APPROVAL,
-            safe_message="Operation created; awaiting approval",
+            from_status=None,
+            to_status=OperationStatus.DRAFT,
+            safe_message="Operation draft created; no host action executed",
             created_at=utcnow(),
         )
     )
     record_audit(
         db,
-        event_type="operation.create",
+        event_type="operation.draft",
         actor=context.user.normalized_login,
         actor_role="/".join(sorted(role.name for role in context.user.roles)),
         source_ip=client_ip(request),
@@ -307,6 +347,54 @@ def create_operation(
             status_code=409,
             detail={"code": "IDEMPOTENCY_CONFLICT", "message": "幂等键冲突"},
         ) from exc
+    return operation_response(operation)
+
+
+@router.post("/{operation_id}/submit")
+def submit_operation(
+    operation_id: str,
+    body: OperationSubmitRequest,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("operations.write")),
+    db: Session = Depends(get_db),
+) -> OperationResponse:
+    require_session_csrf(request, context)
+    try:
+        operation = db.get(PortalOperation, uuid.UUID(operation_id))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404, detail={"code": "OPERATION_NOT_FOUND", "message": "任务不存在"}
+        ) from exc
+    if operation is None:
+        raise HTTPException(
+            status_code=404, detail={"code": "OPERATION_NOT_FOUND", "message": "任务不存在"}
+        )
+    if operation.status != OperationStatus.DRAFT:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "INVALID_OPERATION_STATE", "message": "仅草稿可以提交审批"},
+        )
+    if body.confirmation != operation.target_id:
+        raise HTTPException(
+            status_code=428,
+            detail={"code": "CONFIRMATION_REQUIRED", "message": "请输入准确的对象名确认"},
+        )
+    if operation.operation_type in HIGH_RISK_OPERATION_TYPES:
+        require_recent_reauthentication(context)
+    transition(operation, OperationStatus.PENDING_APPROVAL, "submitted for dry-run approval", db)
+    record_audit(
+        db,
+        event_type="operation.submit",
+        actor=context.user.normalized_login,
+        actor_role="/".join(sorted(role.name for role in context.user.roles)),
+        source_ip=client_ip(request),
+        user_agent=user_agent(request),
+        object_type="operation",
+        object_id=str(operation.id),
+        metadata={"operation_type": operation.operation_type, "execution_mode": "dry-run"},
+        operation_id=operation.id,
+    )
+    db.commit()
     return operation_response(operation)
 
 
@@ -353,12 +441,14 @@ def approve_operation(
     if body.decision == "REJECT":
         transition(operation, OperationStatus.CANCELLED, "approval rejected", db)
     else:
+        operation.approved_by = context.user.id
+        operation.approved_at = utcnow()
         transition(operation, OperationStatus.APPROVED, "approval granted", db)
         transition(operation, OperationStatus.QUEUED, "queued for controlled Worker dry-run", db)
         background_tasks.add_task(execute_operation, operation.id, context.user.normalized_login)
     record_audit(
         db,
-        event_type="operation.approval",
+        event_type="operation.approval_simulation",
         actor=context.user.normalized_login,
         actor_role="/".join(sorted(role.name for role in context.user.roles)),
         source_ip=client_ip(request),
@@ -366,7 +456,7 @@ def approve_operation(
         object_type="operation",
         object_id=str(operation.id),
         result=body.decision,
-        metadata={"decision": body.decision},
+        metadata={"decision": body.decision, "execution_mode": "dry-run"},
         operation_id=operation.id,
     )
     db.commit()

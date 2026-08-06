@@ -6,6 +6,7 @@ import re
 import stat
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ BINARIES = {
     "df": "/usr/bin/df",
     "vgs": "/usr/sbin/vgs",
     "xfs_quota": "/usr/sbin/xfs_quota",
+    "du": "/usr/bin/du",
     "hostname": "/usr/bin/hostname",
     "squeue-fallback": "/usr/bin/squeue",
 }
@@ -50,6 +52,21 @@ SCRIPT_ALLOWLIST = {
 SCRIPT_HASH_CONFIG = Path("/etc/h100-portal/worker-scripts.json")
 GPU_ISOLATED_USERS = Path("/etc/h100-platform/gpu-isolated-users")
 GPU_INFO_ROOT = Path("/proc/driver/nvidia/gpus")
+PROJECTS_FILE = Path("/etc/projects")
+PROJID_FILE = Path("/etc/projid")
+ENROOT_ROOT = Path("/srv/gpu-platform/enroot")
+STORAGE_PATHS = {
+    "docker": "/var/lib/docker",
+    "enroot": "/srv/gpu-platform/enroot",
+    "datasets": "/srv/gpu-platform/datasets",
+    "models": "/srv/gpu-platform/models",
+    "scratch": "/srv/gpu-platform/scratch",
+}
+REGISTRY_ENDPOINTS = {
+    "NGC": "https://nvcr.io/v2/",
+    "GHCR": "https://ghcr.io/v2/",
+    "Quay": "https://quay.io/v2/",
+}
 PCI_BUS_ID = re.compile(
     r"^(?P<domain>[0-9A-Fa-f]{4,8}):(?P<bus>[0-9A-Fa-f]{2}):"
     r"(?P<device>[0-9A-Fa-f]{2})\.(?P<function>[0-7])$"
@@ -160,6 +177,67 @@ def _driver_gpu_minor_map() -> dict[str, dict[str, str]]:
     return mapping
 
 
+def _parse_dcgm_json(text: str) -> dict[int, str]:
+    """Return DCGM diagnostic status keyed by DCGM/NVML entity id."""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    statuses: dict[int, str] = {}
+    categories = payload.get("DCGM Diagnostic", {}).get("test_categories", [])
+    if not isinstance(categories, list):
+        return statuses
+    for category in categories:
+        if not isinstance(category, dict):
+            continue
+        for test in category.get("tests", []):
+            if not isinstance(test, dict):
+                continue
+            for item in test.get("results", []):
+                if not isinstance(item, dict) or item.get("entity_group") != "GPU":
+                    continue
+                entity_id = item.get("entity_id")
+                status_value = item.get("status")
+                if isinstance(entity_id, int) and isinstance(status_value, str):
+                    # Preserve a failure if any test reports one.
+                    previous = statuses.get(entity_id)
+                    statuses[entity_id] = (
+                        status_value
+                        if previous is None or previous.casefold() != "fail"
+                        else previous
+                    )
+    return statuses
+
+
+def _active_gpu_job_ids() -> dict[int, list[int]]:
+    """Best-effort mapping from explicit Slurm GPU index details to job ids.
+
+    If there are no active jobs the empty mapping is authoritative. When Slurm
+    does not expose an explicit index, we return no guessed association.
+    """
+    parsed = _json_command("squeue", ["--json"], timeout=20)
+    if parsed.get("status") != "OK":
+        return {}
+    jobs = parsed.get("data", {}).get("jobs", [])
+    mapping: dict[int, list[int]] = {}
+    if not isinstance(jobs, list):
+        return mapping
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        raw_id = job.get("job_id") or job.get("id")
+        if not isinstance(raw_id, int):
+            continue
+        # Slurm JSON schemas vary across minor releases; only consume fields
+        # that explicitly contain IDX/NVIDIA index values.
+        encoded = json.dumps(job, ensure_ascii=True)
+        for match in re.finditer(r"(?:IDX|index)[=: -]*(\d+)", encoded, re.IGNORECASE):
+            index = int(match.group(1))
+            if 0 <= index < 32:
+                mapping.setdefault(index, []).append(raw_id)
+    return mapping
+
+
 def gpu_list() -> dict[str, Any]:
     fields = [
         "index",
@@ -205,6 +283,17 @@ def gpu_list() -> dict[str, Any]:
             item["minor_source"] = "nvidia-driver-procfs"
         rows.append(item)
     status = "OK" if rows and not mapping_errors else "UNKNOWN"
+    job_mapping = _active_gpu_job_ids() if rows else {}
+    for item in rows:
+        try:
+            index = int(item["index"])
+        except KeyError, TypeError, ValueError:
+            continue
+        # DCGM diagnostic is sampled by gpu.health.read (a slower independent
+        # source) and merged by the API. Never infer a DCGM result from NVML.
+        item["dcgm_status"] = "UNKNOWN"
+        item["active_slurm_job_ids"] = sorted(set(job_mapping.get(index, [])))
+        item["slurm_job_mapping"] = "EXPLICIT_INDEX" if index in job_mapping else "NO_ACTIVE_JOB"
     response: dict[str, Any] = {"status": status, "gpus": rows, "count": len(rows)}
     if mapping_errors:
         response["error"] = {
@@ -330,11 +419,6 @@ def slurm_jobs() -> dict[str, Any]:
 
 
 def slurm_accounts() -> dict[str, Any]:
-    parsed = _json_command(
-        "sacctmgr", ["-n", "-P", "show", "account", "format=Account,Description"], timeout=20
-    )
-    if parsed["status"] == "OK":
-        return parsed
     result = run_fixed(
         "sacctmgr", ["-n", "-P", "show", "account", "format=Account,Description"], timeout=20
     )
@@ -345,7 +429,84 @@ def slurm_accounts() -> dict[str, Any]:
         name, _, description = line.partition("|")
         if name:
             accounts.append({"account": name, "description": description})
-    return {"status": "OK", "accounts": accounts}
+    qos_result = run_fixed(
+        "sacctmgr",
+        [
+            "-n",
+            "-P",
+            "show",
+            "qos",
+            "format=Name,Priority,MaxTRESPerUser,MaxJobsPU,MaxSubmitJobsPU",
+        ],
+        timeout=20,
+    )
+    qos = []
+    if qos_result.get("ok"):
+        for line in qos_result["stdout"].splitlines():
+            fields = line.split("|")
+            if fields and fields[0]:
+                qos.append(
+                    dict(
+                        zip(
+                            [
+                                "name",
+                                "priority",
+                                "max_tres_per_user",
+                                "max_jobs_per_user",
+                                "max_submit_jobs_per_user",
+                            ],
+                            fields + [""] * 5,
+                            strict=False,
+                        )
+                    )
+                )
+    assoc_result = run_fixed(
+        "sacctmgr",
+        ["-n", "-P", "show", "assoc", "format=Cluster,Account,User,Partition,QOS,DefaultQOS"],
+        timeout=20,
+    )
+    associations = []
+    if assoc_result.get("ok"):
+        for line in assoc_result["stdout"].splitlines():
+            fields = line.split("|")
+            if fields and fields[0]:
+                associations.append(
+                    dict(
+                        zip(
+                            ["cluster", "account", "user", "partition", "qos", "default_qos"],
+                            fields + [""] * 6,
+                            strict=False,
+                        )
+                    )
+                )
+    status = "OK" if qos_result.get("ok") and assoc_result.get("ok") else "PARTIAL"
+    return {"status": status, "accounts": accounts, "qos": qos, "associations": associations}
+
+
+def slurm_history() -> dict[str, Any]:
+    result = run_fixed(
+        "sacct",
+        [
+            "-S",
+            "now-7days",
+            "-X",
+            "-n",
+            "-P",
+            "-a",
+            "-o",
+            "JobIDRaw,JobName,User,Partition,State,Elapsed,AllocTRES,ExitCode",
+        ],
+        timeout=25,
+    )
+    if not result.get("ok"):
+        return {"status": "UNKNOWN", "error": result}
+    fields = ["job_id", "name", "user", "partition", "state", "elapsed", "alloc_tres", "exit_code"]
+    jobs = []
+    for line in result["stdout"].splitlines()[-200:]:
+        values = line.split("|", len(fields) - 1)
+        if len(values) == len(fields) and values[0]:
+            jobs.append(dict(zip(fields, values, strict=True)))
+    return {"status": "OK", "jobs": jobs, "count": len(jobs), "window": "7d"}
 
 
 def containers_list() -> dict[str, Any]:
@@ -363,6 +524,16 @@ def containers_list() -> dict[str, Any]:
         except json.JSONDecodeError:
             continue
         if isinstance(raw, dict):
+            labels = str(raw.get("Labels") or "")
+            safe_labels: dict[str, str] = {}
+            for pair in labels.split(","):
+                key, separator, value = pair.partition("=")
+                if separator and key in {
+                    "h100.dev.user",
+                    "h100.base.digest",
+                    "org.opencontainers.image.version",
+                }:
+                    safe_labels[key] = value[:255]
             items.append(
                 {
                     key: raw.get(key)
@@ -375,10 +546,12 @@ def containers_list() -> dict[str, Any]:
                         "CreatedAt",
                         "Status",
                         "Ports",
-                        "Labels",
                     )
                 }
             )
+            items[-1]["owner"] = safe_labels.get("h100.dev.user")
+            items[-1]["image_digest"] = raw.get("ImageID")
+            items[-1]["safe_labels"] = safe_labels
     return {"status": "OK", "containers": items, "count": len(items)}
 
 
@@ -399,6 +572,35 @@ def containers_inspect(payload: dict[str, Any]) -> dict[str, Any]:
     host_config = item.get("HostConfig") or {}
     config = item.get("Config") or {}
     network = item.get("NetworkSettings") or {}
+    image_descriptor = item.get("ImageManifestDescriptor") or {}
+    port_bindings = host_config.get("PortBindings") or {}
+    ssh_ports = port_bindings.get("22/tcp") or []
+    ssh_port = (
+        ssh_ports[0].get("HostPort") if ssh_ports and isinstance(ssh_ports[0], dict) else None
+    )
+    labels_value = config.get("Labels")
+    labels: dict[str, Any] = labels_value if isinstance(labels_value, dict) else {}
+    safe_labels = {
+        key: str(labels[key])[:255]
+        for key in ("h100.dev.user", "h100.base.digest", "org.opencontainers.image.version")
+        if key in labels
+    }
+    nano_cpus = host_config.get("NanoCpus")
+    cpu_limit = (
+        (float(nano_cpus) / 1_000_000_000) if isinstance(nano_cpus, int) and nano_cpus else None
+    )
+    memory_limit = host_config.get("Memory")
+    pids_limit = host_config.get("PidsLimit")
+    mounts = [
+        {key: mount.get(key) for key in ("Type", "Source", "Destination", "RW")}
+        for mount in item.get("Mounts", [])
+        if isinstance(mount, dict)
+    ]
+    docker_socket = any(
+        str(mount.get("Destination", "")) in {"/var/run/docker.sock", "/run/docker.sock"}
+        for mount in mounts
+    )
+    device_requests = host_config.get("DeviceRequests")
     return {
         "status": "OK",
         "container": {
@@ -407,17 +609,23 @@ def containers_inspect(payload: dict[str, Any]) -> dict[str, Any]:
             "created": item.get("Created"),
             "state": item.get("State"),
             "image": config.get("Image"),
-            "labels": config.get("Labels"),
+            "image_digest": image_descriptor.get("digest") or item.get("Image"),
+            "image_id": item.get("Image"),
+            "owner": safe_labels.get("h100.dev.user"),
+            "safe_labels": safe_labels,
+            "cpu_limit": cpu_limit,
+            "nano_cpus": nano_cpus,
+            "memory_limit_bytes": memory_limit,
+            "pids_limit": pids_limit,
+            "ssh_port": ssh_port,
             "privileged": host_config.get("Privileged"),
             "network_mode": host_config.get("NetworkMode"),
             "pid_mode": host_config.get("PidMode"),
             "ipc_mode": host_config.get("IpcMode"),
-            "mounts": [
-                {key: mount.get(key) for key in ("Type", "Source", "Destination", "RW")}
-                for mount in item.get("Mounts", [])
-                if isinstance(mount, dict)
-            ],
-            "device_requests": host_config.get("DeviceRequests"),
+            "mounts": mounts,
+            "device_requests": device_requests,
+            "gpu": "NONE" if not device_requests else "REQUESTED",
+            "docker_socket_mounted": docker_socket,
             "restart_policy": host_config.get("RestartPolicy"),
             "ports": network.get("Ports"),
         },
@@ -455,14 +663,90 @@ def storage_summary() -> dict[str, Any]:
                         )
                     )
                 )
-    return {"status": "OK" if mounts else "UNKNOWN", "mounts": mounts, "volume_groups": vgs}
+    usage: dict[str, dict[str, Any]] = {}
+    for label, path in STORAGE_PATHS.items():
+        result = run_fixed("du", ["-s", "-B1", path], timeout=30)
+        if result.get("ok"):
+            first = result.get("stdout", "").splitlines()[0].split()
+            usage[label] = {
+                "path": path,
+                "status": "OK",
+                "bytes": int(first[0]) if first and first[0].isdigit() else None,
+            }
+        else:
+            usage[label] = {"path": path, "status": "ABSENT", "bytes": None}
+    docker_df = run_fixed("docker", ["system", "df", "--format", "{{json .}}"], timeout=25)
+    docker_usage: list[dict[str, str]] = []
+    if docker_df.get("ok"):
+        for line in docker_df.get("stdout", "").splitlines():
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                docker_usage.append(
+                    {
+                        key.casefold(): str(item.get(key, ""))[:128]
+                        for key in ("Type", "TotalCount", "Active", "Size", "Reclaimable")
+                    }
+                )
+    return {
+        "status": "OK" if mounts and vgs.get("status") == "OK" else "PARTIAL",
+        "mounts": mounts,
+        "volume_groups": vgs,
+        "path_usage": usage,
+        "docker_usage": docker_usage,
+        "enroot_cache": usage.get("enroot", {"status": "ABSENT"}),
+        "datasets": usage.get("datasets", {"status": "ABSENT"}),
+        "models": usage.get("models", {"status": "ABSENT"}),
+        "scratch": usage.get("scratch", {"status": "ABSENT"}),
+    }
 
 
 def quotas_list() -> dict[str, Any]:
     result = run_fixed("xfs_quota", ["-x", "-c", "report -p -b -n"], timeout=20)
     if not result.get("ok"):
         return {"status": "UNKNOWN", "error": result}
-    return {"status": "OK", "report": result["stdout"][:MAX_OUTPUT]}
+    projects: dict[str, str] = {}
+    try:
+        for line in PROJECTS_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            name, separator, project_path = line.partition(":")
+            if separator and project_path:
+                projects[project_path.strip()] = name.strip()
+    except OSError:
+        pass
+    projids: dict[str, str] = {}
+    try:
+        for line in PROJID_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            name, separator, number = line.partition(":")
+            if separator:
+                projids[number.strip()] = name.strip()
+    except OSError:
+        pass
+    rows: list[dict[str, Any]] = []
+    for line in result["stdout"].splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("Project") or stripped.startswith("-"):
+            continue
+        fields = stripped.split()
+        if len(fields) >= 4 and fields[0].startswith("#"):
+            project_id = fields[0][1:]
+            rows.append(
+                {
+                    "project_id": project_id,
+                    "name": projids.get(project_id),
+                    "used_blocks": fields[1],
+                    "soft_blocks": fields[2],
+                    "hard_blocks": fields[3],
+                    "grace": fields[4] if len(fields) > 4 else "",
+                }
+            )
+    return {
+        "status": "OK",
+        "report": result["stdout"][:MAX_OUTPUT],
+        "projects": rows,
+        "project_file_entries": len(projects),
+    }
 
 
 def systemd_failed() -> dict[str, Any]:
@@ -474,18 +758,11 @@ def systemd_failed() -> dict[str, Any]:
 
 
 def monitoring_alerts() -> dict[str, Any]:
-    url = "http://127.0.0.1:9090/api/v1/alerts"
-    try:
-        with urllib.request.urlopen(url, timeout=8) as response:
-            payload = json.loads(response.read(MAX_OUTPUT))
-    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-        return {
-            "status": "UNKNOWN",
-            "error": {"error_code": "PROMETHEUS_UNAVAILABLE", "detail": str(exc)[:128]},
-        }
-    if not isinstance(payload, dict) or payload.get("status") != "success":
-        return {"status": "UNKNOWN", "error": {"error_code": "PROMETHEUS_SCHEMA_ERROR"}}
-    alerts = payload.get("data", {}).get("alerts", [])
+    result = _prometheus_json("/api/v1/alerts")
+    if result.get("status") != "OK":
+        return result
+    data = result.get("data", {})
+    alerts = data.get("alerts", []) if isinstance(data, dict) else []
     safe_alerts = []
     for alert in alerts[:200]:
         if isinstance(alert, dict):
@@ -503,21 +780,261 @@ def monitoring_alerts() -> dict[str, Any]:
     return {"status": "OK", "alerts": safe_alerts, "count": len(safe_alerts)}
 
 
-def registry_status() -> dict[str, Any]:
+def _prometheus_json(path: str) -> dict[str, Any]:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:9090{path}", timeout=8) as response:
+            payload = json.loads(response.read(MAX_OUTPUT + 1))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        return {
+            "status": "UNKNOWN",
+            "error": {"code": "PROMETHEUS_UNAVAILABLE", "detail": str(exc)[:128]},
+        }
+    if not isinstance(payload, dict) or payload.get("status") != "success":
+        return {"status": "UNKNOWN", "error": {"code": "PROMETHEUS_SCHEMA_ERROR"}}
+    return {"status": "OK", "data": payload.get("data")}
+
+
+def _prometheus_query(expression: str) -> dict[str, Any]:
+    encoded = urllib.parse.urlencode({"query": expression})
+    return _prometheus_json(f"/api/v1/query?{encoded}")
+
+
+def _prometheus_targets() -> dict[str, Any]:
+    result = _prometheus_json("/api/v1/targets?state=active")
+    if result.get("status") != "OK":
+        return result
+    active = result.get("data", {}).get("activeTargets", [])
+    targets = []
+    if isinstance(active, list):
+        for target in active[:100]:
+            if isinstance(target, dict):
+                labels = target.get("labels", {})
+                targets.append(
+                    {
+                        "job": labels.get("job"),
+                        "instance": labels.get("instance"),
+                        "health": target.get("health"),
+                        "last_error": str(target.get("lastError", ""))[:255],
+                        "last_scrape": target.get("lastScrape"),
+                        "scrape_url": target.get("scrapeUrl"),
+                    }
+                )
+    return {"status": "OK", "targets": targets, "count": len(targets)}
+
+
+def _metric_values(expressions: list[str]) -> list[dict[str, Any]]:
+    values: list[dict[str, Any]] = []
+    for expression in expressions:
+        result = _prometheus_query(expression)
+        if result.get("status") != "OK":
+            continue
+        data = result.get("data", {})
+        result_rows = data.get("result", []) if isinstance(data, dict) else []
+        if isinstance(result_rows, list):
+            for row in result_rows[:200]:
+                if isinstance(row, dict):
+                    metric = row.get("metric", {})
+                    value = row.get("value", [])
+                    values.append(
+                        {
+                            "metric": metric.get("__name__")
+                            if isinstance(metric, dict)
+                            else expression,
+                            "labels": {
+                                str(key): str(value)[:128]
+                                for key, value in (
+                                    metric.items() if isinstance(metric, dict) else []
+                                )
+                                if key != "__name__"
+                                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", str(key))
+                            },
+                            "value": value[1]
+                            if isinstance(value, list) and len(value) > 1
+                            else None,
+                        }
+                    )
+    return values
+
+
+def monitoring_summary() -> dict[str, Any]:
+    alerts = monitoring_alerts()
+    targets = _prometheus_targets()
+    metrics = _metric_values(
+        [
+            "DCGM_FI_DEV_GPU_UTIL",
+            "DCGM_FI_DEV_FB_USED",
+            "DCGM_FI_DEV_GPU_TEMP",
+            "DCGM_FI_DEV_POWER_USAGE",
+            "h100_mellanox_rx_crc_errors_phy_total",
+            "h100_mellanox_rx_symbol_err_phy_total",
+            "h100_gpu_bypass_guard_last_success",
+            "h100_gpu_bypass_guard_managed_users",
+            "h100_gpu_bypass_guard_policy_errors",
+        ]
+    )
+    grafana = _probe_http_health("http://127.0.0.1:3000/api/health")
+    systemd = systemd_failed()
+    slurm = slurm_node()
+    containers = containers_list()
+    storage = storage_summary()
+    statuses = [alerts, targets, systemd, slurm, containers, storage]
     return {
-        "status": "OK",
-        "registries": [
-            {"name": "Local", "status": "AVAILABLE", "detail": "本地受控镜像源"},
-            {"name": "NGC", "status": "AVAILABLE", "detail": "按批准凭据使用"},
-            {"name": "GHCR", "status": "AVAILABLE", "detail": "按批准凭据使用"},
-            {"name": "Quay", "status": "AVAILABLE", "detail": "按批准凭据使用"},
-            {
-                "name": "Docker Hub",
-                "status": "DEFERRED",
-                "detail": "需要替代 Registry；不作为运行时依赖",
-            },
-        ],
+        "status": "OK"
+        if all(item.get("status") in {"OK", "PARTIAL"} for item in statuses)
+        else "PARTIAL",
+        "prometheus": {
+            "status": "OK" if targets.get("status") == "OK" else "UNKNOWN",
+            "targets": targets,
+        },
+        "alerts": alerts,
+        "metrics": metrics,
+        "guard": {
+            "timer": _systemd_state("h100-gpu-bypass-guard.timer"),
+            "metrics": [
+                item
+                for item in metrics
+                if str(item.get("metric", "")).startswith("h100_gpu_bypass_guard")
+            ],
+        },
+        "mellanox": {
+            "risk": "P0_DEFERRED",
+            "metrics": [
+                item for item in metrics if str(item.get("metric", "")).startswith("h100_mellanox_")
+            ],
+        },
+        "systemd": systemd,
+        "docker": {"status": containers.get("status"), "count": containers.get("count")},
+        "slurm": {"status": slurm.get("status"), "node": slurm},
+        "storage": {"status": storage.get("status"), "mounts": storage.get("mounts", [])},
+        "grafana": grafana | {"url": "http://10.10.10.2:3000"},
     }
+
+
+def _probe_http_health(url: str) -> dict[str, Any]:
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:  # noqa: S310 - fixed localhost Grafana URL
+            payload = json.loads(response.read(16 * 1024))
+        return {
+            "status": "OK",
+            "http_status": response.status,
+            "data": payload if isinstance(payload, dict) else {},
+        }
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        return {
+            "status": "UNKNOWN",
+            "error": {"code": "HTTP_HEALTH_UNAVAILABLE", "detail": str(exc)[:128]},
+        }
+
+
+def _systemd_state(unit: str) -> dict[str, str]:
+    enabled = run_fixed("systemctl", ["is-enabled", unit], timeout=10)
+    active = run_fixed("systemctl", ["is-active", unit], timeout=10)
+    return {
+        "unit": unit,
+        "enabled": str(enabled.get("stdout", "")).strip() or "unknown",
+        "active": str(active.get("stdout", "")).strip() or "unknown",
+    }
+
+
+def registry_status() -> dict[str, Any]:
+    local = images_list()
+    registries: list[dict[str, Any]] = [
+        {
+            "name": "Local",
+            "status": "AVAILABLE" if local.get("status") in {"OK", "PARTIAL"} else "UNKNOWN",
+            "detail": "本地 Docker 镜像库存",
+            "endpoint": "local://docker",
+        }
+    ]
+    for name, endpoint in REGISTRY_ENDPOINTS.items():
+        probe = _probe_registry(endpoint)
+        registries.append(
+            {
+                "name": name,
+                "status": probe["status"],
+                "detail": probe["detail"],
+                "endpoint": endpoint,
+            }
+        )
+    registries.append(
+        {
+            "name": "Docker Hub",
+            "status": "DEFERRED",
+            "detail": "管理员明确延期；不作为运行时依赖",
+            "endpoint": "https://registry-1.docker.io/v2/",
+        }
+    )
+    return {"status": "OK", "registries": registries}
+
+
+def _probe_registry(endpoint: str) -> dict[str, str]:
+    request = urllib.request.Request(  # noqa: S310 - endpoint is a fixed registry allowlist
+        endpoint, method="GET", headers={"User-Agent": "h100-portal/1"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:  # noqa: S310 - endpoint is a fixed registry allowlist
+            code = int(response.status)
+            return {
+                "status": "AVAILABLE" if code in {200, 401, 403} else "UNKNOWN",
+                "detail": f"endpoint reachable (HTTP {code})",
+            }
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            return {"status": "AVAILABLE", "detail": f"endpoint reachable (HTTP {exc.code})"}
+        return {"status": "UNKNOWN", "detail": f"HTTP {exc.code}"}
+    except (OSError, urllib.error.URLError) as exc:
+        return {"status": "UNKNOWN", "detail": f"probe failed: {type(exc).__name__}"}
+
+
+def images_list() -> dict[str, Any]:
+    result = run_fixed(
+        "docker",
+        ["image", "ls", "--no-trunc", "--digests", "--format", "{{json .}}"],
+        timeout=25,
+    )
+    if not result.get("ok"):
+        return {"status": "UNKNOWN", "error": result}
+    images: list[dict[str, Any]] = []
+    for line in result.get("stdout", "").splitlines():
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        image_id = str(raw.get("ID", ""))
+        descriptor: dict[str, Any] = {}
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+            inspected = run_fixed("docker", ["image", "inspect", image_id], timeout=20)
+            if inspected.get("ok"):
+                try:
+                    parsed = json.loads(inspected.get("stdout", ""))
+                    descriptor = parsed[0] if isinstance(parsed, list) and parsed else {}
+                except json.JSONDecodeError, IndexError:
+                    descriptor = {}
+        repo = str(raw.get("Repository", ""))
+        tag = str(raw.get("Tag", ""))
+        digest = str(raw.get("Digest", ""))
+        if digest in {"", "<none>"}:
+            digest = image_id
+        images.append(
+            {
+                "registry": repo.split("/", 1)[0]
+                if "/" in repo and "." in repo.split("/", 1)[0]
+                else "Local",
+                "repository": repo,
+                "tag": None if tag == "<none>" else tag,
+                "digest": digest,
+                "image_id": image_id,
+                "size": raw.get("Size"),
+                "architecture": descriptor.get("Architecture"),
+                "os": descriptor.get("Os"),
+                "containers": raw.get("Containers"),
+                "created_at": raw.get("CreatedAt"),
+                "immutable": digest.startswith("sha256:"),
+            }
+        )
+    return {"status": "OK", "images": images, "count": len(images)}
 
 
 def gpu_isolation_status() -> dict[str, Any]:
@@ -540,7 +1057,7 @@ def gpu_isolation_status() -> dict[str, Any]:
 
 def gpu_health() -> dict[str, Any]:
     discovery = run_fixed("dcgmi", ["discovery", "-l"], timeout=20)
-    diag = run_fixed("dcgmi", ["diag", "-r", "1"], timeout=90)
+    diag = run_fixed("dcgmi", ["diag", "-r", "1", "-j"], timeout=90)
     kernel = run_fixed(
         "journalctl",
         ["-k", "-b", "--no-pager", "-g", "NVRM: Xid|PCIe Bus Error|AER:.*error"],
@@ -565,6 +1082,7 @@ def gpu_health() -> dict[str, Any]:
         if kernel_query_ok
         else "UNKNOWN"
     )
+    per_gpu = _parse_dcgm_json(str(diag.get("stdout", ""))) if diag.get("ok") else {}
     status = (
         "OK" if discovery.get("ok") and diag.get("ok") and kernel_status == "CLEAR" else "PARTIAL"
     )
@@ -572,6 +1090,9 @@ def gpu_health() -> dict[str, Any]:
         "status": status,
         "discovery": {"ok": discovery.get("ok"), "output": discovery.get("stdout", "")[-4096:]},
         "diag": {"ok": diag.get("ok"), "output": diag.get("stdout", "")[-8192:]},
+        "per_gpu": [
+            {"index": index, "dcgm_status": value} for index, value in sorted(per_gpu.items())
+        ],
         "kernel_errors": {
             "status": kernel_status,
             "count": len(event_lines),
@@ -691,6 +1212,8 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
             return slurm_jobs()
         if request.operation_type == "slurm.accounts.read":
             return slurm_accounts()
+        if request.operation_type == "slurm.history.read":
+            return slurm_history()
         if request.operation_type == "containers.list":
             return containers_list()
         if request.operation_type == "containers.inspect":
@@ -703,8 +1226,12 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
             return systemd_failed()
         if request.operation_type == "monitoring.alerts.read":
             return monitoring_alerts()
+        if request.operation_type == "monitoring.summary.read":
+            return monitoring_summary()
         if request.operation_type == "registry.status.read":
             return registry_status()
+        if request.operation_type == "images.list":
+            return images_list()
         if request.operation_type == "gpu_isolation.status.read":
             return gpu_isolation_status()
     except Exception as exc:

@@ -440,6 +440,29 @@ button {
 .section-card-body {
   padding: 14px;
 }
+.subsection-title {
+  margin: 16px 0 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.operation-actions {
+  border-top: 1px solid var(--line);
+  padding: 8px 14px;
+}
+.operation-action-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 42px;
+  border-bottom: 1px dotted var(--line);
+}
+.operation-action-row:last-child {
+  border-bottom: 0;
+}
 .kv-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -647,6 +670,10 @@ button {
   }
   .topbar-search {
     width: 180px;
+  }
+  .ui-table th,
+  .ui-table td {
+    padding: 8px 9px;
   }
 }
 @media (max-width: 760px) {

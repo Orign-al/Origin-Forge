@@ -6,17 +6,21 @@
 `SUCCEEDED`、`FAILED`、`ROLLING_BACK`、`ROLLED_BACK`、`CANCELLED`、`EXPIRED`。
 后端只允许定义好的相邻转换；非法跳转返回冲突，不通过直接数据库赋值绕过。
 
-Portal-0/1 的成功含义是“Worker dry-run 已验证”，不是宿主变更已经执行。UI 和
+Portal-2 的成功含义是“Worker dry-run 已验证”，不是宿主变更已经执行。UI 和
 `result_summary` 必须明确这一点。
 
 ## 创建任务
 
-写请求先创建数据库 Operation，保存：operation/target type、精确 target id、请求人、
+写请求先创建 `DRAFT` Operation，保存：operation/target type、精确 target id、请求人、
 清洗后的 payload、幂等键、风险级别和摘要。HTTP 请求不长时间等待宿主命令。
+
+创建草稿不会隐式进入审批。管理员必须显式提交，状态才转换为
+`PENDING_APPROVAL`；对象名确认及高风险重新认证在提交和审批边界重新校验。
 
 - payload 只允许每类 operation 的固定字段；未知字段被拒绝。
 - 用户名、容器名、节点名、job id 和 quota 在 API 与 Worker 两层验证。
-- `root`、`origin-al`、`codexops` 不能成为计算用户写操作目标。
+- `root`、`origin-al`、`codexops` 不能成为计算用户写操作目标；唯一例外是
+  `user.plan(origin-al)` 只生成 NOT_ENROLLED 资源草稿，Worker 仍禁止 stage/activate。
 - 同一请求人和幂等键返回既有任务，不重复执行。
 
 ## 高风险门槛

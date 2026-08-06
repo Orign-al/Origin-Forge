@@ -7,7 +7,7 @@ import { useEffect, useState } from "react";
 
 import { navigation } from "@h100-portal/config";
 import { Badge, Button } from "@h100-portal/ui";
-import { alerts, logout, me } from "../lib/api";
+import { alerts, logout, me, recordPageAccess } from "../lib/api";
 
 const ROLE_LABELS: Record<string, string> = {
   platform_owner: "平台所有者",
@@ -33,6 +33,11 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (current.isError) router.replace("/login");
   }, [current.isError, router]);
+  useEffect(() => {
+    if (current.isSuccess) {
+      void recordPageAccess(pathname).catch(() => undefined);
+    }
+  }, [current.isSuccess, pathname]);
   if (current.isPending)
     return (
       <div className="auth-page">
@@ -66,7 +71,7 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
       <aside className="portal-sidebar">
         <div className="brand">
           <div className="brand-title">H100 管理平台</div>
-          <div className="brand-subtitle">单机控制面 · Portal-0/1</div>
+          <div className="brand-subtitle">单机控制面 · Portal-2</div>
         </div>
         <nav className="nav-group" aria-label="主导航">
           <div className="nav-label">平台</div>

@@ -6,7 +6,7 @@ import pytest
 from h100_portal_worker import handlers
 from h100_portal_worker.handlers import handle, run_fixed
 from h100_portal_worker.protocol import ProtocolError, decode_frame, encode_frame
-from h100_portal_worker.schemas import WorkerRequest
+from h100_portal_worker.schemas import WorkerRequest, validate_payload
 from pydantic import ValidationError
 
 
@@ -53,6 +53,14 @@ def test_worker_rejects_arbitrary_path_and_non_dry_write() -> None:
     assert rejected["error"]["code"] == "PAYLOAD_REJECTED"
     write = handle(request("user.stage", {"username": "example-user"}, dry_run=False))
     assert write["error"]["code"] == "WRITE_EXECUTION_DISABLED"
+
+
+def test_origin_al_is_allowed_only_for_non_executing_user_plan() -> None:
+    assert validate_payload("user.plan", {"username": "origin-al"}) == {"username": "origin-al"}
+    with pytest.raises(ValueError, match="protected username"):
+        validate_payload("user.stage", {"username": "origin-al"})
+    with pytest.raises(ValueError, match="invalid node name"):
+        validate_payload("slurm.resume", {"node_name": "other-node"})
 
 
 def test_dry_run_returns_plan_not_command(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -269,3 +277,37 @@ def test_slurm_jobs_json_is_normalized(monkeypatch) -> None:  # type: ignore[no-
         "reason": "Resources",
         "nodes": 1,
     }
+
+
+def test_live_image_inventory_requires_digest_and_uses_whitelisted_fields(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    digest = "sha256:" + "a" * 64
+
+    def docker_result(_binary, args, **_kwargs):  # type: ignore[no-untyped-def]
+        if args[:2] == ["image", "ls"]:
+            return {
+                "ok": True,
+                "stdout": json.dumps(
+                    {
+                        "Repository": "h100-local/dev-container",
+                        "Tag": "ubuntu24.04",
+                        "Digest": digest,
+                        "ID": digest,
+                        "Size": "983MB",
+                        "Containers": "1",
+                        "CreatedAt": "2026-08-04",
+                    }
+                ),
+            }
+        return {
+            "ok": True,
+            "stdout": json.dumps([{"Architecture": "amd64", "Os": "linux"}]),
+        }
+
+    monkeypatch.setattr(handlers, "run_fixed", docker_result)
+    result = handlers.images_list()
+    assert result["status"] == "OK"
+    assert result["images"][0]["digest"] == digest
+    assert result["images"][0]["immutable"] is True
+    assert result["images"][0]["architecture"] == "amd64"
