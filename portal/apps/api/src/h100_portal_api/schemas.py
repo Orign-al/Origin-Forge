@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -88,6 +88,44 @@ class OperationCreateRequest(ApiModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     idempotency_key: str = Field(pattern=r"^[A-Za-z0-9_.:-]{8,128}$")
     confirmation: str | None = Field(default=None, max_length=128)
+
+
+class UserStagePayload(ApiModel):
+    """Closed Portal/Worker contract for the approved Stage plan."""
+
+    username: Literal["origin-pilot"]
+    uid: int = Field(ge=20_000, le=60_000)
+    gid: int = Field(ge=20_000, le=60_000)
+    project_id: int = Field(ge=30_000, le=39_999)
+    ssh_port: int = Field(ge=1024, le=65_535)
+    quota_gb: Literal[300]
+    slurm_account: Literal["company"]
+    slurm_qos: Literal["general"]
+    max_gpus: Literal[1]
+    container_name: Literal["gpu-dev-origin-pilot"]
+    cpus: Literal[8]
+    memory_gb: Literal[32]
+    pids_limit: Literal[4096]
+    gpu: Literal["none"]
+    expected_state: Literal["DRAFT"]
+    approval_reference: str | None = Field(
+        default=None, min_length=8, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$"
+    )
+
+
+class UserActivatePayload(ApiModel):
+    """Activate accepts approved record IDs, never key bytes or host paths."""
+
+    managed_user_id: uuid.UUID
+    approved_ssh_key_record_ids: list[uuid.UUID] = Field(min_length=1, max_length=5)
+    expected_state: Literal["STAGED"]
+    approval_reference: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+
+    @model_validator(mode="after")
+    def key_records_are_unique(self) -> UserActivatePayload:
+        if len(set(self.approved_ssh_key_record_ids)) != len(self.approved_ssh_key_record_ids):
+            raise ValueError("duplicate SSH key record ID")
+        return self
 
 
 class OperationResponse(ApiModel):

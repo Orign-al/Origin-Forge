@@ -54,8 +54,18 @@ Prometheus/Grafana。GPU minor 只按 UUID + PCI Bus ID 与 NVIDIA driver procfs
 - `slurm.drain`、`slurm.resume`、`job.cancel`、`quota.update`
 - `ssh_key.add`、`ssh_key.revoke`
 
-Portal-0/1 对所有非 dry-run 写请求固定返回 `WRITE_EXECUTION_DISABLED`。dry-run 只返回
+Portal-3B-R 对所有非 dry-run 写请求固定返回 `WRITE_EXECUTION_DISABLED`。dry-run 只返回
 handler、已清洗参数、预期备份/验证/回滚和脚本完整性，不返回 shell 命令字符串。
+
+`user.stage` 使用固定的 UID/GID、project、端口、Slurm、quota 和 GPU-less 容器字段，
+不接受任何 SSH key 字段；Worker 返回 `NOT_REQUIRED_FOR_STAGE` 并明确公钥延后到
+Activate。`user.activate` 只接受 `managed_user_id`、`approved_ssh_key_record_ids`、
+`expected_state=STAGED` 和审批引用。Worker 从 root-owned UUID staging 目录读取记录，
+拒绝任意路径、私钥、密码、argv 和 command；缺少 key 返回
+`PUBLIC_KEY_REQUIRED_FOR_ACTIVATION`。幂等键继续位于签名/校验后的 Worker envelope，
+不得在 payload 中用第二个可篡改字段覆盖。
+API 还必须将 `managed_user_id`、目标 `origin-pilot`、Portal owner 和每个 key record 的
+所属受管身份、active/revoked 与独立批准状态交叉绑定；不能只验证 UUID 格式。
 
 Portal-3A 将 `user.plan` 进一步限制为精确目标 `origin-pilot`。Worker 使用固定数据源
 生成 UID/GID、project ID、SSH 端口、Slurm、GPU isolation、Stage、Activate 和回滚的

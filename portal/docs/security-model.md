@@ -7,6 +7,10 @@
 任意宿主命令能力。Root Worker 仅信任通过 Unix Socket 对端凭据验证、协议版本验证、
 严格 schema 验证和 allowlist 分派后的请求。
 
+计算用户采用两阶段 SSH 公钥契约：`user.stage` 永不读取或安装公钥；`user.activate`
+只接收受控 key record ID，并在 root-owned staging 文件上使用 `O_NOFOLLOW`、owner/mode/
+inode/大小检查和 `ssh-keygen` fingerprint 校验。公钥验证失败不会部分激活用户。
+
 Worker 禁止接收任意 command、argv、shell、SQL、路径、systemd unit、Docker mount、
 capability 或 `scontrol` 参数。子进程一律 `shell=False`，使用固定环境、超时与输出
 上限。现有管理脚本在调用前检查 root owner、普通用户不可写和 SHA-256 allowlist。

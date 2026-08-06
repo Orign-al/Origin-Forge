@@ -71,16 +71,33 @@ sudo /usr/local/sbin/h100-quota-show codexops >/dev/null
 
 collision_log="$(mktemp /tmp/h100-management-collision.XXXXXX)"
 if sudo /usr/local/sbin/h100-user-create \
-  codexops \
-  10002 \
-  /home/codexops/.ssh/authorized_keys \
-  --confirm-create \
+  --stage codexops 10002 10002 30002 22022 company general \
+  --confirm-stage codexops \
   >"${collision_log}" 2>&1; then
   rm -f -- "${collision_log}"
   fail 'existing-user collision test unexpectedly succeeded'
 fi
-grep -q 'already exists' "${collision_log}" \
+grep -Eq 'protected|forbidden' "${collision_log}" \
   || { rm -f -- "${collision_log}"; fail 'existing-user collision was not detected'; }
+
+if sudo /usr/local/sbin/h100-user-create \
+  --stage example-pilot 20001 20001 30001 22023 company general \
+  --public-key-file /tmp/forbidden.pub --confirm-stage example-pilot \
+  >"${collision_log}" 2>&1; then
+  rm -f -- "${collision_log}"
+  fail 'Stage unexpectedly accepted a public-key file'
+fi
+grep -q 'PUBLIC_KEY_NOT_ALLOWED_DURING_STAGE' "${collision_log}" \
+  || { rm -f -- "${collision_log}"; fail 'Stage key contract rejection was not detected'; }
+
+if sudo /usr/local/sbin/h100-user-create \
+  --activate origin-pilot --confirm-activate origin-pilot \
+  >"${collision_log}" 2>&1; then
+  rm -f -- "${collision_log}"
+  fail 'Activate unexpectedly accepted a missing public key'
+fi
+grep -q 'PUBLIC_KEY_REQUIRED_FOR_ACTIVATION' "${collision_log}" \
+  || { rm -f -- "${collision_log}"; fail 'Activate missing-key rejection was not detected'; }
 
 if sudo /usr/local/sbin/h100-container-create \
   codexops \

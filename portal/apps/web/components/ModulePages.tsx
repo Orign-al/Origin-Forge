@@ -869,9 +869,14 @@ export function OperationsModule() {
               <div className="operation-action-row" key={String(row.id)}>
                 <span className="mono">{String(row.id).slice(0, 12)}…</span>
                 {row.status === "DRAFT" ? (
-                  <Button onClick={() => void submit(row)} disabled={busy}>
-                    提交审批
-                  </Button>
+                  row.operation_type === "user.stage" ||
+                  row.operation_type === "user.activate" ? (
+                    <Button disabled>生命周期 Gate 未开放</Button>
+                  ) : (
+                    <Button onClick={() => void submit(row)} disabled={busy}>
+                      提交审批
+                    </Button>
+                  )
                 ) : null}
                 {row.status === "PENDING_APPROVAL" ? (
                   <Button onClick={() => void approve(row)} disabled={busy}>

@@ -1,6 +1,6 @@
 from collections.abc import Iterable
 
-from h100_portal_api.enums import OperationStatus, RiskLevel
+from h100_portal_api.enums import OnboardingState, OperationStatus, RiskLevel
 
 READ_OPERATION_TYPES = {
     "platform.health.read",
@@ -103,6 +103,22 @@ ALLOWED_TRANSITIONS: dict[OperationStatus, set[OperationStatus]] = {
 
 def can_transition(current: OperationStatus, target: OperationStatus) -> bool:
     return target in ALLOWED_TRANSITIONS.get(current, set())
+
+
+ONBOARDING_TRANSITIONS: dict[OnboardingState, set[OnboardingState]] = {
+    OnboardingState.NOT_ENROLLED: {OnboardingState.DRAFT},
+    OnboardingState.DRAFT: {OnboardingState.STAGED, OnboardingState.FAILED},
+    OnboardingState.STAGED: {OnboardingState.ACTIVE, OnboardingState.FAILED},
+    OnboardingState.ACTIVE: {OnboardingState.SUSPENDED, OnboardingState.FAILED},
+    OnboardingState.SUSPENDED: {OnboardingState.ACTIVE, OnboardingState.FAILED},
+    OnboardingState.FAILED: {OnboardingState.DRAFT, OnboardingState.SUSPENDED},
+    OnboardingState.READY_FOR_ACTIVATION: {OnboardingState.ACTIVE, OnboardingState.FAILED},
+}
+
+
+def can_transition_onboarding(current: OnboardingState, target: OnboardingState) -> bool:
+    """Enforce that only a successful Activate can make a user ACTIVE."""
+    return target in ONBOARDING_TRANSITIONS.get(current, set())
 
 
 def allowed_operation_types() -> Iterable[str]:

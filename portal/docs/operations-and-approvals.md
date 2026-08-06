@@ -22,6 +22,8 @@ Portal-2 的成功含义是“Worker dry-run 已验证”，不是宿主变更�
 - `root`、`origin-al`、`codexops` 不能成为计算用户写操作目标。
 - Portal-3A 仅允许 `user.plan(origin-pilot)` 为 Origin-al 生成独立计算身份 DRAFT；
   Worker 仍禁止真实 stage/activate，且 `origin-al` 始终保持 NOT_ENROLLED。
+- Portal-3B-R 的 Stage/Activate 审批 Gate 在本阶段关闭。Stage 不要求公钥；Activate
+  必须带已批准 key record UUID，且不能带宿主路径、私钥、密码或任意 argv。
 - 同一请求人和幂等键返回既有任务，不重复执行。
 
 ## 高风险门槛
@@ -38,7 +40,7 @@ Slurm DRAIN/RESUME、用户 Activate/Suspend、删除、quota/QOS、运行容器
 前端隐藏按钮不构成授权。`platform_owner` 可审批；其他角色按权限矩阵受限，auditor
 只读，user 只能访问自己的资源。
 
-## Portal-0/1 执行边界
+## Portal-3B-R 执行边界
 
 审批通过后任务进入 `QUEUED`，后台调用 Worker 时始终设置 `dry_run=true`。Worker 返回
 计划后任务可进入 `SUCCEEDED`；返回拒绝、超时或 schema 错误则进入 `FAILED`。本阶段：

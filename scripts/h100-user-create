@@ -13,6 +13,9 @@ readonly STATE_DIR=/etc/h100-platform/users
 readonly ISOLATION_TOOL=/usr/local/sbin/h100-user-gpu-isolation
 readonly GUARD_TIMER=h100-gpu-bypass-guard.timer
 readonly GUARD_SERVICE=h100-gpu-bypass-guard.service
+readonly SSH_KEY_STAGING_ROOT=/var/lib/h100-portal/ssh-key-staging
+readonly MAX_PUBLIC_KEY_BYTES=16384
+readonly MAX_PUBLIC_KEYS=5
 
 mode=
 user_name=
@@ -23,7 +26,6 @@ ssh_port=
 slurm_account=
 slurm_qos=
 public_key_input=
-public_key_file=
 project_name=
 user_root=
 state_file=
@@ -42,15 +44,16 @@ container_created=0
 host_key_installed=0
 data_key_installed=0
 timer_was_enabled=0
+guard_timer_changed=0
 declare -a normalized_keys=()
 declare -a key_fingerprints=()
 
 usage() {
   printf '%s\n' \
     'Usage:' \
-    '  sudo h100-user-create --plan USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS PUBLIC_KEY_FILE' \
-    '  sudo h100-user-create --stage USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS PUBLIC_KEY_FILE --confirm-stage USER' \
-    '  sudo h100-user-create --activate USER PUBLIC_KEY_FILE --confirm-activate USER' \
+    '  sudo h100-user-create --plan USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS' \
+    '  sudo h100-user-create --stage USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS --confirm-stage USER' \
+    '  sudo h100-user-create --activate USER --public-key-file ROOT_CONTROLLED_FILE --confirm-activate USER' \
     '  sudo h100-user-create --status USER' \
     '' \
     'Stage creates a locked nologin account, exact user-UID.slice policy, quota,' \
@@ -85,11 +88,23 @@ restore_mapping_file() {
 }
 
 write_state() {
-  local status=$1 temp
+  local status=$1 temp state_key_hash state_key_fingerprints ssh_key_state
+  case "${status}" in
+    ACTIVE)
+      state_key_hash=${key_hash}
+      state_key_fingerprints=${key_fingerprints_csv}
+      ssh_key_state=INSTALLED
+      ;;
+    *)
+      state_key_hash=
+      state_key_fingerprints=
+      ssh_key_state=REQUIRED_BEFORE_ACTIVATION
+      ;;
+  esac
   install -d -o root -g gpu-platform-admin -m 0750 "${STATE_DIR}"
   temp="$(mktemp "${STATE_DIR}/.${user_name}.state.XXXXXX")"
   {
-    printf 'VERSION=1\n'
+    printf 'VERSION=2\n'
     printf 'STATUS=%s\n' "${status}"
     printf 'USERNAME=%s\n' "${user_name}"
     printf 'UID=%s\n' "${user_uid}"
@@ -98,8 +113,9 @@ write_state() {
     printf 'SSH_PORT=%s\n' "${ssh_port}"
     printf 'SLURM_ACCOUNT=%s\n' "${slurm_account}"
     printf 'SLURM_QOS=%s\n' "${slurm_qos}"
-    printf 'KEY_SHA256=%s\n' "${key_hash}"
-    printf 'KEY_FINGERPRINTS=%s\n' "${key_fingerprints_csv}"
+    printf 'SSH_KEY_STATE=%s\n' "${ssh_key_state}"
+    printf 'KEY_SHA256=%s\n' "${state_key_hash}"
+    printf 'KEY_FINGERPRINTS=%s\n' "${state_key_fingerprints}"
     printf 'UPDATED_AT=%s\n' "$(date --iso-8601=seconds)"
   } >"${temp}"
   chown root:gpu-platform-admin "${temp}"
@@ -133,6 +149,9 @@ rollback_stage() {
         --file "${compose_file}" \
         down --remove-orphans
     fi
+  fi
+  if ((guard_timer_changed == 1 && timer_was_enabled == 0)); then
+    systemctl disable --now "${GUARD_TIMER}" >/dev/null 2>&1 || true
   fi
   if ((association_created == 1)); then
     sacctmgr -i delete user where \
@@ -235,40 +254,89 @@ validate_slurm_name() {
     || h100_fail 'invalid Slurm account or QOS name'
 }
 
-validate_public_keys() {
-  public_key_file="$(realpath -e "${public_key_input}")"
-  [[ -f "${public_key_file}" && ! -L "${public_key_input}" ]] \
-    || h100_fail 'public key input must be a regular non-symlink file'
-  if find "${public_key_file}" -maxdepth 0 -perm /022 | grep -q .; then
-    h100_fail 'public key file must not be group- or world-writable'
+public_key_file_metadata() {
+  local candidate=$1 require_staging=$2 expected_uid=$3 expected_gid=$4
+  local parent base file_type owner_uid owner_gid mode links size
+  [[ -n "${candidate}" ]] || h100_fail 'PUBLIC_KEY_REQUIRED_FOR_ACTIVATION'
+  parent="$(dirname -- "${candidate}")"
+  base="$(basename -- "${candidate}")"
+  if ((require_staging == 1)); then
+    [[ "${parent}" == "${SSH_KEY_STAGING_ROOT}" ]] \
+      || h100_fail 'PUBLIC_KEY_PATH_NOT_ALLOWED'
+    [[ "${base}" =~ ^[0-9A-Fa-f-]{36}\.pub$ ]] \
+      || h100_fail 'PUBLIC_KEY_PATH_NOT_ALLOWED'
+    [[ -d "${SSH_KEY_STAGING_ROOT}" && ! -L "${SSH_KEY_STAGING_ROOT}" ]] \
+      || h100_fail 'PUBLIC_KEY_STAGING_DIRECTORY_INVALID'
+    [[ "$(stat -c '%U:%G:%a' "${SSH_KEY_STAGING_ROOT}")" == 'root:root:700' ]] \
+      || h100_fail 'PUBLIC_KEY_STAGING_DIRECTORY_INVALID'
+  else
+    [[ "${parent}" == "/home/${user_name}/.ssh" \
+      || "${parent}" == "${user_root}/home/.ssh" ]] \
+      || h100_fail 'AUTHORIZED_KEYS_PATH_INVALID'
+    [[ "$(stat -c '%U:%G:%a' "${parent}" 2>/dev/null || true)" == \
+      "${user_name}:${user_name}:700" ]] \
+      || h100_fail 'AUTHORIZED_KEYS_PARENT_INVALID'
   fi
+  file_type="$(stat -c '%F' -- "${candidate}" 2>/dev/null || true)"
+  owner_uid="$(stat -c '%u' -- "${candidate}" 2>/dev/null || true)"
+  owner_gid="$(stat -c '%g' -- "${candidate}" 2>/dev/null || true)"
+  mode="$(stat -c '%a' -- "${candidate}" 2>/dev/null || true)"
+  links="$(stat -c '%h' -- "${candidate}" 2>/dev/null || true)"
+  size="$(stat -c '%s' -- "${candidate}" 2>/dev/null || true)"
+  [[ "${file_type}" == 'regular file' ]] || h100_fail 'PUBLIC_KEY_VALIDATION_FAILED'
+  [[ "${owner_uid}" == "${expected_uid}" && "${owner_gid}" == "${expected_gid}" ]] \
+    || h100_fail 'PUBLIC_KEY_FILE_OWNERSHIP_INVALID'
+  [[ "${links}" == 1 ]] || h100_fail 'PUBLIC_KEY_VALIDATION_FAILED'
+  [[ "${mode}" =~ ^[0-7]+$ ]] || h100_fail 'PUBLIC_KEY_VALIDATION_FAILED'
+  (( (8#${mode}) & 022 )) && h100_fail 'PUBLIC_KEY_FILE_PERMISSIONS_INVALID'
+  if ((require_staging == 0)); then
+    [[ "${mode}" == 600 ]] || h100_fail 'AUTHORIZED_KEYS_PERMISSIONS_INVALID'
+  fi
+  [[ "${size}" =~ ^[0-9]+$ ]] || h100_fail 'PUBLIC_KEY_VALIDATION_FAILED'
+  ((size > 0 && size <= MAX_PUBLIC_KEY_BYTES)) \
+    || h100_fail 'PUBLIC_KEY_SIZE_INVALID'
+}
+
+parse_public_key_file() {
+  local require_staging=$1 expected_uid=$2 expected_gid=$3
+  public_key_file_metadata "${public_key_input}" "${require_staging}" \
+    "${expected_uid}" "${expected_gid}"
   normalized_keys=()
   key_fingerprints=()
   local raw key_type key_blob rest fingerprint
   local -A seen_fingerprints=()
   while IFS= read -r raw || [[ -n "${raw}" ]]; do
-    [[ "${raw}" =~ ^[[:space:]]*($|#) ]] && continue
+    [[ "${raw}" =~ ^[[:space:]]*$ ]] && continue
+    [[ "${raw}" != *$'\r'* && "${raw}" != *'BEGIN '* ]] \
+      || h100_fail 'PUBLIC_KEY_VALIDATION_FAILED'
     read -r key_type key_blob rest <<<"${raw}"
     case "${key_type:-}" in
       ssh-ed25519|sk-ssh-ed25519@openssh.com) ;;
-      *) h100_fail 'only ssh-ed25519 and sk-ssh-ed25519 public keys are allowed' ;;
+      *) h100_fail 'PUBLIC_KEY_VALIDATION_FAILED' ;;
     esac
     [[ -n "${key_blob:-}" && "${key_blob}" =~ ^[A-Za-z0-9+/]+={0,3}$ ]] \
-      || h100_fail 'invalid SSH public-key payload'
-    fingerprint="$(ssh-keygen -lf <(printf '%s\n' "${raw}") | awk '{print $2}')" \
-      || h100_fail 'SSH public-key fingerprint validation failed'
+      || h100_fail 'PUBLIC_KEY_VALIDATION_FAILED'
+    fingerprint="$(ssh-keygen -lf <(printf '%s\n' "${raw}") -E sha256 2>/dev/null \
+      | awk '{print $2}')" || h100_fail 'PUBLIC_KEY_VALIDATION_FAILED'
     [[ "${fingerprint}" == SHA256:* ]] \
-      || h100_fail 'SSH public key did not produce a SHA256 fingerprint'
+      || h100_fail 'PUBLIC_KEY_VALIDATION_FAILED'
     [[ -z "${seen_fingerprints[${fingerprint}]+present}" ]] \
-      || h100_fail 'duplicate public key in input file'
+      || h100_fail 'PUBLIC_KEY_DUPLICATE'
     seen_fingerprints[${fingerprint}]=1
     normalized_keys+=("${raw}")
     key_fingerprints+=("${fingerprint}")
-  done <"${public_key_file}"
-  ((${#normalized_keys[@]} >= 1 && ${#normalized_keys[@]} <= 5)) \
-    || h100_fail 'public key file must contain between 1 and 5 allowed keys'
+  done <"${public_key_input}"
+  ((${#normalized_keys[@]} >= 1 && ${#normalized_keys[@]} <= MAX_PUBLIC_KEYS)) \
+    || h100_fail 'PUBLIC_KEY_VALIDATION_FAILED'
   key_hash="$({ printf '%s\n' "${normalized_keys[@]}"; } | sha256sum | awk '{print $1}')"
   key_fingerprints_csv="$(IFS=,; printf '%s' "${key_fingerprints[*]}")"
+  if ((require_staging == 1)); then
+    public_key_file_metadata "${public_key_input}" 1 0 0
+  fi
+}
+
+validate_public_keys() {
+  parse_public_key_file 1 0 0
 
   local existing_state existing_fingerprints candidate
   shopt -s nullglob
@@ -278,7 +346,7 @@ validate_public_keys() {
       "${existing_state}")"
     for candidate in "${key_fingerprints[@]}"; do
       if tr ',' '\n' <<<"${existing_fingerprints}" | grep -Fxq "${candidate}"; then
-        h100_fail 'public-key fingerprint is already assigned to another Pilot user'
+        h100_fail 'PUBLIC_KEY_DUPLICATE'
       fi
     done
   done
@@ -341,7 +409,6 @@ validate_new_user_plan() {
     | awk -F'|' -v user="${user_name}" '$1 == user {found=1} END {exit found ? 0 : 1}'; then
     h100_fail 'Slurm association already exists for username'
   fi
-  validate_public_keys
 }
 
 state_value() {
@@ -355,13 +422,14 @@ state_value() {
 load_staged_state() {
   h100_validate_username "${user_name}"
   [[ -f "${state_file}" && ! -L "${state_file}" ]] \
-    || h100_fail 'Pilot user state file is missing'
+    || h100_fail 'USER_NOT_IN_STAGED_STATE'
   [[ "$(stat -c '%U:%G:%a' "${state_file}")" == \
     'root:gpu-platform-admin:640' ]] \
     || h100_fail 'Pilot user state ownership or mode is invalid'
-  [[ "$(state_value VERSION)" == 1 ]] || h100_fail 'unsupported state version'
+  [[ "$(state_value VERSION)" == 1 || "$(state_value VERSION)" == 2 ]] \
+    || h100_fail 'unsupported state version'
   [[ "$(state_value STATUS)" == STAGED ]] \
-    || h100_fail 'user is not in STAGED state'
+    || h100_fail 'USER_NOT_IN_STAGED_STATE'
   [[ "$(state_value USERNAME)" == "${user_name}" ]] \
     || h100_fail 'state username mismatch'
   user_uid="$(state_value UID)"
@@ -370,8 +438,12 @@ load_staged_state() {
   ssh_port="$(state_value SSH_PORT)"
   slurm_account="$(state_value SLURM_ACCOUNT)"
   slurm_qos="$(state_value SLURM_QOS)"
-  key_hash="$(state_value KEY_SHA256)"
-  key_fingerprints_csv="$(state_value KEY_FINGERPRINTS)"
+  if [[ "$(state_value VERSION)" == 2 ]]; then
+    [[ "$(state_value SSH_KEY_STATE)" == REQUIRED_BEFORE_ACTIVATION ]] \
+      || h100_fail 'STAGED user has an invalid SSH key state'
+    [[ -z "$(state_value KEY_SHA256)" && -z "$(state_value KEY_FINGERPRINTS)" ]] \
+      || h100_fail 'STAGED user unexpectedly has installed SSH key metadata'
+  fi
   project_name="h100_${user_name}"
   user_root="${H100_DATA_ROOT}/users/${user_name}"
   validate_identity_numbers
@@ -379,11 +451,15 @@ load_staged_state() {
     || h100_fail 'host UID no longer matches staged state'
   [[ "$(id -g "${user_name}")" == "${user_gid}" ]] \
     || h100_fail 'host GID no longer matches staged state'
+  [[ "$(getent passwd "${user_name}" | cut -d: -f7)" == /usr/sbin/nologin ]] \
+    || h100_fail 'USER_NOT_IN_STAGED_STATE'
+  [[ "$(passwd -S "${user_name}" | awk '{print $2}')" == L ]] \
+    || h100_fail 'USER_NOT_IN_STAGED_STATE'
 }
 
 assert_forbidden_groups_absent() {
   local forbidden_group
-  for forbidden_group in sudo docker video render gpu-platform-admin; do
+  for forbidden_group in sudo docker video render gpu-platform-admin adm systemd-journal; do
     if id -nG "${user_name}" | tr ' ' '\n' | grep -Fxq "${forbidden_group}"; then
       h100_fail "Pilot user belongs to forbidden group: ${forbidden_group}"
     fi
@@ -398,6 +474,7 @@ validate_container_security() {
     --arg expected_port "${ssh_port}" '
       .[0] as $c
       | ($c.Name | ltrimstr("/")) == $expected_name
+      and ($c.Image | startswith("sha256:"))
       and $c.HostConfig.Privileged == false
       and $c.HostConfig.NetworkMode != "host"
       and $c.HostConfig.PidMode != "host"
@@ -405,8 +482,41 @@ validate_container_security() {
       and (($c.HostConfig.DeviceRequests // []) | length == 0)
       and (($c.HostConfig.Devices // []) | length == 0)
       and (($c.Mounts // []) | map(.Destination) | index("/var/run/docker.sock") | not)
+      and (($c.Mounts // []) | map(.Destination) | index("/etc") | not)
+      and (($c.Mounts // []) | map(.Destination) | index("/root") | not)
+      and (($c.Mounts // []) | map(.Destination) | index("/var/run") | not)
+      and (($c.Mounts // []) | map(.Destination) | index("/run/munge") | not)
       and $c.HostConfig.PortBindings["22/tcp"][0].HostPort == $expected_port
     ' >/dev/null || h100_fail 'long-lived container security validation failed'
+}
+
+assert_container_stopped() {
+  local container
+  container="$(h100_container_name "${user_name}")"
+  [[ "$(docker inspect --format '{{.State.Running}}' "${container}")" == false ]] \
+    || h100_fail 'staged container must be stopped'
+  ! ss -H -lnt "sport = :${ssh_port}" | grep -q . \
+    || h100_fail 'staged container SSH port is listening'
+}
+
+enable_and_verify_guard() {
+  local guard_output managed verified
+  systemctl start "${GUARD_SERVICE}"
+  systemctl enable --now "${GUARD_TIMER}"
+  guard_timer_changed=1
+  systemctl is-enabled --quiet "${GUARD_TIMER}" \
+    || h100_fail 'GPU bypass Guard timer was not enabled'
+  systemctl is-active --quiet "${GUARD_TIMER}" \
+    || h100_fail 'GPU bypass Guard timer is not active'
+  guard_output="$(journalctl -u "${GUARD_SERVICE}" --since '-2 minutes' \
+    --no-pager -o cat 2>/dev/null)" \
+    || h100_fail 'GPU bypass Guard result is unavailable'
+  [[ "${guard_output}" =~ GPU[[:space:]]BYPASS[[:space:]]GUARD[[:space:]]PASSED[[:space:]]managed_users=([0-9]+)[[:space:]]users_verified=([0-9]+) ]] \
+    || h100_fail 'GPU bypass Guard did not report a successful managed-user verification'
+  managed=${BASH_REMATCH[1]}
+  verified=${BASH_REMATCH[2]}
+  ((managed >= 1 && managed == verified)) \
+    || h100_fail 'GPU bypass Guard managed/verified user counts differ'
 }
 
 prepare_common_paths() {
@@ -419,7 +529,7 @@ run_plan() {
   validate_new_user_plan
   printf '%s\n' \
     "PLAN user=${user_name} uid=${user_uid} gid=${user_gid}" \
-    "STAGE shell=/usr/sbin/nologin authorized_keys=absent" \
+    "STAGE shell=/usr/sbin/nologin password=locked authorized_keys=absent ssh_key=NOT_REQUIRED_FOR_STAGE" \
     "GPU_POLICY unit=user-${user_uid}.slice policy=closed DeviceAllow=none" \
     "SLURM account=${slurm_account} qos=${slurm_qos} max_gpus=1" \
     "QUOTA project_id=${project_id} hard_limit_gb=300" \
@@ -454,8 +564,8 @@ run_stage() {
   install -d -o root -g gpu-platform-admin -m 0750 "${backup_dir}"
   cp -a /etc/projects "${backup_dir}/projects.before"
   cp -a /etc/projid "${backup_dir}/projid.before"
-  printf '%s\n' "${key_fingerprints[@]}" >"${backup_dir}/approved-key-fingerprints"
-  chmod 0640 "${backup_dir}/approved-key-fingerprints"
+  timer_was_enabled=0
+  systemctl is-enabled --quiet "${GUARD_TIMER}" && timer_was_enabled=1
   ROLLBACK_KIND=stage
 
   groupadd --gid "${user_gid}" "${user_name}"
@@ -470,6 +580,8 @@ run_stage() {
   passwd -l "${user_name}" >/dev/null
   [[ "$(getent passwd "${user_name}" | cut -d: -f7)" == /usr/sbin/nologin ]] \
     || h100_fail 'staged account shell is not nologin'
+  [[ "$(passwd -S "${user_name}" | awk '{print $2}')" == L ]] \
+    || h100_fail 'staged account password is not locked'
   [[ ! -e "/home/${user_name}/.ssh/authorized_keys" ]] \
     || h100_fail 'authorized_keys unexpectedly exists before isolation'
   assert_forbidden_groups_absent
@@ -514,11 +626,14 @@ run_stage() {
   h100-container-create "${user_name}" "${ssh_port}"
   container_created=1
   validate_container_security
+  h100-container-stop "${user_name}"
+  assert_container_stopped
   [[ ! -e "/home/${user_name}/.ssh/authorized_keys" ]] \
     || h100_fail 'host authorized_keys appeared during stage'
   [[ ! -e "${user_root}/home/.ssh/authorized_keys" ]] \
     || h100_fail 'container authorized_keys appeared during stage'
   "${ISOLATION_TOOL}" verify "${user_name}"
+  enable_and_verify_guard
   write_state STAGED
   {
     printf '# H100 Pilot user staged\n\n'
@@ -534,41 +649,89 @@ run_stage() {
       "${slurm_account}" "${slurm_qos}"
     printf -- '- Project quota: `%s`, 300GB hard\n' "${project_id}"
     printf -- '- Container: `gpu-dev-%s`, GPU request none\n' "${user_name}"
+    printf -- '- Container state: `STOPPED`; SSH port is not listening\n'
+    printf -- '- SSH key state: `REQUIRED_BEFORE_ACTIVATION`\n'
+    printf -- '- GPU bypass Guard timer: enabled and verified\n'
     printf -- '- Separate activation approval required\n'
     printf -- '- Backup: `%s`\n' "${backup_dir}"
   } >"${report_file}"
   ROLLBACK_KIND=
-  printf 'STAGED user=%s uid=%s shell=/usr/sbin/nologin authorized_keys=absent\n' \
+  printf 'STAGED user=%s uid=%s shell=/usr/sbin/nologin password=locked authorized_keys=absent ssh_key=REQUIRED_BEFORE_ACTIVATION guard_timer=enabled\n' \
     "${user_name}" "${user_uid}"
 }
 
 install_normalized_keys() {
   local target=$1 owner=$2 group=$3 temp
+  [[ ! -e "${target}" && ! -L "${target}" ]] \
+    || h100_fail 'authorized_keys target must be absent before activation'
+  [[ ! -L "$(dirname "${target}")" ]] \
+    || h100_fail 'authorized_keys parent must not be a symlink'
   temp="$(mktemp "$(dirname "${target}")/.authorized_keys.XXXXXX")"
   printf '%s\n' "${normalized_keys[@]}" >"${temp}"
   chown "${owner}:${group}" "${temp}"
   chmod 0600 "${temp}"
   sync -f "${temp}"
-  mv -f -- "${temp}" "${target}"
+  mv -fT -- "${temp}" "${target}"
+  sync -f "$(dirname "${target}")"
 }
 
-run_activate() {
-  load_staged_state
-  h100_require_slurm_drained
-  [[ "$(squeue -h | wc -l)" -eq 0 ]] || h100_fail 'Slurm queue must be empty'
-  validate_public_keys
-  [[ "${key_hash}" == "$(state_value KEY_SHA256)" ]] \
-    || h100_fail 'activation public keys differ from staged approval'
-  [[ "${key_fingerprints_csv}" == "$(state_value KEY_FINGERPRINTS)" ]] \
-    || h100_fail 'activation public-key fingerprints differ from staged approval'
+validate_installed_keys() {
+  local target=$1 expected_uid=$2 expected_gid=$3
+  local approved_hash=${key_hash} approved_fingerprints=${key_fingerprints_csv}
+  local approved_input=${public_key_input}
+  public_key_input=${target}
+  parse_public_key_file 0 "${expected_uid}" "${expected_gid}"
+  [[ "${key_hash}" == "${approved_hash}" \
+    && "${key_fingerprints_csv}" == "${approved_fingerprints}" ]] \
+    || h100_fail 'installed authorized_keys fingerprints do not match approval'
+  public_key_input=${approved_input}
+  key_hash=${approved_hash}
+  key_fingerprints_csv=${approved_fingerprints}
+}
+
+validate_staged_resources() {
   assert_forbidden_groups_absent
   "${ISOLATION_TOOL}" verify "${user_name}"
   "${ISOLATION_TOOL}" self-test "${user_name}"
+  grep -Fxq "${project_id}:${user_root}" /etc/projects \
+    || h100_fail 'staged project mapping is missing'
+  grep -Fxq "${project_name}:${project_id}" /etc/projid \
+    || h100_fail 'staged project name mapping is missing'
+  xfs_quota -x -c 'report -p -h' "${H100_DATA_ROOT}" \
+    | grep -E "^${project_name}[[:space:]]" \
+    | grep -q '300G' \
+    || h100_fail 'staged 300GB project quota validation failed'
+  sacctmgr -nP show assoc where \
+    User="${user_name}" Account="${slurm_account}" \
+    format=User,Account,QOS,DefaultQOS \
+    | awk -F'|' -v user="${user_name}" -v account="${slurm_account}" \
+      '$1 == user && $2 == account {found=1} END {exit found ? 0 : 1}' \
+    || h100_fail 'staged Slurm association validation failed'
+  local qos_record
+  qos_record="$(sacctmgr -nP show qos "${slurm_qos}" format=Name,MaxTRESPerUser)"
+  grep -Eq "^${slurm_qos}\\|.*gres/gpu=1" <<<"${qos_record}" \
+    || h100_fail 'staged Slurm QOS GPU limit validation failed'
   validate_container_security
+  assert_container_stopped
   [[ ! -e "/home/${user_name}/.ssh/authorized_keys" ]] \
     || h100_fail 'host authorized_keys must be absent before activation'
   [[ ! -e "${user_root}/home/.ssh/authorized_keys" ]] \
     || h100_fail 'managed-home authorized_keys must be absent before activation'
+  systemctl start "${GUARD_SERVICE}"
+  systemctl is-enabled --quiet "${GUARD_TIMER}" \
+    || h100_fail 'GPU bypass Guard timer is not enabled for staged user'
+  systemctl is-active --quiet "${GUARD_TIMER}" \
+    || h100_fail 'GPU bypass Guard timer is not active for staged user'
+}
+
+run_activate() {
+  # Public-key bytes are validated before state or resource mutation. The
+  # accepted path is constrained to the root-owned Portal staging directory.
+  validate_public_keys
+  load_staged_state
+  h100_require_slurm_drained
+  [[ "$(squeue -h | wc -l)" -eq 0 ]] || h100_fail 'Slurm queue must be empty'
+  validate_staged_resources
 
   local stamp container
   stamp="$(date +%Y%m%d-%H%M%S-%N)"
@@ -591,18 +754,22 @@ run_activate() {
   install_normalized_keys "${user_root}/home/.ssh/authorized_keys" \
     "${user_name}" "${user_name}"
   data_key_installed=1
+  validate_installed_keys "/home/${user_name}/.ssh/authorized_keys" \
+    "${user_uid}" "${user_gid}"
+  validate_installed_keys "${user_root}/home/.ssh/authorized_keys" \
+    "${user_uid}" "${user_gid}"
 
   systemctl start "${GUARD_SERVICE}"
   systemctl enable --now "${GUARD_TIMER}"
   systemctl is-enabled --quiet "${GUARD_TIMER}" \
     || h100_fail 'GPU bypass Guard timer was not enabled'
-  h100-container-start "${user_name}"
-  validate_container_security
   usermod --shell /bin/bash "${user_name}"
   [[ "$(getent passwd "${user_name}" | cut -d: -f7)" == /bin/bash ]] \
     || h100_fail 'approved login shell activation failed'
   [[ "$(passwd -S "${user_name}" | awk '{print $2}')" == L ]] \
     || h100_fail 'password unexpectedly became usable'
+  h100-container-start "${user_name}"
+  validate_container_security
   "${ISOLATION_TOOL}" verify "${user_name}"
   write_state ACTIVE
   {
@@ -657,7 +824,11 @@ case "$1" in
     exit 0
     ;;
   --plan)
-    (($# == 9)) || { usage >&2; exit 2; }
+    if (($# != 8)); then
+      (($# == 9)) && h100_fail 'PUBLIC_KEY_NOT_ALLOWED_DURING_PLAN'
+      usage >&2
+      exit 2
+    fi
     mode=plan
     user_name=$2
     user_uid=$3
@@ -666,11 +837,18 @@ case "$1" in
     ssh_port=$6
     slurm_account=$7
     slurm_qos=$8
-    public_key_input=$9
     ;;
   --stage)
-    (($# == 11)) || { usage >&2; exit 2; }
-    [[ "${10}" == --confirm-stage && "${11}" == "$2" ]] \
+    for argument in "$@"; do
+      [[ "${argument}" != --public-key-file ]] \
+        || h100_fail 'PUBLIC_KEY_NOT_ALLOWED_DURING_STAGE'
+    done
+    if (($# != 10)); then
+      (($# == 11)) && h100_fail 'PUBLIC_KEY_NOT_ALLOWED_DURING_STAGE'
+      usage >&2
+      exit 2
+    fi
+    [[ "$9" == --confirm-stage && "${10}" == "$2" ]] \
       || h100_fail 'stage confirmation must repeat the exact username'
     mode=stage
     user_name=$2
@@ -680,15 +858,16 @@ case "$1" in
     ssh_port=$6
     slurm_account=$7
     slurm_qos=$8
-    public_key_input=$9
     ;;
   --activate)
-    (($# == 5)) || { usage >&2; exit 2; }
-    [[ "$4" == --confirm-activate && "$5" == "$2" ]] \
+    (($# == 6)) || h100_fail 'PUBLIC_KEY_REQUIRED_FOR_ACTIVATION'
+    [[ "$3" == --public-key-file && -n "$4" ]] \
+      || h100_fail 'PUBLIC_KEY_REQUIRED_FOR_ACTIVATION'
+    [[ "$5" == --confirm-activate && "$6" == "$2" ]] \
       || h100_fail 'activation confirmation must repeat the exact username'
     mode=activate
     user_name=$2
-    public_key_input=$3
+    public_key_input=$4
     ;;
   --status)
     (($# == 2)) || { usage >&2; exit 2; }

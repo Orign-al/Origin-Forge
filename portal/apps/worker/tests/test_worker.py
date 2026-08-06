@@ -67,6 +67,115 @@ def test_origin_pilot_is_the_only_portal3a_plan_target() -> None:
         validate_payload("slurm.resume", {"node_name": "other-node"})
 
 
+def approved_stage_payload() -> dict[str, object]:
+    return {
+        "username": "origin-pilot",
+        "uid": 20001,
+        "gid": 20001,
+        "project_id": 30001,
+        "ssh_port": 22023,
+        "quota_gb": 300,
+        "slurm_account": "company",
+        "slurm_qos": "general",
+        "max_gpus": 1,
+        "container_name": "gpu-dev-origin-pilot",
+        "cpus": 8,
+        "memory_gb": 32,
+        "pids_limit": 4096,
+        "gpu": "none",
+        "expected_state": "DRAFT",
+        "approval_reference": "portal3b-r-test-v1",
+    }
+
+
+def test_stage_contract_defers_public_key() -> None:
+    payload = approved_stage_payload()
+    assert validate_payload("user.stage", payload)["username"] == "origin-pilot"
+    assert (
+        validate_payload(
+            "user.stage",
+            {key: value for key, value in payload.items() if key != "approval_reference"},
+        )["uid"]
+        == 20001
+    )
+    with pytest.raises(ValueError, match="PUBLIC_KEY_NOT_ALLOWED_DURING_STAGE"):
+        validate_payload("user.stage", {**payload, "public_key_file": "record-id.pub"})
+    with pytest.raises(ValueError, match="STAGE_PAYLOAD_REJECTED"):
+        validate_payload("user.stage", {"username": "origin-pilot"})
+
+
+def test_activate_requires_record_ids_before_any_worker_write() -> None:
+    with pytest.raises(ValueError, match="PUBLIC_KEY_REQUIRED_FOR_ACTIVATION"):
+        validate_payload(
+            "user.activate",
+            {
+                "managed_user_id": str(uuid.uuid4()),
+                "expected_state": "STAGED",
+                "approval_reference": "portal3b-r-test-v1",
+            },
+        )
+    rejected = handle(
+        request(
+            "user.activate",
+            {
+                "managed_user_id": str(uuid.uuid4()),
+                "expected_state": "STAGED",
+                "approval_reference": "portal3b-r-test-v1",
+            },
+            dry_run=True,
+        )
+    )
+    assert rejected["error"]["code"] == "PUBLIC_KEY_REQUIRED_FOR_ACTIVATION"
+
+
+def test_stage_dry_run_has_no_key_and_fixed_future_argv(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(
+        handlers,
+        "_user_plan",
+        lambda _username: {
+            "status": "DRY_RUN",
+            "plan_status": "READY",
+            "proposed_uid": 20001,
+            "proposed_gid": 20001,
+            "proposed_project_id": 30001,
+            "proposed_ssh_port": 22023,
+            "proposed_quota_hard_limit_gb": 300,
+            "proposed_slurm_account": "company",
+            "proposed_qos": "general",
+            "proposed_max_gpus": 1,
+            "proposed_container": {
+                "name": "gpu-dev-origin-pilot",
+                "cpus": 8,
+                "memory_gb": 32,
+                "pids_limit": 4096,
+                "gpu": "none",
+            },
+            "conflicts": [],
+        },
+    )
+    payload = approved_stage_payload()
+    result = handle(request("user.stage", payload, dry_run=True))
+    assert result["status"] == "DRY_RUN"
+    assert result["stage_status"] == "READY"
+    assert result["ssh_key_status"] == "NOT_REQUIRED_FOR_STAGE"
+    assert result["post_stage_ssh_key_state"] == "REQUIRED_BEFORE_ACTIVATION"
+    assert result["execution_enabled"] is False
+    assert "--public-key-file" not in handlers.build_user_stage_argv(payload)
+
+
+def test_activate_rejects_arbitrary_path_and_private_key_field() -> None:
+    base = {
+        "managed_user_id": str(uuid.uuid4()),
+        "approved_ssh_key_record_ids": [str(uuid.uuid4())],
+        "expected_state": "STAGED",
+        "approval_reference": "portal3b-r-test-v1",
+    }
+    with pytest.raises(ValueError, match="ARBITRARY_PATH_REJECTED"):
+        validate_payload("user.activate", {**base, "public_key_path": "/etc/shadow"})
+    with pytest.raises(ValueError, match="PAYLOAD_REJECTED"):
+        validate_payload("user.activate", {**base, "raw_private_key": "PRIVATE KEY"})
+
+
 def test_dry_run_returns_plan_not_command(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr(
         handlers,
@@ -100,6 +209,8 @@ def test_origin_pilot_plan_is_structured_and_never_executes(monkeypatch) -> None
             "h100-user-create": {"integrity_ok": True},
             "h100-user-gpu-isolation": {"integrity_ok": True},
             "h100-container-create": {"integrity_ok": True},
+            "h100-container-stop": {"integrity_ok": True},
+            "h100-gpu-bypass-guard": {"integrity_ok": True},
         },
     )
     monkeypatch.setattr(

@@ -45,11 +45,12 @@ Stage 计划（Portal-3A 只展示和 dry-run）：
 3. 建立受控目录和 XFS project quota。
 4. 建立 `company/general` association（最多 1 GPU）。
 5. 创建无 GPU、非 privileged、无 Docker Socket 的长期容器。
-6. 保持 `STAGED`，不安装 `authorized_keys`。
+6. 保持 `STAGED`，不要求或验证 SSH 公钥，也不安装 `authorized_keys`；容器保持停止。
 
 Activate 必须单独审批、二次确认并重新验证隔离。需要已批准的
-`ssh-ed25519` 公钥；当前状态为 `SSH KEY REQUIRED BEFORE ACTIVATION`。随后才可
-安装公钥、启用普通 shell、启用 Guard timer，并执行本人登录及单 GPU Slurm 验收。
+`ssh-ed25519` 公钥 record；当前状态为 `REQUIRED_BEFORE_ACTIVATION`。随后才可
+安装公钥、启用普通 shell、启动容器，并执行本人登录及单 GPU Slurm 验收。Guard 在
+Stage 资源全部验证后启用。
 
 ## 回滚
 
@@ -59,9 +60,9 @@ association 和容器配置，保留用户数据并保持账号禁用。回滚�
 
 ## 当前 Gate
 
-当前仅允许 Portal `user.plan` dry-run 和数据库 `DRAFT`。没有 Linux 用户、Linux
+当前仅允许 Portal `user.plan`、无公钥 `user.stage` dry-run 和数据库 `DRAFT`。没有 Linux 用户、Linux
 组、UID drop-in、project quota、Slurm association、SSH 公钥、容器或新监听端口。
 `origin-al` 仍为管理账号，Slurm 仍 `DRAIN`，Guard timer 保持 disabled/inactive。
-下一步必须获得明确批准语句后才可 Stage：
+Portal-3B-R 修订验收后仍需获得明确批准语句才可 Stage：
 
 > 允许按 Portal-3A 已验证计划 Stage 独立计算用户 origin-pilot

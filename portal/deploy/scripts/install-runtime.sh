@@ -5,6 +5,7 @@ readonly SOURCE_DIR=/srv/gpu-platform/platform/portal
 readonly RUNTIME_DIR=/opt/h100-portal
 readonly UNIT_DIR=/etc/systemd/system
 readonly CONFIG_DIR=/etc/h100-portal
+readonly SSH_KEY_STAGING_DIR=/var/lib/h100-portal/ssh-key-staging
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "install-runtime.sh must run as root" >&2
@@ -39,6 +40,10 @@ rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
 
 "$RUNTIME_DIR/venv/bin/pip" install --no-deps --no-build-isolation "$RUNTIME_DIR"
 "$RUNTIME_DIR/venv/bin/pip" check
+
+# Activate accepts UUID key records from this Worker-only directory. The API
+# never passes an arbitrary host path and cannot write this root-owned tree.
+install -d -o root -g root -m 0700 "${SSH_KEY_STAGING_DIR}"
 
 install -o root -g root -m 0640 \
   "$SOURCE_DIR/deploy/worker-scripts.json" \

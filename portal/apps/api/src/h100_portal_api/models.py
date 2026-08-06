@@ -6,6 +6,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Enum,
@@ -218,6 +219,19 @@ class PortalSystemSnapshot(Base):
 
 class PortalManagedUser(Base):
     __tablename__ = "portal_managed_users"
+    __table_args__ = (
+        CheckConstraint("ssh_key_count >= 0", name="ck_managed_user_ssh_key_count"),
+        CheckConstraint(
+            "onboarding_state != 'ACTIVE' OR "
+            "(ssh_key_count > 0 AND shell != '/usr/sbin/nologin' "
+            "AND compute_activated_at IS NOT NULL)",
+            name="ck_managed_user_active_login_contract",
+        ),
+        CheckConstraint(
+            "onboarding_state NOT IN ('DRAFT', 'STAGED') OR ssh_key_state != 'SSH_READY'",
+            name="ck_managed_user_no_early_ssh_ready",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     portal_user_id: Mapped[uuid.UUID] = mapped_column(
@@ -238,6 +252,12 @@ class PortalManagedUser(Base):
     onboarding_state: Mapped[OnboardingState] = mapped_column(
         Enum(OnboardingState, native_enum=False, length=40), default=OnboardingState.DRAFT
     )
+    ssh_key_state: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="NOT_REQUIRED_FOR_STAGE"
+    )
+    ssh_key_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    staged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    compute_activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -255,6 +275,12 @@ class PortalSshKey(Base):
     fingerprint: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     comment_summary: Mapped[str] = mapped_column(String(128), nullable=False)
     public_key_ciphertext: Mapped[str | None] = mapped_column(Text)
+    staging_file_name: Mapped[str | None] = mapped_column(String(64), unique=True)
+    content_sha256: Mapped[str | None] = mapped_column(String(64))
+    approved_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("portal_users.id"))
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    installed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

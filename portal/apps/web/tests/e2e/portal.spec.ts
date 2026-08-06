@@ -704,6 +704,8 @@ test("Origin-al 计算资源页只创建 origin-pilot DRAFT 并锁定 Stage/Acti
   await expect(
     page.getByRole("button", { name: "Activate 未授权" }),
   ).toBeDisabled();
+  await expect(page.getByText(/Stage 不读取、不验证、不安装 SSH 公钥/)).toBeVisible();
+  await expect(page.locator('input[type="file"], textarea[name*="key"]')).toHaveCount(0);
   await expect(page.getByText(/不会被转换为 Pilot/)).toBeVisible();
 });
 

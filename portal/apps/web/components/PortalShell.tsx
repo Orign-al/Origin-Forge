@@ -71,7 +71,7 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
       <aside className="portal-sidebar">
         <div className="brand">
           <div className="brand-title">H100 管理平台</div>
-          <div className="brand-subtitle">单机控制面 · Portal-2</div>
+          <div className="brand-subtitle">单机控制面 · Portal-3B-R</div>
         </div>
         <nav className="nav-group" aria-label="主导航">
           <div className="nav-label">平台</div>

@@ -18,6 +18,9 @@ def resource_view(user: PortalUser, resource: PortalManagedUser | None) -> dict[
             "unix_username": user.unix_username,
             "onboarding_state": user.resource_onboarding_state,
             "gpu_isolation_state": "NOT_APPLIED",
+            "ssh_key_state": "NOT_REQUIRED_FOR_STAGE",
+            "ssh_key_count": 0,
+            "host_access_state": "NOT_ACTIVATED",
         }
     return {
         "unix_username": resource.unix_username,
@@ -27,6 +30,8 @@ def resource_view(user: PortalUser, resource: PortalManagedUser | None) -> dict[
         "host_access_state": resource.host_access_state,
         "gpu_isolation_state": resource.gpu_isolation_state,
         "onboarding_state": resource.onboarding_state,
+        "ssh_key_state": resource.ssh_key_state,
+        "ssh_key_count": resource.ssh_key_count,
         "slurm_account": resource.slurm_account,
         "slurm_qos": resource.slurm_qos,
         "project_id": resource.project_id,
@@ -43,13 +48,14 @@ def compute_plan_view(user: PortalUser, db: Session) -> dict[str, Any]:
             "status": "NOT_APPLICABLE",
             "compute_username": None,
             "draft_state": "NOT_APPLICABLE",
+            "ssh_key_status": "NOT_APPLICABLE",
             "plan": None,
         }
     operation = db.scalar(
         select(PortalOperation)
         .where(
             PortalOperation.requested_by == user.id,
-            PortalOperation.operation_type == "user.plan",
+            PortalOperation.operation_type.in_({"user.plan", "user.stage", "user.activate"}),
             PortalOperation.target_id == "origin-pilot",
         )
         .order_by(PortalOperation.created_at.desc())
@@ -59,10 +65,11 @@ def compute_plan_view(user: PortalUser, db: Session) -> dict[str, Any]:
             "status": "NOT_CREATED",
             "compute_username": "origin-pilot",
             "draft_state": "DRAFT NOT CREATED",
+            "ssh_key_status": "NOT_REQUIRED_FOR_STAGE",
             "plan": None,
         }
     return {
-        "status": "DRAFT",
+        "status": "DRAFT" if operation.operation_type != "user.activate" else "ACTIVATE_DRAFT",
         "compute_username": "origin-pilot",
         "draft_state": "DRAFT",
         "operation_id": str(operation.id),
@@ -70,6 +77,12 @@ def compute_plan_view(user: PortalUser, db: Session) -> dict[str, Any]:
         if hasattr(operation.status, "value")
         else str(operation.status),
         "plan": operation.dry_run_result,
+        "operation_type": operation.operation_type,
+        "ssh_key_status": (
+            "NOT_REQUIRED_FOR_STAGE"
+            if operation.operation_type in {"user.plan", "user.stage"}
+            else "REQUIRED_FOR_ACTIVATION"
+        ),
         "result_summary": operation.result_summary,
         "error_code": operation.error_code,
     }

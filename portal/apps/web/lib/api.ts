@@ -24,6 +24,8 @@ export type User = {
     draft_state: string;
     operation_id?: string;
     operation_status?: string;
+    operation_type?: string;
+    ssh_key_status?: string;
     plan?: Record<string, unknown> | null;
     result_summary?: string | null;
     error_code?: string | null;

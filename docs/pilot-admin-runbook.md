@@ -130,21 +130,24 @@ sudo h100-user-gpu-isolation self-test USER
 在维护窗口先 DRAIN 并确认队列为空。使用既有脚本，不手工并行实现：
 
 ```bash
-sudo h100-user-create --plan USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS /root-secure-path/USER.pub
-sudo h100-user-create --stage USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS /root-secure-path/USER.pub --confirm-stage USER
+sudo h100-user-create --plan USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS
+sudo h100-user-create --stage USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS \
+  --confirm-stage USER
 sudo h100-user-create --status USER
 ```
 
-`--stage` 创建锁定密码、`/usr/sbin/nologin`、无 `authorized_keys` 的账号；隔离 self-test 通过后才创建 300GB quota、`general` QOS association 和默认无 GPU 的长期容器。Stage 成功只输出 STAGED，用户仍不能登录。任何失败都保持 nologin、停止容器、回滚 association/project 映射/精确策略并保留可能创建的数据供人工审计。
+`--stage` 不接受公钥参数，创建锁定密码、`/usr/sbin/nologin`、无 `authorized_keys` 的账号；隔离 self-test 通过后才创建 300GB quota、`general` QOS association 和默认无 GPU 的长期容器。Stage 成功只输出 STAGED，用户仍不能登录，SSH key 状态为 `REQUIRED_BEFORE_ACTIVATION`。传入 `--public-key-file` 必须以 `PUBLIC_KEY_NOT_ALLOWED_DURING_STAGE` 拒绝。任何失败都保持 nologin、停止容器、回滚 association/project 映射/精确策略并保留可能创建的数据供人工审计。
 
 独立复核 STAGED 报告和审批后才执行：
 
 ```bash
-sudo h100-user-create --activate USER /root-secure-path/USER.pub --confirm-activate USER
+sudo h100-user-create --activate USER \
+  --public-key-file /var/lib/h100-portal/ssh-key-staging/<UUID>.pub \
+  --confirm-activate USER
 sudo h100-user-create --status USER
 ```
 
-ACTIVATE 再次验证策略、无高权组、容器无 GPU和公钥指纹，启动 Guard 后最后才开放 `/bin/bash`。密码保持锁定。用户本人随后验证 SSH 与 Pilot Slurm 作业；管理员不得用用户私钥代测。
+Activate 缺少公钥时在任何修改前以 `PUBLIC_KEY_REQUIRED_FOR_ACTIVATION` 拒绝；只接受 Root Worker 受控 staging 目录中的 UUID 文件，不接受浏览器宿主路径、私钥、密码或占位密钥。Activate 再次验证策略、无高权组、容器无 GPU 和公钥指纹，安装 `authorized_keys` 后启动 Guard，最后才开放 `/bin/bash`。密码保持锁定。用户本人随后验证 SSH 与 Pilot Slurm 作业；管理员不得用用户私钥代测。
 
 ## Guard 日常操作与失败
 
@@ -157,7 +160,7 @@ curl -fsS http://127.0.0.1:9100/metrics | grep '^h100_gpu_'
 curl -fsS http://127.0.0.1:9090/api/v1/alerts
 ```
 
-无受管用户时 timer 必须 disabled/inactive，手工 service 应输出 `NO MANAGED PILOT USERS`。首名用户 ACTIVATE 成功后脚本才 enable timer。Guard 失败会在节点尚未 DRAIN 时写精确 Reason 并 DRAIN；若已有 DRAIN，则保留原 Reason。它永不自动 RESUME、删除策略或杀用户进程。先查看 policy、registry、transient probe、GPU/GRES/MIG 和当前作业，再人工修复；不得通过放开全部 NVIDIA 设备消除告警。
+无受管用户时 timer 必须 disabled/inactive，手工 service 应输出 `NO MANAGED PILOT USERS`。首名用户 Stage 的账号、精确策略、self-test、quota、association 和无 GPU 容器全部验收成功后脚本才 enable timer；Activate 只重新验证 Guard。Guard 失败会在节点尚未 DRAIN 时写精确 Reason 并 DRAIN；若已有 DRAIN，则保留原 Reason。它永不自动 RESUME、删除策略或杀用户进程。先查看 policy、registry、transient probe、GPU/GRES/MIG 和当前作业，再人工修复；不得通过放开全部 NVIDIA 设备消除告警。
 
 ## 创建和管理长期容器
 

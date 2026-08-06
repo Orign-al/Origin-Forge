@@ -25,7 +25,10 @@ from h100_portal_api.models import (
     utcnow,
 )
 from h100_portal_api.rbac import PERMISSIONS
-from h100_portal_api.routes.operations import enrich_user_plan_with_portal_state
+from h100_portal_api.routes.operations import (
+    APPROVED_ORIGIN_PILOT_STAGE,
+    enrich_user_plan_with_portal_state,
+)
 from h100_portal_api.security import digest_secret, normalize_login, random_token, safe_metadata
 from h100_portal_api.worker_client import WorkerClientError, call_worker
 
@@ -298,6 +301,105 @@ def plan_origin_pilot() -> int:
     return 0
 
 
+def draft_origin_pilot_stage() -> int:
+    """Create an idempotent Stage DRAFT after a no-key Worker dry-run."""
+    with SessionLocal() as db:
+        user = db.scalar(select(PortalUser).where(PortalUser.normalized_login == "origin-al"))
+        if (
+            user is None
+            or user.account_state != AccountState.ACTIVE
+            or not any(role.name == "platform_owner" for role in user.roles)
+        ):
+            print(
+                "PORTAL-3B-R STAGE DRAFT BLOCKED — Origin-al owner is unavailable", file=sys.stderr
+            )
+            return 2
+        idempotency_key = "portal3b-r-origin-pilot-stage-v1"
+        existing = db.scalar(
+            select(PortalOperation).where(
+                PortalOperation.requested_by == user.id,
+                PortalOperation.idempotency_key == idempotency_key,
+            )
+        )
+        if existing is not None:
+            print("Origin-pilot user.stage DRAFT already exists; no duplicate created.")
+            print(f"operation_status={existing.status} target=origin-pilot")
+            return 0
+        payload = {
+            **APPROVED_ORIGIN_PILOT_STAGE,
+            "approval_reference": "portal3b-r-lifecycle-revalidated",
+        }
+        try:
+            result = call_worker(
+                "user.stage",
+                payload=payload,
+                requested_by="origin-al",
+                approved_by=None,
+                idempotency_key=idempotency_key,
+                dry_run=True,
+                timeout_seconds=30,
+            )
+        except WorkerClientError as exc:
+            print(f"PORTAL-3B-R STAGE DRAFT BLOCKED — {exc.code}", file=sys.stderr)
+            return 2
+        if result.get("status") != "DRY_RUN" or result.get("stage_status") != "READY":
+            error = result.get("error", {})
+            code = (
+                error.get("code", "STAGE_DRY_RUN_BLOCKED")
+                if isinstance(error, dict)
+                else "STAGE_DRY_RUN_BLOCKED"
+            )
+            print(f"PORTAL-3B-R STAGE DRAFT BLOCKED — {code}", file=sys.stderr)
+            return 2
+        operation = PortalOperation(
+            operation_type="user.stage",
+            target_type="compute_identity",
+            target_id="origin-pilot",
+            requested_by=user.id,
+            request_summary="按重新验收契约 Stage origin-pilot（当前仅 DRAFT/dry-run）",
+            validated_payload=payload,
+            idempotency_key=idempotency_key,
+            risk_level=RiskLevel.HIGH,
+            status=OperationStatus.DRAFT,
+            dry_run_result=safe_metadata(result),
+            result_summary="user.stage 无公钥 dry-run READY；未执行宿主写操作",
+            created_at=utcnow(),
+        )
+        db.add(operation)
+        db.flush()
+        db.add(
+            PortalOperationEvent(
+                operation_id=operation.id,
+                from_status=None,
+                to_status=OperationStatus.DRAFT,
+                safe_message="Portal-3B-R Stage draft created after no-key dry-run",
+                created_at=utcnow(),
+            )
+        )
+        record_audit(
+            db,
+            event_type="operation.draft",
+            actor="origin-al",
+            actor_role="platform_owner",
+            source_ip="local-console",
+            user_agent="h100-portal-admin",
+            object_type="compute_identity_stage",
+            object_id="origin-pilot",
+            result="SUCCESS",
+            metadata={
+                "operation_type": "user.stage",
+                "execution_mode": "dry-run",
+                "ssh_key_state": "NOT_REQUIRED_FOR_STAGE",
+            },
+            operation_id=operation.id,
+        )
+        db.commit()
+        print("Origin-pilot user.stage DRAFT created after Worker dry-run.")
+        print("stage_status=READY execution_enabled=false ssh_key=NOT_REQUIRED_FOR_STAGE")
+        print("No Linux user, policy, quota, association, container, or SSH key was created.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="H100 Portal administrator bootstrap")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -307,6 +409,7 @@ def main() -> int:
     subparsers.add_parser("prepare-origin-al")
     subparsers.add_parser("status-origin-al")
     subparsers.add_parser("plan-origin-pilot")
+    subparsers.add_parser("draft-origin-pilot-stage")
     args = parser.parse_args()
     if args.command == "prepare-origin-al":
         return prepare_origin_al()
@@ -316,6 +419,8 @@ def main() -> int:
         return status_origin_al()
     if args.command == "plan-origin-pilot":
         return plan_origin_pilot()
+    if args.command == "draft-origin-pilot-stage":
+        return draft_origin_pilot_stage()
     return 2
 
 

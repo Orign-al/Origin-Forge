@@ -279,7 +279,13 @@ export default function UserDetailPage() {
                       "SSH 端口",
                       `${String(plan.proposed_ssh_port ?? "—")} @ ${String(container.network_bind ?? "—")} — NOT RESERVED`,
                     ],
-                    ["SSH key", plan.ssh_key_status],
+                    [
+                      "SSH 公钥契约",
+                      plan.stage_ssh_key_status ??
+                        plan.ssh_key_status ??
+                        compute?.ssh_key_status ??
+                        "NOT_REQUIRED_FOR_STAGE",
+                    ],
                   ])}
                   <h3 className="subheading">GPU 隔离计划</h3>
                   {kv([
@@ -340,12 +346,17 @@ export default function UserDetailPage() {
                     >
                       重新执行 dry-run
                     </Button>
-                    <Button disabled>Stage 未授权</Button>
-                    <Button disabled>Activate 未授权</Button>
+                    <Button disabled aria-label="Stage 未授权">
+                      Stage（无需公钥）未授权
+                    </Button>
+                    <Button disabled aria-label="Activate 未授权">
+                      Activate（需公钥）未授权
+                    </Button>
                   </div>
                   <div className="notice">
-                    SSH KEY REQUIRED BEFORE ACTIVATION。下一阶段批准前，Worker
-                    不会进入真实写模式。
+                    Stage 不读取、不验证、不安装 SSH 公钥；Stage 后状态为
+                    REQUIRED_BEFORE_ACTIVATION。Activate 才要求受控公钥记录，且下一阶段
+                    批准前 Worker 不会进入真实写模式。
                   </div>
                 </>
               )}
@@ -398,10 +409,13 @@ export default function UserDetailPage() {
             ])
           : null}
         {activeTab === "SSH 公钥" ? (
-          <EmptyState
-            title="没有可展示的 SSH 公钥记录"
-            detail="页面永不显示私钥或完整公钥正文"
-          />
+          <>
+            <EmptyState
+              title="SSH 公钥：待添加"
+              detail="Stage 不要求公钥；Activate 前必须通过受控记录添加并验证。页面永不显示私钥或完整公钥正文。"
+            />
+            <Button disabled>添加受控公钥（等待 Stage 完成）</Button>
+          </>
         ) : null}
         {activeTab === "操作记录" ? (
           <EmptyState

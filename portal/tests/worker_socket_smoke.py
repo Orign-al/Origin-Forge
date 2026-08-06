@@ -3,6 +3,7 @@
 
 import json
 import sys
+import uuid
 from typing import Any
 
 from h100_portal_api.worker_client import call_worker
@@ -24,9 +25,28 @@ READ_OPERATIONS: tuple[tuple[str, dict[str, Any]], ...] = (
 )
 
 DRY_RUN_OPERATIONS: tuple[tuple[str, dict[str, Any]], ...] = (
-    ("user.plan", {"username": "example-user"}),
-    ("user.stage", {"username": "example-user"}),
-    ("user.activate", {"username": "example-user"}),
+    ("user.plan", {"username": "origin-pilot"}),
+    (
+        "user.stage",
+        {
+            "username": "origin-pilot",
+            "uid": 20001,
+            "gid": 20001,
+            "project_id": 30001,
+            "ssh_port": 22023,
+            "quota_gb": 300,
+            "slurm_account": "company",
+            "slurm_qos": "general",
+            "max_gpus": 1,
+            "container_name": "gpu-dev-origin-pilot",
+            "cpus": 8,
+            "memory_gb": 32,
+            "pids_limit": 4096,
+            "gpu": "none",
+            "expected_state": "DRAFT",
+            "approval_reference": "portal3b-r-smoke-v1",
+        },
+    ),
     ("user.suspend", {"username": "example-user"}),
     ("container.start", {"name": "gpu-dev-example-user"}),
     ("container.stop", {"name": "gpu-dev-example-user"}),
@@ -103,6 +123,20 @@ def main() -> int:
         results.append(_safe_result(f"{operation}:dry-run", response))
         if response.get("status") != "DRY_RUN" or response.get("execution_enabled") is not False:
             failed = True
+
+    activate_missing_key = call_worker(
+        "user.activate",
+        payload={
+            "managed_user_id": str(uuid.uuid4()),
+            "expected_state": "STAGED",
+            "approval_reference": "portal3b-r-smoke-v1",
+        },
+        requested_by="portal-smoke",
+        dry_run=True,
+    )
+    results.append(_safe_result("user.activate:missing-key", activate_missing_key))
+    if activate_missing_key.get("error", {}).get("code") != "PUBLIC_KEY_REQUIRED_FOR_ACTIVATION":
+        failed = True
 
     denied = call_worker(
         "user.plan",

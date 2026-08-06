@@ -2,6 +2,7 @@ import uuid
 from typing import Any, cast
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from pydantic import ValidationError
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -16,13 +17,14 @@ from h100_portal_api.auth import (
 )
 from h100_portal_api.database import SessionLocal, get_db
 from h100_portal_api.dependencies import permission_dependency
-from h100_portal_api.enums import OperationStatus
+from h100_portal_api.enums import OnboardingState, OperationStatus
 from h100_portal_api.models import (
     PortalAuditEvent,
     PortalManagedUser,
     PortalOperation,
     PortalOperationApproval,
     PortalOperationEvent,
+    PortalSshKey,
     PortalUser,
     utcnow,
 )
@@ -38,11 +40,103 @@ from h100_portal_api.schemas import (
     OperationCreateRequest,
     OperationResponse,
     OperationSubmitRequest,
+    UserActivatePayload,
+    UserStagePayload,
 )
 from h100_portal_api.security import SAFE_TARGET_RE, safe_metadata, safe_target
 from h100_portal_api.worker_client import WorkerClientError, call_worker
 
 router = APIRouter(prefix="/operations", tags=["operations"])
+
+STAGE_PUBLIC_KEY_FIELDS = {
+    "public_key_file",
+    "public_key_path",
+    "public_key",
+    "raw_public_key",
+    "approved_ssh_key_record_ids",
+}
+FORBIDDEN_SECRET_OR_COMMAND_FIELDS = {
+    "raw_private_key",
+    "private_key",
+    "password",
+    "command",
+    "argv",
+    "path",
+}
+APPROVED_ORIGIN_PILOT_STAGE: dict[str, Any] = {
+    "username": "origin-pilot",
+    "uid": 20001,
+    "gid": 20001,
+    "project_id": 30001,
+    "ssh_port": 22023,
+    "quota_gb": 300,
+    "slurm_account": "company",
+    "slurm_qos": "general",
+    "max_gpus": 1,
+    "container_name": "gpu-dev-origin-pilot",
+    "cpus": 8,
+    "memory_gb": 32,
+    "pids_limit": 4096,
+    "gpu": "none",
+    "expected_state": "DRAFT",
+}
+
+
+class OperationPayloadError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+
+
+def validate_activate_database_bindings(
+    db: Session, *, owner_id: uuid.UUID, target_id: str, payload: dict[str, Any]
+) -> None:
+    """Bind Activate IDs to the owner's staged origin-pilot record.
+
+    The Worker independently validates the root-controlled key bytes.  The API
+    must still prevent a caller from mixing a managed-user UUID or approved key
+    records belonging to another Portal account into this operation.
+    """
+    try:
+        managed_id = uuid.UUID(str(payload["managed_user_id"]))
+        key_ids = [uuid.UUID(str(value)) for value in payload["approved_ssh_key_record_ids"]]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise OperationPayloadError(
+            "ACTIVATE_PAYLOAD_REJECTED", "invalid managed user or SSH key record ID"
+        ) from exc
+    managed = db.get(PortalManagedUser, managed_id)
+    if (
+        managed is None
+        or managed.portal_user_id != owner_id
+        or managed.unix_username != target_id
+        or managed.onboarding_state != OnboardingState.STAGED
+        or managed.shell != "/usr/sbin/nologin"
+    ):
+        raise OperationPayloadError(
+            "USER_NOT_IN_STAGED_STATE",
+            "managed identity is not the owner's staged origin-pilot record",
+        )
+    records = db.scalars(select(PortalSshKey).where(PortalSshKey.id.in_(key_ids))).all()
+    by_id = {record.id: record for record in records}
+    if len(by_id) != len(key_ids):
+        raise OperationPayloadError(
+            "PUBLIC_KEY_RECORD_NOT_FOUND", "one or more approved SSH key records do not exist"
+        )
+    for key_id in key_ids:
+        record = by_id[key_id]
+        if record.managed_user_id != managed.id:
+            raise OperationPayloadError(
+                "PUBLIC_KEY_RECORD_OWNER_MISMATCH",
+                "approved SSH key record belongs to another managed identity",
+            )
+        if not record.active or record.revoked_at is not None:
+            raise OperationPayloadError(
+                "PUBLIC_KEY_RECORD_NOT_ACTIVE", "approved SSH key record is not active"
+            )
+        if record.approved_by is None or record.approved_at is None:
+            raise OperationPayloadError(
+                "PUBLIC_KEY_RECORD_NOT_APPROVED", "SSH key record has no independent approval"
+            )
 
 
 def operation_response(operation: PortalOperation) -> OperationResponse:
@@ -67,10 +161,53 @@ def operation_response(operation: PortalOperation) -> OperationResponse:
 
 
 def validate_operation_payload(operation_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if operation_type == "user.stage":
+        if set(payload) & STAGE_PUBLIC_KEY_FIELDS:
+            raise OperationPayloadError(
+                "PUBLIC_KEY_NOT_ALLOWED_DURING_STAGE",
+                "SSH public keys are accepted only by user.activate",
+            )
+        if set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+            raise OperationPayloadError(
+                "PAYLOAD_REJECTED", "secret or command fields are forbidden"
+            )
+        try:
+            validated = UserStagePayload.model_validate(payload).model_dump(
+                mode="json", exclude_none=True
+            )
+        except ValidationError as exc:
+            raise OperationPayloadError(
+                "STAGE_PAYLOAD_REJECTED", "invalid user.stage payload"
+            ) from exc
+        for field, expected in APPROVED_ORIGIN_PILOT_STAGE.items():
+            if validated[field] != expected:
+                raise OperationPayloadError(
+                    "STAGE_PLAN_MISMATCH", "user.stage payload differs from the validated plan"
+                )
+        return validated
+    if operation_type == "user.activate":
+        if set(payload) & (STAGE_PUBLIC_KEY_FIELDS - {"approved_ssh_key_record_ids"}):
+            raise OperationPayloadError(
+                "ARBITRARY_PATH_REJECTED", "Activate accepts approved key record IDs, not paths"
+            )
+        if set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+            raise OperationPayloadError(
+                "PAYLOAD_REJECTED", "secret or command fields are forbidden"
+            )
+        key_ids = payload.get("approved_ssh_key_record_ids")
+        if not isinstance(key_ids, list) or not key_ids:
+            raise OperationPayloadError(
+                "PUBLIC_KEY_REQUIRED_FOR_ACTIVATION",
+                "at least one approved SSH key record is required",
+            )
+        try:
+            return UserActivatePayload.model_validate(payload).model_dump(mode="json")
+        except ValidationError as exc:
+            raise OperationPayloadError(
+                "ACTIVATE_PAYLOAD_REJECTED", "invalid user.activate payload"
+            ) from exc
     allowed: dict[str, set[str]] = {
         "user.plan": {"username"},
-        "user.stage": {"username"},
-        "user.activate": {"username"},
         "user.suspend": {"username"},
         "container.start": {"name"},
         "container.stop": {"name"},
@@ -84,9 +221,9 @@ def validate_operation_payload(operation_type: str, payload: dict[str, Any]) -> 
         "ssh_key.revoke": {"username", "fingerprint"},
     }
     if operation_type not in allowed:
-        raise ValueError("unknown write operation")
+        raise OperationPayloadError("UNKNOWN_OPERATION", "unknown write operation")
     if set(payload) - allowed[operation_type]:
-        raise ValueError("payload contains unsupported fields")
+        raise OperationPayloadError("PAYLOAD_REJECTED", "payload contains unsupported fields")
     result: dict[str, Any] = {}
     if "username" in allowed[operation_type]:
         username = payload.get("username")
@@ -390,7 +527,8 @@ def create_operation(
         validated = validate_operation_payload(operation_type, body.payload)
     except ValueError as exc:
         raise HTTPException(
-            status_code=422, detail={"code": "PAYLOAD_REJECTED", "message": str(exc)}
+            status_code=422,
+            detail={"code": getattr(exc, "code", "PAYLOAD_REJECTED"), "message": str(exc)},
         ) from exc
     if operation_type == "user.plan" and target_id != "origin-pilot":
         raise HTTPException(
@@ -400,6 +538,23 @@ def create_operation(
                 "message": "Portal-3A 计划目标必须为 origin-pilot",
             },
         )
+    if operation_type in {"user.stage", "user.activate"} and target_id != "origin-pilot":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "LIFECYCLE_TARGET_REJECTED",
+                "message": "当前两阶段生命周期仅允许 origin-pilot",
+            },
+        )
+    if operation_type == "user.activate":
+        try:
+            validate_activate_database_bindings(
+                db, owner_id=context.user.id, target_id=target_id, payload=validated
+            )
+        except OperationPayloadError as exc:
+            raise HTTPException(
+                status_code=409, detail={"code": exc.code, "message": str(exc)}
+            ) from exc
     existing = db.scalar(
         select(PortalOperation).where(
             PortalOperation.requested_by == context.user.id,
@@ -422,26 +577,32 @@ def create_operation(
     )
     db.add(operation)
     db.flush()
-    if operation_type == "user.plan":
+    if operation_type in {"user.plan", "user.stage", "user.activate"}:
         try:
             worker_plan = call_worker(
-                "user.plan",
+                operation_type,
                 payload=validated,
                 requested_by=context.user.normalized_login,
-                approved_by=context.user.normalized_login,
+                approved_by=None,
                 idempotency_key=body.idempotency_key,
                 dry_run=True,
                 timeout_seconds=25,
             )
             if worker_plan.get("status") == "DRY_RUN":
-                worker_plan = enrich_user_plan_with_portal_state(worker_plan, db, context.user.id)
+                if operation_type == "user.plan":
+                    worker_plan = enrich_user_plan_with_portal_state(
+                        worker_plan, db, context.user.id
+                    )
                 operation.dry_run_result = cast(dict[str, Any], safe_metadata(worker_plan))
-                operation.result_summary = (
-                    "user.plan dry-run 已验证；未创建 Linux 用户、UID 策略、quota、association 或容器"
-                    if worker_plan.get("plan_status") == "READY"
-                    else "user.plan dry-run 发现冲突；未执行宿主写操作"
+                lifecycle_status = worker_plan.get(
+                    "plan_status", worker_plan.get("stage_status", "READY")
                 )
-                if worker_plan.get("plan_status") != "READY":
+                operation.result_summary = (
+                    f"{operation_type} dry-run 已验证；未执行任何宿主写操作"
+                    if lifecycle_status == "READY"
+                    else f"{operation_type} dry-run 发现冲突；未执行宿主写操作"
+                )
+                if lifecycle_status != "READY":
                     operation.error_code = "PLAN_CONFLICT"
             else:
                 operation.dry_run_result = cast(dict[str, Any], safe_metadata(worker_plan))
@@ -451,7 +612,7 @@ def create_operation(
                 operation.result_summary = "Worker 未能完成规划；未执行宿主写操作"
             record_audit(
                 db,
-                event_type="worker.plan",
+                event_type="worker.plan" if operation_type == "user.plan" else "worker.dry_run",
                 actor=context.user.normalized_login,
                 actor_role="/".join(sorted(role.name for role in context.user.roles)),
                 source_ip=client_ip(request),
@@ -460,8 +621,10 @@ def create_operation(
                 object_id="origin-pilot",
                 result="DRY_RUN" if worker_plan.get("status") == "DRY_RUN" else "FAILED",
                 metadata={
-                    "operation_type": "user.plan",
-                    "plan_status": worker_plan.get("plan_status", "UNKNOWN"),
+                    "operation_type": operation_type,
+                    "plan_status": worker_plan.get(
+                        "plan_status", worker_plan.get("stage_status", "UNKNOWN")
+                    ),
                 },
                 operation_id=operation.id,
             )
@@ -538,6 +701,14 @@ def submit_operation(
         raise HTTPException(
             status_code=409,
             detail={"code": "INVALID_OPERATION_STATE", "message": "仅草稿可以提交审批"},
+        )
+    if operation.operation_type in {"user.stage", "user.activate"}:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "LIFECYCLE_APPROVAL_GATE_CLOSED",
+                "message": "Portal-3B-R 尚停在新的 Stage/Activate 审批 Gate",
+            },
         )
     if body.confirmation != operation.target_id:
         raise HTTPException(

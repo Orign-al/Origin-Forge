@@ -13,7 +13,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from h100_portal_worker.schemas import KNOWN_WRITES, WorkerRequest, validate_payload
+from h100_portal_worker.schemas import (
+    KNOWN_WRITES,
+    WorkerRequest,
+    validate_payload,
+)
 
 MAX_OUTPUT = 256 * 1024
 FIXED_ENV = {
@@ -39,6 +43,7 @@ BINARIES = {
     "find": "/usr/bin/find",
     "hostname": "/usr/bin/hostname",
     "ss": "/usr/bin/ss",
+    "ssh-keygen": "/usr/bin/ssh-keygen",
     "squeue-fallback": "/usr/bin/squeue",
 }
 SCRIPT_ALLOWLIST = {
@@ -104,6 +109,9 @@ PILOT_SCAN_ROOTS = (
     Path("/var/spool/slurmctld"),
     Path("/var/spool/slurmd"),
 )
+SSH_KEY_STAGING_ROOT = Path("/var/lib/h100-portal/ssh-key-staging")
+MAX_SSH_KEY_FILE_BYTES = 16 * 1024
+MAX_APPROVED_SSH_KEYS = 5
 
 
 def _truncate(value: str) -> str:
@@ -1192,6 +1200,194 @@ def script_integrity() -> dict[str, Any]:
     return result
 
 
+class LifecycleValidationError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+
+
+def _ssh_key_fingerprint(public_key_line: str) -> str:
+    executable = BINARIES["ssh-keygen"]
+    try:
+        completed = subprocess.run(
+            [executable, "-lf", "-", "-E", "sha256"],
+            cwd="/",
+            env=FIXED_ENV,
+            input=f"{public_key_line}\n",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+            shell=False,
+            text=True,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "SSH public-key validation could not run"
+        ) from exc
+    if completed.returncode != 0:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "SSH public-key validation failed"
+        )
+    fields = completed.stdout.split()
+    if len(fields) < 2 or not fields[1].startswith("SHA256:"):
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "SSH key did not produce a SHA-256 fingerprint"
+        )
+    return fields[1]
+
+
+def _read_approved_ssh_key_record(record_id: str) -> dict[str, Any]:
+    """Read one UUID-named, root-controlled key without following links."""
+    try:
+        root_stat = SSH_KEY_STAGING_ROOT.lstat()
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "SSH key staging directory is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISDIR(root_stat.st_mode)
+        or stat.S_ISLNK(root_stat.st_mode)
+        or root_stat.st_uid != 0
+        or root_stat.st_gid != 0
+        or stat.S_IMODE(root_stat.st_mode) != 0o700
+    ):
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "SSH key staging directory metadata is invalid"
+        )
+    path = SSH_KEY_STAGING_ROOT / f"{record_id}.pub"
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key record is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_uid != 0
+        or before.st_gid != 0
+        or before.st_nlink != 1
+        or bool(before.st_mode & 0o022)
+        or not 0 < before.st_size <= MAX_SSH_KEY_FILE_BYTES
+    ):
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key file metadata is invalid"
+        )
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise LifecycleValidationError(
+                    "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key file changed during open"
+                )
+            content = os.read(descriptor, MAX_SSH_KEY_FILE_BYTES + 1)
+            if os.read(descriptor, 1):
+                content += b"x"
+        finally:
+            os.close(descriptor)
+    except LifecycleValidationError:
+        raise
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key file could not be read safely"
+        ) from exc
+    if not 0 < len(content) <= MAX_SSH_KEY_FILE_BYTES:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key file has an invalid size"
+        )
+    try:
+        decoded = content.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key is not valid UTF-8"
+        ) from exc
+    upper = decoded.upper()
+    if "PRIVATE KEY" in upper or "-----BEGIN" in upper or "-----END" in upper:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "private-key material is forbidden"
+        )
+    lines = [line for line in decoded.splitlines() if line.strip()]
+    if len(lines) != 1 or lines[0] != lines[0].strip() or "\r" in lines[0]:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "one canonical public key is required per record"
+        )
+    parts = lines[0].split(maxsplit=2)
+    if len(parts) < 2 or parts[0] not in {"ssh-ed25519", "sk-ssh-ed25519@openssh.com"}:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "SSH key type is not approved"
+        )
+    if re.fullmatch(r"[A-Za-z0-9+/]+={0,3}", parts[1]) is None:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "SSH public-key payload is malformed"
+        )
+    if len(parts) == 3 and any(ord(character) < 32 for character in parts[2]):
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "SSH key comment contains control characters"
+        )
+    fingerprint = _ssh_key_fingerprint(lines[0])
+    return {
+        "record_id": record_id,
+        "key_type": parts[0],
+        "fingerprint": fingerprint,
+        "content_sha256": hashlib.sha256(content).hexdigest(),
+        "size_bytes": len(content),
+    }
+
+
+def validate_approved_ssh_key_records(record_ids: list[str]) -> list[dict[str, Any]]:
+    if not 1 <= len(record_ids) <= MAX_APPROVED_SSH_KEYS:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_REQUIRED_FOR_ACTIVATION", "approved SSH key records are required"
+        )
+    results = [_read_approved_ssh_key_record(record_id) for record_id in record_ids]
+    fingerprints = [str(item["fingerprint"]) for item in results]
+    if len(set(fingerprints)) != len(fingerprints):
+        raise LifecycleValidationError("PUBLIC_KEY_DUPLICATE", "duplicate SSH key fingerprint")
+    return results
+
+
+def build_user_stage_argv(payload: dict[str, Any]) -> list[str]:
+    """Build the fixed future real-write argv; no public-key option exists."""
+    return [
+        SCRIPT_ALLOWLIST["h100-user-create"],
+        "--stage",
+        str(payload["username"]),
+        str(payload["uid"]),
+        str(payload["gid"]),
+        str(payload["project_id"]),
+        str(payload["ssh_port"]),
+        str(payload["slurm_account"]),
+        str(payload["slurm_qos"]),
+        "--confirm-stage",
+        str(payload["username"]),
+    ]
+
+
+def build_user_activate_argv(username: str, controlled_key_file: Path) -> list[str]:
+    """Build Activate argv only for a Worker-owned UUID staging path."""
+    if (
+        controlled_key_file.parent != SSH_KEY_STAGING_ROOT
+        or re.fullmatch(r"[0-9A-Fa-f-]{36}\.pub", controlled_key_file.name) is None
+    ):
+        raise LifecycleValidationError(
+            "ARBITRARY_PATH_REJECTED", "Activate key file is outside the controlled staging root"
+        )
+    return [
+        SCRIPT_ALLOWLIST["h100-user-create"],
+        "--activate",
+        username,
+        "--public-key-file",
+        str(controlled_key_file),
+        "--confirm-activate",
+        username,
+    ]
+
+
 def _safe_file_lines(path: Path) -> list[str]:
     """Read one of the fixed platform metadata files, failing closed."""
     try:
@@ -1704,7 +1900,13 @@ def _user_plan(requested_username: str) -> dict[str, Any]:
         )
 
     integrity = script_integrity()
-    required_scripts = {"h100-user-create", "h100-user-gpu-isolation", "h100-container-create"}
+    required_scripts = {
+        "h100-user-create",
+        "h100-user-gpu-isolation",
+        "h100-container-create",
+        "h100-container-stop",
+        "h100-gpu-bypass-guard",
+    }
     integrity_ok = all(
         integrity.get(name, {}).get("integrity_ok", False) for name in required_scripts
     )
@@ -1712,7 +1914,7 @@ def _user_plan(requested_username: str) -> dict[str, Any]:
         {
             "check": "lifecycle_script_integrity",
             "status": "PASS" if integrity_ok else "FAIL",
-            "detail": "用户创建、GPU 隔离和容器模板脚本均为 root-owned 且 hash 匹配"
+            "detail": "用户、隔离、容器停止和 Guard 生命周期脚本均为 root-owned 且 hash 匹配"
             if integrity_ok
             else "生命周期脚本完整性校验失败",
         }
@@ -1743,7 +1945,7 @@ def _user_plan(requested_username: str) -> dict[str, Any]:
         conflicts.append(
             {
                 "code": "GUARD_TIMER_STATE",
-                "message": "Guard timer 必须在实际 Activate 前保持 disabled/inactive",
+                "message": "没有 STAGED Pilot 用户时 Guard timer 必须保持 disabled/inactive",
             }
         )
 
@@ -1798,6 +2000,7 @@ def _user_plan(requested_username: str) -> dict[str, Any]:
         "proposed_data_path": data_path,
         "proposed_compose_path": compose_path,
         "ssh_key_status": "REQUIRED BEFORE ACTIVATION",
+        "stage_ssh_key_status": "NOT_REQUIRED_FOR_STAGE",
         "validation_results": validations,
         "candidate_rejections": uid_rejections,
         "conflicts": conflicts,
@@ -1808,13 +2011,15 @@ def _user_plan(requested_username: str) -> dict[str, Any]:
             "创建受控目录并建立 XFS project quota",
             "创建 company/general Slurm association（max_gpus=1）",
             "创建 GPU=none 的长期容器并验证安全属性",
+            "停止长期容器并确认 SSH 端口不监听",
+            "启用 Guard timer 并验证全部受管 UID",
             "保持 STAGED；不安装 authorized_keys",
         ],
         "activate_steps": [
             "重新验证精确 UID slice、无高权限组和 GPU=none 容器",
             "要求经批准的 SSH 公钥（当前缺少，故不可激活）",
             "安装公钥后再启用普通 shell",
-            "启用 Guard timer 并执行本人登录、CPU 与单 GPU Slurm 验收",
+            "重新验证 Guard，并执行本人登录、CPU 与单 GPU Slurm 验收",
             "通过人工验收后标记 ACTIVE",
         ],
         "rollback_steps": [
@@ -1835,6 +2040,111 @@ def _user_plan(requested_username: str) -> dict[str, Any]:
             "存在冲突或候选资源不可用；仅允许管理员重新选择并重新规划"
         )
     return plan
+
+
+def _user_stage_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
+    """Revalidate the approved plan without invoking the lifecycle script."""
+    stage_argv = build_user_stage_argv(payload)
+    if "--public-key-file" in stage_argv:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_NOT_ALLOWED_DURING_STAGE", "Stage argv unexpectedly contains a key"
+        )
+    plan = _user_plan(str(payload["username"]))
+    if plan.get("status") != "DRY_RUN" or plan.get("plan_status") != "READY":
+        plan["handler"] = "user.stage"
+        plan["stage_status"] = "CONFLICT"
+        plan["ssh_key_status"] = "NOT_REQUIRED_FOR_STAGE"
+        return plan
+    comparisons = {
+        "uid": plan.get("proposed_uid"),
+        "gid": plan.get("proposed_gid"),
+        "project_id": plan.get("proposed_project_id"),
+        "ssh_port": plan.get("proposed_ssh_port"),
+        "quota_gb": plan.get("proposed_quota_hard_limit_gb"),
+        "slurm_account": plan.get("proposed_slurm_account"),
+        "slurm_qos": plan.get("proposed_qos"),
+        "max_gpus": plan.get("proposed_max_gpus"),
+    }
+    container = plan.get("proposed_container", {})
+    if isinstance(container, dict):
+        comparisons.update(
+            {
+                "container_name": container.get("name"),
+                "cpus": container.get("cpus"),
+                "memory_gb": container.get("memory_gb"),
+                "pids_limit": container.get("pids_limit"),
+                "gpu": container.get("gpu"),
+            }
+        )
+    mismatches = [field for field, current in comparisons.items() if payload.get(field) != current]
+    if mismatches:
+        return {
+            "status": "ERROR",
+            "handler": "user.stage",
+            "stage_status": "CONFLICT",
+            "execution_enabled": False,
+            "error": {
+                "code": "STAGE_PLAN_MISMATCH",
+                "message": "validated Stage values changed",
+                "fields": sorted(mismatches),
+            },
+        }
+    return {
+        **plan,
+        "handler": "user.stage",
+        "stage_status": "READY",
+        "execution_enabled": False,
+        "ssh_key_status": "NOT_REQUIRED_FOR_STAGE",
+        "post_stage_ssh_key_state": "REQUIRED_BEFORE_ACTIVATION",
+        "public_key_validation": "DEFERRED_TO_ACTIVATE",
+        "authorized_keys_expected": "ABSENT",
+        "host_login_expected": "DISABLED",
+        "stage_cli_contract": "NO_PUBLIC_KEY_ARGUMENT",
+    }
+
+
+def _staged_origin_pilot_state() -> dict[str, str]:
+    path = PILOT_STATE_ROOT / f"{PILOT_USERNAME}.state"
+    values: dict[str, str] = {}
+    for line in _safe_file_lines(path):
+        key, separator, value = line.partition("=")
+        if separator and re.fullmatch(r"[A-Z0-9_]{1,32}", key):
+            values[key] = value[:256]
+    if (
+        values.get("STATUS") != "STAGED"
+        or values.get("USERNAME") != PILOT_USERNAME
+        or values.get("SSH_KEY_STATE", "REQUIRED_BEFORE_ACTIVATION") != "REQUIRED_BEFORE_ACTIVATION"
+    ):
+        raise LifecycleValidationError(
+            "USER_NOT_IN_STAGED_STATE", "origin-pilot is not in the STAGED state"
+        )
+    return values
+
+
+def _user_activate_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
+    # Key files are validated before consulting or mutating lifecycle state.
+    key_records = validate_approved_ssh_key_records(payload["approved_ssh_key_record_ids"])
+    staged = _staged_origin_pilot_state()
+    return {
+        "status": "DRY_RUN",
+        "handler": "user.activate",
+        "activate_status": "READY",
+        "execution_enabled": False,
+        "expected_state": "STAGED",
+        "managed_user_id": payload["managed_user_id"],
+        "approved_ssh_keys": key_records,
+        "validated_username": staged["USERNAME"],
+        "validated_uid": staged.get("UID"),
+        "public_key_validation": "PASSED",
+        "authorized_keys_install": "DEFERRED_UNTIL_REAL_ACTIVATE",
+        "expected_rollback": [
+            "恢复 /usr/sbin/nologin",
+            "禁用或回滚 authorized_keys",
+            "停止用户容器",
+            "保留 GPU policy、quota 与用户数据",
+            "保持 Slurm DRAIN",
+        ],
+    }
 
 
 def dry_run_plan(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1861,24 +2171,42 @@ def dry_run_plan(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, A
         }
     if request.operation_type == "user.plan":
         return _user_plan(payload["username"])
+    if request.operation_type == "user.stage" and set(payload) != {"username"}:
+        return _user_stage_dry_run(payload)
+    if request.operation_type == "user.activate":
+        if failed_scripts:
+            return result
+        return _user_activate_dry_run(payload)
     return result
 
 
 def handle(request: WorkerRequest) -> dict[str, Any]:
     try:
-        payload = validate_payload(request.operation_type, request.payload)
+        payload = validate_payload(
+            request.operation_type,
+            request.payload,
+            allow_legacy_stage=(
+                request.operation_type == "user.stage" and set(request.payload) == {"username"}
+            ),
+        )
     except ValueError as exc:
-        return {"status": "ERROR", "error": {"code": "PAYLOAD_REJECTED", "message": str(exc)}}
+        return {
+            "status": "ERROR",
+            "error": {"code": getattr(exc, "code", "PAYLOAD_REJECTED"), "message": str(exc)},
+        }
     if request.operation_type in KNOWN_WRITES:
         if not request.dry_run:
             return {
                 "status": "ERROR",
                 "error": {
                     "code": "WRITE_EXECUTION_DISABLED",
-                    "message": "Portal-0/1 仅允许 dry-run",
+                    "message": "Portal-3B-R 生命周期 Gate 仅允许 dry-run",
                 },
             }
-        return dry_run_plan(request, payload)
+        try:
+            return dry_run_plan(request, payload)
+        except LifecycleValidationError as exc:
+            return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
     try:
         if request.operation_type == "platform.health.read":
             return platform_health()

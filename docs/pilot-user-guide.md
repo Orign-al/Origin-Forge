@@ -126,3 +126,9 @@ sacct -S today -u "$USER" \
 - 重要结果应在作业完成后及时归档。
 
 故障报告至少包含：发生时间、用户名、Job ID/容器名、操作命令（去除 secret）、错误文本、是否仍可 SSH、是否影响数据。管理员会按健康与安全条件决定是否紧急 DRAIN。
+# SSH 公钥与计算身份生命周期
+
+网页登录密码只用于 Portal，不会修改 Linux/SSH 密码。计算身份 Stage 时不需要公钥，
+账号保持锁定且 `/usr/sbin/nologin`，不会生成 `authorized_keys`。只有管理员批准
+Activate 后，用户才能在 Portal 添加自己的 `ssh-ed25519` 公钥；不得上传私钥、密码或
+占位密钥。Portal 只显示 key 类型和 SHA-256 fingerprint，不显示完整公钥正文。
