@@ -30,8 +30,9 @@ sudo 或 `authorized_keys`。
 ## 会话
 
 会话 ID 使用 48 字节 CSPRNG，仅 hash 入库。Cookie 为 `HttpOnly`、`SameSite=Strict`、
-`Path=/`；本地 SSH Tunnel HTTP 模式为 `Secure=false`，未来 HTTPS 部署必须切换为
-`Secure=true`。会话空闲超时 30 分钟、绝对超时 12 小时；登录后建立新会话，改密后
+`Path=/`；批准的私有隧道网络和 SSH Tunnel HTTP 模式为 `Secure=false`，未来 HTTPS
+部署必须切换为 `Secure=true`。CSRF 只接受 `127.0.0.1:18080` 与 `10.10.10.2:18080`
+两个精确 Origin，不使用通配。会话空闲超时 30 分钟、绝对超时 12 小时；登录后建立新会话，改密后
 撤销其他会话，退出立即撤销当前会话。高风险操作要求十分钟内重新认证。
 
 ## CSRF 与登录保护

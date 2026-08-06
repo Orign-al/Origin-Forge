@@ -4,7 +4,7 @@ import { Providers } from "./providers";
 
 export const metadata: Metadata = {
   title: "H100 管理平台",
-  description: "本地 SSH Tunnel 管理入口",
+  description: "H100 私有隧道网络管理入口",
 };
 
 export default function RootLayout({

@@ -8,11 +8,13 @@
 - 配置：`/etc/h100-portal`
 - 数据和日志：`/var/lib/h100-portal`、`/var/log/h100-portal`
 - Runtime socket：`/run/h100-portal/worker.sock`
-- Web/API：`127.0.0.1:18080`、`127.0.0.1:18081`
+- Web：`10.10.10.2:18080`（精确绑定 `tun0`）
+- API：`127.0.0.1:18081`（继续仅限 loopback）
 - PostgreSQL：本机 Unix Socket，不监听 Portal TCP 端口
 
-Portal-0/1 只允许 SSH Tunnel 访问，不修改防火墙或公网监听。Slurm 必须在整个部署过程
-保持 `IDLE+DRAIN` 且队列为空。
+Portal-0/1 允许经管理员批准的 `10.10.10.0/24` 私有隧道网络直接访问 Web；SSH Tunnel
+保留为回退方式。Web 不监听 `0.0.0.0`，API 不监听管理网地址。本变更不修改防火墙或公网
+监听。Slurm 必须在整个部署过程保持 `IDLE+DRAIN` 且队列为空。
 
 ## 前置检查
 
@@ -96,22 +98,25 @@ Socket unit 以 `DirectoryMode=0755` 创建 `/run/h100-portal`；socket 本身�
 ```bash
 curl -fsS http://127.0.0.1:18081/health/live
 curl -fsS http://127.0.0.1:18081/health/ready
-curl -fsS http://127.0.0.1:18080/login >/dev/null
+curl -fsS http://10.10.10.2:18080/login >/dev/null
 ss -lntup
 systemctl --failed
 ```
 
-ready 必须同时报告数据库和 Worker 可用。确认不存在 `0.0.0.0:18080`、
-`0.0.0.0:18081`、管理网地址或全局 IPv6 Portal 监听。以 API UID 运行
+ready 必须同时报告数据库和 Worker 可用。确认 Web 只有 `10.10.10.2:18080`，API 只有
+`127.0.0.1:18081`，且不存在 `0.0.0.0:18080/18081` 或全局 IPv6 Portal 监听。
+Web unit 的网络沙箱必须保留 `IPAddressDeny=any`，只额外允许 localhost 和
+`10.10.10.0/24`；API unit 仍只允许 localhost。以 API UID 运行
 `/opt/h100-portal/tests/worker_socket_smoke.py` 验证固定读取、dry-run 和拒绝路径。
 
-管理员本地访问：
+批准的私有隧道客户端直接打开 `http://10.10.10.2:18080`。如需 SSH Tunnel 回退：
 
 ```bash
-ssh -L 18080:127.0.0.1:18080 h100-codex
+ssh -L 18080:10.10.10.2:18080 h100-codex
 ```
 
-浏览器打开 `http://127.0.0.1:18080`。
+浏览器打开 `http://127.0.0.1:18080`。两种入口都在精确 CSRF Origin allowlist 中；不得
+增加通配 Origin。
 
 ## 回滚
 

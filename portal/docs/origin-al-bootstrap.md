@@ -17,7 +17,7 @@ sudo 或 GPU slice。不得创建大小写变体 Linux 账号。
 ```bash
 getent passwd origin-al
 curl -fsS http://127.0.0.1:18081/health/ready
-curl -fsS http://127.0.0.1:18080/login >/dev/null
+curl -fsS http://10.10.10.2:18080/login >/dev/null
 sudo bash -c \
   'set -a; . /etc/h100-portal/portal.env; set +a; exec /usr/bin/setpriv --reuid=h100-portal-api --regid=h100-portal-api --init-groups /opt/h100-portal/venv/bin/h100-portal-admin status-origin-al'
 ```
@@ -44,7 +44,7 @@ credential 的 `portal_owner.prepare` 审计事件。
 
 ```bash
 sudo bash -c \
-  'set -a; . /etc/h100-portal/portal.env; set +a; exec /usr/bin/setpriv --reuid=h100-portal-api --regid=h100-portal-api --init-groups /opt/h100-portal/venv/bin/h100-portal-admin bootstrap-origin-al --reset-setup-token --base-url http://127.0.0.1:18080'
+  'set -a; . /etc/h100-portal/portal.env; set +a; exec /usr/bin/setpriv --reuid=h100-portal-api --regid=h100-portal-api --init-groups /opt/h100-portal/venv/bin/h100-portal-admin bootstrap-origin-al --reset-setup-token --base-url http://10.10.10.2:18080'
 ```
 
 `--reset-setup-token` 在此处是显式授权：预创建后账号已存在，而最终步骤必须签发首次
@@ -58,14 +58,15 @@ token 或请求正文。
 配置目录保持 `root:root 0750`。上面的固定命令由 root 读取 EnvironmentFile，随后立即用
 `setpriv` 降为 API UID；不要让 API 账号直接遍历 `/etc/h100-portal`，也不要把环境打印出来。
 
-管理员本地先建立：
+批准的私有隧道客户端可直接打开 CLI 显示的 `10.10.10.2:18080` 一次性 URL。如需
+SSH Tunnel 回退，管理员本地先建立：
 
 ```bash
-ssh -L 18080:127.0.0.1:18080 h100-codex
+ssh -L 18080:10.10.10.2:18080 h100-codex
 ```
 
-然后在 30 分钟内打开终端显示的一次性 URL。管理员不得替 Origin-al 设置或获知最终
-密码。
+然后把 CLI 链接的主机部分替换为 `127.0.0.1:18080`，在 30 分钟内打开。token 与主机名
+不绑定，但 API 只接受上述两个精确 Origin。管理员不得替 Origin-al 设置或获知最终密码。
 
 ## 设置完成后的状态
 

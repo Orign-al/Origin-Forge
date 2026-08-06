@@ -87,3 +87,17 @@
 - 不变项：Slurm IDLE+DRAIN、队列为空、Guard timer disabled、MIG Disabled、无 Pilot Linux
   用户、无新容器、无防火墙/NFS/第二节点变更。
 - 未解决问题：Mellanox P0、Docker Hub deferred、PCI DOE P1 和待重启 microcode 观察项。
+
+## Portal-0/1 后续批准变更：私有隧道地址监听
+
+- 开始：2026-08-06 14:51:27 +08:00
+- 结束：2026-08-06 15:17:08 +08:00。
+- 授权：管理员明确确认 `10.10.10.2` 为安全管理入口。
+- 设计：只把 Web 从 loopback 改为精确 `10.10.10.2:18080`；API 继续强制
+  `127.0.0.1:18081`，PostgreSQL 和 Root Worker 仍为 Unix Socket。
+- 网络沙箱：Web 继续 `IPAddressDeny=any`，只允许 localhost 与 `10.10.10.0/24`；不监听
+  `0.0.0.0`，不修改防火墙。
+- 认证：CSRF/CORS allowlist 只加入精确 `http://10.10.10.2:18080`，保留 localhost
+  SSH Tunnel 回退，不使用通配 Origin。
+- 不变项：Slurm DRAIN、Guard timer disabled、MIG Disabled、无 Pilot Linux 用户、无计算
+  onboarding、无 NFS/第二节点变更。

@@ -90,7 +90,7 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
         <header className="topbar">
           <div className="topbar-left">
             <span className="env-label">H100 单节点环境</span>
-            <span className="local-mode">LOCAL SSH TUNNEL MODE</span>
+            <span className="local-mode">PRIVATE TUNNEL NETWORK MODE</span>
           </div>
           <div className="topbar-search">
             <label htmlFor="global-search" className="sr-only">

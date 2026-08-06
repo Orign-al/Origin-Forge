@@ -596,7 +596,7 @@ export function SystemModule() {
           <dl className="kv-grid">
             <div className="kv">
               <dt>Web</dt>
-              <dd className="mono">127.0.0.1:18080</dd>
+              <dd className="mono">10.10.10.2:18080</dd>
             </div>
             <div className="kv">
               <dt>API</dt>
@@ -604,7 +604,7 @@ export function SystemModule() {
             </div>
             <div className="kv">
               <dt>访问方式</dt>
-              <dd>SSH Tunnel</dd>
+              <dd>私有 tun0 网络（SSH Tunnel 可选）</dd>
             </div>
             <div className="kv">
               <dt>写操作</dt>

@@ -400,6 +400,9 @@ test("首次密码设置后进入总览", async ({ page }) => {
   await fillPasswordSetup(page);
   await expect(page).toHaveURL(/\/$/);
   await expect(page.getByRole("heading", { name: "总览" })).toBeVisible();
+  await expect(
+    page.getByText("PRIVATE TUNNEL NETWORK MODE").first(),
+  ).toBeVisible();
 });
 
 test("过期 token 被拒绝", async ({ page }) => {

@@ -47,9 +47,9 @@ export default function LoginPage() {
     <div className="auth-page">
       <Card className="auth-panel">
         <div className="auth-brand">
-          <span className="local-mode">LOCAL SSH TUNNEL MODE</span>
+          <span className="local-mode">PRIVATE TUNNEL NETWORK MODE</span>
           <h1>H100 管理平台</h1>
-          <p>本地管理入口 · 请使用网页账号登录</p>
+          <p>私有管理入口 · 请使用网页账号登录</p>
         </div>
         <form onSubmit={handleSubmit(submit)} noValidate>
           <div className="form-field">
@@ -92,7 +92,8 @@ export default function LoginPage() {
           </div>
         </form>
         <div className="auth-foot">
-          网页密码与 Linux/SSH 密码分离。当前入口只允许通过 SSH Tunnel 使用。
+          网页密码与 Linux/SSH 密码分离。当前入口仅绑定已批准的私有隧道地址，SSH
+          Tunnel 仍可作为回退方式。
           <br />
           <Link href="/setup-password" className="muted">
             已有一次性设置链接？

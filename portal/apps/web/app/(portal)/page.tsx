@@ -96,7 +96,7 @@ export default function DashboardPage() {
       <PageHeading
         title="总览"
         description="单节点 H100 平台实时概况"
-        action={<StatusBadge value="LOCAL SSH TUNNEL MODE" />}
+        action={<StatusBadge value="PRIVATE TUNNEL NETWORK MODE" />}
       />
       {query.isFetching ? <StaleNotice /> : null}
       <div className="grid-compact" style={{ marginTop: 14 }}>

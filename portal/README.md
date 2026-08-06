@@ -1,14 +1,20 @@
 # H100 网页管理平台
 
-Portal-0/1 是 H100 单机平台的本地管理控制面。Web 和 API 仅监听 localhost；管理员
-必须先建立 SSH Tunnel：
+Portal-0/1 是 H100 单机平台的私有管理控制面。Web 精确监听批准的 `tun0` 地址
+`10.10.10.2:18080`，API 仍仅监听 `127.0.0.1:18081`。私有隧道客户端可直接访问：
 
-```bash
-ssh -L 18080:127.0.0.1:18080 h100-codex
+```text
+http://10.10.10.2:18080
 ```
 
-浏览器访问 `http://127.0.0.1:18080`。当前模式为 **LOCAL SSH TUNNEL MODE**，
-不是公开 HTTPS 入口。
+SSH Tunnel 仍可作为回退：
+
+```bash
+ssh -L 18080:10.10.10.2:18080 h100-codex
+```
+
+通过 SSH Tunnel 时浏览器访问 `http://127.0.0.1:18080`。当前模式为
+**PRIVATE TUNNEL NETWORK MODE**，不是公开 HTTPS 入口。
 
 ## 边界
 

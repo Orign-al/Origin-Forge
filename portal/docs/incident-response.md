@@ -39,7 +39,7 @@ MUNGE key、shadow 或任意 shell/argv/path 能力。
 - 根因、影响范围和时间线已确认；
 - 恶意/错误会话与 token 已撤销，必要凭据已轮换；
 - Ruff/MyPy/Pytest、前端 lint/typecheck/test/build、Playwright、systemd verify 均通过；
-- Worker smoke、localhost监听、PostgreSQL Unix Socket 和审计链路通过；
+- Worker smoke、Web 私有地址/API localhost 精确监听、PostgreSQL Unix Socket 和审计链路通过；
 - GPU 4/4、DCGM、Docker、Prometheus/Grafana 与 systemd 回归通过；
 - Slurm 仍 DRAIN、队列为空，且没有自动创建 Pilot 用户或容器。
 

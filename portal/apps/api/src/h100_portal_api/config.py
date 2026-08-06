@@ -12,7 +12,10 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+pysqlite:////tmp/h100-portal-dev.db"
     secret_key: str = Field(default="development-only-change-me-000000000000", min_length=32)
     worker_socket: str = "/run/h100-portal/worker.sock"
-    allowed_origins: Annotated[tuple[str, ...], NoDecode] = ("http://127.0.0.1:18080",)
+    allowed_origins: Annotated[tuple[str, ...], NoDecode] = (
+        "http://127.0.0.1:18080",
+        "http://10.10.10.2:18080",
+    )
     cookie_secure: bool = False
     cookie_name: str = "h100_session"
     csrf_cookie_name: str = "h100_csrf"

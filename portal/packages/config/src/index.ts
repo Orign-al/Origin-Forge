@@ -1,5 +1,5 @@
 export const PORTAL_TITLE = "H100 管理平台";
-export const LOCAL_MODE_LABEL = "LOCAL SSH TUNNEL MODE";
+export const ACCESS_MODE_LABEL = "PRIVATE TUNNEL NETWORK MODE";
 export const API_PREFIX = "/api/v1";
 
 export const navigation = [

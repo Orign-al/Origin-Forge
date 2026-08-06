@@ -1,4 +1,5 @@
 import pytest
+from h100_portal_api.config import Settings
 from h100_portal_api.enums import AccountState, OnboardingState, PasswordState
 from h100_portal_api.models import PortalUser
 from h100_portal_api.security import (
@@ -11,6 +12,15 @@ from h100_portal_api.security import (
     verify_password,
 )
 from sqlalchemy.exc import IntegrityError
+
+
+def test_private_and_loopback_origins_are_parsed_without_exposing_api() -> None:
+    assert Settings.parse_origins("http://127.0.0.1:18080,http://10.10.10.2:18080") == (
+        "http://127.0.0.1:18080",
+        "http://10.10.10.2:18080",
+    )
+    with pytest.raises(ValueError, match="loopback"):
+        Settings(api_host="10.10.10.2")
 
 
 def test_login_normalization_is_case_insensitive() -> None:

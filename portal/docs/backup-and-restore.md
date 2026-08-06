@@ -41,5 +41,6 @@ token hash 和 session hash，仍需按 credential 数据保护。
 ## 恢复演练
 
 至少验证：dump 可读、迁移可完成、账号大小写唯一约束仍在、旧 token/session 无法使用、
-RBAC 和 CSRF 仍生效、Worker socket 非 API UID 被拒绝、Web/API 仍仅监听 localhost。演练
-结果只记录 hash、版本和结论，不记录 credential 内容。
+RBAC 和 CSRF 仍生效、Worker socket 非 API UID 被拒绝、Web 精确监听
+`10.10.10.2:18080`、API 仍仅监听 localhost。演练结果只记录 hash、版本和结论，不记录
+credential 内容。
