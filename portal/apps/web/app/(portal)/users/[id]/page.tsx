@@ -355,8 +355,9 @@ export default function UserDetailPage() {
                   </div>
                   <div className="notice">
                     Stage 不读取、不验证、不安装 SSH 公钥；Stage 后状态为
-                    REQUIRED_BEFORE_ACTIVATION。Activate 才要求受控公钥记录，且下一阶段
-                    批准前 Worker 不会进入真实写模式。
+                    REQUIRED_BEFORE_ACTIVATION。Activate
+                    才要求受控公钥记录，且下一阶段 批准前 Worker
+                    不会进入真实写模式。
                   </div>
                 </>
               )}
