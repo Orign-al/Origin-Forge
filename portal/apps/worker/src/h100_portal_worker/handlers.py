@@ -2419,6 +2419,87 @@ def _stage_postcondition_summary(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _stage_retained_resources(payload: dict[str, Any]) -> list[str]:
+    """Conservatively classify host state after a failed Stage script.
+
+    useradd can persist account database entries before reporting a later home
+    creation error.  The state file is therefore not an authoritative rollback
+    marker.  Any unreadable adapter is retained for manual review rather than
+    being mislabeled as a complete rollback.
+    """
+    retained: set[str] = set()
+    state_path = PILOT_STATE_ROOT / f"{PILOT_USERNAME}.state"
+    if state_path.exists() or state_path.is_symlink():
+        retained.add("pilot-state")
+    try:
+        pwd.getpwnam(PILOT_USERNAME)
+        retained.add("linux-user")
+    except KeyError:
+        pass
+    try:
+        grp.getgrnam(PILOT_USERNAME)
+        retained.add("linux-group")
+    except KeyError:
+        pass
+    try:
+        uid_owner = pwd.getpwuid(int(payload["uid"]))
+        retained.add(
+            "linux-user" if uid_owner.pw_name == PILOT_USERNAME else "approved-uid-conflict"
+        )
+    except KeyError:
+        pass
+    try:
+        gid_owner = grp.getgrgid(int(payload["gid"]))
+        retained.add(
+            "linux-group" if gid_owner.gr_name == PILOT_USERNAME else "approved-gid-conflict"
+        )
+    except KeyError:
+        pass
+
+    paths = {
+        "host-home": Path("/home") / PILOT_USERNAME,
+        "managed-data": PILOT_DATA_ROOT / PILOT_USERNAME,
+        "container-data": Path("/srv/gpu-platform/container-data") / PILOT_USERNAME,
+        "container-config": PILOT_COMPOSE_ROOT / PILOT_USERNAME,
+        "gpu-policy": Path(f"/etc/systemd/system/user-{payload['uid']}.slice.d/{GPU_DROPIN_NAME}"),
+    }
+    for label, path in paths.items():
+        if path.exists() or path.is_symlink():
+            retained.add(label)
+    if any(
+        item["username"] == PILOT_USERNAME or item["uid"] == payload["uid"]
+        for item in _registry_entries()
+    ):
+        retained.add("gpu-registry")
+    projects_entry = f"{payload['project_id']}:{PILOT_DATA_ROOT / PILOT_USERNAME}"
+    projid_entry = f"h100_{PILOT_USERNAME}:{payload['project_id']}"
+    if projects_entry in _safe_file_lines(PROJECTS_FILE) or projid_entry in _safe_file_lines(
+        PROJID_FILE
+    ):
+        retained.add("xfs-project-mapping")
+
+    association = _assoc_exists(PILOT_USERNAME)
+    if association is True:
+        retained.add("slurm-association")
+    elif association is None:
+        retained.add("slurm-association-unknown")
+    container = run_fixed(
+        "docker", ["container", "inspect", str(payload["container_name"])], timeout=15
+    )
+    if container.get("ok"):
+        retained.add("container")
+    elif "no such" not in str(container.get("stderr", "")).casefold():
+        retained.add("container-state-unknown")
+    for command, expected_absent in (("is-enabled", "disabled"), ("is-active", "inactive")):
+        timer = run_fixed("systemctl", [command, "h100-gpu-bypass-guard.timer"], timeout=10)
+        observed = str(timer.get("stdout", "")).strip()
+        if observed and observed != expected_absent:
+            retained.add("guard-timer")
+        elif not observed:
+            retained.add("guard-timer-state-unknown")
+    return sorted(retained)
+
+
 def _execute_origin_pilot_stage(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
     """Execute the one Portal-3C write approved by the administrator."""
     if (
@@ -2495,7 +2576,7 @@ def _execute_origin_pilot_stage(request: WorkerRequest, payload: dict[str, Any])
         build_user_stage_argv(payload), timeout=STAGE_EXECUTION_TIMEOUT_SECONDS
     )
     if not execution.get("ok"):
-        retained_state = state_path.exists() or state_path.is_symlink()
+        retained_resources = _stage_retained_resources(payload)
         return {
             "status": "ERROR",
             "error": {
@@ -2503,8 +2584,9 @@ def _execute_origin_pilot_stage(request: WorkerRequest, payload: dict[str, Any])
                 "message": "transactional Stage script failed",
                 "exit_code": execution.get("exit_code"),
             },
-            "rollback_status": "PARTIAL_RETAINED" if retained_state else "ROLLED_BACK",
-            "host_resources_retained": retained_state,
+            "rollback_status": "PARTIAL_RETAINED" if retained_resources else "ROLLED_BACK",
+            "host_resources_retained": bool(retained_resources),
+            "retained_resources": retained_resources,
         }
     try:
         summary = _stage_postcondition_summary(payload)

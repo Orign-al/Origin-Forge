@@ -32,6 +32,7 @@ def test_operation_state_machine() -> None:
     assert can_transition(OperationStatus.APPROVED, OperationStatus.QUEUED)
     assert can_transition(OperationStatus.QUEUED, OperationStatus.RUNNING)
     assert can_transition(OperationStatus.RUNNING, OperationStatus.SUCCEEDED)
+    assert can_transition(OperationStatus.ROLLED_BACK, OperationStatus.DRAFT)
     assert not can_transition(OperationStatus.SUCCEEDED, OperationStatus.RUNNING)
     assert can_transition_onboarding(OnboardingState.DRAFT, OnboardingState.STAGED)
     assert can_transition_onboarding(OnboardingState.STAGED, OnboardingState.ACTIVE)

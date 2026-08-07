@@ -410,6 +410,62 @@ def draft_origin_pilot_stage() -> int:
     return 0
 
 
+def reopen_portal3c_stage_retry(
+    db: Session, *, operation: PortalOperation, owner: PortalUser
+) -> None:
+    """Reopen only the exact fully rolled-back Portal-3C operation.
+
+    The caller must still run the complete Worker dry-run before this database
+    transaction is committed.  If that preflight fails, the session closes and
+    this transition is rolled back to the terminal ROLLED_BACK record.
+    """
+    if (
+        operation.status != OperationStatus.ROLLED_BACK
+        or operation.operation_type != "user.stage"
+        or operation.target_type != "compute_identity"
+        or operation.target_id != "origin-pilot"
+        or operation.requested_by != owner.id
+        or operation.approved_by != owner.id
+        or operation.idempotency_key != PORTAL3C_STAGE_IDEMPOTENCY_KEY
+        or operation.error_code != "STAGE_EXECUTION_FAILED"
+        or operation.rollback_status != "ROLLED_BACK"
+    ):
+        raise RuntimeError("rolled-back Operation is not eligible for Portal-3C retry")
+    validated = validate_operation_payload(operation.operation_type, operation.validated_payload)
+    if (
+        validated != operation.validated_payload
+        or validated.get("approval_reference") != PORTAL3C_STAGE_APPROVAL_REFERENCE
+    ):
+        raise RuntimeError("rolled-back Operation payload no longer matches Portal-3C approval")
+
+    transition(operation, OperationStatus.DRAFT, "rolled-back Stage reopened for revalidation", db)
+    operation.approved_by = None
+    operation.approved_at = None
+    operation.started_at = None
+    operation.finished_at = None
+    operation.worker_execution_id = None
+    operation.error_code = None
+    operation.rollback_status = None
+    operation.result_summary = "Portal-3C retry requires a fresh dry-run and administrator approval"
+    record_audit(
+        db,
+        event_type="user.stage.retry_reopened",
+        actor="origin-al",
+        actor_role="platform_owner",
+        source_ip="local-console",
+        user_agent="h100-portal-admin",
+        object_type="operation",
+        object_id=str(operation.id),
+        result="SUCCESS",
+        metadata={
+            "target": "origin-pilot",
+            "prior_status": "ROLLED_BACK",
+            "idempotency_key_reused": True,
+        },
+        operation_id=operation.id,
+    )
+
+
 def stage_origin_pilot(approval_text: str) -> int:
     """Advance and execute the one pre-existing Portal-3C Stage Operation."""
     if approval_text != PORTAL3C_APPROVAL_TEXT:
@@ -448,6 +504,12 @@ def stage_origin_pilot(approval_text: str) -> int:
                 return 0
             print("PORTAL-3C STAGE BLOCKED — Operation/result state mismatch", file=sys.stderr)
             return 2
+        if operation.status == OperationStatus.ROLLED_BACK:
+            try:
+                reopen_portal3c_stage_retry(db, operation=operation, owner=owner)
+            except (RuntimeError, ValueError) as exc:
+                print(f"PORTAL-3C STAGE BLOCKED — {exc}", file=sys.stderr)
+                return 2
         if operation.status == OperationStatus.QUEUED:
             print("Origin-pilot Stage is already QUEUED; resuming controlled execution.")
         elif operation.status != OperationStatus.DRAFT:

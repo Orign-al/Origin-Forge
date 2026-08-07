@@ -57,6 +57,13 @@ managed identity 才写为 STAGED。本阶段：
 
 后续公钥上传和 Activate 必须重新规划、验证并获得独立明确审批，不能复用 Stage 批准。
 
+Stage 脚本失败后，Worker 必须重新检查 Linux 用户/组、UID/GID、home/data、state、精确
+GPU policy、registry、project mapping、Slurm association、容器和 Guard；不能只凭 state
+文件缺失宣称完整回滚。发现任一残留或适配器状态不可读时返回 `PARTIAL_RETAINED` 并进入
+人工复核。只有宿主资源已证明全部不存在、Worker dry-run 再次 READY 且管理员重新提交
+同一精确批准时，固定管理员 CLI 才可将该 `ROLLED_BACK` Operation 以原幂等键重新打开为
+`DRAFT`；HTTP 调用者不能直接重开终态 Operation。
+
 ## 审计
 
 任务创建、审批、状态转换和 Worker 结果分别写 operation event 与 audit event。审计记录

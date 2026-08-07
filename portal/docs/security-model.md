@@ -65,9 +65,11 @@ fingerprint 与截断注释。
 
 唯一真实写允许固定 `origin-pilot`、UID/GID 20001、project 30001、端口 22023 和固定
 容器/Slurm 参数。Worker systemd sandbox 仅为 hash-pinned 生命周期脚本增加 `/etc`、
-`/home`、`/srv/gpu-platform` 写白名单；固定 schema、actor/approval/idempotency 绑定和
-`shell=False` 不变。Activate、其他用户、任意命令、Slurm RESUME、MIG、GRES、Kernel、
-Driver、Mellanox、防火墙、NFS 和第二节点仍不在授权范围。
+`/home`、`/srv/gpu-platform` 及固定平台审计日志写白名单。`ProtectHome=no` 仅避免覆盖
+`ReadWritePaths=/home` 的精确 Stage 需求；`ProtectSystem=strict` 继续使其余宿主树只读。
+固定 schema、actor/approval/idempotency 绑定和 `shell=False` 不变。Activate、其他用户、
+任意命令、Slurm RESUME、MIG、GRES、Kernel、Driver、Mellanox、防火墙、NFS 和第二节点
+仍不在授权范围。
 
-内部 HTTP 的管理员接受仅解除 transport 对未来 Portal-3 的阻断，不构成 Portal-3 执行
-批准。收到完整 Portal-3 批准前，真实写 handler 继续禁用。
+内部 HTTP 的管理员接受仅解除 transport 阻断，不构成额外执行批准。Portal-3C 只开放
+当前精确批准的 `origin-pilot user.stage`；Activate 和所有其他真实写 handler 继续禁用。

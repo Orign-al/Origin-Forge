@@ -65,6 +65,11 @@ Portal-3C 只开放一条真实写路径：`requested_by=approved_by=origin-al`�
 无 GPU 的容器、Guard timer、Slurm DRAIN 和空队列。相同幂等键只在这些后置条件仍精确
 匹配时返回幂等成功；不匹配时要求人工复核，绝不重新创建资源。
 
+失败分类必须检查实际宿主资源。尤其 `useradd` 可能先写入 passwd/group/subuid 数据再因
+home 创建失败返回非零，因此 state 文件缺失不等于完整回滚。Worker 检测到用户、组、
+路径、policy、mapping、association、容器、Guard 或不可读适配器时返回
+`PARTIAL_RETAINED` 和安全资源类别；只有全部检查为空才返回 `ROLLED_BACK`。
+
 `user.stage` 使用固定的 UID/GID、project、端口、Slurm、quota 和 GPU-less 容器字段，
 不接受任何 SSH key 字段；Worker 返回 `NOT_REQUIRED_FOR_STAGE` 并明确公钥延后到
 Activate。`user.activate` 只接受 `managed_user_id`、`approved_ssh_key_record_ids`、

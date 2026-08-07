@@ -271,6 +271,7 @@ def test_real_stage_reports_transaction_rollback(monkeypatch) -> None:  # type: 
         "run_allowlisted_script",
         lambda *_args, **_kwargs: {"ok": False, "exit_code": 1},
     )
+    monkeypatch.setattr(handlers, "_stage_retained_resources", lambda _payload: [])
     result = handle(
         request(
             "user.stage",
@@ -281,6 +282,42 @@ def test_real_stage_reports_transaction_rollback(monkeypatch) -> None:  # type: 
     )
     assert result["status"] == "ERROR"
     assert result["rollback_status"] == "ROLLED_BACK"
+    assert result["host_resources_retained"] is False
+
+
+def test_real_stage_reports_partial_useradd_state_as_retained(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {name: {"integrity_ok": True} for name in handlers.STAGE_REQUIRED_SCRIPTS},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_user_stage_dry_run",
+        lambda _payload: {"status": "DRY_RUN", "stage_status": "READY"},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: {"ok": False, "exit_code": 12},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_stage_retained_resources",
+        lambda _payload: ["linux-group", "linux-user"],
+    )
+    result = handle(
+        request(
+            "user.stage",
+            approved_stage_payload(),
+            approved_by="origin-al",
+            idempotency_key=handlers.PORTAL3C_STAGE_IDEMPOTENCY_KEY,
+        )
+    )
+    assert result["status"] == "ERROR"
+    assert result["rollback_status"] == "PARTIAL_RETAINED"
+    assert result["host_resources_retained"] is True
+    assert result["retained_resources"] == ["linux-group", "linux-user"]
 
 
 def test_real_stage_idempotent_replay_does_not_execute(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]

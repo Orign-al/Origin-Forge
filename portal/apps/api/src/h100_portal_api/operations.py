@@ -98,6 +98,10 @@ ALLOWED_TRANSITIONS: dict[OperationStatus, set[OperationStatus]] = {
         OperationStatus.ROLLING_BACK,
     },
     OperationStatus.ROLLING_BACK: {OperationStatus.ROLLED_BACK, OperationStatus.FAILED},
+    # Only the fixed administrator CLI uses this retry edge, after a complete
+    # host-absence dry-run and a fresh approval. HTTP callers cannot reopen a
+    # terminal operation directly.
+    OperationStatus.ROLLED_BACK: {OperationStatus.DRAFT},
 }
 
 

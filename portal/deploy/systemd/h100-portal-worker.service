@@ -15,7 +15,9 @@ RestartSec=3s
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ProtectHome=read-only
+# Stage must create the approved nologin home. ProtectSystem=strict plus the
+# explicit /home ReadWritePaths entry keeps the writable scope bounded.
+ProtectHome=no
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
