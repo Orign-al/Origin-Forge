@@ -1,6 +1,7 @@
 import json
 import subprocess
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from h100_portal_worker import handlers
@@ -473,6 +474,19 @@ def test_dry_run_fails_closed_when_script_integrity_fails(monkeypatch) -> None: 
 
 
 def test_origin_pilot_plan_is_structured_and_never_executes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    def fake_getpwnam(username: str) -> SimpleNamespace:
+        if username == handlers.MANAGEMENT_USERNAME:
+            return SimpleNamespace(pw_uid=1000, pw_gid=1000)
+        raise KeyError(username)
+
+    def fake_getgrnam(group_name: str) -> None:
+        raise KeyError(group_name)
+
+    monkeypatch.setattr(handlers.pwd, "getpwnam", fake_getpwnam)
+    monkeypatch.setattr(handlers.grp, "getgrnam", fake_getgrnam)
+    monkeypatch.setattr(handlers, "_group_names", lambda _username, _gid: ["adm", "lxd", "sudo"])
+    monkeypatch.setattr(handlers.Path, "exists", lambda _path: False)
+    monkeypatch.setattr(handlers, "_registry_entries", lambda: [])
     monkeypatch.setattr(
         handlers,
         "script_integrity",
