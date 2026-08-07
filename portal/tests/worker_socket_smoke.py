@@ -140,7 +140,7 @@ def main() -> int:
 
     denied = call_worker(
         "user.plan",
-        payload={"username": "example-user"},
+        payload={"username": "origin-pilot"},
         requested_by="portal-smoke",
         dry_run=False,
     )
