@@ -60,9 +60,12 @@ association 和容器配置，保留用户数据并保持账号禁用。回滚�
 
 ## 当前 Gate
 
-当前仅允许 Portal `user.plan`、无公钥 `user.stage` dry-run 和数据库 `DRAFT`。没有 Linux 用户、Linux
-组、UID drop-in、project quota、Slurm association、SSH 公钥、容器或新监听端口。
-`origin-al` 仍为管理账号，Slurm 仍 `DRAIN`，Guard timer 保持 disabled/inactive。
-Portal-3B-R 修订验收后仍需获得明确批准语句才可 Stage：
+Portal-3C 已获得只针对 `origin-pilot` 和既有固定资源参数的真实 Stage 批准。执行路径是
+管理员控制台审批 → Portal Operation → Root Worker → hash-pinned 两阶段脚本；不得手工
+绕过。成功后 `origin-al` 仍为管理账号，`origin-pilot` 为 STAGED/nologin/密码锁定/
+authorized_keys absent，长期容器停止，Slurm 仍 DRAIN。
 
-> 允许按 Portal-3A 已验证计划 Stage 独立计算用户 origin-pilot
+该批准不包含 SSH 公钥上传或 Activate。下一 Gate 需要先核对用户公钥类型和 SHA-256
+fingerprint，再生成 Activate dry-run，并获得新的明确批准语句。
+
+> 允许使用修订并重新验收通过的两阶段流程 Stage 独立计算用户 origin-pilot

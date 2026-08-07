@@ -10,15 +10,29 @@ from h100_portal_worker.schemas import WorkerRequest, validate_payload
 from pydantic import ValidationError
 
 
-def request(operation: str, payload: dict | None = None, dry_run: bool = False) -> WorkerRequest:  # type: ignore[type-arg]
+@pytest.fixture(autouse=True)
+def isolate_pilot_state(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    state_root = tmp_path / "pilot-state"
+    state_root.mkdir()
+    monkeypatch.setattr(handlers, "PILOT_STATE_ROOT", state_root)
+
+
+def request(
+    operation: str,
+    payload: dict | None = None,  # type: ignore[type-arg]
+    dry_run: bool = False,
+    *,
+    approved_by: str | None = None,
+    idempotency_key: str = "worker-test-0001",
+) -> WorkerRequest:
     return WorkerRequest(
         protocol_version=1,
         request_id=str(uuid.uuid4()),
         operation_type=operation,
         payload=payload or {},
         requested_by="origin-al",
-        approved_by=None,
-        idempotency_key="worker-test-0001",
+        approved_by=approved_by,
+        idempotency_key=idempotency_key,
         dry_run=dry_run,
     )
 
@@ -52,7 +66,7 @@ def test_worker_rejects_arbitrary_path_and_non_dry_write() -> None:
     rejected = handle(request("containers.inspect", {"name": "../../etc/shadow"}))
     assert rejected["error"]["code"] == "PAYLOAD_REJECTED"
     write = handle(request("user.stage", {"username": "example-user"}, dry_run=False))
-    assert write["error"]["code"] == "WRITE_EXECUTION_DISABLED"
+    assert write["error"]["code"] == "STAGE_APPROVAL_BINDING_REJECTED"
 
 
 def test_origin_pilot_is_the_only_portal3a_plan_target() -> None:
@@ -84,8 +98,228 @@ def approved_stage_payload() -> dict[str, object]:
         "pids_limit": 4096,
         "gpu": "none",
         "expected_state": "DRAFT",
-        "approval_reference": "portal3b-r-test-v1",
+        "approval_reference": handlers.PORTAL3C_STAGE_APPROVAL_REFERENCE,
     }
+
+
+def staged_result() -> dict[str, object]:
+    return {
+        "username": "origin-pilot",
+        "uid": 20001,
+        "gid": 20001,
+        "shell": "/usr/sbin/nologin",
+        "password": "LOCKED",
+        "authorized_keys": "ABSENT",
+        "supplemental_groups": [],
+        "gpu_policy": {
+            "unit": "user-20001.slice",
+            "path": "/etc/systemd/system/user-20001.slice.d/50-h100-gpu-isolation.conf",
+            "device_policy": "closed",
+            "device_allow": [],
+            "open_probe": "DENIED",
+            "cuda_context_probe": "DENIED",
+        },
+        "quota": {"project_id": 30001, "hard_limit_gb": 300},
+        "slurm": {
+            "account": "company",
+            "qos": "general",
+            "max_gpus": 1,
+            "node_state": "DRAIN",
+            "queue": "EMPTY",
+        },
+        "container": {
+            "name": "gpu-dev-origin-pilot",
+            "state": "STOPPED",
+            "gpu": "NONE",
+            "cpus": 8,
+            "memory_gb": 32,
+            "pids_limit": 4096,
+            "ssh_port": 22023,
+            "image_digest": "sha256:" + "a" * 64,
+        },
+        "guard": {"timer": "ENABLED_ACTIVE", "status": "PASSING"},
+        "ssh_key_state": "REQUIRED_BEFORE_ACTIVATION",
+        "host_access": "DISABLED",
+        "onboarding_state": "STAGED",
+    }
+
+
+def test_only_exact_approved_real_stage_executes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {name: {"integrity_ok": True} for name in handlers.STAGE_REQUIRED_SCRIPTS},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_user_stage_dry_run",
+        lambda _payload: {"status": "DRY_RUN", "stage_status": "READY", "conflicts": []},
+    )
+    calls: list[list[str]] = []
+
+    def execute(argv, timeout):  # type: ignore[no-untyped-def]
+        calls.append(argv)
+        assert timeout == handlers.STAGE_EXECUTION_TIMEOUT_SECONDS
+        return {"ok": True, "exit_code": 0, "stdout": "STAGED", "stderr": ""}
+
+    monkeypatch.setattr(handlers, "run_allowlisted_script", execute)
+    monkeypatch.setattr(handlers, "_stage_postcondition_summary", lambda _payload: staged_result())
+    result = handle(
+        request(
+            "user.stage",
+            approved_stage_payload(),
+            approved_by="origin-al",
+            idempotency_key=handlers.PORTAL3C_STAGE_IDEMPOTENCY_KEY,
+        )
+    )
+    assert result["status"] == "SUCCEEDED"
+    assert result["stage"]["onboarding_state"] == "STAGED"
+    assert result["idempotent_replay"] is False
+    assert calls == [handlers.build_user_stage_argv(approved_stage_payload())]
+    assert "--public-key-file" not in calls[0]
+
+
+@pytest.mark.parametrize(
+    ("approved_by", "idempotency_key"),
+    [
+        (None, handlers.PORTAL3C_STAGE_IDEMPOTENCY_KEY),
+        ("codexops", handlers.PORTAL3C_STAGE_IDEMPOTENCY_KEY),
+        ("origin-al", "different-stage-key"),
+    ],
+)
+def test_real_stage_rejects_actor_or_operation_binding(
+    approved_by: str | None, idempotency_key: str
+) -> None:
+    result = handle(
+        request(
+            "user.stage",
+            approved_stage_payload(),
+            approved_by=approved_by,
+            idempotency_key=idempotency_key,
+        )
+    )
+    assert result["error"]["code"] == "STAGE_APPROVAL_BINDING_REJECTED"
+
+
+def test_real_stage_fails_closed_on_script_hash_mismatch(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {
+            name: {"integrity_ok": name != "h100-user-create"}
+            for name in handlers.STAGE_REQUIRED_SCRIPTS
+        },
+    )
+    result = handle(
+        request(
+            "user.stage",
+            approved_stage_payload(),
+            approved_by="origin-al",
+            idempotency_key=handlers.PORTAL3C_STAGE_IDEMPOTENCY_KEY,
+        )
+    )
+    assert result["error"]["code"] == "SCRIPT_INTEGRITY_FAILED"
+    assert result["error"]["scripts"] == ["h100-user-create"]
+
+
+def test_real_stage_revalidates_conflicts_before_script(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {name: {"integrity_ok": True} for name in handlers.STAGE_REQUIRED_SCRIPTS},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_user_stage_dry_run",
+        lambda _payload: {
+            "status": "ERROR",
+            "stage_status": "CONFLICT",
+            "error": {"code": "UID_CONFLICT"},
+            "conflicts": [{"code": "UID_CONFLICT"}],
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: pytest.fail("Stage script must not execute after conflict"),
+    )
+    result = handle(
+        request(
+            "user.stage",
+            approved_stage_payload(),
+            approved_by="origin-al",
+            idempotency_key=handlers.PORTAL3C_STAGE_IDEMPOTENCY_KEY,
+        )
+    )
+    assert result["status"] == "ERROR"
+    assert result["error"]["code"] == "UID_CONFLICT"
+
+
+def test_real_stage_reports_transaction_rollback(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {name: {"integrity_ok": True} for name in handlers.STAGE_REQUIRED_SCRIPTS},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_user_stage_dry_run",
+        lambda _payload: {"status": "DRY_RUN", "stage_status": "READY"},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: {"ok": False, "exit_code": 1},
+    )
+    result = handle(
+        request(
+            "user.stage",
+            approved_stage_payload(),
+            approved_by="origin-al",
+            idempotency_key=handlers.PORTAL3C_STAGE_IDEMPOTENCY_KEY,
+        )
+    )
+    assert result["status"] == "ERROR"
+    assert result["rollback_status"] == "ROLLED_BACK"
+
+
+def test_real_stage_idempotent_replay_does_not_execute(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    state_root = tmp_path / "users"
+    state_root.mkdir()
+    (state_root / "origin-pilot.state").write_text("STATUS=STAGED\n", encoding="utf-8")
+    monkeypatch.setattr(handlers, "PILOT_STATE_ROOT", state_root)
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {name: {"integrity_ok": True} for name in handlers.STAGE_REQUIRED_SCRIPTS},
+    )
+    monkeypatch.setattr(handlers, "_stage_postcondition_summary", lambda _payload: staged_result())
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: pytest.fail("idempotent replay must not run Stage script"),
+    )
+    result = handle(
+        request(
+            "user.stage",
+            approved_stage_payload(),
+            approved_by="origin-al",
+            idempotency_key=handlers.PORTAL3C_STAGE_IDEMPOTENCY_KEY,
+        )
+    )
+    assert result["status"] == "SUCCEEDED"
+    assert result["idempotent_replay"] is True
+
+
+def test_activate_real_write_remains_disabled() -> None:
+    payload = {
+        "managed_user_id": str(uuid.uuid4()),
+        "approved_ssh_key_record_ids": [str(uuid.uuid4())],
+        "expected_state": "STAGED",
+        "approval_reference": "portal3c-test-approval",
+    }
+    result = handle(request("user.activate", payload, approved_by="origin-al"))
+    assert result["error"]["code"] == "WRITE_EXECUTION_DISABLED"
 
 
 def test_stage_contract_defers_public_key() -> None:

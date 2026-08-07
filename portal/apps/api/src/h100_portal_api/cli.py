@@ -1,7 +1,9 @@
 import argparse
 import pwd
 import sys
+import uuid
 from datetime import timedelta
+from typing import Any, cast
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
@@ -17,7 +19,9 @@ from h100_portal_api.enums import (
     RiskLevel,
 )
 from h100_portal_api.models import (
+    PortalManagedUser,
     PortalOperation,
+    PortalOperationApproval,
     PortalOperationEvent,
     PortalPasswordSetupToken,
     PortalRole,
@@ -27,7 +31,12 @@ from h100_portal_api.models import (
 from h100_portal_api.rbac import PERMISSIONS
 from h100_portal_api.routes.operations import (
     APPROVED_ORIGIN_PILOT_STAGE,
+    PORTAL3C_STAGE_APPROVAL_REFERENCE,
+    PORTAL3C_STAGE_IDEMPOTENCY_KEY,
     enrich_user_plan_with_portal_state,
+    execute_operation,
+    transition,
+    validate_operation_payload,
 )
 from h100_portal_api.security import digest_secret, normalize_login, random_token, safe_metadata
 from h100_portal_api.worker_client import WorkerClientError, call_worker
@@ -39,6 +48,7 @@ ROLE_DESCRIPTIONS = {
     "auditor": "只读审计员",
     "user": "普通用户",
 }
+PORTAL3C_APPROVAL_TEXT = "允许使用修订并重新验收通过的两阶段流程 Stage 独立计算用户 origin-pilot"
 
 
 def ensure_roles(db: Session) -> None:
@@ -400,6 +410,184 @@ def draft_origin_pilot_stage() -> int:
     return 0
 
 
+def stage_origin_pilot(approval_text: str) -> int:
+    """Advance and execute the one pre-existing Portal-3C Stage Operation."""
+    if approval_text != PORTAL3C_APPROVAL_TEXT:
+        print(
+            "PORTAL-3C STAGE BLOCKED — exact administrator approval text required", file=sys.stderr
+        )
+        return 2
+    operation_id: uuid.UUID
+    with SessionLocal() as db:
+        owner = db.scalar(select(PortalUser).where(PortalUser.normalized_login == "origin-al"))
+        if (
+            owner is None
+            or owner.account_state != AccountState.ACTIVE
+            or owner.unix_username != "origin-al"
+            or not any(role.name == "platform_owner" for role in owner.roles)
+        ):
+            print("PORTAL-3C STAGE BLOCKED — Origin-al owner binding is invalid", file=sys.stderr)
+            return 2
+        operation = db.scalar(
+            select(PortalOperation).where(
+                PortalOperation.requested_by == owner.id,
+                PortalOperation.idempotency_key == PORTAL3C_STAGE_IDEMPOTENCY_KEY,
+            )
+        )
+        if operation is None:
+            print("PORTAL-3C STAGE BLOCKED — approved DRAFT Operation is absent", file=sys.stderr)
+            return 2
+        operation_id = operation.id
+        if operation.status == OperationStatus.SUCCEEDED:
+            managed = db.scalar(
+                select(PortalManagedUser).where(PortalManagedUser.portal_user_id == owner.id)
+            )
+            if managed is not None and managed.onboarding_state == OnboardingState.STAGED:
+                print("Origin-pilot Portal Stage already SUCCEEDED; no duplicate execution.")
+                print(f"operation_id={operation.id} status={operation.status}")
+                return 0
+            print("PORTAL-3C STAGE BLOCKED — Operation/result state mismatch", file=sys.stderr)
+            return 2
+        if operation.status == OperationStatus.QUEUED:
+            print("Origin-pilot Stage is already QUEUED; resuming controlled execution.")
+        elif operation.status != OperationStatus.DRAFT:
+            print(
+                f"PORTAL-3C STAGE BLOCKED — Operation state is {operation.status}",
+                file=sys.stderr,
+            )
+            return 2
+        else:
+            if (
+                operation.operation_type != "user.stage"
+                or operation.target_type != "compute_identity"
+                or operation.target_id != "origin-pilot"
+            ):
+                print("PORTAL-3C STAGE BLOCKED — DRAFT target mismatch", file=sys.stderr)
+                return 2
+            try:
+                validated = validate_operation_payload(
+                    operation.operation_type, operation.validated_payload
+                )
+            except ValueError as exc:
+                print(f"PORTAL-3C STAGE BLOCKED — {exc}", file=sys.stderr)
+                return 2
+            if (
+                validated != operation.validated_payload
+                or validated.get("approval_reference") != PORTAL3C_STAGE_APPROVAL_REFERENCE
+            ):
+                print("PORTAL-3C STAGE BLOCKED — validated payload changed", file=sys.stderr)
+                return 2
+            try:
+                preflight = call_worker(
+                    "user.stage",
+                    payload=validated,
+                    requested_by="origin-al",
+                    approved_by=None,
+                    idempotency_key=PORTAL3C_STAGE_IDEMPOTENCY_KEY,
+                    dry_run=True,
+                    timeout_seconds=45,
+                )
+            except WorkerClientError as exc:
+                print(f"PORTAL-3C STAGE BLOCKED — {exc.code}", file=sys.stderr)
+                return 2
+            if preflight.get("status") != "DRY_RUN" or preflight.get("stage_status") != "READY":
+                error = preflight.get("error", {})
+                code = (
+                    error.get("code", "STAGE_DRY_RUN_BLOCKED")
+                    if isinstance(error, dict)
+                    else "STAGE_DRY_RUN_BLOCKED"
+                )
+                print(f"PORTAL-3C STAGE BLOCKED — {code}", file=sys.stderr)
+                return 2
+            operation.dry_run_result = cast(dict[str, Any], safe_metadata(preflight))
+            operation.result_summary = (
+                "Portal-3C execution preflight READY; awaiting controlled Worker"
+            )
+            transition(
+                operation,
+                OperationStatus.PENDING_APPROVAL,
+                "submitted by current administrator console for real Stage",
+                db,
+            )
+            record_audit(
+                db,
+                event_type="user.stage.request",
+                actor="origin-al",
+                actor_role="platform_owner",
+                source_ip="local-console",
+                user_agent="h100-portal-admin",
+                object_type="operation",
+                object_id=str(operation.id),
+                result="SUCCESS",
+                metadata={"target": "origin-pilot", "execution_mode": "real-stage"},
+                operation_id=operation.id,
+            )
+            record_audit(
+                db,
+                event_type="user.stage.validation",
+                actor="origin-al",
+                actor_role="platform_owner",
+                source_ip="local-console",
+                user_agent="h100-portal-admin",
+                object_type="operation",
+                object_id=str(operation.id),
+                result="PASS",
+                metadata={"stage_status": "READY", "conflicts": []},
+                operation_id=operation.id,
+            )
+            db.add(
+                PortalOperationApproval(
+                    operation_id=operation.id,
+                    approver_id=owner.id,
+                    decision="APPROVE",
+                    safe_comment=approval_text,
+                    decided_at=utcnow(),
+                )
+            )
+            operation.approved_by = owner.id
+            operation.approved_at = utcnow()
+            transition(
+                operation, OperationStatus.APPROVED, "administrator console approval granted", db
+            )
+            transition(operation, OperationStatus.QUEUED, "queued for controlled real Stage", db)
+            record_audit(
+                db,
+                event_type="operation.approval",
+                actor="origin-al",
+                actor_role="platform_owner",
+                source_ip="local-console",
+                user_agent="h100-portal-admin",
+                object_type="operation",
+                object_id=str(operation.id),
+                result="APPROVE",
+                metadata={
+                    "approval_source": "current_administrator_console",
+                    "approval_text": approval_text,
+                    "execution_mode": "real-stage",
+                },
+                operation_id=operation.id,
+            )
+            db.commit()
+            print(f"operation_id={operation.id} status=QUEUED target=origin-pilot")
+
+    execute_operation(operation_id, "origin-al")
+    with SessionLocal() as db:
+        operation = db.get(PortalOperation, operation_id)
+        if operation is None:
+            print("PORTAL-3C STAGE BLOCKED — Operation disappeared", file=sys.stderr)
+            return 2
+        print(f"operation_id={operation.id}")
+        print(f"operation_status={operation.status}")
+        print(f"error_code={operation.error_code or 'NONE'}")
+        print(f"rollback_status={operation.rollback_status or 'NONE'}")
+        if operation.status == OperationStatus.SUCCEEDED:
+            print("origin-pilot compute identity state=STAGED")
+            print("SSH key state=REQUIRED_BEFORE_ACTIVATION")
+            return 0
+        print("PORTAL-3C STAGE OPERATION DID NOT SUCCEED", file=sys.stderr)
+        return 2
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="H100 Portal administrator bootstrap")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -410,6 +598,8 @@ def main() -> int:
     subparsers.add_parser("status-origin-al")
     subparsers.add_parser("plan-origin-pilot")
     subparsers.add_parser("draft-origin-pilot-stage")
+    stage = subparsers.add_parser("stage-origin-pilot")
+    stage.add_argument("--approval-text", required=True)
     args = parser.parse_args()
     if args.command == "prepare-origin-al":
         return prepare_origin_al()
@@ -421,6 +611,8 @@ def main() -> int:
         return plan_origin_pilot()
     if args.command == "draft-origin-pilot-stage":
         return draft_origin_pilot_stage()
+    if args.command == "stage-origin-pilot":
+        return stage_origin_pilot(args.approval_text)
     return 2
 
 

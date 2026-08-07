@@ -54,8 +54,16 @@ Prometheus/Grafana。GPU minor 只按 UUID + PCI Bus ID 与 NVIDIA driver procfs
 - `slurm.drain`、`slurm.resume`、`job.cancel`、`quota.update`
 - `ssh_key.add`、`ssh_key.revoke`
 
-Portal-3B-R 对所有非 dry-run 写请求固定返回 `WRITE_EXECUTION_DISABLED`。dry-run 只返回
-handler、已清洗参数、预期备份/验证/回滚和脚本完整性，不返回 shell 命令字符串。
+Portal-3C 只开放一条真实写路径：`requested_by=approved_by=origin-al`、固定幂等键、固定
+审批引用和逐字段匹配既有计划的 `user.stage(origin-pilot)`。Worker 在执行前再次运行
+资源冲突检查并校验全部依赖脚本 hash，只能以 `shell=False` 调用固定
+`h100-user-create --stage ... --confirm-stage origin-pilot` argv。所有 Activate 和其他
+非 dry-run 写请求仍固定返回 `WRITE_EXECUTION_DISABLED`。
+
+真实 Stage 使用有界长超时并在脚本成功后重新读取 STAGED state、UID/GID、nologin、密码
+锁定、authorized_keys 缺失、精确 UID policy、project mapping、Slurm association、停止且
+无 GPU 的容器、Guard timer、Slurm DRAIN 和空队列。相同幂等键只在这些后置条件仍精确
+匹配时返回幂等成功；不匹配时要求人工复核，绝不重新创建资源。
 
 `user.stage` 使用固定的 UID/GID、project、端口、Slurm、quota 和 GPU-less 容器字段，
 不接受任何 SSH key 字段；Worker 返回 `NOT_REQUIRED_FOR_STAGE` 并明确公钥延后到
@@ -104,5 +112,6 @@ sudo -u h100-portal-api \
   /opt/h100-portal/tests/worker_socket_smoke.py
 ```
 
-脚本覆盖所有只读 adapter、全部写 dry-run、无副作用的非 dry-run 拒绝、任意路径拒绝和
-未知 operation 拒绝。不得用非 dry-run `slurm.resume` 做冒烟测试。
+脚本覆盖所有只读 adapter、全部写 dry-run、唯一 Stage 写路径的 mock 成功/幂等/冲突/
+hash/回滚测试、其他非 dry-run 拒绝、任意路径拒绝和未知 operation 拒绝。不得用真实
+`user.stage` 或非 dry-run `slurm.resume` 做普通冒烟测试。

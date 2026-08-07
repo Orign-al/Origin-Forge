@@ -1,4 +1,4 @@
-from h100_portal_api.cli import ensure_origin_al_record
+from h100_portal_api.cli import ensure_origin_al_record, stage_origin_pilot
 from h100_portal_api.enums import AccountState, OnboardingState, PasswordState
 from h100_portal_api.models import PortalPasswordSetupToken, PortalUser
 from sqlalchemy import func, select
@@ -23,3 +23,7 @@ def test_prepare_origin_record_is_idempotent_and_does_not_issue_token(database) 
     assert same_user.id == user.id
     assert database.scalar(select(func.count()).select_from(PortalUser)) == 1
     assert database.scalar(select(func.count()).select_from(PortalPasswordSetupToken)) == 0
+
+
+def test_portal3c_console_stage_requires_exact_approval_text() -> None:
+    assert stage_origin_pilot("Stage origin-pilot") == 2

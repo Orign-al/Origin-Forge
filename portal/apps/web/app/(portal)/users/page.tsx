@@ -201,8 +201,9 @@ export default function UsersPage() {
         </SectionCard>
         <SectionCard title="安全边界">
           <div className="notice">
-            本阶段只创建 Portal DRAFT 和 Worker dry-run 计划；不创建 Linux
-            用户、不安装 SSH key、不启动员工容器，Stage/Activate 仍未授权。
+            {origin?.resource_onboarding_state === "STAGED"
+              ? "origin-pilot 已 STAGED，但没有 SSH key、登录权限或运行中的长期容器；Activate 仍未授权。"
+              : "本阶段只创建 Portal DRAFT 和 Worker dry-run 计划；不创建 Linux 用户、不安装 SSH key、不启动员工容器，Stage/Activate 仍未授权。"}
           </div>
         </SectionCard>
       </div>

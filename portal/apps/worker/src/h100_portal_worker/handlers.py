@@ -44,6 +44,7 @@ BINARIES = {
     "hostname": "/usr/bin/hostname",
     "ss": "/usr/bin/ss",
     "ssh-keygen": "/usr/bin/ssh-keygen",
+    "passwd": "/usr/bin/passwd",
     "squeue-fallback": "/usr/bin/squeue",
 }
 SCRIPT_ALLOWLIST = {
@@ -112,6 +113,21 @@ PILOT_SCAN_ROOTS = (
 SSH_KEY_STAGING_ROOT = Path("/var/lib/h100-portal/ssh-key-staging")
 MAX_SSH_KEY_FILE_BYTES = 16 * 1024
 MAX_APPROVED_SSH_KEYS = 5
+PORTAL3C_STAGE_IDEMPOTENCY_KEY = "portal3b-r-origin-pilot-stage-v1"
+PORTAL3C_STAGE_APPROVAL_REFERENCE = "portal3b-r-lifecycle-revalidated"
+STAGE_EXECUTION_TIMEOUT_SECONDS = 1800.0
+STAGE_REQUIRED_SCRIPTS = frozenset(
+    {
+        "h100-user-create",
+        "h100-user-gpu-isolation",
+        "h100-container-create",
+        "h100-container-stop",
+        "h100-gpu-bypass-guard",
+    }
+)
+FORBIDDEN_PILOT_GROUPS = frozenset(
+    {"sudo", "docker", "video", "render", "adm", "systemd-journal", "gpu-platform-admin"}
+)
 
 
 def _truncate(value: str) -> str:
@@ -152,6 +168,63 @@ def run_fixed(binary: str, args: list[str], timeout: float = 20.0) -> dict[str, 
         return {
             "ok": False,
             "error_code": "COMMAND_EXECUTION_ERROR",
+            "stdout": "",
+            "stderr": str(exc)[:512],
+        }
+    return {
+        "ok": completed.returncode == 0,
+        "exit_code": completed.returncode,
+        "stdout": _truncate(completed.stdout),
+        "stderr": _truncate(completed.stderr),
+    }
+
+
+def run_allowlisted_script(argv: list[str], timeout: float) -> dict[str, Any]:
+    """Run one exact management-script argv without a shell.
+
+    The caller must validate the operation payload and script hashes first.
+    This second boundary prevents a future caller from passing an arbitrary
+    executable, NUL-containing argument, working directory, environment, or
+    stdin into the root Worker.
+    """
+    if not argv or argv[0] not in SCRIPT_ALLOWLIST.values():
+        return {
+            "ok": False,
+            "error_code": "SCRIPT_NOT_ALLOWLISTED",
+            "stdout": "",
+            "stderr": "",
+        }
+    if any(not isinstance(item, str) or "\x00" in item for item in argv):
+        return {
+            "ok": False,
+            "error_code": "ARGUMENT_INVALID",
+            "stdout": "",
+            "stderr": "",
+        }
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd="/",
+            env=FIXED_ENV,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+            shell=False,
+            text=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error_code": "STAGE_EXECUTION_TIMEOUT",
+            "stdout": _truncate(str(exc.stdout or "")),
+            "stderr": _truncate(str(exc.stderr or "")),
+        }
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error_code": "SCRIPT_EXECUTION_ERROR",
             "stdout": "",
             "stderr": str(exc)[:512],
         }
@@ -2121,6 +2194,336 @@ def _staged_origin_pilot_state() -> dict[str, str]:
     return values
 
 
+def _stage_postcondition_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    """Re-read the fixed Stage target after the transactional script succeeds."""
+    staged = _staged_origin_pilot_state()
+    expected_state = {
+        "USERNAME": payload["username"],
+        "UID": str(payload["uid"]),
+        "GID": str(payload["gid"]),
+        "PROJECT_ID": str(payload["project_id"]),
+        "SSH_PORT": str(payload["ssh_port"]),
+        "SLURM_ACCOUNT": payload["slurm_account"],
+        "SLURM_QOS": payload["slurm_qos"],
+        "SSH_KEY_STATE": "REQUIRED_BEFORE_ACTIVATION",
+        "KEY_SHA256": "",
+        "KEY_FINGERPRINTS": "",
+    }
+    mismatches = sorted(
+        key for key, expected in expected_state.items() if staged.get(key) != expected
+    )
+    if mismatches:
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED",
+            f"staged state differs from the approved payload: {','.join(mismatches)}",
+        )
+
+    try:
+        account = pwd.getpwnam(PILOT_USERNAME)
+        private_group = grp.getgrnam(PILOT_USERNAME)
+    except KeyError as exc:
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "staged account or private group is missing"
+        ) from exc
+    if (
+        account.pw_uid != payload["uid"]
+        or account.pw_gid != payload["gid"]
+        or private_group.gr_gid != payload["gid"]
+        or account.pw_shell != "/usr/sbin/nologin"
+    ):
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "staged account identity does not match approval"
+        )
+    groups = _group_names(PILOT_USERNAME, account.pw_gid)
+    unexpected_groups = sorted(set(groups) - {PILOT_USERNAME})
+    if unexpected_groups or set(groups) & FORBIDDEN_PILOT_GROUPS:
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "staged account has unexpected supplemental groups"
+        )
+
+    password = run_fixed("passwd", ["-S", PILOT_USERNAME], timeout=10)
+    password_fields = str(password.get("stdout", "")).split()
+    if not password.get("ok") or len(password_fields) < 2 or password_fields[1] != "L":
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "staged account password is not locked"
+        )
+    authorized_key_paths = (
+        Path(account.pw_dir) / ".ssh" / "authorized_keys",
+        PILOT_DATA_ROOT / PILOT_USERNAME / "home" / ".ssh" / "authorized_keys",
+    )
+    if any(path.exists() or path.is_symlink() for path in authorized_key_paths):
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "authorized_keys exists before activation"
+        )
+
+    dropin = Path(f"/etc/systemd/system/user-{payload['uid']}.slice.d/{GPU_DROPIN_NAME}")
+    try:
+        dropin_stat = dropin.lstat()
+        dropin_content = dropin.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "exact UID GPU policy is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISREG(dropin_stat.st_mode)
+        or stat.S_ISLNK(dropin_stat.st_mode)
+        or dropin_stat.st_uid != 0
+        or dropin_stat.st_gid != 0
+        or stat.S_IMODE(dropin_stat.st_mode) != 0o644
+        or dropin_content != GPU_DROPIN_CONTENT
+        or "DeviceAllow" in dropin_content
+    ):
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "exact UID GPU policy metadata is invalid"
+        )
+    matching_registry = [
+        item
+        for item in _registry_entries()
+        if item["username"] == PILOT_USERNAME or item["uid"] == payload["uid"]
+    ]
+    if matching_registry != [{"username": PILOT_USERNAME, "uid": payload["uid"]}]:
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "managed GPU isolation registry is inconsistent"
+        )
+
+    projects_entry = f"{payload['project_id']}:{PILOT_DATA_ROOT / PILOT_USERNAME}"
+    projid_entry = f"h100_{PILOT_USERNAME}:{payload['project_id']}"
+    if projects_entry not in _safe_file_lines(
+        PROJECTS_FILE
+    ) or projid_entry not in _safe_file_lines(PROJID_FILE):
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "XFS project mappings are missing"
+        )
+
+    association = run_fixed(
+        "sacctmgr",
+        [
+            "-n",
+            "-P",
+            "show",
+            "assoc",
+            "where",
+            f"User={PILOT_USERNAME}",
+            f"Account={payload['slurm_account']}",
+            "format=User,Account,QOS,DefaultQOS",
+        ],
+        timeout=20,
+    )
+    association_ok = association.get("ok") and any(
+        line.split("|")[:2] == [PILOT_USERNAME, payload["slurm_account"]]
+        for line in str(association.get("stdout", "")).splitlines()
+    )
+    if not association_ok:
+        raise LifecycleValidationError("STAGE_POSTCONDITION_FAILED", "Slurm association is missing")
+
+    container_result = containers_inspect({"name": payload["container_name"]})
+    container = container_result.get("container", {})
+    state = container.get("state", {}) if isinstance(container, dict) else {}
+    mounts = container.get("mounts", []) if isinstance(container, dict) else []
+    approved_mount_roots = (
+        str(PILOT_DATA_ROOT / PILOT_USERNAME),
+        "/srv/gpu-platform/container-data/origin-pilot",
+    )
+    mount_sources_ok = all(
+        isinstance(item, dict)
+        and any(str(item.get("Source", "")).startswith(root) for root in approved_mount_roots)
+        for item in mounts
+    )
+    container_ok = (
+        container_result.get("status") == "OK"
+        and isinstance(container, dict)
+        and str(container.get("name", "")).lstrip("/") == payload["container_name"]
+        and container.get("owner") == PILOT_USERNAME
+        and container.get("cpu_limit") == float(payload["cpus"])
+        and container.get("memory_limit_bytes") == payload["memory_gb"] * 1024**3
+        and container.get("pids_limit") == payload["pids_limit"]
+        and container.get("ssh_port") == str(payload["ssh_port"])
+        and container.get("privileged") is False
+        and container.get("network_mode") != "host"
+        and container.get("pid_mode") != "host"
+        and container.get("ipc_mode") != "host"
+        and container.get("gpu") == "NONE"
+        and not container.get("docker_socket_mounted")
+        and isinstance(state, dict)
+        and state.get("Running") is False
+        and state.get("Status") in {"exited", "created"}
+        and mount_sources_ok
+    )
+    if not container_ok:
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "staged container security state is invalid"
+        )
+
+    guard_enabled = run_fixed(
+        "systemctl", ["is-enabled", "h100-gpu-bypass-guard.timer"], timeout=10
+    )
+    guard_active = run_fixed("systemctl", ["is-active", "h100-gpu-bypass-guard.timer"], timeout=10)
+    if (
+        str(guard_enabled.get("stdout", "")).strip() != "enabled"
+        or str(guard_active.get("stdout", "")).strip() != "active"
+    ):
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "GPU bypass Guard timer is not enabled and active"
+        )
+    node = slurm_node()
+    jobs = slurm_jobs()
+    if (
+        node.get("status") != "OK"
+        or not node.get("nodes")
+        or not all("DRAIN" in str(item.get("state", "")).upper() for item in node["nodes"])
+        or jobs.get("status") != "OK"
+        or jobs.get("jobs")
+    ):
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "Slurm is not drained with an empty queue"
+        )
+
+    return {
+        "username": PILOT_USERNAME,
+        "uid": payload["uid"],
+        "gid": payload["gid"],
+        "shell": "/usr/sbin/nologin",
+        "password": "LOCKED",
+        "authorized_keys": "ABSENT",
+        "supplemental_groups": [],
+        "gpu_policy": {
+            "unit": f"user-{payload['uid']}.slice",
+            "path": str(dropin),
+            "device_policy": "closed",
+            "device_allow": [],
+            "open_probe": "DENIED",
+            "cuda_context_probe": "DENIED",
+        },
+        "quota": {"project_id": payload["project_id"], "hard_limit_gb": payload["quota_gb"]},
+        "slurm": {
+            "account": payload["slurm_account"],
+            "qos": payload["slurm_qos"],
+            "max_gpus": payload["max_gpus"],
+            "node_state": "DRAIN",
+            "queue": "EMPTY",
+        },
+        "container": {
+            "name": payload["container_name"],
+            "state": "STOPPED",
+            "gpu": "NONE",
+            "cpus": payload["cpus"],
+            "memory_gb": payload["memory_gb"],
+            "pids_limit": payload["pids_limit"],
+            "ssh_port": payload["ssh_port"],
+            "image_digest": container.get("image_digest") or container.get("image_id"),
+        },
+        "guard": {"timer": "ENABLED_ACTIVE", "status": "PASSING"},
+        "ssh_key_state": "REQUIRED_BEFORE_ACTIVATION",
+        "host_access": "DISABLED",
+        "onboarding_state": "STAGED",
+    }
+
+
+def _execute_origin_pilot_stage(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    """Execute the one Portal-3C write approved by the administrator."""
+    if (
+        request.requested_by != MANAGEMENT_USERNAME
+        or request.approved_by != MANAGEMENT_USERNAME
+        or request.idempotency_key != PORTAL3C_STAGE_IDEMPOTENCY_KEY
+        or payload.get("approval_reference") != PORTAL3C_STAGE_APPROVAL_REFERENCE
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "STAGE_APPROVAL_BINDING_REJECTED",
+                "message": "real Stage is not bound to the approved Portal-3C operation",
+            },
+        }
+    integrity = script_integrity()
+    failed_scripts = sorted(
+        name
+        for name in STAGE_REQUIRED_SCRIPTS
+        if not integrity.get(name, {}).get("integrity_ok", False)
+    )
+    if failed_scripts:
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "SCRIPT_INTEGRITY_FAILED",
+                "message": "fixed lifecycle script integrity check failed",
+                "scripts": failed_scripts,
+            },
+        }
+
+    state_path = PILOT_STATE_ROOT / f"{PILOT_USERNAME}.state"
+    if state_path.exists() or state_path.is_symlink():
+        try:
+            summary = _stage_postcondition_summary(payload)
+        except LifecycleValidationError as exc:
+            return {
+                "status": "ERROR",
+                "error": {"code": "IDEMPOTENCY_STATE_MISMATCH", "message": str(exc)},
+                "rollback_status": "REQUIRES_MANUAL_REVIEW",
+            }
+        return {
+            "status": "SUCCEEDED",
+            "handler": "user.stage",
+            "idempotent_replay": True,
+            "execution_enabled": True,
+            "stage": summary,
+        }
+
+    try:
+        preflight = _user_stage_dry_run(payload)
+    except LifecycleValidationError as exc:
+        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+    if preflight.get("status") != "DRY_RUN" or preflight.get("stage_status") != "READY":
+        error = preflight.get("error", {})
+        code = (
+            error.get("code", "PLAN_VALUES_CHANGED")
+            if isinstance(error, dict)
+            else "PLAN_VALUES_CHANGED"
+        )
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": str(code)[:64],
+                "message": "approved resource identifiers are no longer available",
+            },
+            "preflight": {
+                "stage_status": preflight.get("stage_status", "CONFLICT"),
+                "conflicts": preflight.get("conflicts", []),
+            },
+        }
+
+    execution = run_allowlisted_script(
+        build_user_stage_argv(payload), timeout=STAGE_EXECUTION_TIMEOUT_SECONDS
+    )
+    if not execution.get("ok"):
+        retained_state = state_path.exists() or state_path.is_symlink()
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": str(execution.get("error_code", "STAGE_EXECUTION_FAILED"))[:64],
+                "message": "transactional Stage script failed",
+                "exit_code": execution.get("exit_code"),
+            },
+            "rollback_status": "PARTIAL_RETAINED" if retained_state else "ROLLED_BACK",
+            "host_resources_retained": retained_state,
+        }
+    try:
+        summary = _stage_postcondition_summary(payload)
+    except LifecycleValidationError as exc:
+        return {
+            "status": "ERROR",
+            "error": {"code": exc.code, "message": str(exc)},
+            "rollback_status": "REQUIRES_MANUAL_REVIEW",
+            "host_resources_retained": True,
+        }
+    return {
+        "status": "SUCCEEDED",
+        "handler": "user.stage",
+        "idempotent_replay": False,
+        "execution_enabled": True,
+        "stage": summary,
+    }
+
+
 def _user_activate_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
     # Key files are validated before consulting or mutating lifecycle state.
     key_records = validate_approved_ssh_key_records(payload["approved_ssh_key_record_ids"])
@@ -2196,11 +2599,13 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
         }
     if request.operation_type in KNOWN_WRITES:
         if not request.dry_run:
+            if request.operation_type == "user.stage":
+                return _execute_origin_pilot_stage(request, payload)
             return {
                 "status": "ERROR",
                 "error": {
                     "code": "WRITE_EXECUTION_DISABLED",
-                    "message": "Portal-3B-R 生命周期 Gate 仅允许 dry-run",
+                    "message": "Only the approved Portal-3C user.stage write is enabled",
                 },
             }
         try:

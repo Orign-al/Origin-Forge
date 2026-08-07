@@ -22,8 +22,9 @@ Portal-2 的成功含义是“Worker dry-run 已验证”，不是宿主变更�
 - `root`、`origin-al`、`codexops` 不能成为计算用户写操作目标。
 - Portal-3A 仅允许 `user.plan(origin-pilot)` 为 Origin-al 生成独立计算身份 DRAFT；
   Worker 仍禁止真实 stage/activate，且 `origin-al` 始终保持 NOT_ENROLLED。
-- Portal-3B-R 的 Stage/Activate 审批 Gate 在本阶段关闭。Stage 不要求公钥；Activate
-  必须带已批准 key record UUID，且不能带宿主路径、私钥、密码或任意 argv。
+- Portal-3C 只允许既有 `portal3b-r-origin-pilot-stage-v1` DRAFT 经当前管理员控制台的
+  精确批准文本进入真实 Stage；Stage 不要求公钥。Activate 仍关闭，且未来只能带已批准
+  key record UUID，不能带宿主路径、私钥、密码或任意 argv。
 - 同一请求人和幂等键返回既有任务，不重复执行。
 
 ## 高风险门槛
@@ -40,18 +41,21 @@ Slurm DRAIN/RESUME、用户 Activate/Suspend、删除、quota/QOS、运行容器
 前端隐藏按钮不构成授权。`platform_owner` 可审批；其他角色按权限矩阵受限，auditor
 只读，user 只能访问自己的资源。
 
-## Portal-3B-R 执行边界
+## Portal-3C 执行边界
 
-审批通过后任务进入 `QUEUED`，后台调用 Worker 时始终设置 `dry_run=true`。Worker 返回
-计划后任务可进入 `SUCCEEDED`；返回拒绝、超时或 schema 错误则进入 `FAILED`。本阶段：
+唯一 DRAFT 依次进入 `PENDING_APPROVAL → APPROVED → QUEUED → RUNNING`。API 只有在
+requester、approver、target、payload、审批引用和幂等键全部精确匹配时才向 Worker 发送
+`dry_run=false`。Worker 返回并通过后置条件验证后，Operation 才进入 `SUCCEEDED`，Portal
+managed identity 才写为 STAGED。本阶段：
 
-- 不创建、Stage、Activate 或 Suspend 真实 Linux 用户；
-- 不改变 quota、QOS、GPU 隔离或容器状态；
+- 仅创建并 Stage `origin-pilot`，准备精确 quota、association、GPU policy 和停止容器；
+- 不 Activate、Suspend 或创建第二个用户；
+- 不安装 SSH 公钥，不启用普通 shell，不允许登录；
 - 不执行真实 job cancel；
-- 不 DRAIN 新原因，也绝不 RESUME Slurm。
+- 不 DRAIN 新原因，也绝不 RESUME Slurm；
+- 所有其他真实写 handler 保持关闭。
 
-未来启用写执行必须经过独立阶段审批、为每个 handler 增加当前状态检查、备份、验证、
-幂等和精确回滚，并移除代码中的全局写禁用开关后重新做安全验收。
+后续公钥上传和 Activate 必须重新规划、验证并获得独立明确审批，不能复用 Stage 批准。
 
 ## 审计
 

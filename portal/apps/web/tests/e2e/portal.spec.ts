@@ -9,6 +9,7 @@ type MockState = {
   enforceCsrf?: boolean;
   draftCreated?: boolean;
   planConflict?: boolean;
+  staged?: boolean;
 };
 
 const MOCK_SETUP_TOKEN = "test-only-portal-setup-token-with-forty-eight-bytes";
@@ -100,6 +101,51 @@ const originPilotConflictPlan = {
       message: "origin-pilot Linux 用户或组已存在",
     },
   ],
+};
+
+const stagedOwner = {
+  ...owner,
+  resource_onboarding_state: "STAGED",
+  linux_identity: {
+    unix_username: "origin-pilot",
+    uid: 20001,
+    gid: 20001,
+    shell: "/usr/sbin/nologin",
+    onboarding_state: "STAGED",
+    host_access_state: "DISABLED",
+    password_state: "LOCKED",
+    authorized_keys_state: "ABSENT",
+    gpu_isolation_state: "VERIFIED",
+    gpu_open_state: "DENIED",
+    cuda_context_state: "DENIED",
+    guard_state: "PASSING",
+    slurm_account: "company",
+    slurm_qos: "general",
+    max_gpus: 1,
+    project_id: 30001,
+    quota_bytes: 300 * 1024 ** 3,
+    container_name: "gpu-dev-origin-pilot",
+    container_port: 22023,
+    container_state: "STOPPED",
+    container_gpu: "NONE",
+    container_cpus: 8,
+    container_memory_gb: 32,
+    container_pids_limit: 4096,
+    container_image_digest: `sha256:${"a".repeat(64)}`,
+  },
+  compute_onboarding: {
+    status: "STAGED",
+    compute_username: "origin-pilot",
+    draft_state: "STAGED",
+    operation_id: "00000000-0000-4000-8000-000000000020",
+    operation_status: "SUCCEEDED",
+    ssh_key_status: "REQUIRED_BEFORE_ACTIVATION",
+    plan: {
+      ...originPilotPlan,
+      stage_status: "STAGED",
+      execution_enabled: true,
+    },
+  },
 };
 
 const managedContainer = {
@@ -411,27 +457,33 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
       return;
     }
     if (path === "/users") {
-      await json(route, { status: "OK", users: [owner], count: 1 });
+      await json(route, {
+        status: "OK",
+        users: [state.staged ? stagedOwner : owner],
+        count: 1,
+      });
       return;
     }
     if (path === `/users/${owner.id}`) {
       await json(route, {
         status: "OK",
-        user: state.draftCreated
-          ? {
-              ...owner,
-              compute_onboarding: {
-                status: "DRAFT",
-                compute_username: "origin-pilot",
-                draft_state: "DRAFT",
-                operation_id: "00000000-0000-4000-8000-000000000020",
-                operation_status: "DRAFT",
-                plan: state.planConflict
-                  ? originPilotConflictPlan
-                  : originPilotPlan,
-              },
-            }
-          : owner,
+        user: state.staged
+          ? stagedOwner
+          : state.draftCreated
+            ? {
+                ...owner,
+                compute_onboarding: {
+                  status: "DRAFT",
+                  compute_username: "origin-pilot",
+                  draft_state: "DRAFT",
+                  operation_id: "00000000-0000-4000-8000-000000000020",
+                  operation_status: "DRAFT",
+                  plan: state.planConflict
+                    ? originPilotConflictPlan
+                    : originPilotPlan,
+                },
+              }
+            : owner,
       });
       return;
     }
@@ -728,6 +780,37 @@ test("origin-pilot 资源冲突在计划页明确阻断", async ({ page }) => {
   await expect(
     page.getByRole("button", { name: "Stage 未授权" }),
   ).toBeDisabled();
+});
+
+test("origin-pilot STAGED 页面保持无公钥、nologin、停止容器和 Activate Gate", async ({
+  page,
+}) => {
+  await installMockApi(page, { authenticated: true, staged: true });
+  await page.goto(`/users/${owner.id}`);
+  await page.getByRole("tab", { name: "计算资源" }).click();
+  await expect(page.getByText("STAGED", { exact: true }).first()).toBeVisible();
+  await expect(
+    page.getByText("origin-pilot", { exact: true }).first(),
+  ).toBeVisible();
+  await expect(page.getByText("20001/20001", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("/usr/sbin/nologin", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("LOCKED", { exact: true })).toBeVisible();
+  await expect(page.getByText("ABSENT", { exact: true })).toBeVisible();
+  await expect(page.getByText("DENIED", { exact: true }).first()).toBeVisible();
+  await expect(
+    page.getByText(/gpu-dev-origin-pilot \/ STOPPED \/ GPU NONE/),
+  ).toBeVisible();
+  await expect(page.getByText("PASSING", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "添加 SSH 公钥（下一 Gate）" }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Activate（未审批）" }),
+  ).toBeDisabled();
+  await expect(page.locator('input[type="file"]')).toHaveCount(0);
+  await expect(page.getByText(/管理映射 origin-al 保持不变/)).toBeVisible();
 });
 
 test("账号安全页显示会话并可撤销其他会话", async ({ page }) => {

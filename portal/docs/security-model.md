@@ -18,9 +18,10 @@ capability 或 `scontrol` 参数。子进程一律 `shell=False`，使用固定�
 ## 身份分离
 
 网页身份与 Linux 资源身份分别建模。网页显示账号 `Origin-al` 的唯一规范化登录名为
-`origin-al`，登录大小写不敏感；它映射现有 Linux 用户 `origin-al`，但初始计算身份为
-`NOT_ENROLLED`。Portal 网页密码不读取或修改 Linux shadow，不修改 SSH 密码、shell、
-sudo 或 `authorized_keys`。
+`origin-al`，登录大小写不敏感；它映射现有 Linux 用户 `origin-al`。独立计算身份
+`origin-pilot` 通过 `PortalManagedUser` 关联到该网页账号，不替换管理映射。Portal 网页
+密码不读取或修改 Linux shadow，不修改 SSH 密码、管理账号 shell、sudo 或
+`authorized_keys`。
 
 ## 密码和邀请
 
@@ -60,11 +61,13 @@ SameSite Cookie 不是唯一防线。登录使用统一错误文案，按 IP 与
 private key、authorized key body、数据库密码和 MUNGE key。SSH 公钥只记录类型、
 fingerprint 与截断注释。
 
-## 明确不变项
+## Portal-3C 精确写边界
 
-Portal-0/1 不创建 Linux/Pilot 用户，不创建长期用户容器，不启用 Guard timer，不修改
-现有 GPU 隔离 drop-in，不修改 MIG、GRES、Kernel、Driver、Mellanox 或防火墙，且不
-RESUME Slurm。
+唯一真实写允许固定 `origin-pilot`、UID/GID 20001、project 30001、端口 22023 和固定
+容器/Slurm 参数。Worker systemd sandbox 仅为 hash-pinned 生命周期脚本增加 `/etc`、
+`/home`、`/srv/gpu-platform` 写白名单；固定 schema、actor/approval/idempotency 绑定和
+`shell=False` 不变。Activate、其他用户、任意命令、Slurm RESUME、MIG、GRES、Kernel、
+Driver、Mellanox、防火墙、NFS 和第二节点仍不在授权范围。
 
 内部 HTTP 的管理员接受仅解除 transport 对未来 Portal-3 的阻断，不构成 Portal-3 执行
 批准。收到完整 Portal-3 批准前，真实写 handler 继续禁用。

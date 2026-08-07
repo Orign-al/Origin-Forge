@@ -103,6 +103,7 @@ export default function UserDetailPage() {
   const gpuPolicy = asRecord(plan.proposed_gpu_policy);
   const validations = asRows(plan.validation_results);
   const conflicts = asRows(plan.conflicts);
+  const isStaged = linux.onboarding_state === "STAGED";
   async function createComputePlan() {
     setBusy(true);
     setMessage(null);
@@ -210,15 +211,59 @@ export default function UserDetailPage() {
                 <div>
                   <h2>独立计算身份 Onboarding</h2>
                   <p className="muted">
-                    管理映射 origin-al 保持不变；这里只创建数据库 DRAFT 和只读
-                    dry-run。
+                    {isStaged
+                      ? "管理映射 origin-al 保持不变；独立计算身份已安全 Stage，尚未激活登录。"
+                      : "管理映射 origin-al 保持不变；这里只创建数据库 DRAFT 和只读 dry-run。"}
                   </p>
                 </div>
                 <StatusBadge
                   value={compute?.draft_state ?? "DRAFT NOT CREATED"}
                 />
               </div>
-              {compute?.status !== "DRAFT" || !Object.keys(plan).length ? (
+              {compute?.status === "STAGED" ? (
+                <>
+                  <div className="plan-status-row">
+                    <StatusBadge value="STAGED" />
+                    <span className="mono">
+                      Operation {compute.operation_id}
+                    </span>
+                    <span>宿主登录未激活</span>
+                  </div>
+                  {kv([
+                    ["Portal owner", "Origin-al"],
+                    ["管理 Linux 映射", "origin-al（保持不变）"],
+                    ["计算身份", linux.unix_username],
+                    ["UID/GID", `${String(linux.uid)}/${String(linux.gid)}`],
+                    ["Shell", linux.shell],
+                    ["Linux 密码", linux.password_state],
+                    ["authorized_keys", linux.authorized_keys_state],
+                    ["宿主登录", "未激活"],
+                    ["SSH 公钥", "激活前必填"],
+                    ["GPU 隔离", linux.gpu_isolation_state],
+                    ["作业外 GPU open", linux.gpu_open_state],
+                    ["作业外 CUDA context", linux.cuda_context_state],
+                    [
+                      "Slurm",
+                      `${String(linux.slurm_account)} / ${String(linux.slurm_qos)} / ${String(linux.max_gpus)} GPU`,
+                    ],
+                    ["配额", "300GB hard limit"],
+                    [
+                      "容器",
+                      `${String(linux.container_name)} / ${String(linux.container_state)} / GPU ${String(linux.container_gpu)}`,
+                    ],
+                    ["Guard", linux.guard_state],
+                  ])}
+                  <div className="operation-actions">
+                    <Button disabled>添加 SSH 公钥（下一 Gate）</Button>
+                    <Button disabled>Activate（未审批）</Button>
+                  </div>
+                  <div className="notice">
+                    SSH PUBLIC KEY REQUIRED。当前没有 authorized_keys，Shell
+                    仍为 /usr/sbin/nologin，容器保持 STOPPED；Activate
+                    计划与明确审批均未完成。
+                  </div>
+                </>
+              ) : compute?.status !== "DRAFT" || !Object.keys(plan).length ? (
                 <div className="empty-plan">
                   <EmptyState
                     title="DRAFT NOT CREATED"
@@ -375,6 +420,8 @@ export default function UserDetailPage() {
               ["UID", linux.uid],
               ["GID", linux.gid],
               ["Shell", linux.shell],
+              ["密码状态", linux.password_state],
+              ["authorized_keys", linux.authorized_keys_state],
               ["宿主访问", linux.host_access_state],
               ["资源状态", linux.onboarding_state],
             ])
@@ -387,12 +434,16 @@ export default function UserDetailPage() {
                 linux.uid ? `user-${String(linux.uid)}.slice` : "NOT_APPLIED",
               ],
               ["宿主直接 GPU", linux.uid ? "DENIED" : "NOT_ENROLLED"],
+              ["GPU open probe", linux.gpu_open_state],
+              ["CUDA context probe", linux.cuda_context_state],
+              ["Guard", linux.guard_state],
             ])
           : null}
         {activeTab === "Slurm"
           ? kv([
               ["Account", linux.slurm_account],
               ["QOS", linux.slurm_qos],
+              ["最大 GPU", linux.max_gpus],
               ["状态", user.resource_onboarding_state],
             ])
           : null}
@@ -401,12 +452,23 @@ export default function UserDetailPage() {
               ["容器", linux.container_name],
               ["SSH 端口", linux.container_port],
               ["GPU", linux.container_name ? "无" : "NOT_ENROLLED"],
+              ["状态", linux.container_state],
+              ["CPU", linux.container_cpus],
+              [
+                "内存",
+                linux.container_memory_gb
+                  ? `${String(linux.container_memory_gb)} GB`
+                  : null,
+              ],
+              ["PIDs", linux.container_pids_limit],
+              ["镜像 digest", linux.container_image_digest],
             ])
           : null}
         {activeTab === "配额"
           ? kv([
               ["Project ID", linux.project_id],
               ["Quota bytes", linux.quota_bytes],
+              ["Hard limit", linux.quota_bytes ? "300GB" : null],
             ])
           : null}
         {activeTab === "SSH 公钥" ? (
@@ -415,7 +477,11 @@ export default function UserDetailPage() {
               title="SSH 公钥：待添加"
               detail="Stage 不要求公钥；Activate 前必须通过受控记录添加并验证。页面永不显示私钥或完整公钥正文。"
             />
-            <Button disabled>添加受控公钥（等待 Stage 完成）</Button>
+            <Button disabled>
+              {isStaged
+                ? "添加 SSH 公钥（下一 Gate）"
+                : "添加受控公钥（等待 Stage 完成）"}
+            </Button>
           </>
         ) : null}
         {activeTab === "操作记录" ? (
@@ -437,7 +503,9 @@ export default function UserDetailPage() {
           不会因网页账号激活而自动执行。
         </SectionCard>
         <SectionCard title="当前阶段">
-          所有资源写操作只形成审批任务和 Worker dry-run，Slurm 保持 DRAIN。
+          {isStaged
+            ? "origin-pilot 已 STAGED；SSH 公钥、登录、容器启动与 Activate 均未执行，Slurm 保持 DRAIN。"
+            : "所有资源写操作只形成审批任务和 Worker dry-run，Slurm 保持 DRAIN。"}
         </SectionCard>
       </div>
     </>

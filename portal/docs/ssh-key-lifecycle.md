@@ -39,5 +39,6 @@ rename 安装 `0700 .ssh` / `0600 authorized_keys`，重新读取 fingerprint，
 启动容器和写入 `ACTIVE`。失败时恢复 nologin、禁用公钥、停止容器并保留数据与 GPU
 policy；Slurm 始终保持 DRAIN。
 
-Portal-3B-R 只部署并 dry-run 验收此契约。真实 Stage、上传真实用户公钥和 Activate 均
-继续受独立审批 Gate 阻断。
+Portal-3C 的明确管理员审批只允许真实 Stage `origin-pilot`。Stage 完成后仍没有 SSH
+公钥、authorized_keys、普通 shell 或运行中的用户容器。上传真实用户公钥、公钥
+fingerprint 复核和 Activate 继续受后续独立 Gate 阻断。

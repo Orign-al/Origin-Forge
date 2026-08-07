@@ -22,10 +22,12 @@ ssh -L 18080:10.10.10.2:18080 h100-codex
 
 - API 非 root，不访问 Docker Socket、MUNGE key、shadow 或 SlurmDBD 密码。
 - 高权限宿主操作只能经由限权 Unix Socket Root Worker。
-- Portal-2 写操作只提供 DRAFT、审批与 dry-run，不创建 Linux 用户、不创建用户容器、
-  不修改 GPU 隔离、不启用 Guard timer，也不 RESUME Slurm。
+- Portal-3C 只允许审批主体和参数均精确绑定的 `origin-pilot user.stage` 经 Root Worker
+  执行；其余写操作仍为 dry-run 或拒绝，`user.activate` 继续禁用，也不 RESUME Slurm。
+- Stage 创建锁定且使用 `/usr/sbin/nologin` 的独立计算身份，不读取或安装 SSH 公钥；
+  公钥验证、普通 shell、容器启动和登录能力全部保留到后续 Activate 审批。
 - Origin-al 网页密码与 Linux/SSH 密码完全分离。
-- 内部 HTTP 接受不再阻断未来 Portal-3 真实写操作，但当前仍须等待完整 Portal-3 执行批准；
-  本次变更不启用任何写 handler。
+- 内部 HTTP 接受不阻断当前单节点 Pilot 的已批准 Stage，但不得据此扩大访问范围或绕过
+  Portal Operation、审批、幂等键、脚本 hash 和 Root Worker 校验链路。
 
 完整部署与安全说明见 [`docs/`](docs/)。

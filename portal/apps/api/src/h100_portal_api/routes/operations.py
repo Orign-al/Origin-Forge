@@ -20,6 +20,7 @@ from h100_portal_api.dependencies import permission_dependency
 from h100_portal_api.enums import OnboardingState, OperationStatus
 from h100_portal_api.models import (
     PortalAuditEvent,
+    PortalContainer,
     PortalManagedUser,
     PortalOperation,
     PortalOperationApproval,
@@ -80,6 +81,8 @@ APPROVED_ORIGIN_PILOT_STAGE: dict[str, Any] = {
     "gpu": "none",
     "expected_state": "DRAFT",
 }
+PORTAL3C_STAGE_IDEMPOTENCY_KEY = "portal3b-r-origin-pilot-stage-v1"
+PORTAL3C_STAGE_APPROVAL_REFERENCE = "portal3b-r-lifecycle-revalidated"
 
 
 class OperationPayloadError(ValueError):
@@ -293,27 +296,300 @@ def transition(
     )
 
 
+def is_portal3c_real_stage(
+    operation: PortalOperation, requester: PortalUser | None, approver: PortalUser | None
+) -> bool:
+    """Recognize the single administrator-approved Portal-3C write."""
+    if (
+        operation.operation_type != "user.stage"
+        or operation.target_type != "compute_identity"
+        or operation.target_id != "origin-pilot"
+        or operation.idempotency_key != PORTAL3C_STAGE_IDEMPOTENCY_KEY
+        or requester is None
+        or approver is None
+        or requester.id != approver.id
+        or requester.normalized_login != "origin-al"
+        or approver.normalized_login != "origin-al"
+        or requester.account_state.value != "ACTIVE"
+        or not any(role.name == "platform_owner" for role in requester.roles)
+    ):
+        return False
+    try:
+        validated = validate_operation_payload("user.stage", operation.validated_payload)
+    except ValueError:
+        return False
+    return (
+        validated == operation.validated_payload
+        and validated.get("approval_reference") == PORTAL3C_STAGE_APPROVAL_REFERENCE
+    )
+
+
+def persist_portal3c_staged_identity(
+    db: Session,
+    *,
+    owner: PortalUser,
+    operation: PortalOperation,
+    worker_result: dict[str, Any],
+) -> PortalManagedUser:
+    """Persist the exact host-verified STAGED result without changing management identity."""
+    stage = worker_result.get("stage")
+    if not isinstance(stage, dict):
+        raise RuntimeError("Worker Stage response has no structured postcondition record")
+    expected = {
+        "username": "origin-pilot",
+        "uid": 20001,
+        "gid": 20001,
+        "shell": "/usr/sbin/nologin",
+        "password": "LOCKED",
+        "host_access": "DISABLED",
+        "onboarding_state": "STAGED",
+        "ssh_key_state": "REQUIRED_BEFORE_ACTIVATION",
+    }
+    if any(stage.get(key) != value for key, value in expected.items()):
+        raise RuntimeError("Worker Stage identity result differs from approval")
+    if stage.get("authorized_keys") != "ABSENT":
+        raise RuntimeError("Worker did not prove authorized_keys absence")
+    gpu_policy = stage.get("gpu_policy")
+    quota = stage.get("quota")
+    slurm = stage.get("slurm")
+    container_stage = stage.get("container")
+    guard = stage.get("guard")
+    if (
+        not isinstance(gpu_policy, dict)
+        or not isinstance(quota, dict)
+        or not isinstance(slurm, dict)
+        or not isinstance(container_stage, dict)
+        or not isinstance(guard, dict)
+    ):
+        raise RuntimeError("Worker Stage resource result is incomplete")
+    if (
+        gpu_policy.get("unit") != "user-20001.slice"
+        or gpu_policy.get("device_policy") != "closed"
+        or gpu_policy.get("device_allow") != []
+        or gpu_policy.get("open_probe") != "DENIED"
+        or gpu_policy.get("cuda_context_probe") != "DENIED"
+        or quota.get("project_id") != 30001
+        or quota.get("hard_limit_gb") != 300
+        or slurm.get("account") != "company"
+        or slurm.get("qos") != "general"
+        or slurm.get("max_gpus") != 1
+        or slurm.get("node_state") != "DRAIN"
+        or slurm.get("queue") != "EMPTY"
+        or container_stage.get("name") != "gpu-dev-origin-pilot"
+        or container_stage.get("state") != "STOPPED"
+        or container_stage.get("gpu") != "NONE"
+        or container_stage.get("cpus") != 8
+        or container_stage.get("memory_gb") != 32
+        or container_stage.get("pids_limit") != 4096
+        or container_stage.get("ssh_port") != 22023
+        or guard.get("timer") != "ENABLED_ACTIVE"
+        or guard.get("status") != "PASSING"
+    ):
+        raise RuntimeError("Worker Stage resource result differs from approval")
+    image_digest = str(container_stage.get("image_digest", ""))
+    if not image_digest.startswith("sha256:") or len(image_digest) > 255:
+        raise RuntimeError("Worker did not return a fixed container image digest")
+    if owner.unix_username != "origin-al":
+        raise RuntimeError("Origin-al management mapping changed before Stage persistence")
+
+    managed = db.scalar(
+        select(PortalManagedUser).where(PortalManagedUser.portal_user_id == owner.id)
+    )
+    if managed is None:
+        managed = PortalManagedUser(  # noqa: S604 -- ORM shell field, no subprocess shell.
+            portal_user_id=owner.id,
+            unix_username="origin-pilot",
+            uid=20001,
+            gid=20001,
+            shell="/usr/sbin/nologin",
+            host_access_state="DISABLED",
+            gpu_isolation_state="VERIFIED",
+            slurm_account="company",
+            slurm_qos="general",
+            project_id=30001,
+            quota_bytes=300 * 1024**3,
+            container_name="gpu-dev-origin-pilot",
+            container_port=22023,
+            onboarding_state=OnboardingState.STAGED,
+            ssh_key_state="REQUIRED_BEFORE_ACTIVATION",
+            ssh_key_count=0,
+            staged_at=utcnow(),
+            compute_activated_at=None,
+        )
+        db.add(managed)
+        db.flush()
+    else:
+        current_identity = (
+            managed.unix_username,
+            managed.uid,
+            managed.gid,
+            managed.project_id,
+            managed.container_name,
+            managed.container_port,
+        )
+        if current_identity != (
+            "origin-pilot",
+            20001,
+            20001,
+            30001,
+            "gpu-dev-origin-pilot",
+            22023,
+        ):
+            raise RuntimeError("existing managed identity conflicts with Portal-3C approval")
+        managed.shell = "/usr/sbin/nologin"
+        managed.host_access_state = "DISABLED"
+        managed.gpu_isolation_state = "VERIFIED"
+        managed.slurm_account = "company"
+        managed.slurm_qos = "general"
+        managed.quota_bytes = 300 * 1024**3
+        managed.onboarding_state = OnboardingState.STAGED
+        managed.ssh_key_state = "REQUIRED_BEFORE_ACTIVATION"
+        managed.ssh_key_count = 0
+        managed.compute_activated_at = None
+        managed.staged_at = managed.staged_at or utcnow()
+
+    container = db.scalar(
+        select(PortalContainer).where(PortalContainer.name == "gpu-dev-origin-pilot")
+    )
+    safe_spec = {
+        "cpus": 8,
+        "memory_gb": 32,
+        "pids_limit": 4096,
+        "gpu": "NONE",
+        "privileged": False,
+        "host_network": False,
+        "host_pid": False,
+        "host_ipc": False,
+        "docker_socket": False,
+        "password_authentication": False,
+        "root_login": False,
+        "authorized_keys": "ABSENT",
+        "guard": "PASSING",
+        "gpu_open_probe": "DENIED",
+        "cuda_context_probe": "DENIED",
+        "max_gpus": 1,
+    }
+    if container is None:
+        container = PortalContainer(
+            managed_user_id=managed.id,
+            name="gpu-dev-origin-pilot",
+            image_digest=image_digest,
+            ssh_port=22023,
+            desired_state="STOPPED",
+            observed_state="STOPPED",
+            safe_spec=safe_spec,
+        )
+        db.add(container)
+    else:
+        if container.managed_user_id not in {None, managed.id}:
+            raise RuntimeError("existing container record belongs to another identity")
+        container.managed_user_id = managed.id
+        container.image_digest = image_digest
+        container.ssh_port = 22023
+        container.desired_state = "STOPPED"
+        container.observed_state = "STOPPED"
+        container.safe_spec = safe_spec
+
+    owner.resource_onboarding_state = OnboardingState.STAGED
+    for event_type, object_type, metadata in (
+        ("user.stage.linux", "managed_user", {"uid": 20001, "gid": 20001, "shell": "nologin"}),
+        ("user.stage.gpu_policy", "gpu_policy", {"unit": "user-20001.slice", "verified": True}),
+        ("user.stage.gpu_self_test", "gpu_policy", {"open": "DENIED", "cuda": "DENIED"}),
+        ("user.stage.quota", "xfs_project", {"project_id": 30001, "hard_limit_gb": 300}),
+        (
+            "user.stage.slurm",
+            "slurm_association",
+            {"account": "company", "qos": "general", "max_gpus": 1},
+        ),
+        (
+            "user.stage.container",
+            "container",
+            {"name": "gpu-dev-origin-pilot", "state": "STOPPED", "gpu": "NONE"},
+        ),
+        ("user.stage.guard", "gpu_guard", {"timer": "ENABLED", "status": "PASSING"}),
+        (
+            "user.stage.completed",
+            "managed_user",
+            {"state": "STAGED", "ssh_key_state": "REQUIRED_BEFORE_ACTIVATION"},
+        ),
+    ):
+        record_audit(
+            db,
+            event_type=event_type,
+            actor="h100-portal-worker",
+            actor_role="root_worker",
+            source_ip="local-worker-socket",
+            user_agent="h100-portal-api",
+            object_type=object_type,
+            object_id="origin-pilot",
+            result="SUCCESS",
+            metadata=metadata,
+            operation_id=operation.id,
+        )
+    return managed
+
+
 def execute_operation(operation_id: uuid.UUID, actor_login: str) -> None:
     with SessionLocal() as db:
         operation = db.get(PortalOperation, operation_id)
         if operation is None or operation.status != OperationStatus.QUEUED:
             return
-        transition(operation, OperationStatus.RUNNING, "Worker dry-run started", db)
+        requester = db.get(PortalUser, operation.requested_by)
+        approver = db.get(PortalUser, operation.approved_by) if operation.approved_by else None
+        real_stage = is_portal3c_real_stage(operation, requester, approver)
+        transition(
+            operation,
+            OperationStatus.RUNNING,
+            "Controlled Worker Stage started" if real_stage else "Worker dry-run started",
+            db,
+        )
         operation.started_at = utcnow()
         db.commit()
         try:
-            requester = db.get(PortalUser, operation.requested_by)
-            approver = db.get(PortalUser, operation.approved_by) if operation.approved_by else None
             result = call_worker(
                 operation.operation_type,
                 payload=operation.validated_payload,
                 requested_by=requester.normalized_login if requester else "portal",
                 approved_by=approver.normalized_login if approver else actor_login,
                 idempotency_key=operation.idempotency_key,
-                dry_run=True,
-                timeout_seconds=30,
+                dry_run=not real_stage,
+                timeout_seconds=1830 if real_stage else 30,
             )
-            if result.get("status") == "DRY_RUN":
+            if real_stage and result.get("status") == "SUCCEEDED" and requester is not None:
+                persist_portal3c_staged_identity(
+                    db,
+                    owner=requester,
+                    operation=operation,
+                    worker_result=result,
+                )
+                execution_record = cast(dict[str, Any], safe_metadata(result))
+                previous_plan = operation.dry_run_result or {}
+                operation.dry_run_result = {
+                    **previous_plan,
+                    "execution_result": execution_record,
+                    "stage_status": "STAGED",
+                    "execution_enabled": True,
+                }
+                transition(operation, OperationStatus.SUCCEEDED, "origin-pilot Stage verified", db)
+                operation.result_summary = (
+                    "origin-pilot 已 STAGED；nologin、密码锁定、无 authorized_keys；"
+                    "GPU/quota/Slurm/容器/Guard 已验证；未 Activate"
+                )
+                operation.worker_execution_id = str(result.get("request_id", "worker"))[:64]
+                record_audit(
+                    db,
+                    event_type="worker.execute",
+                    actor=actor_login,
+                    actor_role="platform_owner",
+                    source_ip="local-worker-socket",
+                    user_agent="h100-portal-api",
+                    object_type="operation",
+                    object_id=str(operation.id),
+                    result="SUCCESS",
+                    metadata={"operation_type": "user.stage", "execution_mode": "real-stage"},
+                    operation_id=operation.id,
+                )
+            elif not real_stage and result.get("status") == "DRY_RUN":
                 operation.dry_run_result = cast(dict[str, Any], safe_metadata(result))
                 transition(operation, OperationStatus.SUCCEEDED, "dry-run plan validated", db)
                 operation.result_summary = (
@@ -334,14 +610,33 @@ def execute_operation(operation_id: uuid.UUID, actor_login: str) -> None:
                     operation_id=operation.id,
                 )
             else:
-                transition(operation, OperationStatus.FAILED, "Worker rejected dry-run", db)
+                rollback_status = str(result.get("rollback_status", ""))[:32]
+                if real_stage and rollback_status == "ROLLED_BACK":
+                    transition(
+                        operation, OperationStatus.ROLLING_BACK, "Worker rollback recorded", db
+                    )
+                    transition(
+                        operation, OperationStatus.ROLLED_BACK, "Worker rollback completed", db
+                    )
+                else:
+                    transition(
+                        operation,
+                        OperationStatus.FAILED,
+                        "Worker rejected Stage" if real_stage else "Worker rejected dry-run",
+                        db,
+                    )
+                operation.rollback_status = rollback_status or None
                 operation.error_code = str(result.get("error", {}).get("code", "WORKER_FAILED"))[
                     :64
                 ]
-                operation.result_summary = "Worker 未执行宿主写操作"
+                operation.result_summary = (
+                    "Stage 失败；保持 nologin/密码锁定/无公钥，需按 rollback_status 核查宿主"
+                    if real_stage
+                    else "Worker 未执行宿主写操作"
+                )
                 record_audit(
                     db,
-                    event_type="worker.reject",
+                    event_type="worker.stage_failed" if real_stage else "worker.reject",
                     actor=actor_login,
                     actor_role="platform_owner",
                     source_ip="local-worker-socket",
@@ -352,10 +647,19 @@ def execute_operation(operation_id: uuid.UUID, actor_login: str) -> None:
                     metadata={"operation_type": operation.operation_type},
                     operation_id=operation.id,
                 )
-        except (WorkerClientError, RuntimeError) as exc:
+            # Force every Portal-side write issued above to reach the database
+            # while it is still covered by the persistence error boundary.  A
+            # successful Worker Stage must never leave a half-persisted managed
+            # identity if a later constraint rejects the Portal transaction.
+            db.flush()
+        except WorkerClientError as exc:
             transition(operation, OperationStatus.FAILED, "Worker unavailable or rejected", db)
             operation.error_code = getattr(exc, "code", "WORKER_FAILED")[:64]
-            operation.result_summary = "受控 Worker 不可用；未执行宿主写操作"
+            operation.result_summary = (
+                "Worker 连接失败；Stage 宿主状态未知，保持 Slurm DRAIN 并人工核查"
+                if real_stage
+                else "受控 Worker 不可用；未执行宿主写操作"
+            )
             record_audit(
                 db,
                 event_type="worker.reject",
@@ -369,6 +673,42 @@ def execute_operation(operation_id: uuid.UUID, actor_login: str) -> None:
                 metadata={
                     "operation_type": operation.operation_type,
                     "error_code": operation.error_code,
+                },
+                operation_id=operation.id,
+            )
+        except (RuntimeError, IntegrityError) as exc:
+            # RUNNING was committed before invoking the Worker.  Roll back all
+            # uncommitted managed-user/container/audit writes, then reload that
+            # durable RUNNING operation before recording the manual-review
+            # failure.  Reusing the pre-rollback ORM objects could otherwise
+            # commit a partial Portal representation of a successful host Stage.
+            db.rollback()
+            operation = db.get(PortalOperation, operation_id)
+            if operation is None or operation.status != OperationStatus.RUNNING:
+                return
+            transition(operation, OperationStatus.FAILED, "Portal Stage persistence rejected", db)
+            operation.error_code = "PORTAL_STAGE_STATE_REJECTED"
+            operation.rollback_status = "REQUIRES_MANUAL_REVIEW"
+            operation.result_summary = (
+                "Worker 返回后 Portal 状态持久化失败；宿主可能已 STAGED，保持 DRAIN 并人工核查"
+            )
+            record_audit(
+                db,
+                event_type="portal.stage_persist_failed",
+                actor=actor_login,
+                actor_role="platform_owner",
+                source_ip="local-worker-socket",
+                user_agent="h100-portal-api",
+                object_type="operation",
+                object_id=str(operation.id),
+                result="FAILED",
+                metadata={
+                    "operation_type": operation.operation_type,
+                    "detail": (
+                        "database integrity constraint rejected Portal Stage state"
+                        if isinstance(exc, IntegrityError)
+                        else str(exc)[:255]
+                    ),
                 },
                 operation_id=operation.id,
             )
