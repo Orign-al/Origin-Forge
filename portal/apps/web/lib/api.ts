@@ -29,7 +29,48 @@ export type User = {
     plan?: Record<string, unknown> | null;
     result_summary?: string | null;
     error_code?: string | null;
+    activate_dry_run?: {
+      operation_id: string;
+      status: string;
+      plan?: Record<string, unknown> | null;
+      result_summary?: string | null;
+      error_code?: string | null;
+    } | null;
   };
+};
+
+export type SshEnrollment = {
+  required: boolean;
+  managed_user_id: string | null;
+  compute_identity: string | null;
+  compute_state: string;
+  validated_key_count: number;
+  ssh_key_state: string;
+  setup_path: string | null;
+};
+
+export type SshKeyRecord = {
+  id: string;
+  managed_user_id: string;
+  key_type: string;
+  fingerprint_sha256: string;
+  comment: string;
+  scope: "HOST" | "CONTAINER" | "BOTH";
+  state: "VALIDATED" | "INSTALLED" | "REVOKED";
+  generation_method: "BROWSER_GENERATED" | "IMPORTED";
+  created_at: string;
+  created_by: string;
+  validated_at: string | null;
+  installed_at: string | null;
+  revoked_at: string | null;
+};
+
+export type SshKeyList = {
+  status: string;
+  keys: SshKeyRecord[];
+  count: number;
+  maximum_active_keys: number;
+  enrollment: SshEnrollment;
 };
 
 export type Overview = {
@@ -100,7 +141,7 @@ export type PortalSession = {
 
 export const getCsrf = () => apiFetch<{ csrf_token: string }>("/auth/csrf");
 export const login = (payload: { username: string; password: string }) =>
-  apiFetch<{ user: User }>("/auth/login", {
+  apiFetch<{ user: User; ssh_enrollment: SshEnrollment }>("/auth/login", {
     method: "POST",
     body: JSON.stringify(payload),
   });
@@ -109,17 +150,48 @@ export const setupPassword = (payload: {
   password: string;
   confirmation: string;
 }) =>
-  apiFetch<{ user: User }>("/auth/setup-password", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-export const me = () => apiFetch<{ user: User; role: string }>("/auth/me");
+  apiFetch<{ user: User; ssh_enrollment: SshEnrollment }>(
+    "/auth/setup-password",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+export const me = () =>
+  apiFetch<{ user: User; role: string; ssh_enrollment: SshEnrollment }>(
+    "/auth/me",
+  );
 export const logout = () => apiFetch<void>("/auth/logout", { method: "POST" });
 export const overview = () => apiFetch<Overview>("/platform/overview");
 export const users = () =>
   apiFetch<{ status: string; users: User[]; count: number }>("/users");
 export const userDetail = (id: string) =>
   apiFetch<{ status: string; user: User }>(`/users/${encodeURIComponent(id)}`);
+export const sshKeys = (userId: string) =>
+  apiFetch<SshKeyList>(`/users/${encodeURIComponent(userId)}/ssh-keys`);
+export const enrollSshKey = (
+  userId: string,
+  payload: {
+    key_type:
+      "ssh-ed25519" | "ecdsa-sha2-nistp256" | "sk-ssh-ed25519@openssh.com";
+    public_key: string;
+    comment: string;
+    scope: "HOST" | "CONTAINER" | "BOTH";
+    generation_method: "BROWSER_GENERATED" | "IMPORTED";
+    client_fingerprint_sha256: string;
+    confirmed_private_key_saved?: boolean;
+    confirmed_public_key?: boolean;
+  },
+) =>
+  apiFetch<{
+    status: string;
+    key: SshKeyRecord;
+    private_key_received: false;
+    authorized_keys_installed: false;
+  }>(`/users/${encodeURIComponent(userId)}/ssh-keys`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 export const gpus = () =>
   apiFetch<{
     status: string;
@@ -140,6 +212,23 @@ export const containers = () =>
   apiFetch<Record<string, unknown>>("/containers");
 export const containerInspect = (name: string) =>
   apiFetch<Record<string, unknown>>(`/containers/${encodeURIComponent(name)}`);
+export const startManagedContainer = (
+  name: string,
+  payload: {
+    idempotency_key: string;
+    expected_compute_state: "ACTIVE";
+    expected_container_state: "STOPPED";
+    expected_ssh_key_state: "INSTALLED";
+  },
+) =>
+  apiFetch<{
+    status: string;
+    operation_id: string;
+    container: { name: string; state: string; gpu: string };
+  }>(`/containers/${encodeURIComponent(name)}/start`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 export const storage = () =>
   apiFetch<Record<string, unknown>>("/platform/storage");
 export const quotas = () =>

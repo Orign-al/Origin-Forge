@@ -31,6 +31,7 @@ Next.js Web 10.10.10.2:18080 -- /api/* --> FastAPI 127.0.0.1:18081
 ## 组件职责
 
 - `apps/web`：中文控制台、表格、筛选、表单和任务状态轮询。它不执行宿主命令。
+  SSH key pair 生成只发生在浏览器；Web bundle 不把 private key 发送给任何服务。
 - `apps/api`：认证、会话、CSRF、RBAC、审批状态机、审计、数据库事务以及 Worker
   客户端。API 以非 root 系统账号运行，不能访问 Docker Socket、MUNGE key、
   Linux shadow 或 SlurmDBD 密码。
@@ -64,8 +65,20 @@ HTTP 请求只创建 Operation，不等待宿主操作完成。危险操作需�
 最近十分钟重新认证和审批。API 通过 Worker Socket 提交已审批任务；Worker 再检查
 对象、参数、当前状态、脚本 owner/mode/hash 与幂等键。
 
-Portal-0/1 的写 handler 仅返回 dry-run 计划。`user.stage`、`user.activate`、
-`quota.update`、`slurm.resume` 和真实用户创建均不会执行。Slurm 保持 DRAIN。
+Portal-3C 已只对精确 `origin-pilot` 参数开放并完成一次真实 `user.stage`；该路径保持
+hash、actor、approval、payload 和幂等键绑定。Portal-3D-R 增加自助 public-key record：
+API 保存 canonical public key/metadata，Worker 在 root-only 目录准备 UUID `.pub` 和绑定
+sidecar。`user.activate` 只返回 dry-run 计划；它验证 HOST/CONTAINER Scope 和 STAGED
+宿主状态，但不会安装 authorized_keys、切换 shell 或启动容器。
+
+连接页还定义了 Activate 后的专用“启动我的受管容器”路径：只有资源所有者的计算身份为
+ACTIVE、适用 CONTAINER Key 为 INSTALLED、容器为安全的 STOPPED/GPU NONE 时才显示。
+API 从数据库生成闭合 Worker payload；Worker 再核对 root-owned 生命周期状态、持久
+authorized_keys fingerprint、精确资源/挂载和脚本 hash。失败或后置条件不满足时固定停止
+容器。该路径不接受通用 Docker 参数，也不使当前 STAGED 用户可启动容器。
+
+其他用户写、真实 Activate、`quota.update`、`slurm.resume` 等仍不会执行。Slurm 保持
+DRAIN。
 
 ## 现阶段基础设施约束
 

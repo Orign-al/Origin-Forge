@@ -73,6 +73,12 @@ sudo bash -c \
 `alembic check`。`/etc/h100-portal` 保持 `root:root 0750`；不得为方便 CLI 而放宽目录。
 应用启动不得自动改变 schema。
 
+Portal-3D-R 的目标 revision 是 `f4a91c3e7b20`。迁移把 SSH Key 从单值式字段扩展为多条
+record，并增加 Scope、状态、生成方式、创建者和 enrollment Operation 绑定。部署前必须
+确认不存在无法迁移的 NULL 活跃 Key；升级后执行 `alembic current`、`alembic check`，并
+在临时 PostgreSQL 数据库完成 upgrade → downgrade → upgrade 往返。不得用 SQLite 结果
+代替 PostgreSQL DDL 验收。
+
 ## 安装与 systemd
 
 `deploy/scripts/install-runtime.sh` 将源码复制到 `/opt/h100-portal`，排除 venv、缓存和开发
@@ -94,6 +100,22 @@ sudo systemctl enable --now h100-portal-web.service
 Socket unit 以 `DirectoryMode=0755` 创建 `/run/h100-portal`；socket 本身必须为
 `root:h100-portal-api 0660`。父目录必须允许 API UID 遍历，但不得放宽 socket。
 
+SSH public-key staging 必须在启用自助登记前存在：
+
+```text
+/var/lib/h100-portal/ssh-key-staging  root:root 0700
+```
+
+不得把该目录放入 Git、Web static 目录或普通备份报告。Worker 只允许创建 UUID `.pub` 和
+配套 `.meta.json`，均为 `root:root 0600`。API 服务账号不得直接写该目录；Web 服务账号
+不得读取。部署脚本或 tmpfiles 规则必须保证目录 metadata，不得在运行时放宽权限。
+
+本轮同时修改 `h100-user-create` 与 `h100-container-start`。必须先以 root-only 方式备份
+已安装文件，再以同目录临时文件、`root:root`、批准 mode、fsync 和原子 rename 部署；随后
+把两个新 SHA-256 精确写入 `/etc/h100-portal/worker-scripts.json`。仓库
+`deploy/worker-scripts.json` 必须保存同一精确值。不得使用通配 hash、跳过校验或先启动
+Worker 再补 allowlist；Worker 重启后必须先证明两个脚本的 `integrity_ok=true`。
+
 ## 验收
 
 ```bash
@@ -109,6 +131,11 @@ ready 必须同时报告数据库和 Worker 可用。确认 Web 只有 `10.10.10
 Web unit 的网络沙箱必须保留 `IPAddressDeny=any`，只额外允许 localhost 和
 `10.10.10.0/24`；API unit 仍只允许 localhost。以 API UID 运行
 `/opt/h100-portal/tests/worker_socket_smoke.py` 验证固定读取、dry-run 和拒绝路径。
+
+浏览器验收必须覆盖 1366×768 和 1920×1080 的 Key 空状态、生成、导入、fingerprint
+确认、一次性私钥下载确认、Key 列表、连接 Gate 与 Activate dry-run。测试 Key 只在测试
+内存/临时目录生成，测试结束删除，不安装到真实账号。部署后用源码/日志/数据库扫描确认
+没有 private-key 装甲；扫描输出不得反向打印任何疑似 secret 正文。
 
 批准的虚拟网络客户端直接打开 `http://10.10.10.2:18080`。如需可选 SSH Tunnel 回退：
 

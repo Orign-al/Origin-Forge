@@ -59,15 +59,21 @@ def process_connection(connection: socket.socket) -> None:
             result = handle(request)
             result.setdefault("request_id", request.request_id)
             result.setdefault("captured_at", datetime.now(UTC).isoformat())
-        except (ProtocolError, json.JSONDecodeError, ValidationError) as exc:
+        except ProtocolError, json.JSONDecodeError, ValidationError:
             result = {
                 "status": "ERROR",
-                "error": {"code": "PROTOCOL_REJECTED", "message": str(exc)[:255]},
+                "error": {
+                    "code": "PROTOCOL_REJECTED",
+                    "message": "request rejected by fixed Worker protocol",
+                },
             }
-        except Exception as exc:
+        except Exception:
             result = {
                 "status": "ERROR",
-                "error": {"code": "WORKER_EXCEPTION", "message": str(exc)[:255]},
+                "error": {
+                    "code": "WORKER_EXCEPTION",
+                    "message": "Worker failed closed while processing the request",
+                },
             }
         try:
             connection.sendall(encode_frame(result))

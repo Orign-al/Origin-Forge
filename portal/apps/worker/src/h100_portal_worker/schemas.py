@@ -38,6 +38,8 @@ KNOWN_WRITES = {
     "quota.update",
     "ssh_key.add",
     "ssh_key.revoke",
+    "ssh_key.prepare",
+    "ssh_key.discard",
 }
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,127}$")
 SAFE_USERNAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
@@ -52,11 +54,19 @@ STAGE_PUBLIC_KEY_FIELDS = {
 FORBIDDEN_SECRET_OR_COMMAND_FIELDS = {
     "raw_private_key",
     "private_key",
+    "private_key_password",
+    "private_key_path",
     "password",
     "command",
     "argv",
     "path",
 }
+APPROVED_SSH_KEY_TYPES = {
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "sk-ssh-ed25519@openssh.com",
+}
+PRIVATE_KEY_MARKERS = ("PRIVATE KEY",)
 APPROVED_STAGE_PAYLOAD: dict[str, Any] = {
     "username": "origin-pilot",
     "uid": 20001,
@@ -197,6 +207,138 @@ def _validate_user_activate(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validate_ssh_key_prepare(payload: dict[str, Any]) -> dict[str, Any]:
+    if set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+        raise PayloadValidationError(
+            "SSH_PRIVATE_KEY_UPLOAD_REJECTED", "private-key fields are forbidden"
+        )
+    expected_fields = {
+        "record_id",
+        "operation_id",
+        "managed_user_id",
+        "username",
+        "public_key",
+        "key_type",
+        "fingerprint_sha256",
+        "content_sha256",
+        "scope",
+    }
+    if set(payload) != expected_fields:
+        raise PayloadValidationError(
+            "SSH_KEY_PREPARE_REJECTED", "SSH key prepare fields are incomplete"
+        )
+    public_key = payload.get("public_key")
+    if not isinstance(public_key, str) or not 32 <= len(public_key.encode("utf-8")) <= 16 * 1024:
+        raise PayloadValidationError(
+            "SSH_KEY_PREPARE_REJECTED", "SSH public key has an invalid size"
+        )
+    upper = public_key.upper()
+    if any(marker in upper for marker in PRIVATE_KEY_MARKERS):
+        raise PayloadValidationError(
+            "SSH_PRIVATE_KEY_UPLOAD_REJECTED", "private-key material is forbidden"
+        )
+    key_type = payload.get("key_type")
+    fingerprint = payload.get("fingerprint_sha256")
+    content_sha256 = payload.get("content_sha256")
+    scope = payload.get("scope")
+    if key_type not in APPROVED_SSH_KEY_TYPES:
+        raise PayloadValidationError(
+            "SSH_PUBLIC_KEY_TYPE_REJECTED", "SSH public-key type is not approved"
+        )
+    if (
+        not isinstance(fingerprint, str)
+        or re.fullmatch(r"SHA256:[A-Za-z0-9+/]+", fingerprint) is None
+    ):
+        raise PayloadValidationError("SSH_KEY_PREPARE_REJECTED", "SSH key fingerprint is invalid")
+    if not isinstance(content_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", content_sha256) is None:
+        raise PayloadValidationError(
+            "SSH_KEY_PREPARE_REJECTED", "SSH key content digest is invalid"
+        )
+    if scope not in {"HOST", "CONTAINER", "BOTH"}:
+        raise PayloadValidationError("SSH_KEY_PREPARE_REJECTED", "SSH key scope is invalid")
+    username = payload.get("username")
+    if username != "origin-pilot":
+        raise PayloadValidationError(
+            "SSH_KEY_PREPARE_REJECTED", "current Pilot may prepare keys only for origin-pilot"
+        )
+    return {
+        "record_id": _canonical_uuid(payload.get("record_id"), "SSH key record ID"),
+        "operation_id": _canonical_uuid(payload.get("operation_id"), "operation ID"),
+        "managed_user_id": _canonical_uuid(payload.get("managed_user_id"), "managed user ID"),
+        "username": username,
+        "public_key": public_key,
+        "key_type": key_type,
+        "fingerprint_sha256": fingerprint,
+        "content_sha256": content_sha256,
+        "scope": scope,
+    }
+
+
+def _validate_ssh_key_discard(payload: dict[str, Any]) -> dict[str, Any]:
+    if set(payload) != {"record_id", "operation_id", "content_sha256"}:
+        raise PayloadValidationError(
+            "SSH_KEY_DISCARD_REJECTED", "SSH key discard fields are incomplete"
+        )
+    content_sha256 = payload.get("content_sha256")
+    if not isinstance(content_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", content_sha256) is None:
+        raise PayloadValidationError(
+            "SSH_KEY_DISCARD_REJECTED", "SSH key content digest is invalid"
+        )
+    return {
+        "record_id": _canonical_uuid(payload.get("record_id"), "SSH key record ID"),
+        "operation_id": _canonical_uuid(payload.get("operation_id"), "operation ID"),
+        "content_sha256": content_sha256,
+    }
+
+
+def _validate_container_start(payload: dict[str, Any]) -> dict[str, Any]:
+    legacy_fields = {"name"}
+    managed_fields = {
+        "name",
+        "username",
+        "managed_user_id",
+        "expected_compute_state",
+        "expected_container_state",
+        "expected_ssh_key_state",
+    }
+    if set(payload) == legacy_fields:
+        name = payload.get("name")
+        if not isinstance(name, str) or not SAFE_IDENTIFIER.fullmatch(name):
+            raise PayloadValidationError("PAYLOAD_REJECTED", "invalid container name")
+        return {"name": name}
+    if set(payload) != managed_fields:
+        raise PayloadValidationError(
+            "CONTAINER_START_PAYLOAD_REJECTED", "managed container start fields are incomplete"
+        )
+    username = payload.get("username")
+    name = payload.get("name")
+    if (
+        not isinstance(username, str)
+        or not SAFE_USERNAME.fullmatch(username)
+        or username in {"root", "origin-al", "codexops"}
+        or name != f"gpu-dev-{username}"
+    ):
+        raise PayloadValidationError(
+            "CONTAINER_OWNERSHIP_REJECTED", "container name is not bound to the managed user"
+        )
+    if (
+        payload.get("expected_compute_state") != "ACTIVE"
+        or payload.get("expected_container_state") != "STOPPED"
+        or payload.get("expected_ssh_key_state") != "INSTALLED"
+    ):
+        raise PayloadValidationError(
+            "CONTAINER_START_STATE_REJECTED", "container start requires ACTIVE/STOPPED/INSTALLED"
+        )
+    return {
+        "name": name,
+        "username": username,
+        "managed_user_id": _canonical_uuid(payload.get("managed_user_id"), "managed user ID"),
+        "expected_compute_state": "ACTIVE",
+        "expected_container_state": "STOPPED",
+        "expected_ssh_key_state": "INSTALLED",
+    }
+
+
 def validate_payload(
     operation_type: str, payload: dict[str, Any], *, allow_legacy_stage: bool = False
 ) -> dict[str, Any]:
@@ -214,6 +356,12 @@ def validate_payload(
         return _validate_user_stage(payload, allow_legacy_stage)
     if operation_type == "user.activate":
         return _validate_user_activate(payload)
+    if operation_type == "ssh_key.prepare":
+        return _validate_ssh_key_prepare(payload)
+    if operation_type == "ssh_key.discard":
+        return _validate_ssh_key_discard(payload)
+    if operation_type == "container.start":
+        return _validate_container_start(payload)
     if operation_type.startswith("user."):
         username = payload.get("username")
         if not isinstance(username, str) or not SAFE_USERNAME.fullmatch(username):

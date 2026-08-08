@@ -144,13 +144,32 @@ def test_activate_ids_are_bound_to_the_owners_staged_identity(database: Session)
     database.add(managed)
     database.flush()
     key_id = uuid.uuid4()
+    enrollment = PortalOperation(
+        operation_type="ssh_key.enroll",
+        target_type="ssh_public_key",
+        target_id=str(key_id),
+        requested_by=owner.id,
+        approved_by=owner.id,
+        request_summary="test self-service SSH key enrollment",
+        validated_payload={"fingerprint_sha256": "SHA256:portal3br-test-fingerprint"},
+        idempotency_key=f"ssh-key-enroll:{key_id}",
+        risk_level=RiskLevel.MEDIUM,
+        status=OperationStatus.SUCCEEDED,
+    )
+    database.add(enrollment)
+    database.flush()
     key = PortalSshKey(
         id=key_id,
         managed_user_id=managed.id,
         key_type="ssh-ed25519",
-        fingerprint="SHA256:portal3br-test-fingerprint",
-        comment_summary="test record without key body",
-        public_key_ciphertext=None,
+        fingerprint_sha256="SHA256:portal3br-test-fingerprint",
+        public_key="ssh-ed25519 TEST-ONLY-NOT-A-REAL-KEY",
+        comment="test self-service record",
+        scope="BOTH",
+        state="VALIDATED",
+        generation_method="IMPORTED",
+        created_by=owner.id,
+        enrollment_operation_id=enrollment.id,
         staging_file_name=f"{key_id}.pub",
         content_sha256="a" * 64,
         approved_by=owner.id,

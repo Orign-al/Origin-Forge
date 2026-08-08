@@ -47,8 +47,8 @@ Stage 计划（Portal-3A 只展示和 dry-run）：
 5. 创建无 GPU、非 privileged、无 Docker Socket 的长期容器。
 6. 保持 `STAGED`，不要求或验证 SSH 公钥，也不安装 `authorized_keys`；容器保持停止。
 
-Activate 必须单独审批、二次确认并重新验证隔离。需要已批准的
-`ssh-ed25519` 公钥 record；当前状态为 `REQUIRED_BEFORE_ACTIVATION`。随后才可
+Activate 必须单独审批、二次确认并重新验证隔离。需要通过 Portal 自助生成或导入并验证
+的公钥 record；当前状态为 `REQUIRED_BEFORE_ACTIVATION`。随后才可
 安装公钥、启用普通 shell、启动容器，并执行本人登录及单 GPU Slurm 验收。Guard 在
 Stage 资源全部验证后启用。
 
@@ -60,12 +60,15 @@ association 和容器配置，保留用户数据并保持账号禁用。回滚�
 
 ## 当前 Gate
 
-Portal-3C 已获得只针对 `origin-pilot` 和既有固定资源参数的真实 Stage 批准。执行路径是
+Portal-3C 已完成只针对 `origin-pilot` 和既有固定资源参数的真实 Stage。执行路径是
 管理员控制台审批 → Portal Operation → Root Worker → hash-pinned 两阶段脚本；不得手工
 绕过。成功后 `origin-al` 仍为管理账号，`origin-pilot` 为 STAGED/nologin/密码锁定/
 authorized_keys absent，长期容器停止，Slurm 仍 DRAIN。
 
-该批准不包含 SSH 公钥上传或 Activate。下一 Gate 需要先核对用户公钥类型和 SHA-256
-fingerprint，再生成 Activate dry-run，并获得新的明确批准语句。
+Portal-3D-R 允许 Origin-al 在网页选择“生成新密钥”或“导入已有公钥”。浏览器生成时
+private key 只下载给 Origin-al，Portal/Worker/数据库只保存 public key。登记后 record 为
+`VALIDATED — NOT INSTALLED`，宿主和容器 authorized_keys 仍不存在，shell 仍为 nologin，
+容器仍停止。下一 Gate 需要核对用户公钥类型、SHA-256 fingerprint 和 BOTH Scope，生成
+Activate dry-run，并获得新的明确批准语句。
 
-> 允许使用修订并重新验收通过的两阶段流程 Stage 独立计算用户 origin-pilot
+> 允许按已验证的 Activate 计划激活 origin-pilot

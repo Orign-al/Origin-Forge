@@ -220,7 +220,7 @@ class PortalSystemSnapshot(Base):
 class PortalManagedUser(Base):
     __tablename__ = "portal_managed_users"
     __table_args__ = (
-        CheckConstraint("ssh_key_count >= 0", name="ck_managed_user_ssh_key_count"),
+        CheckConstraint("ssh_key_count BETWEEN 0 AND 5", name="ck_managed_user_ssh_key_count"),
         CheckConstraint(
             "onboarding_state != 'ACTIVE' OR "
             "(ssh_key_count > 0 AND shell != '/usr/sbin/nologin' "
@@ -266,15 +266,48 @@ class PortalManagedUser(Base):
 
 class PortalSshKey(Base):
     __tablename__ = "portal_ssh_keys"
+    __table_args__ = (
+        CheckConstraint("scope IN ('HOST', 'CONTAINER', 'BOTH')", name="ck_portal_ssh_key_scope"),
+        CheckConstraint(
+            "state IN ('VALIDATED', 'INSTALLED', 'REVOKED')",
+            name="ck_portal_ssh_key_state",
+        ),
+        CheckConstraint(
+            "generation_method IN ('BROWSER_GENERATED', 'IMPORTED')",
+            name="ck_portal_ssh_key_generation_method",
+        ),
+        CheckConstraint(
+            "(state = 'REVOKED' AND active = false AND revoked_at IS NOT NULL) OR "
+            "(state IN ('VALIDATED', 'INSTALLED') AND active = true AND revoked_at IS NULL)",
+            name="ck_portal_ssh_key_active_state",
+        ),
+        CheckConstraint(
+            "state != 'INSTALLED' OR installed_at IS NOT NULL",
+            name="ck_portal_ssh_key_installed_at",
+        ),
+        CheckConstraint(
+            "state = 'REVOKED' OR (public_key IS NOT NULL AND validated_at IS NOT NULL "
+            "AND staging_file_name IS NOT NULL AND content_sha256 IS NOT NULL "
+            "AND enrollment_operation_id IS NOT NULL)",
+            name="ck_portal_ssh_key_validated_binding",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     managed_user_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("portal_managed_users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     key_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    fingerprint: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
-    comment_summary: Mapped[str] = mapped_column(String(128), nullable=False)
-    public_key_ciphertext: Mapped[str | None] = mapped_column(Text)
+    fingerprint_sha256: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    public_key: Mapped[str | None] = mapped_column(Text)
+    comment: Mapped[str] = mapped_column(String(128), nullable=False)
+    scope: Mapped[str] = mapped_column(String(16), nullable=False, default="BOTH")
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="VALIDATED")
+    generation_method: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("portal_users.id"), nullable=False)
+    enrollment_operation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("portal_operations.id"), nullable=True
+    )
     staging_file_name: Mapped[str | None] = mapped_column(String(64), unique=True)
     content_sha256: Mapped[str | None] = mapped_column(String(64))
     approved_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("portal_users.id"))

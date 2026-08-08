@@ -26,11 +26,17 @@ ssh_port=
 slurm_account=
 slurm_qos=
 public_key_input=
+host_public_key_input=
+container_public_key_input=
 project_name=
 user_root=
 state_file=
 key_hash=
 key_fingerprints_csv=
+host_key_hash=
+host_key_fingerprints_csv=
+container_key_hash=
+container_key_fingerprints_csv=
 OUTCOME=FAILED
 ROLLBACK_KIND=
 backup_dir=
@@ -47,6 +53,10 @@ timer_was_enabled=0
 guard_timer_changed=0
 declare -a normalized_keys=()
 declare -a key_fingerprints=()
+declare -a host_normalized_keys=()
+declare -a host_key_fingerprints=()
+declare -a container_normalized_keys=()
+declare -a container_key_fingerprints=()
 
 usage() {
   printf '%s\n' \
@@ -54,11 +64,14 @@ usage() {
     '  sudo h100-user-create --plan USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS' \
     '  sudo h100-user-create --stage USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS --confirm-stage USER' \
     '  sudo h100-user-create --activate USER --public-key-file ROOT_CONTROLLED_FILE --confirm-activate USER' \
+    '  sudo h100-user-create --activate USER --host-public-key-file ROOT_CONTROLLED_HOST_FILE --container-public-key-file ROOT_CONTROLLED_CONTAINER_FILE --confirm-activate USER' \
     '  sudo h100-user-create --status USER' \
     '' \
     'Stage creates a locked nologin account, exact user-UID.slice policy, quota,' \
     'Slurm association, and GPU-less container, but installs no authorized_keys.' \
-    'Activate revalidates every boundary before enabling public-key access.'
+    'Activate revalidates every boundary before enabling public-key access.' \
+    'The single-file form installs the same approved keys at both targets; the' \
+    'target-scoped form keeps Host and Container key sets independent.'
 }
 
 stage_report_failure() {
@@ -88,16 +101,26 @@ restore_mapping_file() {
 }
 
 write_state() {
-  local status=$1 temp state_key_hash state_key_fingerprints ssh_key_state
+  local status=$1 temp state_key_hash state_key_fingerprints
+  local state_host_key_hash state_host_key_fingerprints
+  local state_container_key_hash state_container_key_fingerprints ssh_key_state
   case "${status}" in
     ACTIVE)
       state_key_hash=${key_hash}
       state_key_fingerprints=${key_fingerprints_csv}
+      state_host_key_hash=${host_key_hash}
+      state_host_key_fingerprints=${host_key_fingerprints_csv}
+      state_container_key_hash=${container_key_hash}
+      state_container_key_fingerprints=${container_key_fingerprints_csv}
       ssh_key_state=INSTALLED
       ;;
     *)
       state_key_hash=
       state_key_fingerprints=
+      state_host_key_hash=
+      state_host_key_fingerprints=
+      state_container_key_hash=
+      state_container_key_fingerprints=
       ssh_key_state=REQUIRED_BEFORE_ACTIVATION
       ;;
   esac
@@ -116,6 +139,10 @@ write_state() {
     printf 'SSH_KEY_STATE=%s\n' "${ssh_key_state}"
     printf 'KEY_SHA256=%s\n' "${state_key_hash}"
     printf 'KEY_FINGERPRINTS=%s\n' "${state_key_fingerprints}"
+    printf 'HOST_KEY_SHA256=%s\n' "${state_host_key_hash}"
+    printf 'HOST_KEY_FINGERPRINTS=%s\n' "${state_host_key_fingerprints}"
+    printf 'CONTAINER_KEY_SHA256=%s\n' "${state_container_key_hash}"
+    printf 'CONTAINER_KEY_FINGERPRINTS=%s\n' "${state_container_key_fingerprints}"
     printf 'UPDATED_AT=%s\n' "$(date --iso-8601=seconds)"
   } >"${temp}"
   chown root:gpu-platform-admin "${temp}"
@@ -263,7 +290,7 @@ public_key_file_metadata() {
   if ((require_staging == 1)); then
     [[ "${parent}" == "${SSH_KEY_STAGING_ROOT}" ]] \
       || h100_fail 'PUBLIC_KEY_PATH_NOT_ALLOWED'
-    [[ "${base}" =~ ^[0-9A-Fa-f-]{36}\.pub$ ]] \
+    [[ "${base}" =~ ^[0-9A-Fa-f-]{36}(\.(host|container))?\.pub$ ]] \
       || h100_fail 'PUBLIC_KEY_PATH_NOT_ALLOWED'
     [[ -d "${SSH_KEY_STAGING_ROOT}" && ! -L "${SSH_KEY_STAGING_ROOT}" ]] \
       || h100_fail 'PUBLIC_KEY_STAGING_DIRECTORY_INVALID'
@@ -283,7 +310,8 @@ public_key_file_metadata() {
   mode="$(stat -c '%a' -- "${candidate}" 2>/dev/null || true)"
   links="$(stat -c '%h' -- "${candidate}" 2>/dev/null || true)"
   size="$(stat -c '%s' -- "${candidate}" 2>/dev/null || true)"
-  [[ "${file_type}" == 'regular file' ]] || h100_fail 'PUBLIC_KEY_VALIDATION_FAILED'
+  [[ ! -L "${candidate}" && "${file_type}" == 'regular file' ]] \
+    || h100_fail 'PUBLIC_KEY_VALIDATION_FAILED'
   [[ "${owner_uid}" == "${expected_uid}" && "${owner_gid}" == "${expected_gid}" ]] \
     || h100_fail 'PUBLIC_KEY_FILE_OWNERSHIP_INVALID'
   [[ "${links}" == 1 ]] || h100_fail 'PUBLIC_KEY_VALIDATION_FAILED'
@@ -311,7 +339,7 @@ parse_public_key_file() {
       || h100_fail 'PUBLIC_KEY_VALIDATION_FAILED'
     read -r key_type key_blob rest <<<"${raw}"
     case "${key_type:-}" in
-      ssh-ed25519|sk-ssh-ed25519@openssh.com) ;;
+      ssh-ed25519|ecdsa-sha2-nistp256|sk-ssh-ed25519@openssh.com) ;;
       *) h100_fail 'PUBLIC_KEY_VALIDATION_FAILED' ;;
     esac
     [[ -n "${key_blob:-}" && "${key_blob}" =~ ^[A-Za-z0-9+/]+={0,3}$ ]] \
@@ -335,7 +363,7 @@ parse_public_key_file() {
   fi
 }
 
-validate_public_keys() {
+validate_public_key_set() {
   parse_public_key_file 1 0 0
 
   local existing_state existing_fingerprints candidate
@@ -351,6 +379,63 @@ validate_public_keys() {
     done
   done
   shopt -u nullglob
+}
+
+select_host_key_set() {
+  public_key_input=${host_public_key_input}
+  normalized_keys=("${host_normalized_keys[@]}")
+  key_fingerprints=("${host_key_fingerprints[@]}")
+  key_hash=${host_key_hash}
+  key_fingerprints_csv=${host_key_fingerprints_csv}
+}
+
+select_container_key_set() {
+  public_key_input=${container_public_key_input}
+  normalized_keys=("${container_normalized_keys[@]}")
+  key_fingerprints=("${container_key_fingerprints[@]}")
+  key_hash=${container_key_hash}
+  key_fingerprints_csv=${container_key_fingerprints_csv}
+}
+
+select_combined_key_state() {
+  local -A seen=()
+  local candidate
+  local -a combined_fingerprints=()
+  for candidate in "${host_key_fingerprints[@]}" "${container_key_fingerprints[@]}"; do
+    [[ -n "${seen[${candidate}]+present}" ]] && continue
+    seen[${candidate}]=1
+    combined_fingerprints+=("${candidate}")
+  done
+  ((${#combined_fingerprints[@]} >= 1 && ${#combined_fingerprints[@]} <= MAX_PUBLIC_KEYS)) \
+    || h100_fail 'PUBLIC_KEY_VALIDATION_FAILED'
+  key_fingerprints=("${combined_fingerprints[@]}")
+  key_fingerprints_csv="$(IFS=,; printf '%s' "${combined_fingerprints[*]}")"
+  key_hash="$({
+    printf 'HOST\n'
+    printf '%s\n' "${host_normalized_keys[@]}"
+    printf 'CONTAINER\n'
+    printf '%s\n' "${container_normalized_keys[@]}"
+  } | sha256sum | awk '{print $1}')"
+  public_key_input=
+  normalized_keys=()
+}
+
+validate_public_keys() {
+  public_key_input=${host_public_key_input}
+  validate_public_key_set
+  host_normalized_keys=("${normalized_keys[@]}")
+  host_key_fingerprints=("${key_fingerprints[@]}")
+  host_key_hash=${key_hash}
+  host_key_fingerprints_csv=${key_fingerprints_csv}
+
+  public_key_input=${container_public_key_input}
+  validate_public_key_set
+  container_normalized_keys=("${normalized_keys[@]}")
+  container_key_fingerprints=("${key_fingerprints[@]}")
+  container_key_hash=${key_hash}
+  container_key_fingerprints_csv=${key_fingerprints_csv}
+
+  select_combined_key_state
 }
 
 validate_new_user_plan() {
@@ -748,16 +833,20 @@ run_activate() {
   ROLLBACK_KIND=activate
 
   install -d -o "${user_name}" -g "${user_name}" -m 0700 "/home/${user_name}/.ssh"
+  select_host_key_set
   install_normalized_keys "/home/${user_name}/.ssh/authorized_keys" \
     "${user_name}" "${user_name}"
   host_key_installed=1
+  validate_installed_keys "/home/${user_name}/.ssh/authorized_keys" \
+    "${user_uid}" "${user_gid}"
+
+  select_container_key_set
   install_normalized_keys "${user_root}/home/.ssh/authorized_keys" \
     "${user_name}" "${user_name}"
   data_key_installed=1
-  validate_installed_keys "/home/${user_name}/.ssh/authorized_keys" \
-    "${user_uid}" "${user_gid}"
   validate_installed_keys "${user_root}/home/.ssh/authorized_keys" \
     "${user_uid}" "${user_gid}"
+  select_combined_key_state
 
   systemctl start "${GUARD_SERVICE}"
   systemctl enable --now "${GUARD_TIMER}"
@@ -768,17 +857,23 @@ run_activate() {
     || h100_fail 'approved login shell activation failed'
   [[ "$(passwd -S "${user_name}" | awk '{print $2}')" == L ]] \
     || h100_fail 'password unexpectedly became usable'
+  # The fixed container-start tool independently requires ACTIVE lifecycle
+  # metadata and verifies the persistent container authorized_keys against it.
+  # Any failure after this atomic write is returned to STAGED by rollback_activate.
+  write_state ACTIVE
   h100-container-start "${user_name}"
   validate_container_security
   "${ISOLATION_TOOL}" verify "${user_name}"
-  write_state ACTIVE
   {
     printf '# H100 Pilot user activated\n\n'
     printf -- '- User: `%s`\n' "${user_name}"
     printf -- '- Status: `ACTIVE`\n'
     printf -- '- Host shell: `/bin/bash`\n'
     printf -- '- Password authentication credential: locked\n'
-    printf -- '- Public keys: installed after GPU isolation revalidation\n'
+    printf -- '- Host public keys: `%s` installed after GPU isolation revalidation\n' \
+      "${#host_normalized_keys[@]}"
+    printf -- '- Container public keys: `%s` installed independently\n' \
+      "${#container_normalized_keys[@]}"
     printf -- '- GPU policy: `user-%s.slice DevicePolicy=closed`\n' "${user_uid}"
     printf -- '- Long-lived container GPU: none\n'
     printf -- '- GPU bypass Guard timer: enabled\n'
@@ -840,8 +935,11 @@ case "$1" in
     ;;
   --stage)
     for argument in "$@"; do
-      [[ "${argument}" != --public-key-file ]] \
-        || h100_fail 'PUBLIC_KEY_NOT_ALLOWED_DURING_STAGE'
+      case "${argument}" in
+        --public-key-file|--host-public-key-file|--container-public-key-file)
+          h100_fail 'PUBLIC_KEY_NOT_ALLOWED_DURING_STAGE'
+          ;;
+      esac
     done
     if (($# != 10)); then
       (($# == 11)) && h100_fail 'PUBLIC_KEY_NOT_ALLOWED_DURING_STAGE'
@@ -860,14 +958,31 @@ case "$1" in
     slurm_qos=$8
     ;;
   --activate)
-    (($# == 6)) || h100_fail 'PUBLIC_KEY_REQUIRED_FOR_ACTIVATION'
-    [[ "$3" == --public-key-file && -n "$4" ]] \
-      || h100_fail 'PUBLIC_KEY_REQUIRED_FOR_ACTIVATION'
-    [[ "$5" == --confirm-activate && "$6" == "$2" ]] \
-      || h100_fail 'activation confirmation must repeat the exact username'
+    (($# >= 2)) || h100_fail 'PUBLIC_KEY_REQUIRED_FOR_ACTIVATION'
     mode=activate
     user_name=$2
-    public_key_input=$4
+    if (($# == 6)) && [[ "$3" == --public-key-file && -n "$4" ]]; then
+      [[ "$5" == --confirm-activate && "$6" == "$2" ]] \
+        || h100_fail 'activation confirmation must repeat the exact username'
+      host_public_key_input=$4
+      container_public_key_input=$4
+    elif (($# == 8)) \
+      && [[ "$3" == --host-public-key-file && -n "$4" ]] \
+      && [[ "$5" == --container-public-key-file && -n "$6" ]]; then
+      [[ "$7" == --confirm-activate && "$8" == "$2" ]] \
+        || h100_fail 'activation confirmation must repeat the exact username'
+      host_public_key_input=$4
+      container_public_key_input=$6
+    else
+      for argument in "$@"; do
+        case "${argument}" in
+          --public-key-file|--host-public-key-file|--container-public-key-file)
+            h100_fail 'PUBLIC_KEY_TARGET_SCOPE_INVALID'
+            ;;
+        esac
+      done
+      h100_fail 'PUBLIC_KEY_REQUIRED_FOR_ACTIVATION'
+    fi
     ;;
   --status)
     (($# == 2)) || { usage >&2; exit 2; }

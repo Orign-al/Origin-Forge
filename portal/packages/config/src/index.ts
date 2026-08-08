@@ -9,6 +9,7 @@ export const API_PREFIX = "/api/v1";
 export const navigation = [
   ["总览", "/"],
   ["用户", "/users"],
+  ["连接", "/access"],
   ["容器", "/containers"],
   ["Slurm", "/slurm"],
   ["作业", "/jobs"],

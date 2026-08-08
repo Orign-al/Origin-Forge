@@ -27,6 +27,29 @@ Portal-2 的成功含义是“Worker dry-run 已验证”，不是宿主变更�
   key record UUID，不能带宿主路径、私钥、密码或任意 argv。
 - 同一请求人和幂等键返回既有任务，不重复执行。
 
+## Portal-3D-R 自助 Key Operation
+
+用户确认浏览器私钥已下载，或确认导入的是自己持有私钥对应的 `.pub` 后，API 创建内部
+`ssh_key.enroll` Operation。它只记录 public metadata 与 fingerprint，不构成计算身份
+Activate 审批。API 调用 `ssh_key.prepare` 将规范化 public key 写入 root-owned staging；
+数据库提交失败时以同一 record/Operation/hash 调用 `ssh_key.discard`。私钥字段或内容在
+创建 Operation 前拒绝，因此不会进入 Worker、数据库或普通审计。
+
+登记完成的 record 是 `VALIDATED — NOT INSTALLED`。用户可登记最多五把独立 Key，Scope
+可以是 HOST、CONTAINER 或 BOTH。增加 Key 不修改 shell、不创建 authorized_keys、不启动
+容器，也不改变 STAGED。
+
+有完整 HOST/CONTAINER Scope 后，Portal 可以创建 `user.activate` DRAFT 并调用 Worker
+dry-run。Operation 保存 `execution_enabled=false` 的结构化计划；此时不能提交为真实写，
+不能复用 Stage 审批。真正 Activate 必须等待新的明确管理员审批语句。
+
+Activate 完成后的容器启动使用独立 `container.start` Operation，而不是复用 Activate 或
+接受任意容器参数。它只能由受管资源所有者发起，API 固定绑定当前 managed user、容器名
+和 ACTIVE/STOPPED/INSTALLED 预期状态。Worker 在执行前后独立复核持久公钥 fingerprint、
+GPU NONE、容器隔离、精确挂载及脚本 hash；任何失败都调用固定 stop 脚本并重新读取停止
+后置条件。无法证明 STOPPED 时 observed state 标记为 UNKNOWN 并要求人工复核。当前 STAGED
+状态不能创建可执行的容器启动 Operation。
+
 ## 高风险门槛
 
 Slurm DRAIN/RESUME、用户 Activate/Suspend、删除、quota/QOS、运行容器停止、GPU 隔离
@@ -55,7 +78,8 @@ managed identity 才写为 STAGED。本阶段：
 - 不 DRAIN 新原因，也绝不 RESUME Slurm；
 - 所有其他真实写 handler 保持关闭。
 
-后续公钥上传和 Activate 必须重新规划、验证并获得独立明确审批，不能复用 Stage 批准。
+自助公钥登记不需要管理员在服务器准备文件；Activate 必须重新规划、验证并获得独立明确
+审批，不能复用 Stage 批准。
 
 Stage 脚本失败后，Worker 必须重新检查 Linux 用户/组、UID/GID、home/data、state、精确
 GPU policy、registry、project mapping、Slurm association、容器和 Guard；不能只凭 state

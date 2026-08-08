@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useSearchParams } from "next/navigation";
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -18,6 +18,7 @@ import {
   type SimpleColumnDef,
   type SimpleRow,
 } from "../../../../components/Tables";
+import { SshKeyEnrollment } from "../../../../components/SshKeyEnrollment";
 
 const TABS = [
   "概览",
@@ -72,8 +73,13 @@ function Value({ children }: { children: unknown }) {
 
 export default function UserDetailPage() {
   const params = useParams<{ id: string }>();
+  const searchParams = useSearchParams();
   const queryClient = useQueryClient();
-  const [activeTab, setActiveTab] = useState<(typeof TABS)[number]>("概览");
+  const [selectedTab, setActiveTab] = useState<(typeof TABS)[number] | null>(
+    null,
+  );
+  const activeTab =
+    selectedTab ?? (searchParams.get("tab") === "ssh" ? "SSH 公钥" : "概览");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const query = useQuery({
@@ -104,6 +110,12 @@ export default function UserDetailPage() {
   const validations = asRows(plan.validation_results);
   const conflicts = asRows(plan.conflicts);
   const isStaged = linux.onboarding_state === "STAGED";
+  const canManageSshKeys = ["STAGED", "ACTIVE"].includes(
+    String(linux.onboarding_state ?? ""),
+  );
+  const sshKeyCount = Number(linux.ssh_key_count ?? 0);
+  const activatePlanReady =
+    asRecord(compute?.activate_dry_run?.plan).activate_status === "READY";
   async function createComputePlan() {
     setBusy(true);
     setMessage(null);
@@ -238,7 +250,10 @@ export default function UserDetailPage() {
                     ["Linux 密码", linux.password_state],
                     ["authorized_keys", linux.authorized_keys_state],
                     ["宿主登录", "未激活"],
-                    ["SSH 公钥", "激活前必填"],
+                    [
+                      "SSH 公钥",
+                      sshKeyCount > 0 ? "已验证，待安装" : "激活前必填",
+                    ],
                     ["GPU 隔离", linux.gpu_isolation_state],
                     ["作业外 GPU open", linux.gpu_open_state],
                     ["作业外 CUDA context", linux.cuda_context_state],
@@ -254,13 +269,22 @@ export default function UserDetailPage() {
                     ["Guard", linux.guard_state],
                   ])}
                   <div className="operation-actions">
-                    <Button disabled>添加 SSH 公钥（下一 Gate）</Button>
+                    <Button
+                      type="button"
+                      onClick={() => setActiveTab("SSH 公钥")}
+                    >
+                      设置 SSH 公钥
+                    </Button>
                     <Button disabled>Activate（未审批）</Button>
                   </div>
                   <div className="notice">
-                    SSH PUBLIC KEY REQUIRED。当前没有 authorized_keys，Shell
-                    仍为 /usr/sbin/nologin，容器保持 STOPPED；Activate
-                    计划与明确审批均未完成。
+                    {sshKeyCount === 0
+                      ? "SSH PUBLIC KEY REQUIRED。"
+                      : activatePlanReady
+                        ? "SSH 公钥已验证，Activate dry-run 已通过；仍需管理员明确审批。"
+                        : "SSH 公钥已验证，等待生成 Activate dry-run。"}
+                    当前没有 authorized_keys，Shell 仍为
+                    /usr/sbin/nologin，容器保持 STOPPED。
                   </div>
                 </>
               ) : compute?.status !== "DRAFT" || !Object.keys(plan).length ? (
@@ -472,17 +496,24 @@ export default function UserDetailPage() {
             ])
           : null}
         {activeTab === "SSH 公钥" ? (
-          <>
-            <EmptyState
-              title="SSH 公钥：待添加"
-              detail="Stage 不要求公钥；Activate 前必须通过受控记录添加并验证。页面永不显示私钥或完整公钥正文。"
+          canManageSshKeys ? (
+            <SshKeyEnrollment
+              userId={user.id}
+              username={String(linux.unix_username ?? "origin-pilot")}
+              computeState={String(linux.onboarding_state ?? "UNKNOWN")}
+              managedUserId={String(linux.managed_user_id ?? "") || null}
+              activateDryRun={
+                compute?.activate_dry_run?.plan
+                  ? asRecord(compute.activate_dry_run.plan)
+                  : null
+              }
             />
-            <Button disabled>
-              {isStaged
-                ? "添加 SSH 公钥（下一 Gate）"
-                : "添加受控公钥（等待 Stage 完成）"}
-            </Button>
-          </>
+          ) : (
+            <EmptyState
+              title="等待计算身份 Stage"
+              detail="Stage 完成后才能生成或导入 SSH 公钥。"
+            />
+          )
         ) : null}
         {activeTab === "操作记录" ? (
           <EmptyState
@@ -504,7 +535,9 @@ export default function UserDetailPage() {
         </SectionCard>
         <SectionCard title="当前阶段">
           {isStaged
-            ? "origin-pilot 已 STAGED；SSH 公钥、登录、容器启动与 Activate 均未执行，Slurm 保持 DRAIN。"
+            ? sshKeyCount > 0
+              ? "origin-pilot 已 STAGED；SSH 公钥已验证但未安装，登录、容器启动与 Activate 均未执行，Slurm 保持 DRAIN。"
+              : "origin-pilot 已 STAGED；SSH 公钥尚未登记，登录、容器启动与 Activate 均未执行，Slurm 保持 DRAIN。"
             : "所有资源写操作只形成审批任务和 Worker dry-run，Slurm 保持 DRAIN。"}
         </SectionCard>
       </div>

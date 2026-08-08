@@ -11,6 +11,23 @@
 只接收受控 key record ID，并在 root-owned staging 文件上使用 `O_NOFOLLOW`、owner/mode/
 inode/大小检查和 `ssh-keygen` fingerprint 校验。公钥验证失败不会部分激活用户。
 
+新 Key 可以在浏览器生成或由用户导入已有 `.pub`。浏览器生成使用固定依赖和 Web Crypto
+随机源；私钥只保留在页面内存及用户下载，不提交 API，也不使用 localStorage、
+sessionStorage、IndexedDB、Service Worker cache、analytics 或错误遥测。API 不提供
+server-generated private key endpoint，Worker 不生成私钥。当前内部 HTTP 是管理员已接受
+的虚拟网络模式，不得声称有 HTTPS；该 transport 决策不放宽“私钥永不离开浏览器”的
+数据边界。
+
+API 将请求先作为未记录正文检查私钥字段与装甲，再进入 `extra=forbid` schema 和结构化
+public-key parser；错误消息与审计不回显正文。数据库保存 canonical public key 是有意的，
+但常规响应和审计只返回类型、SHA-256 fingerprint、注释、Scope 和状态。全局 fingerprint
+唯一，撤销记录保留以阻止复用。
+
+Root Worker staging 以 UUID 文件和 sidecar 绑定 enrollment Operation/managed identity，
+使用 root-only 目录、无链接跟随读取、inode/owner/mode/link/size/hash 复核和原子写入。
+HOST 与 CONTAINER 的 authorized_keys 永远是独立目标；不得挂载宿主 `.ssh` 或任何私钥到
+容器。
+
 Worker 禁止接收任意 command、argv、shell、SQL、路径、systemd unit、Docker mount、
 capability 或 `scontrol` 参数。子进程一律 `shell=False`，使用固定环境、超时与输出
 上限。现有管理脚本在调用前检查 root owner、普通用户不可写和 SHA-256 allowlist。
@@ -61,7 +78,7 @@ SameSite Cookie 不是唯一防线。登录使用统一错误文案，按 IP 与
 private key、authorized key body、数据库密码和 MUNGE key。SSH 公钥只记录类型、
 fingerprint 与截断注释。
 
-## Portal-3C 精确写边界
+## Portal-3C/3D-R 精确写边界
 
 唯一真实写允许固定 `origin-pilot`、UID/GID 20001、project 30001、端口 22023 和固定
 容器/Slurm 参数。Worker systemd sandbox 仅为 hash-pinned 生命周期脚本增加 `/etc`、
@@ -73,3 +90,5 @@ fingerprint 与截断注释。
 
 内部 HTTP 的管理员接受仅解除 transport 阻断，不构成额外执行批准。Portal-3C 只开放
 当前精确批准的 `origin-pilot user.stage`；Activate 和所有其他真实写 handler 继续禁用。
+Portal-3D-R 只增加 public-key self-service staging 与 `user.activate` dry-run。它不修改
+宿主/容器 authorized_keys、shell、密码、容器状态、Slurm、quota 或 GPU policy。

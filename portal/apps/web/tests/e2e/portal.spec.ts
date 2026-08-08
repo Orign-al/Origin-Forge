@@ -107,6 +107,7 @@ const stagedOwner = {
   ...owner,
   resource_onboarding_state: "STAGED",
   linux_identity: {
+    managed_user_id: "00000000-0000-4000-8000-000000000030",
     unix_username: "origin-pilot",
     uid: 20001,
     gid: 20001,
@@ -132,6 +133,8 @@ const stagedOwner = {
     container_memory_gb: 32,
     container_pids_limit: 4096,
     container_image_digest: `sha256:${"a".repeat(64)}`,
+    ssh_key_count: 0,
+    ssh_key_state: "REQUIRED_BEFORE_ACTIVATION",
   },
   compute_onboarding: {
     status: "STAGED",
@@ -280,7 +283,23 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
         );
         return;
       }
-      await json(route, { user: owner, role: state.role ?? "platform_owner" });
+      await json(route, {
+        user: state.staged ? stagedOwner : owner,
+        role: state.role ?? "platform_owner",
+        ssh_enrollment: {
+          required: Boolean(state.staged),
+          managed_user_id: state.staged
+            ? "00000000-0000-4000-8000-000000000030"
+            : null,
+          compute_identity: state.staged ? "origin-pilot" : null,
+          compute_state: state.staged ? "STAGED" : "NOT_ENROLLED",
+          validated_key_count: 0,
+          ssh_key_state: state.staged
+            ? "REQUIRED_BEFORE_ACTIVATION"
+            : "NOT_APPLICABLE",
+          setup_path: state.staged ? `/users/${owner.id}?tab=ssh` : null,
+        },
+      });
       return;
     }
     if (path === "/auth/login") {
@@ -484,6 +503,24 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
                 },
               }
             : owner,
+      });
+      return;
+    }
+    if (path === `/users/${owner.id}/ssh-keys`) {
+      await json(route, {
+        status: "OK",
+        keys: [],
+        count: 0,
+        maximum_active_keys: 5,
+        enrollment: {
+          required: true,
+          managed_user_id: "00000000-0000-4000-8000-000000000030",
+          compute_identity: "origin-pilot",
+          compute_state: "STAGED",
+          validated_key_count: 0,
+          ssh_key_state: "REQUIRED_BEFORE_ACTIVATION",
+          setup_path: `/users/${owner.id}?tab=ssh`,
+        },
       });
       return;
     }
@@ -803,14 +840,19 @@ test("origin-pilot STAGED 页面保持无公钥、nologin、停止容器和 Acti
     page.getByText(/gpu-dev-origin-pilot \/ STOPPED \/ GPU NONE/),
   ).toBeVisible();
   await expect(page.getByText("PASSING", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "设置 SSH 公钥" }).click();
   await expect(
-    page.getByRole("button", { name: "添加 SSH 公钥（下一 Gate）" }),
-  ).toBeDisabled();
+    page.getByRole("heading", { name: "SSH 密钥设置" }),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "生成新密钥" })).toBeEnabled();
   await expect(
-    page.getByRole("button", { name: "Activate（未审批）" }),
-  ).toBeDisabled();
-  await expect(page.locator('input[type="file"]')).toHaveCount(0);
-  await expect(page.getByText(/管理映射 origin-al 保持不变/)).toBeVisible();
+    page.getByRole("button", { name: "导入已有公钥" }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "生成 Activate Dry-Run" }),
+  ).toHaveCount(0);
+  await expect(page.getByText(/authorized_keys 为 ABSENT/)).toBeVisible();
+  await expect(page.getByText(/Origin-al 是平台恢复\/管理账号/)).toBeVisible();
 });
 
 test("账号安全页显示会话并可撤销其他会话", async ({ page }) => {

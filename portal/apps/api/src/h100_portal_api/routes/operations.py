@@ -59,6 +59,8 @@ STAGE_PUBLIC_KEY_FIELDS = {
 FORBIDDEN_SECRET_OR_COMMAND_FIELDS = {
     "raw_private_key",
     "private_key",
+    "private_key_password",
+    "private_key_path",
     "password",
     "command",
     "argv",
@@ -93,7 +95,7 @@ class OperationPayloadError(ValueError):
 
 def validate_activate_database_bindings(
     db: Session, *, owner_id: uuid.UUID, target_id: str, payload: dict[str, Any]
-) -> None:
+) -> list[PortalSshKey]:
     """Bind Activate IDs to the owner's staged origin-pilot record.
 
     The Worker independently validates the root-controlled key bytes.  The API
@@ -132,7 +134,7 @@ def validate_activate_database_bindings(
                 "PUBLIC_KEY_RECORD_OWNER_MISMATCH",
                 "approved SSH key record belongs to another managed identity",
             )
-        if not record.active or record.revoked_at is not None:
+        if not record.active or record.revoked_at is not None or record.state != "VALIDATED":
             raise OperationPayloadError(
                 "PUBLIC_KEY_RECORD_NOT_ACTIVE", "approved SSH key record is not active"
             )
@@ -140,6 +142,80 @@ def validate_activate_database_bindings(
             raise OperationPayloadError(
                 "PUBLIC_KEY_RECORD_NOT_APPROVED", "SSH key record has no independent approval"
             )
+        if (
+            record.validated_at is None
+            or record.public_key is None
+            or record.enrollment_operation_id is None
+            or record.staging_file_name != f"{record.id}.pub"
+            or record.content_sha256 is None
+            or record.scope not in {"HOST", "CONTAINER", "BOTH"}
+            or not record.fingerprint_sha256.startswith("SHA256:")
+        ):
+            raise OperationPayloadError(
+                "PUBLIC_KEY_RECORD_NOT_VALIDATED",
+                "SSH key record has no complete self-service enrollment binding",
+            )
+    ordered = [by_id[key_id] for key_id in key_ids]
+    if not any(record.scope in {"HOST", "BOTH"} for record in ordered) or not any(
+        record.scope in {"CONTAINER", "BOTH"} for record in ordered
+    ):
+        raise OperationPayloadError(
+            "SSH_KEY_SCOPE_INCOMPLETE", "Activate requires key coverage for host and container"
+        )
+    return ordered
+
+
+def validate_activate_worker_result(
+    records: list[PortalSshKey], worker_result: dict[str, Any]
+) -> None:
+    observed = worker_result.get("approved_ssh_keys")
+    if not isinstance(observed, list) or len(observed) != len(records):
+        raise OperationPayloadError(
+            "PUBLIC_KEY_WORKER_MISMATCH", "Worker did not return every approved SSH key"
+        )
+    by_id = {str(item.get("record_id")): item for item in observed if isinstance(item, dict)}
+    for record in records:
+        item = by_id.get(str(record.id))
+        if (
+            item is None
+            or item.get("key_type") != record.key_type
+            or item.get("fingerprint_sha256") != record.fingerprint_sha256
+            or item.get("content_sha256") != record.content_sha256
+            or item.get("scope") != record.scope
+            or item.get("managed_user_id") != str(record.managed_user_id)
+            or item.get("operation_id") != str(record.enrollment_operation_id)
+        ):
+            raise OperationPayloadError(
+                "PUBLIC_KEY_WORKER_MISMATCH",
+                "Worker key bytes do not match the approved Portal record",
+            )
+    expected_host_plan = [
+        {
+            "record_id": str(record.id),
+            "fingerprint_sha256": record.fingerprint_sha256,
+        }
+        for record in records
+        if record.scope in {"HOST", "BOTH"}
+    ]
+    expected_container_plan = [
+        {
+            "record_id": str(record.id),
+            "fingerprint_sha256": record.fingerprint_sha256,
+        }
+        for record in records
+        if record.scope in {"CONTAINER", "BOTH"}
+    ]
+    if (
+        worker_result.get("host_authorized_keys_install") != "PLANNED"
+        or worker_result.get("container_authorized_keys_install") != "PLANNED"
+        or worker_result.get("host_authorized_keys_plan") != expected_host_plan
+        or worker_result.get("container_authorized_keys_plan") != expected_container_plan
+        or worker_result.get("activate_cli_contract") != "TARGET_SCOPED_ROOT_CONTROLLED_BUNDLES"
+        or worker_result.get("execution_enabled") is not False
+    ):
+        raise OperationPayloadError(
+            "ACTIVATE_DRY_RUN_INCOMPLETE", "Worker Activate plan is incomplete"
+        )
 
 
 def operation_response(operation: PortalOperation) -> OperationResponse:
@@ -886,9 +962,10 @@ def create_operation(
                 "message": "当前两阶段生命周期仅允许 origin-pilot",
             },
         )
+    activate_records: list[PortalSshKey] = []
     if operation_type == "user.activate":
         try:
-            validate_activate_database_bindings(
+            activate_records = validate_activate_database_bindings(
                 db, owner_id=context.user.id, target_id=target_id, payload=validated
             )
         except OperationPayloadError as exc:
@@ -929,6 +1006,15 @@ def create_operation(
                 timeout_seconds=25,
             )
             if worker_plan.get("status") == "DRY_RUN":
+                if operation_type == "user.activate":
+                    try:
+                        validate_activate_worker_result(activate_records, worker_plan)
+                    except OperationPayloadError as exc:
+                        db.rollback()
+                        raise HTTPException(
+                            status_code=409,
+                            detail={"code": exc.code, "message": str(exc)},
+                        ) from exc
                 if operation_type == "user.plan":
                     worker_plan = enrich_user_plan_with_portal_state(
                         worker_plan, db, context.user.id

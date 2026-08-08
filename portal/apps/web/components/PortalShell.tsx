@@ -71,7 +71,7 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
       <aside className="portal-sidebar">
         <div className="brand">
           <div className="brand-title">H100 管理平台</div>
-          <div className="brand-subtitle">单机控制面 · Portal-3B-R</div>
+          <div className="brand-subtitle">单机控制面 · Portal-3D-R</div>
         </div>
         <nav className="nav-group" aria-label="主导航">
           <div className="nav-label">平台</div>
@@ -135,7 +135,24 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
             <Button onClick={signOut}>退出</Button>
           </div>
         </header>
-        <main className="content">{children}</main>
+        <main className="content">
+          {current.data.ssh_enrollment?.required &&
+          current.data.ssh_enrollment.setup_path ? (
+            <div className="onboarding-banner" role="status">
+              <div>
+                <strong>完成 SSH 密钥设置后即可启用计算环境。</strong>
+                <span>宿主 SSH、容器 SSH 与 VS Code 连接仍保持关闭。</span>
+              </div>
+              <Link
+                className="ui-button ui-button-primary"
+                href={current.data.ssh_enrollment.setup_path}
+              >
+                设置 SSH 密钥
+              </Link>
+            </div>
+          ) : null}
+          {children}
+        </main>
       </div>
     </div>
   );

@@ -47,6 +47,7 @@ from h100_portal_api.security import (
     validate_password,
     verify_password,
 )
+from h100_portal_api.ssh_keys import ssh_enrollment_status
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -171,7 +172,11 @@ def login(
     _record_session_created(db, request, user, new_session, reason="login")
     db.commit()
     set_session_cookies(response, session_raw, csrf_raw)
-    return {"user": serialize_user(user).model_dump(mode="json"), "csrf_token": csrf_raw}
+    return {
+        "user": serialize_user(user).model_dump(mode="json"),
+        "csrf_token": csrf_raw,
+        "ssh_enrollment": ssh_enrollment_status(db, user),
+    }
 
 
 def highest_role_safe(user: PortalUser) -> str:
@@ -307,14 +312,21 @@ def setup_password(
     _record_session_created(db, request, user, new_session, reason="password_setup")
     db.commit()
     set_session_cookies(response, session_raw, csrf_raw)
-    return {"user": serialize_user(user).model_dump(mode="json"), "csrf_token": csrf_raw}
+    return {
+        "user": serialize_user(user).model_dump(mode="json"),
+        "csrf_token": csrf_raw,
+        "ssh_enrollment": ssh_enrollment_status(db, user),
+    }
 
 
 @router.get("/me")
-def me(context: AuthContext = Depends(auth_context)) -> dict[str, object]:
+def me(
+    context: AuthContext = Depends(auth_context), db: Session = Depends(get_db)
+) -> dict[str, object]:
     return {
         "user": serialize_user(context.user).model_dump(mode="json"),
         "role": highest_role_safe(context.user),
+        "ssh_enrollment": ssh_enrollment_status(db, context.user),
     }
 
 

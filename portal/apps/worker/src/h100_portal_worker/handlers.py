@@ -1,19 +1,30 @@
+import base64
+import binascii
 import csv
+import fcntl
 import grp
 import hashlib
 import json
 import os
 import pwd
 import re
+import secrets
 import stat
+import struct
 import subprocess
+import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
 from h100_portal_worker.schemas import (
+    APPROVED_STAGE_PAYLOAD,
     KNOWN_WRITES,
     WorkerRequest,
     validate_payload,
@@ -100,6 +111,10 @@ MANAGEMENT_IP = "10.82.36.1"
 GPU_DROPIN_NAME = "50-h100-gpu-isolation.conf"
 GPU_DROPIN_CONTENT = "[Slice]\nDevicePolicy=closed\n"
 GPU_REGISTRY = Path("/etc/h100-platform/gpu-isolated-users")
+GUARD_METRIC_FILE = Path("/var/lib/node_exporter/textfile_collector/h100_gpu_bypass_guard.prom")
+GUARD_METRIC_OWNER_UID = 0
+GUARD_METRIC_OWNER_GID = 0
+GUARD_METRIC_MAX_AGE_SECONDS = 15 * 60
 PILOT_STATE_ROOT = Path("/etc/h100-platform/users")
 PILOT_DATA_ROOT = Path("/srv/gpu-platform/users")
 PILOT_COMPOSE_ROOT = Path("/srv/gpu-platform/platform/config/dev-containers")
@@ -111,6 +126,8 @@ PILOT_SCAN_ROOTS = (
     Path("/var/spool/slurmd"),
 )
 SSH_KEY_STAGING_ROOT = Path("/var/lib/h100-portal/ssh-key-staging")
+SSH_KEY_STAGING_OWNER_UID = 0
+SSH_KEY_STAGING_OWNER_GID = 0
 MAX_SSH_KEY_FILE_BYTES = 16 * 1024
 MAX_APPROVED_SSH_KEYS = 5
 PORTAL3C_STAGE_IDEMPOTENCY_KEY = "portal3b-r-origin-pilot-stage-v1"
@@ -1310,104 +1327,226 @@ def _ssh_key_fingerprint(public_key_line: str) -> str:
     return fields[1]
 
 
-def _read_approved_ssh_key_record(record_id: str) -> dict[str, Any]:
-    """Read one UUID-named, root-controlled key without following links."""
+def _validate_public_key_content(public_key_line: str) -> dict[str, Any]:
+    upper = public_key_line.upper()
+    if "PRIVATE KEY" in upper or "-----BEGIN" in upper or "-----END" in upper:
+        raise LifecycleValidationError(
+            "SSH_PRIVATE_KEY_UPLOAD_REJECTED", "private-key material is forbidden"
+        )
+    if (
+        public_key_line != public_key_line.strip()
+        or "\r" in public_key_line
+        or "\n" in public_key_line
+    ):
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "one canonical public key is required per record"
+        )
+    parts = public_key_line.split(maxsplit=2)
+    allowed_types = {
+        "ssh-ed25519",
+        "ecdsa-sha2-nistp256",
+        "sk-ssh-ed25519@openssh.com",
+    }
+    if len(parts) < 2 or parts[0] not in allowed_types:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "SSH key type is not approved"
+        )
     try:
-        root_stat = SSH_KEY_STAGING_ROOT.lstat()
+        blob = base64.b64decode(parts[1], validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "SSH public-key payload is malformed"
+        ) from exc
+
+    def read_field(offset: int) -> tuple[bytes, int]:
+        if offset + 4 > len(blob):
+            raise LifecycleValidationError(
+                "PUBLIC_KEY_VALIDATION_FAILED", "SSH public-key blob is truncated"
+            )
+        length = struct.unpack(">I", blob[offset : offset + 4])[0]
+        start = offset + 4
+        end = start + length
+        if length > MAX_SSH_KEY_FILE_BYTES or end > len(blob):
+            raise LifecycleValidationError(
+                "PUBLIC_KEY_VALIDATION_FAILED", "SSH public-key field length is invalid"
+            )
+        return blob[start:end], end
+
+    encoded_type, offset = read_field(0)
+    if encoded_type != parts[0].encode("ascii"):
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "SSH public-key type does not match its blob"
+        )
+    if parts[0] == "ssh-ed25519":
+        public_bytes, offset = read_field(offset)
+        structure_ok = len(public_bytes) == 32
+    elif parts[0] == "ecdsa-sha2-nistp256":
+        curve, offset = read_field(offset)
+        point, offset = read_field(offset)
+        structure_ok = curve == b"nistp256" and len(point) == 65 and point[:1] == b"\x04"
+    else:
+        public_bytes, offset = read_field(offset)
+        application, offset = read_field(offset)
+        structure_ok = len(public_bytes) == 32 and bool(application)
+    if not structure_ok or offset != len(blob):
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "SSH public-key blob structure is invalid"
+        )
+    if len(parts) == 3:
+        comment = parts[2]
+        if len(comment) > 128 or any(
+            unicodedata.category(character).startswith("C") for character in comment
+        ):
+            raise LifecycleValidationError(
+                "PUBLIC_KEY_VALIDATION_FAILED", "SSH key comment is invalid"
+            )
+    canonical_blob = base64.b64encode(blob).decode("ascii")
+    canonical = f"{parts[0]} {canonical_blob}"
+    if len(parts) == 3:
+        canonical = f"{canonical} {parts[2]}"
+    if canonical != public_key_line:
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_VALIDATION_FAILED", "SSH public key is not canonical"
+        )
+    content = f"{canonical}\n".encode()
+    return {
+        "key_type": parts[0],
+        "fingerprint_sha256": _ssh_key_fingerprint(canonical),
+        "content_sha256": hashlib.sha256(content).hexdigest(),
+        "content": content,
+    }
+
+
+def _open_staging_directory() -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(SSH_KEY_STAGING_ROOT, flags)
+        directory_stat = os.fstat(descriptor)
     except OSError as exc:
         raise LifecycleValidationError(
             "PUBLIC_KEY_VALIDATION_FAILED", "SSH key staging directory is unavailable"
         ) from exc
     if (
-        not stat.S_ISDIR(root_stat.st_mode)
-        or stat.S_ISLNK(root_stat.st_mode)
-        or root_stat.st_uid != 0
-        or root_stat.st_gid != 0
-        or stat.S_IMODE(root_stat.st_mode) != 0o700
+        not stat.S_ISDIR(directory_stat.st_mode)
+        or directory_stat.st_uid != SSH_KEY_STAGING_OWNER_UID
+        or directory_stat.st_gid != SSH_KEY_STAGING_OWNER_GID
+        or stat.S_IMODE(directory_stat.st_mode) != 0o700
     ):
+        os.close(descriptor)
         raise LifecycleValidationError(
             "PUBLIC_KEY_VALIDATION_FAILED", "SSH key staging directory metadata is invalid"
         )
-    path = SSH_KEY_STAGING_ROOT / f"{record_id}.pub"
+    return descriptor
+
+
+def _read_staging_component(name: str, maximum_size: int) -> bytes:
+    directory = _open_staging_directory()
     try:
-        before = path.lstat()
-    except OSError as exc:
-        raise LifecycleValidationError(
-            "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key record is unavailable"
-        ) from exc
-    if (
-        not stat.S_ISREG(before.st_mode)
-        or stat.S_ISLNK(before.st_mode)
-        or before.st_uid != 0
-        or before.st_gid != 0
-        or before.st_nlink != 1
-        or bool(before.st_mode & 0o022)
-        or not 0 < before.st_size <= MAX_SSH_KEY_FILE_BYTES
-    ):
-        raise LifecycleValidationError(
-            "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key file metadata is invalid"
-        )
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(path, flags)
+        try:
+            before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except OSError as exc:
+            raise LifecycleValidationError(
+                "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key record is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != SSH_KEY_STAGING_OWNER_UID
+            or before.st_gid != SSH_KEY_STAGING_OWNER_GID
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or not 0 < before.st_size <= maximum_size
+        ):
+            raise LifecycleValidationError(
+                "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key file metadata is invalid"
+            )
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(name, flags, dir_fd=directory)
         try:
             opened = os.fstat(descriptor)
             if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
                 raise LifecycleValidationError(
                     "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key file changed during open"
                 )
-            content = os.read(descriptor, MAX_SSH_KEY_FILE_BYTES + 1)
-            if os.read(descriptor, 1):
-                content += b"x"
+            content = os.read(descriptor, maximum_size + 1)
         finally:
             os.close(descriptor)
+        if not 0 < len(content) <= maximum_size:
+            raise LifecycleValidationError(
+                "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key file has an invalid size"
+            )
+        return content
     except LifecycleValidationError:
         raise
     except OSError as exc:
         raise LifecycleValidationError(
             "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key file could not be read safely"
         ) from exc
-    if not 0 < len(content) <= MAX_SSH_KEY_FILE_BYTES:
-        raise LifecycleValidationError(
-            "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key file has an invalid size"
-        )
+    finally:
+        os.close(directory)
+
+
+def _read_approved_ssh_key_record(record_id: str) -> dict[str, Any]:
+    """Read one UUID-named, root-controlled key without following links."""
     try:
+        uuid_value = str(uuid.UUID(record_id))
+        if uuid_value != record_id:
+            raise ValueError("non-canonical UUID")
+        content = _read_staging_component(f"{record_id}.pub", MAX_SSH_KEY_FILE_BYTES)
+        metadata_content = _read_staging_component(f"{record_id}.meta.json", 4096)
         decoded = content.decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
+        metadata = json.loads(metadata_content.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise LifecycleValidationError(
-            "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key is not valid UTF-8"
+            "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key metadata is invalid"
         ) from exc
-    upper = decoded.upper()
-    if "PRIVATE KEY" in upper or "-----BEGIN" in upper or "-----END" in upper:
+    if not isinstance(metadata, dict):
         raise LifecycleValidationError(
-            "PUBLIC_KEY_VALIDATION_FAILED", "private-key material is forbidden"
+            "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key metadata is invalid"
         )
-    lines = [line for line in decoded.splitlines() if line.strip()]
-    if len(lines) != 1 or lines[0] != lines[0].strip() or "\r" in lines[0]:
+    if not decoded.endswith("\n") or "\n" in decoded[:-1] or "\r" in decoded:
         raise LifecycleValidationError(
             "PUBLIC_KEY_VALIDATION_FAILED", "one canonical public key is required per record"
         )
-    parts = lines[0].split(maxsplit=2)
-    if len(parts) < 2 or parts[0] not in {"ssh-ed25519", "sk-ssh-ed25519@openssh.com"}:
+    validated = _validate_public_key_content(decoded[:-1])
+    expected = {
+        "record_id": record_id,
+        "key_type": validated["key_type"],
+        "fingerprint_sha256": validated["fingerprint_sha256"],
+        "content_sha256": validated["content_sha256"],
+    }
+    if any(metadata.get(key) != value for key, value in expected.items()):
         raise LifecycleValidationError(
-            "PUBLIC_KEY_VALIDATION_FAILED", "SSH key type is not approved"
+            "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key metadata does not match key bytes"
         )
-    if re.fullmatch(r"[A-Za-z0-9+/]+={0,3}", parts[1]) is None:
+    try:
+        operation_id = str(uuid.UUID(str(metadata.get("operation_id", ""))))
+        managed_user_id = str(uuid.UUID(str(metadata.get("managed_user_id", ""))))
+    except ValueError as exc:
         raise LifecycleValidationError(
-            "PUBLIC_KEY_VALIDATION_FAILED", "SSH public-key payload is malformed"
-        )
-    if len(parts) == 3 and any(ord(character) < 32 for character in parts[2]):
+            "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key association metadata is invalid"
+        ) from exc
+    if (
+        metadata.get("scope") not in {"HOST", "CONTAINER", "BOTH"}
+        or operation_id != metadata.get("operation_id")
+        or managed_user_id != metadata.get("managed_user_id")
+    ):
         raise LifecycleValidationError(
-            "PUBLIC_KEY_VALIDATION_FAILED", "SSH key comment contains control characters"
+            "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key association metadata is invalid"
         )
-    fingerprint = _ssh_key_fingerprint(lines[0])
     return {
         "record_id": record_id,
-        "key_type": parts[0],
-        "fingerprint": fingerprint,
-        "content_sha256": hashlib.sha256(content).hexdigest(),
+        "key_type": validated["key_type"],
+        "fingerprint_sha256": validated["fingerprint_sha256"],
+        "content_sha256": validated["content_sha256"],
+        "scope": metadata["scope"],
+        "operation_id": operation_id,
+        "managed_user_id": managed_user_id,
         "size_bytes": len(content),
     }
 
@@ -1418,10 +1557,209 @@ def validate_approved_ssh_key_records(record_ids: list[str]) -> list[dict[str, A
             "PUBLIC_KEY_REQUIRED_FOR_ACTIVATION", "approved SSH key records are required"
         )
     results = [_read_approved_ssh_key_record(record_id) for record_id in record_ids]
-    fingerprints = [str(item["fingerprint"]) for item in results]
+    fingerprints = [str(item["fingerprint_sha256"]) for item in results]
     if len(set(fingerprints)) != len(fingerprints):
         raise LifecycleValidationError("PUBLIC_KEY_DUPLICATE", "duplicate SSH key fingerprint")
     return results
+
+
+def _component_exists(directory: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "SSH_KEY_STAGING_FAILED", "SSH key staging component could not be inspected"
+        ) from exc
+
+
+def _write_staging_temp(directory: int, name: str, content: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory)
+    try:
+        os.fchmod(descriptor, 0o600)
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError("short write")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _prepare_ssh_key_record(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    record_id = payload["record_id"]
+    if (
+        request.requested_by != request.approved_by
+        or request.idempotency_key != f"ssh-key-enroll:{record_id}"
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "SSH_KEY_PREPARE_APPROVAL_REJECTED",
+                "message": "SSH key preparation is not bound to self-service confirmation",
+            },
+        }
+    try:
+        validated = _validate_public_key_content(payload["public_key"])
+        for supplied, observed in (
+            (payload["key_type"], validated["key_type"]),
+            (payload["fingerprint_sha256"], validated["fingerprint_sha256"]),
+            (payload["content_sha256"], validated["content_sha256"]),
+        ):
+            if supplied != observed:
+                raise LifecycleValidationError(
+                    "SSH_KEY_PREPARE_MISMATCH", "SSH key metadata differs from key bytes"
+                )
+        metadata = {
+            "record_id": record_id,
+            "operation_id": payload["operation_id"],
+            "managed_user_id": payload["managed_user_id"],
+            "username": payload["username"],
+            "key_type": validated["key_type"],
+            "fingerprint_sha256": validated["fingerprint_sha256"],
+            "content_sha256": validated["content_sha256"],
+            "scope": payload["scope"],
+        }
+        metadata_content = (
+            json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        key_name = f"{record_id}.pub"
+        metadata_name = f"{record_id}.meta.json"
+        directory = _open_staging_directory()
+        key_temp = f".{record_id}.{secrets.token_hex(8)}.pub.tmp"
+        metadata_temp = f".{record_id}.{secrets.token_hex(8)}.meta.tmp"
+        key_installed = False
+        try:
+            fcntl.flock(directory, fcntl.LOCK_EX)
+            key_exists = _component_exists(directory, key_name)
+            metadata_exists = _component_exists(directory, metadata_name)
+            if key_exists or metadata_exists:
+                if not (key_exists and metadata_exists):
+                    raise LifecycleValidationError(
+                        "SSH_KEY_STAGING_CONFLICT", "incomplete SSH key staging record exists"
+                    )
+                existing = _read_approved_ssh_key_record(record_id)
+                comparisons = {
+                    "key_type": payload["key_type"],
+                    "fingerprint_sha256": payload["fingerprint_sha256"],
+                    "content_sha256": payload["content_sha256"],
+                    "scope": payload["scope"],
+                    "operation_id": payload["operation_id"],
+                    "managed_user_id": payload["managed_user_id"],
+                }
+                if any(existing.get(key) != value for key, value in comparisons.items()):
+                    raise LifecycleValidationError(
+                        "SSH_KEY_STAGING_CONFLICT", "existing SSH key staging record differs"
+                    )
+                return {
+                    "status": "SUCCEEDED",
+                    "handler": "ssh_key.prepare",
+                    "idempotent_replay": True,
+                    **existing,
+                }
+            try:
+                _write_staging_temp(directory, key_temp, validated["content"])
+                _write_staging_temp(directory, metadata_temp, metadata_content)
+                os.replace(key_temp, key_name, src_dir_fd=directory, dst_dir_fd=directory)
+                key_installed = True
+                os.replace(metadata_temp, metadata_name, src_dir_fd=directory, dst_dir_fd=directory)
+                os.fsync(directory)
+            except OSError as exc:
+                if key_installed:
+                    with suppress(OSError):
+                        os.unlink(key_name, dir_fd=directory)
+                raise LifecycleValidationError(
+                    "SSH_KEY_STAGING_FAILED", "SSH key staging write failed"
+                ) from exc
+            finally:
+                for temporary in (key_temp, metadata_temp):
+                    try:
+                        os.unlink(temporary, dir_fd=directory)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+        finally:
+            os.close(directory)
+        verified = _read_approved_ssh_key_record(record_id)
+        return {
+            "status": "SUCCEEDED",
+            "handler": "ssh_key.prepare",
+            "idempotent_replay": False,
+            **verified,
+        }
+    except LifecycleValidationError as exc:
+        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+
+
+def _discard_ssh_key_record(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    record_id = payload["record_id"]
+    if (
+        request.requested_by != request.approved_by
+        or request.idempotency_key != f"ssh-key-discard:{record_id}"
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "SSH_KEY_DISCARD_APPROVAL_REJECTED",
+                "message": "SSH key discard is not bound to its enrollment record",
+            },
+        }
+    key_name = f"{record_id}.pub"
+    metadata_name = f"{record_id}.meta.json"
+    try:
+        directory = _open_staging_directory()
+        try:
+            fcntl.flock(directory, fcntl.LOCK_EX)
+            key_exists = _component_exists(directory, key_name)
+            metadata_exists = _component_exists(directory, metadata_name)
+            if not key_exists and not metadata_exists:
+                return {
+                    "status": "SUCCEEDED",
+                    "handler": "ssh_key.discard",
+                    "record_id": record_id,
+                    "removed": False,
+                }
+            if metadata_exists:
+                metadata_raw = _read_staging_component(metadata_name, 4096)
+                metadata = json.loads(metadata_raw.decode("utf-8", errors="strict"))
+                if (
+                    not isinstance(metadata, dict)
+                    or metadata.get("record_id") != record_id
+                    or metadata.get("operation_id") != payload["operation_id"]
+                    or metadata.get("content_sha256") != payload["content_sha256"]
+                ):
+                    raise LifecycleValidationError(
+                        "SSH_KEY_DISCARD_REJECTED", "SSH key staging association does not match"
+                    )
+            if key_exists:
+                key_content = _read_staging_component(key_name, MAX_SSH_KEY_FILE_BYTES)
+                if hashlib.sha256(key_content).hexdigest() != payload["content_sha256"]:
+                    raise LifecycleValidationError(
+                        "SSH_KEY_DISCARD_REJECTED", "SSH key staging bytes do not match"
+                    )
+            for name, exists in ((key_name, key_exists), (metadata_name, metadata_exists)):
+                if exists:
+                    os.unlink(name, dir_fd=directory)
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        return {
+            "status": "SUCCEEDED",
+            "handler": "ssh_key.discard",
+            "record_id": record_id,
+            "removed": True,
+        }
+    except (LifecycleValidationError, UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
+        code = getattr(exc, "code", "SSH_KEY_DISCARD_REJECTED")
+        return {"status": "ERROR", "error": {"code": code, "message": str(exc)[:255]}}
 
 
 def build_user_stage_argv(payload: dict[str, Any]) -> list[str]:
@@ -1441,21 +1779,123 @@ def build_user_stage_argv(payload: dict[str, Any]) -> list[str]:
     ]
 
 
-def build_user_activate_argv(username: str, controlled_key_file: Path) -> list[str]:
-    """Build Activate argv only for a Worker-owned UUID staging path."""
-    if (
-        controlled_key_file.parent != SSH_KEY_STAGING_ROOT
-        or re.fullmatch(r"[0-9A-Fa-f-]{36}\.pub", controlled_key_file.name) is None
-    ):
+def _activation_target_records(
+    key_records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    host_records = [record for record in key_records if record["scope"] in {"HOST", "BOTH"}]
+    container_records = [
+        record for record in key_records if record["scope"] in {"CONTAINER", "BOTH"}
+    ]
+    if not host_records or not container_records:
         raise LifecycleValidationError(
-            "ARBITRARY_PATH_REJECTED", "Activate key file is outside the controlled staging root"
+            "SSH_KEY_SCOPE_INCOMPLETE",
+            "Activate requires approved key coverage for both host and container",
         )
+    return host_records, container_records
+
+
+def _activation_bundle_path(request_id: str, target: str) -> Path:
+    try:
+        canonical_request_id = str(uuid.UUID(request_id))
+    except ValueError as exc:
+        raise LifecycleValidationError(
+            "ACTIVATE_BUNDLE_PATH_REJECTED", "Activate bundle request ID is invalid"
+        ) from exc
+    if canonical_request_id != request_id or target not in {"host", "container"}:
+        raise LifecycleValidationError(
+            "ACTIVATE_BUNDLE_PATH_REJECTED", "Activate bundle target is invalid"
+        )
+    return SSH_KEY_STAGING_ROOT / f"{canonical_request_id}.{target}.pub"
+
+
+@contextmanager
+def activation_key_bundles(
+    request_id: str, key_records: list[dict[str, Any]]
+) -> Iterator[tuple[Path, Path]]:
+    """Build target-scoped, root-only bundles and remove them after one invocation."""
+    host_records, container_records = _activation_target_records(key_records)
+    target_records = {"host": host_records, "container": container_records}
+    bundle_content: dict[str, bytes] = {}
+    bundle_paths = {
+        target: _activation_bundle_path(request_id, target) for target in target_records
+    }
+    for target, records in target_records.items():
+        content = b"".join(
+            _read_staging_component(f"{record['record_id']}.pub", MAX_SSH_KEY_FILE_BYTES)
+            for record in records
+        )
+        if not 0 < len(content) <= MAX_SSH_KEY_FILE_BYTES:
+            raise LifecycleValidationError(
+                "PUBLIC_KEY_SIZE_INVALID", f"{target} SSH key bundle has an invalid size"
+            )
+        bundle_content[target] = content
+
+    directory = _open_staging_directory()
+    installed: list[str] = []
+    temporary: list[str] = []
+    try:
+        fcntl.flock(directory, fcntl.LOCK_EX)
+        for target, path in bundle_paths.items():
+            if _component_exists(directory, path.name):
+                raise LifecycleValidationError(
+                    "ACTIVATE_BUNDLE_CONFLICT", "Activate bundle already exists"
+                )
+            temp_name = f".{request_id}.{target}.{secrets.token_hex(8)}.tmp"
+            temporary.append(temp_name)
+            _write_staging_temp(directory, temp_name, bundle_content[target])
+            os.replace(temp_name, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+            temporary.remove(temp_name)
+            installed.append(path.name)
+        os.fsync(directory)
+        yield bundle_paths["host"], bundle_paths["container"]
+    finally:
+        for name in temporary + installed:
+            with suppress(FileNotFoundError, OSError):
+                os.unlink(name, dir_fd=directory)
+        with suppress(OSError):
+            os.fsync(directory)
+        os.close(directory)
+
+
+def build_user_activate_argv(
+    username: str, host_key_file: Path, container_key_file: Path
+) -> list[str]:
+    """Build Activate argv only for Worker-owned target-scoped bundle paths."""
+    if username != PILOT_USERNAME:
+        raise LifecycleValidationError(
+            "ACTIVATE_TARGET_REJECTED", "Activate target is outside the approved Pilot identity"
+        )
+    expected_names = {
+        "host": host_key_file,
+        "container": container_key_file,
+    }
+    for target, controlled_key_file in expected_names.items():
+        name_match = re.fullmatch(
+            rf"([0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-"
+            rf"[0-9a-f]{{12}})\.{target}\.pub",
+            controlled_key_file.name,
+        )
+        canonical_request_id = None
+        if name_match is not None:
+            with suppress(ValueError):
+                canonical_request_id = str(uuid.UUID(name_match.group(1)))
+        if (
+            controlled_key_file.parent != SSH_KEY_STAGING_ROOT
+            or name_match is None
+            or canonical_request_id != name_match.group(1)
+        ):
+            raise LifecycleValidationError(
+                "ARBITRARY_PATH_REJECTED",
+                "Activate key bundle is outside the controlled staging root",
+            )
     return [
         SCRIPT_ALLOWLIST["h100-user-create"],
         "--activate",
         username,
-        "--public-key-file",
-        str(controlled_key_file),
+        "--host-public-key-file",
+        str(host_key_file),
+        "--container-public-key-file",
+        str(container_key_file),
         "--confirm-activate",
         username,
     ]
@@ -2194,6 +2634,155 @@ def _staged_origin_pilot_state() -> dict[str, str]:
     return values
 
 
+def _verified_project_quota(project_id: int, quota_gb: int) -> dict[str, Any]:
+    state = run_fixed("xfs_quota", ["-x", "-c", "state", str(PILOT_DATA_ROOT.parent)], timeout=20)
+    state_output = str(state.get("stdout", ""))
+    project_state = state_output.partition("Project quota state")[2]
+    if (
+        not state.get("ok")
+        or not project_state
+        or "Accounting: ON" not in project_state
+        or "Enforcement: ON" not in project_state
+    ):
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "XFS project quota is not enforced"
+        )
+
+    report = run_fixed(
+        "xfs_quota",
+        ["-x", "-c", "report -p -b -n", str(PILOT_DATA_ROOT.parent)],
+        timeout=20,
+    )
+    expected_hard_blocks = quota_gb * 1024 * 1024
+    observed_hard_blocks: int | None = None
+    if report.get("ok"):
+        for line in str(report.get("stdout", "")).splitlines():
+            fields = line.split()
+            if len(fields) >= 4 and fields[0] == f"#{project_id}" and fields[3].isdigit():
+                observed_hard_blocks = int(fields[3])
+                break
+    if observed_hard_blocks != expected_hard_blocks:
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "XFS project hard quota differs from approval"
+        )
+    return {
+        "project_id": project_id,
+        "hard_limit_gb": quota_gb,
+        "accounting": "ON",
+        "enforcement": "ON",
+    }
+
+
+def _read_guard_metric_file() -> str:
+    try:
+        before = GUARD_METRIC_FILE.lstat()
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "GPU bypass Guard metrics are unavailable"
+        ) from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_uid != GUARD_METRIC_OWNER_UID
+        or before.st_gid != GUARD_METRIC_OWNER_GID
+        or stat.S_IMODE(before.st_mode) != 0o644
+        or not 0 < before.st_size <= 64 * 1024
+    ):
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "GPU bypass Guard metric metadata is invalid"
+        )
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(GUARD_METRIC_FILE, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise LifecycleValidationError(
+                    "STAGE_POSTCONDITION_FAILED", "GPU bypass Guard metrics changed during open"
+                )
+            content = os.read(descriptor, 64 * 1024 + 1)
+        finally:
+            os.close(descriptor)
+    except LifecycleValidationError:
+        raise
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "GPU bypass Guard metrics could not be read safely"
+        ) from exc
+    if not 0 < len(content) <= 64 * 1024:
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "GPU bypass Guard metrics have an invalid size"
+        )
+    try:
+        return content.decode("ascii", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "GPU bypass Guard metrics are not ASCII"
+        ) from exc
+
+
+def _verified_guard_metrics(uid: int) -> dict[str, Any]:
+    content = _read_guard_metric_file()
+    scalar_metrics: dict[str, int] = {}
+    user_success: int | None = None
+    timestamp: int | None = None
+    scalar_pattern = re.compile(r"^(h100_gpu_bypass_guard_[a-z_]+) ([0-9]+)$")
+    user_pattern = re.compile(
+        rf'^h100_gpu_user_isolation_success\{{username="{re.escape(PILOT_USERNAME)}",'
+        rf'uid="{uid}"\}} ([01])$'
+    )
+    for line in content.splitlines():
+        scalar_match = scalar_pattern.fullmatch(line)
+        if scalar_match:
+            value = int(scalar_match.group(2))
+            if scalar_match.group(1) == "h100_gpu_bypass_guard_timestamp_seconds":
+                timestamp = value
+            else:
+                scalar_metrics[scalar_match.group(1)] = value
+            continue
+        user_match = user_pattern.fullmatch(line)
+        if user_match:
+            user_success = int(user_match.group(1))
+
+    expected = {
+        "h100_gpu_bypass_guard_last_success": 1,
+        "h100_gpu_bypass_guard_managed_users": 1,
+        "h100_gpu_bypass_guard_users_verified": 1,
+        "h100_gpu_bypass_guard_policy_errors": 0,
+        "h100_gpu_bypass_guard_device_open_failures": 0,
+        "h100_gpu_bypass_guard_cuda_context_failures": 0,
+        "h100_gpu_bypass_guard_slurm_constrain_devices": 1,
+        "h100_gpu_bypass_guard_nvidia_gpu_count": 4,
+        "h100_gpu_bypass_guard_slurm_gpu_count": 4,
+    }
+    now = int(time.time())
+    metrics_fresh = (
+        timestamp is not None
+        and timestamp <= now + 60
+        and now - timestamp <= GUARD_METRIC_MAX_AGE_SECONDS
+    )
+    if any(scalar_metrics.get(name) != value for name, value in expected.items()) or not (
+        user_success == 1 and metrics_fresh
+    ):
+        raise LifecycleValidationError(
+            "STAGE_POSTCONDITION_FAILED", "GPU bypass Guard metrics do not prove isolation"
+        )
+    return {
+        "timer": "ENABLED_ACTIVE",
+        "status": "PASSING",
+        "managed_users": 1,
+        "users_verified": 1,
+        "open_probe": "DENIED",
+        "cuda_context_probe": "DENIED",
+        "constrain_devices": 1,
+        "nvidia_gpu_count": 4,
+        "slurm_gpu_count": 4,
+        "metric_timestamp": timestamp,
+    }
+
+
 def _stage_postcondition_summary(payload: dict[str, Any]) -> dict[str, Any]:
     """Re-read the fixed Stage target after the transactional script succeeds."""
     staged = _staged_origin_pilot_state()
@@ -2294,6 +2883,7 @@ def _stage_postcondition_summary(payload: dict[str, Any]) -> dict[str, Any]:
         raise LifecycleValidationError(
             "STAGE_POSTCONDITION_FAILED", "XFS project mappings are missing"
         )
+    quota = _verified_project_quota(payload["project_id"], payload["quota_gb"])
 
     association = run_fixed(
         "sacctmgr",
@@ -2365,6 +2955,7 @@ def _stage_postcondition_summary(payload: dict[str, Any]) -> dict[str, Any]:
         raise LifecycleValidationError(
             "STAGE_POSTCONDITION_FAILED", "GPU bypass Guard timer is not enabled and active"
         )
+    guard = _verified_guard_metrics(payload["uid"])
     node = slurm_node()
     jobs = slurm_jobs()
     if (
@@ -2385,6 +2976,8 @@ def _stage_postcondition_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "shell": "/usr/sbin/nologin",
         "password": "LOCKED",
         "authorized_keys": "ABSENT",
+        "host_authorized_keys": "ABSENT",
+        "container_authorized_keys": "ABSENT",
         "supplemental_groups": [],
         "gpu_policy": {
             "unit": f"user-{payload['uid']}.slice",
@@ -2394,7 +2987,7 @@ def _stage_postcondition_summary(payload: dict[str, Any]) -> dict[str, Any]:
             "open_probe": "DENIED",
             "cuda_context_probe": "DENIED",
         },
-        "quota": {"project_id": payload["project_id"], "hard_limit_gb": payload["quota_gb"]},
+        "quota": quota,
         "slurm": {
             "account": payload["slurm_account"],
             "qos": payload["slurm_qos"],
@@ -2412,7 +3005,7 @@ def _stage_postcondition_summary(payload: dict[str, Any]) -> dict[str, Any]:
             "ssh_port": payload["ssh_port"],
             "image_digest": container.get("image_digest") or container.get("image_id"),
         },
-        "guard": {"timer": "ENABLED_ACTIVE", "status": "PASSING"},
+        "guard": guard,
         "ssh_key_state": "REQUIRED_BEFORE_ACTIVATION",
         "host_access": "DISABLED",
         "onboarding_state": "STAGED",
@@ -2606,10 +3199,374 @@ def _execute_origin_pilot_stage(request: WorkerRequest, payload: dict[str, Any])
     }
 
 
+def _read_active_pilot_state(username: str) -> dict[str, str]:
+    path = PILOT_STATE_ROOT / f"{username}.state"
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "CONTAINER_START_STATE_REJECTED", "managed lifecycle state is unavailable"
+        ) from exc
+    try:
+        state_group_gid = grp.getgrnam("gpu-platform-admin").gr_gid
+    except KeyError as exc:
+        raise LifecycleValidationError(
+            "CONTAINER_START_STATE_REJECTED", "managed lifecycle state group is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_uid != 0
+        or before.st_gid != state_group_gid
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o640
+        or not 0 < before.st_size <= 16 * 1024
+    ):
+        raise LifecycleValidationError(
+            "CONTAINER_START_STATE_REJECTED", "managed lifecycle state metadata is invalid"
+        )
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise LifecycleValidationError(
+                    "CONTAINER_START_STATE_REJECTED", "managed lifecycle state changed during open"
+                )
+            content = os.read(descriptor, 16 * 1024 + 1)
+        finally:
+            os.close(descriptor)
+    except LifecycleValidationError:
+        raise
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "CONTAINER_START_STATE_REJECTED", "managed lifecycle state could not be read safely"
+        ) from exc
+    try:
+        lines = content.decode("ascii", errors="strict").splitlines()
+    except UnicodeDecodeError as exc:
+        raise LifecycleValidationError(
+            "CONTAINER_START_STATE_REJECTED", "managed lifecycle state is not ASCII"
+        ) from exc
+    values: dict[str, str] = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator and re.fullmatch(r"[A-Z0-9_]{1,32}", key):
+            if key in values:
+                raise LifecycleValidationError(
+                    "CONTAINER_START_STATE_REJECTED",
+                    "managed lifecycle state contains duplicate fields",
+                )
+            values[key] = value[:256]
+    if (
+        values.get("STATUS") != "ACTIVE"
+        or values.get("USERNAME") != username
+        or values.get("SSH_KEY_STATE") != "INSTALLED"
+        or re.fullmatch(
+            r"SHA256:[A-Za-z0-9+/]+(?:,SHA256:[A-Za-z0-9+/]+){0,4}",
+            values.get("CONTAINER_KEY_FINGERPRINTS", ""),
+        )
+        is None
+    ):
+        raise LifecycleValidationError(
+            "CONTAINER_START_STATE_REJECTED",
+            "managed compute identity is not ACTIVE with a container SSH key",
+        )
+    return values
+
+
+def _installed_key_fingerprints(path: Path, expected_uid: int, expected_gid: int) -> list[str]:
+    try:
+        parent = path.parent.lstat()
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "CONTAINER_START_KEY_REJECTED", "container .ssh directory is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or stat.S_ISLNK(parent.st_mode)
+        or parent.st_uid != expected_uid
+        or parent.st_gid != expected_gid
+        or stat.S_IMODE(parent.st_mode) != 0o700
+    ):
+        raise LifecycleValidationError(
+            "CONTAINER_START_KEY_REJECTED", "container .ssh directory metadata is invalid"
+        )
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "CONTAINER_START_KEY_REJECTED", "container authorized_keys is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_uid != expected_uid
+        or before.st_gid != expected_gid
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or not 0 < before.st_size <= MAX_SSH_KEY_FILE_BYTES
+    ):
+        raise LifecycleValidationError(
+            "CONTAINER_START_KEY_REJECTED", "container authorized_keys metadata is invalid"
+        )
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise LifecycleValidationError(
+                    "CONTAINER_START_KEY_REJECTED", "container authorized_keys changed during open"
+                )
+            content = os.read(descriptor, MAX_SSH_KEY_FILE_BYTES + 1)
+        finally:
+            os.close(descriptor)
+    except LifecycleValidationError:
+        raise
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "CONTAINER_START_KEY_REJECTED", "container authorized_keys could not be read safely"
+        ) from exc
+    try:
+        lines = [line for line in content.decode("utf-8", errors="strict").splitlines() if line]
+    except UnicodeDecodeError as exc:
+        raise LifecycleValidationError(
+            "CONTAINER_START_KEY_REJECTED", "container authorized_keys is not valid UTF-8"
+        ) from exc
+    if not 1 <= len(lines) <= MAX_APPROVED_SSH_KEYS:
+        raise LifecycleValidationError(
+            "CONTAINER_START_KEY_REJECTED", "container authorized_keys count is invalid"
+        )
+    fingerprints = [str(_validate_public_key_content(line)["fingerprint_sha256"]) for line in lines]
+    if len(set(fingerprints)) != len(fingerprints):
+        raise LifecycleValidationError(
+            "CONTAINER_START_KEY_REJECTED", "container authorized_keys contains duplicates"
+        )
+    return fingerprints
+
+
+def _verify_managed_container_start_preconditions(payload: dict[str, Any]) -> dict[str, Any]:
+    username = str(payload["username"])
+    name = str(payload["name"])
+    if username != PILOT_USERNAME or name != APPROVED_STAGE_PAYLOAD["container_name"]:
+        raise LifecycleValidationError(
+            "CONTAINER_OWNERSHIP_REJECTED", "container is outside the approved Pilot identity"
+        )
+    lifecycle = _read_active_pilot_state(username)
+    try:
+        uid = int(lifecycle["UID"])
+        gid = int(lifecycle["GID"])
+        account = pwd.getpwnam(username)
+    except (KeyError, ValueError) as exc:
+        raise LifecycleValidationError(
+            "CONTAINER_START_STATE_REJECTED", "managed Linux identity is inconsistent"
+        ) from exc
+    if account.pw_uid != uid or account.pw_gid != gid or account.pw_shell != "/bin/bash":
+        raise LifecycleValidationError(
+            "CONTAINER_START_STATE_REJECTED", "managed Linux identity is not activated safely"
+        )
+    password = run_fixed("passwd", ["-S", username], timeout=10)
+    password_fields = str(password.get("stdout", "")).split()
+    if not password.get("ok") or len(password_fields) < 2 or password_fields[1] != "L":
+        raise LifecycleValidationError(
+            "CONTAINER_START_STATE_REJECTED", "managed Linux password is not locked"
+        )
+    installed_fingerprints = _installed_key_fingerprints(
+        PILOT_DATA_ROOT / username / "home/.ssh/authorized_keys", uid, gid
+    )
+    expected_fingerprints = lifecycle["CONTAINER_KEY_FINGERPRINTS"].split(",")
+    if installed_fingerprints != expected_fingerprints:
+        raise LifecycleValidationError(
+            "CONTAINER_START_KEY_REJECTED",
+            "container authorized_keys fingerprints differ from lifecycle state",
+        )
+
+    inspected = containers_inspect({"name": name})
+    container = inspected.get("container", {})
+    state = container.get("state", {}) if isinstance(container, dict) else {}
+    mounts = container.get("mounts", []) if isinstance(container, dict) else []
+    expected_mounts = {
+        (str(PILOT_DATA_ROOT / username / "home"), f"/home/{username}"),
+        (str(PILOT_DATA_ROOT / username / "workspace"), "/workspace"),
+        (str(PILOT_DATA_ROOT / username / "shared"), "/shared"),
+        (
+            f"/srv/gpu-platform/container-data/{username}/ssh-host-keys",
+            "/etc/ssh/persistent",
+        ),
+    }
+    observed_mounts = {
+        (str(item.get("Source", "")), str(item.get("Destination", "")))
+        for item in mounts
+        if isinstance(item, dict) and item.get("Type") == "bind" and item.get("RW") is True
+    }
+    mounts_safe = len(mounts) == len(expected_mounts) and all(
+        isinstance(item, dict)
+        and item.get("Type") == "bind"
+        and item.get("RW") is True
+        and (str(item.get("Source", "")), str(item.get("Destination", ""))) in expected_mounts
+        for item in mounts
+    )
+    if not (
+        inspected.get("status") == "OK"
+        and isinstance(container, dict)
+        and str(container.get("name", "")).lstrip("/") == name
+        and container.get("owner") == username
+        and container.get("image") == f"h100-local/dev-container:ubuntu24.04-{username}-20260804"
+        and str(container.get("image_id", "")).startswith("sha256:")
+        and container.get("cpu_limit") == float(APPROVED_STAGE_PAYLOAD["cpus"])
+        and container.get("memory_limit_bytes") == APPROVED_STAGE_PAYLOAD["memory_gb"] * 1024**3
+        and container.get("pids_limit") == APPROVED_STAGE_PAYLOAD["pids_limit"]
+        and container.get("ssh_port") == str(APPROVED_STAGE_PAYLOAD["ssh_port"])
+        and container.get("privileged") is False
+        and container.get("network_mode") != "host"
+        and container.get("pid_mode") != "host"
+        and container.get("ipc_mode") != "host"
+        and container.get("gpu") == "NONE"
+        and not container.get("docker_socket_mounted")
+        and isinstance(state, dict)
+        and state.get("Running") is False
+        and state.get("Status") in {"exited", "created"}
+        and mounts_safe
+        and observed_mounts == expected_mounts
+    ):
+        raise LifecycleValidationError(
+            "CONTAINER_START_SECURITY_REJECTED", "managed container preconditions are invalid"
+        )
+    return {"lifecycle": lifecycle, "container": container}
+
+
+def _stop_managed_container_after_failed_start(username: str, name: str) -> bool:
+    try:
+        stopped = run_allowlisted_script(
+            [SCRIPT_ALLOWLIST["h100-container-stop"], username], timeout=60
+        )
+        inspected = containers_inspect({"name": name})
+        container = inspected.get("container", {})
+        state = container.get("state", {}) if isinstance(container, dict) else {}
+        return bool(
+            stopped.get("ok")
+            and inspected.get("status") == "OK"
+            and isinstance(state, dict)
+            and state.get("Running") is False
+            and state.get("Status") in {"exited", "created"}
+        )
+    except Exception:
+        return False
+
+
+def _execute_managed_container_start(
+    request: WorkerRequest, payload: dict[str, Any]
+) -> dict[str, Any]:
+    expected_idempotency = re.fullmatch(
+        rf"container-start:{re.escape(str(payload['managed_user_id']))}:"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        request.idempotency_key,
+    )
+    if request.requested_by != request.approved_by or expected_idempotency is None:
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "CONTAINER_START_APPROVAL_REJECTED",
+                "message": "container start is not bound to its managed identity",
+            },
+        }
+    integrity = script_integrity()
+    if not all(
+        integrity.get(name, {}).get("integrity_ok", False)
+        for name in ("h100-container-start", "h100-container-stop")
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "SCRIPT_INTEGRITY_FAILED",
+                "message": "fixed container lifecycle script integrity check failed",
+            },
+        }
+    try:
+        _verify_managed_container_start_preconditions(payload)
+        execution = run_allowlisted_script(
+            [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])], timeout=150
+        )
+        if not execution.get("ok"):
+            if not _stop_managed_container_after_failed_start(
+                str(payload["username"]), str(payload["name"])
+            ):
+                raise LifecycleValidationError(
+                    "CONTAINER_STOP_RECOVERY_FAILED",
+                    "managed container could not be proven stopped after start failure",
+                )
+            raise LifecycleValidationError(
+                "CONTAINER_START_FAILED", "managed container start script failed"
+            )
+        inspected = containers_inspect({"name": str(payload["name"])})
+        container = inspected.get("container", {})
+        state = container.get("state", {}) if isinstance(container, dict) else {}
+        health = state.get("Health", {}) if isinstance(state, dict) else {}
+        if not (
+            inspected.get("status") == "OK"
+            and isinstance(state, dict)
+            and state.get("Running") is True
+            and isinstance(health, dict)
+            and health.get("Status") == "healthy"
+            and isinstance(container, dict)
+            and container.get("gpu") == "NONE"
+            and container.get("privileged") is False
+            and container.get("network_mode") != "host"
+            and not container.get("docker_socket_mounted")
+        ):
+            if not _stop_managed_container_after_failed_start(
+                str(payload["username"]), str(payload["name"])
+            ):
+                raise LifecycleValidationError(
+                    "CONTAINER_STOP_RECOVERY_FAILED",
+                    "managed container could not be proven stopped after unsafe postcondition",
+                )
+            raise LifecycleValidationError(
+                "CONTAINER_START_POSTCONDITION_FAILED",
+                "managed container did not reach a safe healthy state",
+            )
+        return {
+            "status": "SUCCEEDED",
+            "handler": "container.start",
+            "name": payload["name"],
+            "username": payload["username"],
+            "container_state": "RUNNING",
+            "container_gpu": "NONE",
+        }
+    except LifecycleValidationError as exc:
+        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+
+
 def _user_activate_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
     # Key files are validated before consulting or mutating lifecycle state.
     key_records = validate_approved_ssh_key_records(payload["approved_ssh_key_record_ids"])
-    staged = _staged_origin_pilot_state()
+    if any(record["managed_user_id"] != payload["managed_user_id"] for record in key_records):
+        raise LifecycleValidationError(
+            "PUBLIC_KEY_RECORD_OWNER_MISMATCH",
+            "approved SSH key record belongs to another managed identity",
+        )
+    stage_summary = _stage_postcondition_summary(APPROVED_STAGE_PAYLOAD)
+    host_records, container_records = _activation_target_records(key_records)
+    host_plan = [
+        {
+            "record_id": record["record_id"],
+            "fingerprint_sha256": record["fingerprint_sha256"],
+        }
+        for record in host_records
+    ]
+    container_plan = [
+        {
+            "record_id": record["record_id"],
+            "fingerprint_sha256": record["fingerprint_sha256"],
+        }
+        for record in container_records
+    ]
     return {
         "status": "DRY_RUN",
         "handler": "user.activate",
@@ -2618,10 +3575,24 @@ def _user_activate_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
         "expected_state": "STAGED",
         "managed_user_id": payload["managed_user_id"],
         "approved_ssh_keys": key_records,
-        "validated_username": staged["USERNAME"],
-        "validated_uid": staged.get("UID"),
+        "validated_username": stage_summary["username"],
+        "validated_uid": stage_summary["uid"],
         "public_key_validation": "PASSED",
         "authorized_keys_install": "DEFERRED_UNTIL_REAL_ACTIVATE",
+        "activate_cli_contract": "TARGET_SCOPED_ROOT_CONTROLLED_BUNDLES",
+        "host_authorized_keys_install": "PLANNED",
+        "container_authorized_keys_install": "PLANNED",
+        "host_authorized_keys_plan": host_plan,
+        "container_authorized_keys_plan": container_plan,
+        "host_authorized_keys_current": stage_summary["host_authorized_keys"],
+        "container_authorized_keys_current": stage_summary["container_authorized_keys"],
+        "shell_current": stage_summary["shell"],
+        "password_current": stage_summary["password"],
+        "gpu_isolation": "PASS",
+        "guard": stage_summary["guard"],
+        "quota": stage_summary["quota"],
+        "slurm": stage_summary["slurm"],
+        "container": stage_summary["container"],
         "expected_rollback": [
             "恢复 /usr/sbin/nologin",
             "禁用或回滚 authorized_keys",
@@ -2633,6 +3604,15 @@ def _user_activate_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def dry_run_plan(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    if request.operation_type in {"ssh_key.prepare", "ssh_key.discard"}:
+        return {
+            "status": "DRY_RUN",
+            "handler": request.operation_type,
+            "execution_enabled": False,
+            "record_id": payload["record_id"],
+            "controlled_root": str(SSH_KEY_STAGING_ROOT),
+            "authorized_keys_install": "NOT_PERFORMED",
+        }
     integrity = script_integrity() if request.operation_type in KNOWN_WRITES else {}
     failed_scripts = sorted(
         name for name, status in integrity.items() if not status.get("integrity_ok", False)
@@ -2683,11 +3663,17 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
         if not request.dry_run:
             if request.operation_type == "user.stage":
                 return _execute_origin_pilot_stage(request, payload)
+            if request.operation_type == "ssh_key.prepare":
+                return _prepare_ssh_key_record(request, payload)
+            if request.operation_type == "ssh_key.discard":
+                return _discard_ssh_key_record(request, payload)
+            if request.operation_type == "container.start" and set(payload) != {"name"}:
+                return _execute_managed_container_start(request, payload)
             return {
                 "status": "ERROR",
                 "error": {
                     "code": "WRITE_EXECUTION_DISABLED",
-                    "message": "Only the approved Portal-3C user.stage write is enabled",
+                    "message": "This write operation has no approved controlled execution path",
                 },
             }
         try:

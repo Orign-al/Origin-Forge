@@ -38,8 +38,12 @@ export default function LoginPage() {
       return;
     }
     try {
-      await login(parsed.data);
-      router.replace("/");
+      const result = await login(parsed.data);
+      router.replace(
+        result.ssh_enrollment?.required && result.ssh_enrollment.setup_path
+          ? result.ssh_enrollment.setup_path
+          : "/",
+      );
     } catch {
       setError("用户名或密码不正确，或账号暂时被锁定。");
     }

@@ -113,3 +113,17 @@
 - 访问扩展到其他网络、VPN 用户、办公网或公网时，必须重新评估并优先启用 HTTPS。
 - 该决策解除 transport 对未来真实写操作的阻断，但不等于 Portal-3 执行批准；收到完整
   Portal-3 批准前，真实写操作继续禁用，Slurm 保持 DRAIN。
+
+## Portal-3D-R：SSH Key 自助与连接 Gate
+
+- 决策日期：2026-08-08。
+- 浏览器可本地生成标准 OpenSSH ED25519 key pair，或导入已有 `.pub`；服务器只接收和
+  保存 public key/metadata，private key 只存在浏览器内存和用户下载。
+- Key 数据模型支持最多五条独立 record、HOST/CONTAINER/BOTH Scope、VALIDATED/
+  INSTALLED/REVOKED 状态、全局 fingerprint 冲突和 enrollment Operation 绑定。
+- 首次登录、宿主连接、容器连接、复制命令和 VS Code 入口共用同一 Key 设置流程；
+  VALIDATED 但 STAGED 时不显示连接命令。
+- Root Worker 只新增 root-owned public-key staging prepare/discard；真实 Activate handler
+  仍禁用。`user.activate` 仅允许 dry-run，并重新验证 STAGED 资源及两个安装目标计划。
+- 数据库 revision：`f4a91c3e7b20`。最终测试、部署、真实用户 Key 登记和验收结果记录在
+  本阶段运行报告；在真实 Key 登记前不得声称 Activate dry-run READY。

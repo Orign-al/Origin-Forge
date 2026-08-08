@@ -6,9 +6,10 @@ from sqlalchemy.orm import Session
 
 from h100_portal_api.auth import AuthContext, serialize_user
 from h100_portal_api.database import get_db
-from h100_portal_api.dependencies import permission_dependency
+from h100_portal_api.dependencies import auth_context, permission_dependency
 from h100_portal_api.enums import OnboardingState, OperationStatus
 from h100_portal_api.models import PortalContainer, PortalManagedUser, PortalOperation, PortalUser
+from h100_portal_api.rbac import has_permission
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -29,6 +30,7 @@ def resource_view(
         }
     safe_spec = container.safe_spec if container is not None else {}
     return {
+        "managed_user_id": str(resource.id),
         "unix_username": resource.unix_username,
         "uid": resource.uid,
         "gid": resource.gid,
@@ -45,7 +47,7 @@ def resource_view(
         "container_name": resource.container_name,
         "container_port": resource.container_port,
         "password_state": "LOCKED"
-        if resource.onboarding_state == OnboardingState.STAGED
+        if resource.onboarding_state in {OnboardingState.STAGED, OnboardingState.ACTIVE}
         else "UNKNOWN",
         "authorized_keys_state": safe_spec.get("authorized_keys", "UNKNOWN"),
         "max_gpus": safe_spec.get("max_gpus"),
@@ -63,7 +65,10 @@ def resource_view(
 
 def compute_plan_view(user: PortalUser, db: Session) -> dict[str, Any]:
     """Expose the latest origin-pilot plan without treating it as a resource."""
-    if user.normalized_login != "origin-al":
+    managed = db.scalar(
+        select(PortalManagedUser).where(PortalManagedUser.portal_user_id == user.id)
+    )
+    if user.normalized_login != "origin-al" and managed is None:
         return {
             "status": "NOT_APPLICABLE",
             "compute_username": None,
@@ -71,15 +76,12 @@ def compute_plan_view(user: PortalUser, db: Session) -> dict[str, Any]:
             "ssh_key_status": "NOT_APPLICABLE",
             "plan": None,
         }
-    managed = db.scalar(
-        select(PortalManagedUser).where(PortalManagedUser.portal_user_id == user.id)
-    )
+    compute_username = managed.unix_username if managed is not None else "origin-pilot"
     operation_query = (
         select(PortalOperation)
         .where(
-            PortalOperation.requested_by == user.id,
             PortalOperation.operation_type.in_({"user.plan", "user.stage", "user.activate"}),
-            PortalOperation.target_id == "origin-pilot",
+            PortalOperation.target_id == compute_username,
         )
         .order_by(PortalOperation.created_at.desc())
     )
@@ -87,18 +89,43 @@ def compute_plan_view(user: PortalUser, db: Session) -> dict[str, Any]:
         operation_query = (
             select(PortalOperation)
             .where(
-                PortalOperation.requested_by == user.id,
                 PortalOperation.operation_type == "user.stage",
-                PortalOperation.target_id == "origin-pilot",
+                PortalOperation.target_id == compute_username,
                 PortalOperation.status == OperationStatus.SUCCEEDED,
             )
             .order_by(PortalOperation.finished_at.desc())
         )
     operation = db.scalar(operation_query)
+    activate_operation = (
+        db.scalar(
+            select(PortalOperation)
+            .where(
+                PortalOperation.operation_type == "user.activate",
+                PortalOperation.target_id == compute_username,
+            )
+            .order_by(PortalOperation.created_at.desc())
+        )
+        if managed is not None and managed.onboarding_state == OnboardingState.STAGED
+        else None
+    )
     if operation is None:
+        if managed is not None:
+            state = (
+                managed.onboarding_state.value
+                if hasattr(managed.onboarding_state, "value")
+                else str(managed.onboarding_state)
+            )
+            return {
+                "status": state,
+                "compute_username": compute_username,
+                "draft_state": state,
+                "ssh_key_status": managed.ssh_key_state,
+                "plan": None,
+                "activate_dry_run": None,
+            }
         return {
             "status": "NOT_CREATED",
-            "compute_username": "origin-pilot",
+            "compute_username": compute_username,
             "draft_state": "DRAFT NOT CREATED",
             "ssh_key_status": "NOT_REQUIRED_FOR_STAGE",
             "plan": None,
@@ -108,7 +135,7 @@ def compute_plan_view(user: PortalUser, db: Session) -> dict[str, Any]:
         "status": "STAGED"
         if staged
         else ("DRAFT" if operation.operation_type != "user.activate" else "ACTIVATE_DRAFT"),
-        "compute_username": "origin-pilot",
+        "compute_username": compute_username,
         "draft_state": "STAGED" if staged else "DRAFT",
         "operation_id": str(operation.id),
         "operation_status": operation.status.value
@@ -125,6 +152,19 @@ def compute_plan_view(user: PortalUser, db: Session) -> dict[str, Any]:
         ),
         "result_summary": operation.result_summary,
         "error_code": operation.error_code,
+        "activate_dry_run": (
+            {
+                "operation_id": str(activate_operation.id),
+                "status": activate_operation.status.value
+                if hasattr(activate_operation.status, "value")
+                else str(activate_operation.status),
+                "plan": activate_operation.dry_run_result,
+                "result_summary": activate_operation.result_summary,
+                "error_code": activate_operation.error_code,
+            }
+            if activate_operation is not None
+            else None
+        ),
     }
 
 
@@ -155,7 +195,7 @@ def users(
 @router.get("/{user_id}")
 def user_detail(
     user_id: str,
-    context: AuthContext = Depends(permission_dependency("users.read")),
+    context: AuthContext = Depends(auth_context),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     import uuid
@@ -170,6 +210,11 @@ def user_detail(
     if user is None:
         raise HTTPException(
             status_code=404, detail={"code": "USER_NOT_FOUND", "message": "用户不存在"}
+        )
+    if user.id != context.user.id and not has_permission(context.user, "users.read"):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "FORBIDDEN", "message": "当前账号无权查看该用户"},
         )
     resource = db.scalar(
         select(PortalManagedUser).where(PortalManagedUser.portal_user_id == user.id)

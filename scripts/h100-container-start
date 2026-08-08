@@ -18,11 +18,93 @@ h100_require_managed_compose "${user_name}"
 h100_require_slurm_drained
 h100_require_pilot_gpu_isolation_if_managed "${user_name}"
 
+pilot_state_value() {
+  local state_file=$1 key=$2
+  awk -F= -v key="${key}" '
+    $1 == key { print substr($0, index($0, "=") + 1); found=1 }
+    END { exit found ? 0 : 1 }
+  ' "${state_file}"
+}
+
+require_activated_pilot_access() {
+  local state_file="/etc/h100-platform/users/${user_name}.state"
+  local state_uid state_gid expected_fingerprints authorized_keys metadata
+  local key_line fingerprint
+  local -a observed_fingerprints=()
+  [[ -e "${state_file}" ]] || return 0
+  [[ -f "${state_file}" && ! -L "${state_file}" ]] \
+    || h100_fail 'managed Pilot lifecycle state is not a regular file'
+  [[ "$(stat -c '%U:%G:%a' "${state_file}")" == \
+    'root:gpu-platform-admin:640' ]] \
+    || h100_fail 'managed Pilot lifecycle state ownership or mode is invalid'
+  [[ "$(pilot_state_value "${state_file}" VERSION)" == 2 ]] \
+    || h100_fail 'managed Pilot lifecycle state version is invalid'
+  [[ "$(pilot_state_value "${state_file}" STATUS)" == ACTIVE ]] \
+    || h100_fail 'managed Pilot container requires ACTIVE compute identity'
+  [[ "$(pilot_state_value "${state_file}" SSH_KEY_STATE)" == INSTALLED ]] \
+    || h100_fail 'managed Pilot container requires INSTALLED SSH keys'
+  [[ "$(pilot_state_value "${state_file}" USERNAME)" == "${user_name}" ]] \
+    || h100_fail 'managed Pilot lifecycle username is inconsistent'
+  state_uid="$(pilot_state_value "${state_file}" UID)"
+  state_gid="$(pilot_state_value "${state_file}" GID)"
+  [[ "$(id -u "${user_name}")" == "${state_uid}" \
+    && "$(id -g "${user_name}")" == "${state_gid}" ]] \
+    || h100_fail 'managed Pilot UID/GID is inconsistent'
+  [[ "$(getent passwd "${user_name}" | cut -d: -f7)" == /bin/bash ]] \
+    || h100_fail 'managed Pilot login shell is not activated'
+  [[ "$(passwd -S "${user_name}" | awk '{print $2}')" == L ]] \
+    || h100_fail 'managed Pilot password must remain locked'
+
+  expected_fingerprints="$(pilot_state_value \
+    "${state_file}" CONTAINER_KEY_FINGERPRINTS)"
+  [[ "${expected_fingerprints}" =~ ^SHA256:[A-Za-z0-9+/]+(,SHA256:[A-Za-z0-9+/]+){0,4}$ ]] \
+    || h100_fail 'managed Pilot container SSH key state is empty or invalid'
+  authorized_keys="${H100_DATA_ROOT}/users/${user_name}/home/.ssh/authorized_keys"
+  [[ -f "${authorized_keys}" && ! -L "${authorized_keys}" ]] \
+    || h100_fail 'managed Pilot container authorized_keys is missing or unsafe'
+  [[ ! -L "$(dirname "${authorized_keys}")" ]] \
+    || h100_fail 'managed Pilot container .ssh directory is a symlink'
+  [[ "$(stat -c '%u:%g:%a' "$(dirname "${authorized_keys}")")" == \
+    "${state_uid}:${state_gid}:700" ]] \
+    || h100_fail 'managed Pilot container .ssh ownership or mode is invalid'
+  metadata="$(stat -c '%u:%g:%a:%h:%F:%s' "${authorized_keys}")"
+  [[ "${metadata}" == \
+    "${state_uid}:${state_gid}:600:1:regular file:"* ]] \
+    || h100_fail 'managed Pilot container authorized_keys metadata is invalid'
+  [[ "${metadata##*:}" =~ ^[0-9]+$ \
+    && "${metadata##*:}" -gt 0 \
+    && "${metadata##*:}" -le 16384 ]] \
+    || h100_fail 'managed Pilot container authorized_keys size is invalid'
+  while IFS= read -r key_line || [[ -n "${key_line}" ]]; do
+    [[ -n "${key_line}" && "${key_line}" != *$'\r'* ]] \
+      || h100_fail 'managed Pilot container authorized_keys contains an invalid line'
+    case "${key_line%% *}" in
+      ssh-ed25519|ecdsa-sha2-nistp256|sk-ssh-ed25519@openssh.com) ;;
+      *) h100_fail 'managed Pilot container authorized_keys key type is invalid' ;;
+    esac
+    fingerprint="$(ssh-keygen -lf <(printf '%s\n' "${key_line}") -E sha256 \
+      2>/dev/null | awk '{print $2}')" \
+      || h100_fail 'managed Pilot container authorized_keys validation failed'
+    [[ "${fingerprint}" == SHA256:* ]] \
+      || h100_fail 'managed Pilot container authorized_keys fingerprint is invalid'
+    observed_fingerprints+=("${fingerprint}")
+  done <"${authorized_keys}"
+  ((${#observed_fingerprints[@]} >= 1 && ${#observed_fingerprints[@]} <= 5)) \
+    || h100_fail 'managed Pilot container authorized_keys count is invalid'
+  [[ "$(IFS=,; printf '%s' "${observed_fingerprints[*]}")" == \
+    "${expected_fingerprints}" ]] \
+    || h100_fail 'managed Pilot container authorized_keys differs from lifecycle state'
+}
+
+require_activated_pilot_access
+
 container="$(h100_container_name "${user_name}")"
 docker container inspect "${container}" >/dev/null 2>&1 \
   || h100_fail "container does not exist: ${container}"
 docker start "${container}" >/dev/null
-h100_wait_healthy "${container}" 120 \
-  || h100_fail "container did not become healthy: ${container}"
+if ! h100_wait_healthy "${container}" 120; then
+  docker stop --time 30 "${container}" >/dev/null 2>&1 || true
+  h100_fail "container did not become healthy: ${container}"
+fi
 printf 'STARTED %s\n' "${container}"
 h100_mark_success

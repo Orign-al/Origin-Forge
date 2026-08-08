@@ -17,6 +17,7 @@ from h100_portal_api.routes import (
     operations,
     platform,
     slurm,
+    ssh_keys,
     users,
 )
 
@@ -91,5 +92,6 @@ app.include_router(slurm.router, prefix="/api/v1")
 app.include_router(containers.router, prefix="/api/v1")
 app.include_router(images.router, prefix="/api/v1")
 app.include_router(users.router, prefix="/api/v1")
+app.include_router(ssh_keys.router, prefix="/api/v1")
 app.include_router(operations.router, prefix="/api/v1")
 app.include_router(audit.router, prefix="/api/v1")

@@ -128,6 +128,55 @@ class UserActivatePayload(ApiModel):
         return self
 
 
+class SshKeyEnrollRequest(ApiModel):
+    """The browser may submit only one public key and non-secret metadata."""
+
+    key_type: Literal["ssh-ed25519", "ecdsa-sha2-nistp256", "sk-ssh-ed25519@openssh.com"]
+    public_key: str = Field(min_length=32, max_length=16 * 1024)
+    comment: str = Field(default="", max_length=128)
+    scope: Literal["HOST", "CONTAINER", "BOTH"] = "BOTH"
+    generation_method: Literal["BROWSER_GENERATED", "IMPORTED"]
+    client_fingerprint_sha256: str | None = Field(
+        default=None, min_length=16, max_length=128, pattern=r"^SHA256:[A-Za-z0-9+/]+$"
+    )
+    confirmed_private_key_saved: bool = False
+    confirmed_public_key: bool = False
+
+    @model_validator(mode="after")
+    def enrollment_is_confirmed(self) -> SshKeyEnrollRequest:
+        if self.generation_method == "BROWSER_GENERATED":
+            if not self.confirmed_private_key_saved:
+                raise ValueError("browser-generated private key must be saved before enrollment")
+        elif not self.confirmed_public_key:
+            raise ValueError("imported public key must be confirmed")
+        return self
+
+
+class SshKeyResponse(ApiModel):
+    id: uuid.UUID
+    managed_user_id: uuid.UUID
+    key_type: str
+    fingerprint_sha256: str
+    comment: str
+    scope: Literal["HOST", "CONTAINER", "BOTH"]
+    state: Literal["VALIDATED", "INSTALLED", "REVOKED"]
+    generation_method: Literal["BROWSER_GENERATED", "IMPORTED"]
+    created_at: datetime
+    created_by: uuid.UUID
+    validated_at: datetime | None
+    installed_at: datetime | None
+    revoked_at: datetime | None
+
+
+class ManagedContainerStartRequest(ApiModel):
+    """Closed self-service contract for starting the caller's managed container."""
+
+    idempotency_key: uuid.UUID
+    expected_compute_state: Literal["ACTIVE"]
+    expected_container_state: Literal["STOPPED"]
+    expected_ssh_key_state: Literal["INSTALLED"]
+
+
 class OperationResponse(ApiModel):
     id: uuid.UUID
     operation_type: str

@@ -89,11 +89,17 @@ def test_recursive_redaction() -> None:
         {
             "public_key": "ssh-ed25519 body",
             "raw_private_key": "forbidden",
+            "private_key_password": "forbidden",
+            "private_key_passphrase": "forbidden",
+            "private_key_path": "/forbidden/path",
             "fingerprint": "SHA256:safe",
         }
     )
     assert key_value == {
         "public_key": "[REDACTED]",
         "raw_private_key": "[REDACTED]",
+        "private_key_password": "[REDACTED]",
+        "private_key_passphrase": "[REDACTED]",
+        "private_key_path": "[REDACTED]",
         "fingerprint": "SHA256:safe",
     }

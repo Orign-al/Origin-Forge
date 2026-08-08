@@ -11,13 +11,15 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "test:visual": "playwright test tests/e2e/portal2-visual.spec.ts"
+    "test:visual": "playwright test tests/e2e/portal2-visual.spec.ts tests/e2e/portal3d-visual.spec.ts"
   },
   "dependencies": {
     "@h100-portal/api-client": "workspace:*",
     "@h100-portal/config": "workspace:*",
     "@h100-portal/schemas": "workspace:*",
     "@h100-portal/ui": "workspace:*",
+    "@noble/ed25519": "3.1.0",
+    "@noble/hashes": "2.3.0",
     "@tanstack/react-query": "5.101.4",
     "@tanstack/react-table": "9.0.0",
     "clsx": "2.1.1",

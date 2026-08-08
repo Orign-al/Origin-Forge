@@ -46,8 +46,12 @@ function SetupPasswordForm() {
       return;
     }
     try {
-      await setupPassword({ token, ...parsed.data });
-      router.replace("/");
+      const result = await setupPassword({ token, ...parsed.data });
+      router.replace(
+        result.ssh_enrollment?.required && result.ssh_enrollment.setup_path
+          ? result.ssh_enrollment.setup_path
+          : "/",
+      );
     } catch {
       setError("设置链接无效、已过期或密码不符合安全要求。");
     }
@@ -57,7 +61,7 @@ function SetupPasswordForm() {
       <Card className="auth-panel">
         <div className="auth-brand">
           <span className="local-mode">一次性邀请</span>
-          <h1>设置 Origin-al 网页密码</h1>
+          <h1>设置网页密码</h1>
           <p>只设置 Portal 密码，不修改 Linux 或 SSH 密码。</p>
         </div>
         {!token ? (

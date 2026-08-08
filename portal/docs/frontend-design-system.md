@@ -60,3 +60,19 @@ Portal 使用面向基础设施运维的紧凑中文界面。视觉层服务于�
 `pnpm test:e2e`。Playwright 的 fixture 必须与真实 Worker 稳定 schema 一致；不能用仅在
 mock 中存在的字段让生产页面测试假通过。视觉扫描同时拒绝渐变、玻璃拟态、外部字体、
 “AI 助手”和虚构数据。
+
+## SSH Key 与连接流程
+
+SSH Key 设置使用普通控制台页面或 Drawer、紧凑 Stepper、标准表单和表格。空状态只提供
+“生成新密钥”和“导入已有公钥”两个主要操作。不得使用营销 hero、渐变、玻璃拟态、巨大
+卡片、AI 助手或动画 wizard。
+
+首次登录提示是页面顶部紧凑 banner，不遮挡导航。连接页按“宿主提交环境”和“开发容器”
+分区，分别显示 SSH User Public Key 和 SSH Server Host Key fingerprint。无适用 Scope 的
+Key 时，连接按钮打开同一设置流程；有 VALIDATED Key 但身份仍 STAGED 时，连接/复制命令
+按钮 disabled，只显示“等待计算身份激活”，不渲染假 SSH 命令。
+
+浏览器生成页面不显示或要求用户复制 private-key 正文，只提供一次下载和“我已经保存私钥”
+确认。常规 Key 表格不返回 public-key 正文，只显示类型、fingerprint、注释、Scope、状态
+和时间。所有长 fingerprint、命令模板和中文文案必须在 1366×768 与 1920×1080 无横向
+溢出或控件重叠。

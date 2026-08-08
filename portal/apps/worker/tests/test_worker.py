@@ -1,10 +1,15 @@
+import hashlib
 import json
+import os
+import socket
+import struct
 import subprocess
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from h100_portal_worker import handlers
+from h100_portal_worker import handlers, server
 from h100_portal_worker.handlers import handle, run_fixed
 from h100_portal_worker.protocol import ProtocolError, decode_frame, encode_frame
 from h100_portal_worker.schemas import WorkerRequest, validate_payload
@@ -63,6 +68,41 @@ def test_worker_rejects_unknown_operation_and_extra_command() -> None:
         )
 
 
+def test_protocol_rejection_does_not_echo_private_key_material(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("H100_PORTAL_WORKER_TESTING", "1")
+    private_marker = (
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "forbidden-test-material\n"
+        "-----END OPENSSH PRIVATE KEY-----"
+    )
+    request_body = json.dumps(
+        {
+            "protocol_version": 1,
+            "request_id": str(uuid.uuid4()),
+            "operation_type": "gpu.list",
+            "payload": {},
+            "requested_by": "origin-al",
+            "approved_by": None,
+            "idempotency_key": "worker-test-private-rejection",
+            "dry_run": False,
+            "private_key": private_marker,
+        }
+    ).encode()
+    worker_socket, client_socket = socket.socketpair()
+    try:
+        client_socket.sendall(struct.pack("!I", len(request_body)) + request_body)
+        server.process_connection(worker_socket)
+        response = decode_frame(client_socket.recv(64 * 1024))
+    finally:
+        client_socket.close()
+    serialized = json.dumps(response)
+    assert response["error"]["code"] == "PROTOCOL_REJECTED"
+    assert "PRIVATE KEY" not in serialized
+    assert "forbidden-test-material" not in serialized
+
+
 def test_worker_rejects_arbitrary_path_and_non_dry_write() -> None:
     rejected = handle(request("containers.inspect", {"name": "../../etc/shadow"}))
     assert rejected["error"]["code"] == "PAYLOAD_REJECTED"
@@ -111,6 +151,8 @@ def staged_result() -> dict[str, object]:
         "shell": "/usr/sbin/nologin",
         "password": "LOCKED",
         "authorized_keys": "ABSENT",
+        "host_authorized_keys": "ABSENT",
+        "container_authorized_keys": "ABSENT",
         "supplemental_groups": [],
         "gpu_policy": {
             "unit": "user-20001.slice",
@@ -446,6 +488,714 @@ def test_activate_rejects_arbitrary_path_and_private_key_field() -> None:
         validate_payload("user.activate", {**base, "public_key_path": "/etc/shadow"})
     with pytest.raises(ValueError, match="PAYLOAD_REJECTED"):
         validate_payload("user.activate", {**base, "raw_private_key": "PRIVATE KEY"})
+    with pytest.raises(ValueError, match="PAYLOAD_REJECTED"):
+        validate_payload("user.activate", {**base, "private_key_password": "forbidden"})
+    with pytest.raises(ValueError, match="PAYLOAD_REJECTED"):
+        validate_payload("user.activate", {**base, "private_key_path": "/forbidden"})
+
+
+def generate_worker_public_key(tmp_path: Path, name: str) -> str:
+    key_path = tmp_path / name
+    subprocess.run(
+        [
+            "/usr/bin/ssh-keygen",
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "Worker test key",
+            "-f",
+            str(key_path),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    public_key = key_path.with_suffix(".pub").read_text(encoding="utf-8").strip()
+    key_path.unlink()
+    key_path.with_suffix(".pub").unlink()
+    return public_key
+
+
+@pytest.fixture
+def worker_public_key(tmp_path: Path) -> str:
+    return generate_worker_public_key(tmp_path, "worker-test-ed25519")
+
+
+@pytest.fixture
+def controlled_staging(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    staging = tmp_path / "ssh-key-staging"
+    staging.mkdir(mode=0o700)
+    staging.chmod(0o700)
+    monkeypatch.setattr(handlers, "SSH_KEY_STAGING_ROOT", staging)
+    monkeypatch.setattr(handlers, "SSH_KEY_STAGING_OWNER_UID", os.getuid())
+    monkeypatch.setattr(handlers, "SSH_KEY_STAGING_OWNER_GID", os.getgid())
+    return staging
+
+
+def test_project_quota_validation_requires_enforcement_and_exact_hard_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def quota_command(_binary: str, args: list[str], timeout: float = 20.0) -> dict[str, object]:
+        del timeout
+        if args[2] == "state":
+            output = "Project quota state on test\n  Accounting: ON\n  Enforcement: ON\n"
+        else:
+            output = "#30001 0 0 314572800 00 [--------]\n"
+        return {"ok": True, "stdout": output, "stderr": ""}
+
+    monkeypatch.setattr(handlers, "run_fixed", quota_command)
+    result = handlers._verified_project_quota(30001, 300)
+    assert result["hard_limit_gb"] == 300
+    assert result["enforcement"] == "ON"
+
+    def wrong_limit(_binary: str, args: list[str], timeout: float = 20.0) -> dict[str, object]:
+        del timeout
+        output = (
+            "Project quota state on test\n  Accounting: ON\n  Enforcement: ON\n"
+            if args[2] == "state"
+            else "#30001 0 0 1 00 [--------]\n"
+        )
+        return {"ok": True, "stdout": output, "stderr": ""}
+
+    monkeypatch.setattr(handlers, "run_fixed", wrong_limit)
+    with pytest.raises(handlers.LifecycleValidationError, match="hard quota"):
+        handlers._verified_project_quota(30001, 300)
+
+
+def test_guard_metrics_validation_binds_current_user_and_deny_results(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    metric_path = tmp_path / "h100_gpu_bypass_guard.prom"
+    timestamp = int(handlers.time.time())
+    metric_path.write_text(
+        "\n".join(
+            [
+                "h100_gpu_bypass_guard_last_success 1",
+                "h100_gpu_bypass_guard_managed_users 1",
+                "h100_gpu_bypass_guard_users_verified 1",
+                "h100_gpu_bypass_guard_policy_errors 0",
+                "h100_gpu_bypass_guard_device_open_failures 0",
+                "h100_gpu_bypass_guard_cuda_context_failures 0",
+                "h100_gpu_bypass_guard_slurm_constrain_devices 1",
+                "h100_gpu_bypass_guard_nvidia_gpu_count 4",
+                "h100_gpu_bypass_guard_slurm_gpu_count 4",
+                f"h100_gpu_bypass_guard_timestamp_seconds {timestamp}",
+                'h100_gpu_user_isolation_success{username="origin-pilot",uid="20001"} 1',
+                "",
+            ]
+        ),
+        encoding="ascii",
+    )
+    metric_path.chmod(0o644)
+    monkeypatch.setattr(handlers, "GUARD_METRIC_FILE", metric_path)
+    monkeypatch.setattr(handlers, "GUARD_METRIC_OWNER_UID", os.getuid())
+    monkeypatch.setattr(handlers, "GUARD_METRIC_OWNER_GID", os.getgid())
+
+    result = handlers._verified_guard_metrics(20001)
+    assert result["status"] == "PASSING"
+    assert result["open_probe"] == "DENIED"
+    assert result["cuda_context_probe"] == "DENIED"
+
+    metric_path.write_text(
+        metric_path.read_text(encoding="ascii").replace(
+            "h100_gpu_bypass_guard_device_open_failures 0",
+            "h100_gpu_bypass_guard_device_open_failures 1",
+        ),
+        encoding="ascii",
+    )
+    with pytest.raises(handlers.LifecycleValidationError, match="do not prove isolation"):
+        handlers._verified_guard_metrics(20001)
+
+
+def ssh_key_prepare_payload(public_key: str, *, scope: str = "BOTH") -> dict[str, object]:
+    validated = handlers._validate_public_key_content(public_key)
+    return {
+        "record_id": str(uuid.uuid4()),
+        "operation_id": str(uuid.uuid4()),
+        "managed_user_id": str(uuid.uuid4()),
+        "username": "origin-pilot",
+        "public_key": public_key,
+        "key_type": validated["key_type"],
+        "fingerprint_sha256": validated["fingerprint_sha256"],
+        "content_sha256": validated["content_sha256"],
+        "scope": scope,
+    }
+
+
+def prepare_key(payload: dict[str, object]) -> dict[str, object]:
+    record_id = str(payload["record_id"])
+    return handle(
+        request(
+            "ssh_key.prepare",
+            payload,
+            approved_by="origin-al",
+            idempotency_key=f"ssh-key-enroll:{record_id}",
+        )
+    )
+
+
+def test_activation_bundles_separate_host_and_container_scopes(
+    controlled_staging: Path,
+    tmp_path: Path,
+) -> None:
+    managed_user_id = str(uuid.uuid4())
+    host_public_key = generate_worker_public_key(tmp_path, "host-scope-key")
+    container_public_key = generate_worker_public_key(tmp_path, "container-scope-key")
+    host_payload = ssh_key_prepare_payload(host_public_key, scope="HOST")
+    container_payload = ssh_key_prepare_payload(container_public_key, scope="CONTAINER")
+    host_payload["managed_user_id"] = managed_user_id
+    container_payload["managed_user_id"] = managed_user_id
+    assert prepare_key(host_payload)["status"] == "SUCCEEDED"
+    assert prepare_key(container_payload)["status"] == "SUCCEEDED"
+    records = handlers.validate_approved_ssh_key_records(
+        [str(host_payload["record_id"]), str(container_payload["record_id"])]
+    )
+    request_id = str(uuid.uuid4())
+
+    with handlers.activation_key_bundles(request_id, records) as (host_path, container_path):
+        assert host_path.read_text(encoding="utf-8") == f"{host_public_key}\n"
+        assert container_path.read_text(encoding="utf-8") == f"{container_public_key}\n"
+        assert host_public_key not in container_path.read_text(encoding="utf-8")
+        assert container_public_key not in host_path.read_text(encoding="utf-8")
+        assert host_path.stat().st_mode & 0o777 == 0o600
+        assert container_path.stat().st_mode & 0o777 == 0o600
+        argv = handlers.build_user_activate_argv("origin-pilot", host_path, container_path)
+        assert argv == [
+            handlers.SCRIPT_ALLOWLIST["h100-user-create"],
+            "--activate",
+            "origin-pilot",
+            "--host-public-key-file",
+            str(host_path),
+            "--container-public-key-file",
+            str(container_path),
+            "--confirm-activate",
+            "origin-pilot",
+        ]
+
+    assert not (controlled_staging / f"{request_id}.host.pub").exists()
+    assert not (controlled_staging / f"{request_id}.container.pub").exists()
+
+
+def test_activation_bundle_both_scope_covers_both_targets(
+    controlled_staging: Path,
+    worker_public_key: str,
+) -> None:
+    payload = ssh_key_prepare_payload(worker_public_key, scope="BOTH")
+    assert prepare_key(payload)["status"] == "SUCCEEDED"
+    records = handlers.validate_approved_ssh_key_records([str(payload["record_id"])])
+    request_id = str(uuid.uuid4())
+
+    with handlers.activation_key_bundles(request_id, records) as (host_path, container_path):
+        expected = f"{worker_public_key}\n"
+        assert host_path.read_text(encoding="utf-8") == expected
+        assert container_path.read_text(encoding="utf-8") == expected
+
+    assert sorted(item.name for item in controlled_staging.iterdir()) == sorted(
+        [f"{payload['record_id']}.meta.json", f"{payload['record_id']}.pub"]
+    )
+
+
+def test_activate_argv_rejects_arbitrary_or_malformed_bundle_paths(
+    controlled_staging: Path,
+) -> None:
+    request_id = str(uuid.uuid4())
+    valid_host = controlled_staging / f"{request_id}.host.pub"
+    valid_container = controlled_staging / f"{request_id}.container.pub"
+    with pytest.raises(handlers.LifecycleValidationError, match="ARBITRARY_PATH_REJECTED"):
+        handlers.build_user_activate_argv("origin-pilot", Path("/etc/passwd"), valid_container)
+    with pytest.raises(handlers.LifecycleValidationError, match="ARBITRARY_PATH_REJECTED"):
+        handlers.build_user_activate_argv(
+            "origin-pilot", controlled_staging / f"{'a' * 36}.host.pub", valid_container
+        )
+    with pytest.raises(handlers.LifecycleValidationError, match="ACTIVATE_TARGET_REJECTED"):
+        handlers.build_user_activate_argv("other-user", valid_host, valid_container)
+
+
+def test_worker_prepares_root_controlled_key_and_sidecar_idempotently(
+    controlled_staging: Path, worker_public_key: str
+) -> None:
+    payload = ssh_key_prepare_payload(worker_public_key)
+
+    first = prepare_key(payload)
+    second = prepare_key(payload)
+
+    assert first["status"] == "SUCCEEDED"
+    assert first["idempotent_replay"] is False
+    assert second["status"] == "SUCCEEDED"
+    assert second["idempotent_replay"] is True
+    record_id = str(payload["record_id"])
+    key_path = controlled_staging / f"{record_id}.pub"
+    metadata_path = controlled_staging / f"{record_id}.meta.json"
+    assert key_path.stat().st_mode & 0o777 == 0o600
+    assert metadata_path.stat().st_mode & 0o777 == 0o600
+    assert "PRIVATE KEY" not in key_path.read_text(encoding="utf-8").upper()
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["operation_id"] == payload["operation_id"]
+    assert metadata["managed_user_id"] == payload["managed_user_id"]
+    assert metadata["scope"] == "BOTH"
+    assert (
+        handlers.validate_approved_ssh_key_records([record_id])[0]["fingerprint_sha256"]
+        == payload["fingerprint_sha256"]
+    )
+
+
+def test_worker_discard_requires_binding_and_is_idempotent(
+    controlled_staging: Path, worker_public_key: str
+) -> None:
+    payload = ssh_key_prepare_payload(worker_public_key)
+    assert prepare_key(payload)["status"] == "SUCCEEDED"
+    record_id = str(payload["record_id"])
+    discard_payload = {
+        "record_id": record_id,
+        "operation_id": payload["operation_id"],
+        "content_sha256": payload["content_sha256"],
+    }
+    discard_request = request(
+        "ssh_key.discard",
+        discard_payload,
+        approved_by="origin-al",
+        idempotency_key=f"ssh-key-discard:{record_id}",
+    )
+
+    first = handle(discard_request)
+    second = handle(discard_request)
+
+    assert first["status"] == "SUCCEEDED" and first["removed"] is True
+    assert second["status"] == "SUCCEEDED" and second["removed"] is False
+    assert list(controlled_staging.iterdir()) == []
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "writable", "oversized"])
+def test_worker_rejects_unsafe_staging_file(
+    controlled_staging: Path,
+    worker_public_key: str,
+    unsafe_kind: str,
+) -> None:
+    payload = ssh_key_prepare_payload(worker_public_key)
+    assert prepare_key(payload)["status"] == "SUCCEEDED"
+    key_path = controlled_staging / f"{payload['record_id']}.pub"
+    if unsafe_kind == "symlink":
+        key_path.unlink()
+        key_path.symlink_to("/etc/passwd")
+    elif unsafe_kind == "writable":
+        key_path.chmod(0o666)
+    else:
+        key_path.write_bytes(b"x" * (handlers.MAX_SSH_KEY_FILE_BYTES + 1))
+        key_path.chmod(0o600)
+
+    with pytest.raises(handlers.LifecycleValidationError, match="PUBLIC_KEY_VALIDATION_FAILED"):
+        handlers.validate_approved_ssh_key_records([str(payload["record_id"])])
+
+
+def test_worker_prepare_rejects_private_material_before_write(
+    controlled_staging: Path,
+) -> None:
+    record_id = str(uuid.uuid4())
+    payload = {
+        "record_id": record_id,
+        "operation_id": str(uuid.uuid4()),
+        "managed_user_id": str(uuid.uuid4()),
+        "username": "origin-pilot",
+        "public_key": "-----BEGIN OPENSSH PRIVATE KEY----- forbidden",
+        "key_type": "ssh-ed25519",
+        "fingerprint_sha256": "SHA256:test",
+        "content_sha256": hashlib.sha256(b"test").hexdigest(),
+        "scope": "BOTH",
+    }
+    result = handle(
+        request(
+            "ssh_key.prepare",
+            payload,
+            approved_by="origin-al",
+            idempotency_key=f"ssh-key-enroll:{record_id}",
+        )
+    )
+    assert result["error"]["code"] == "SSH_PRIVATE_KEY_UPLOAD_REJECTED"
+    assert list(controlled_staging.iterdir()) == []
+
+
+def test_worker_prepare_rejects_private_key_fields_before_write(
+    controlled_staging: Path,
+    worker_public_key: str,
+) -> None:
+    payload = ssh_key_prepare_payload(worker_public_key)
+    payload["private_key_path"] = "/forbidden"
+    result = handle(
+        request(
+            "ssh_key.prepare",
+            payload,
+            approved_by="origin-al",
+            idempotency_key=f"ssh-key-enroll:{payload['record_id']}",
+        )
+    )
+    assert result["error"]["code"] == "SSH_PRIVATE_KEY_UPLOAD_REJECTED"
+    assert list(controlled_staging.iterdir()) == []
+
+
+def test_activate_dry_run_binds_managed_user_scope_and_staged_state(
+    controlled_staging: Path,
+    worker_public_key: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = ssh_key_prepare_payload(worker_public_key)
+    assert prepare_key(payload)["status"] == "SUCCEEDED"
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {name: {"integrity_ok": True} for name in handlers.STAGE_REQUIRED_SCRIPTS},
+    )
+    monkeypatch.setattr(handlers, "_stage_postcondition_summary", lambda _payload: staged_result())
+    activate = {
+        "managed_user_id": payload["managed_user_id"],
+        "approved_ssh_key_record_ids": [payload["record_id"]],
+        "expected_state": "STAGED",
+        "approval_reference": "portal3d-r-test-v1",
+    }
+
+    result = handle(request("user.activate", activate, dry_run=True))
+    wrong_owner = handle(
+        request(
+            "user.activate",
+            {**activate, "managed_user_id": str(uuid.uuid4())},
+            dry_run=True,
+        )
+    )
+
+    assert result["status"] == "DRY_RUN"
+    assert result["activate_status"] == "READY"
+    assert result["execution_enabled"] is False
+    assert result["host_authorized_keys_install"] == "PLANNED"
+    assert result["container_authorized_keys_install"] == "PLANNED"
+    assert result["host_authorized_keys_current"] == "ABSENT"
+    assert result["container_authorized_keys_current"] == "ABSENT"
+    assert wrong_owner["error"]["code"] == "PUBLIC_KEY_RECORD_OWNER_MISMATCH"
+
+
+def test_activate_dry_run_rejects_incomplete_scope(
+    controlled_staging: Path,
+    worker_public_key: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = ssh_key_prepare_payload(worker_public_key, scope="HOST")
+    assert prepare_key(payload)["status"] == "SUCCEEDED"
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {name: {"integrity_ok": True} for name in handlers.STAGE_REQUIRED_SCRIPTS},
+    )
+    monkeypatch.setattr(handlers, "_stage_postcondition_summary", lambda _payload: staged_result())
+    result = handle(
+        request(
+            "user.activate",
+            {
+                "managed_user_id": payload["managed_user_id"],
+                "approved_ssh_key_record_ids": [payload["record_id"]],
+                "expected_state": "STAGED",
+                "approval_reference": "portal3d-r-test-v1",
+            },
+            dry_run=True,
+        )
+    )
+    assert result["error"]["code"] == "SSH_KEY_SCOPE_INCOMPLETE"
+
+
+def test_activate_dry_run_reports_exact_target_scope_mapping(
+    controlled_staging: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed_user_id = str(uuid.uuid4())
+    host_payload = ssh_key_prepare_payload(
+        generate_worker_public_key(tmp_path, "dry-run-host-key"), scope="HOST"
+    )
+    container_payload = ssh_key_prepare_payload(
+        generate_worker_public_key(tmp_path, "dry-run-container-key"), scope="CONTAINER"
+    )
+    for payload in (host_payload, container_payload):
+        payload["managed_user_id"] = managed_user_id
+        assert prepare_key(payload)["status"] == "SUCCEEDED"
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {name: {"integrity_ok": True} for name in handlers.STAGE_REQUIRED_SCRIPTS},
+    )
+    monkeypatch.setattr(handlers, "_stage_postcondition_summary", lambda _payload: staged_result())
+
+    result = handle(
+        request(
+            "user.activate",
+            {
+                "managed_user_id": managed_user_id,
+                "approved_ssh_key_record_ids": [
+                    host_payload["record_id"],
+                    container_payload["record_id"],
+                ],
+                "expected_state": "STAGED",
+                "approval_reference": "portal3d-r-scope-test-v1",
+            },
+            dry_run=True,
+        )
+    )
+
+    assert result["activate_cli_contract"] == "TARGET_SCOPED_ROOT_CONTROLLED_BUNDLES"
+    assert [item["record_id"] for item in result["host_authorized_keys_plan"]] == [
+        host_payload["record_id"]
+    ]
+    assert [item["record_id"] for item in result["container_authorized_keys_plan"]] == [
+        container_payload["record_id"]
+    ]
+
+
+def managed_container_inspect(*, state: str = "STOPPED") -> dict[str, object]:
+    running = state == "RUNNING"
+    return {
+        "status": "OK",
+        "container": {
+            "name": "/gpu-dev-origin-pilot",
+            "owner": "origin-pilot",
+            "image": "h100-local/dev-container:ubuntu24.04-origin-pilot-20260804",
+            "image_id": "sha256:" + "a" * 64,
+            "cpu_limit": 8.0,
+            "memory_limit_bytes": 32 * 1024**3,
+            "pids_limit": 4096,
+            "ssh_port": "22023",
+            "privileged": False,
+            "network_mode": "bridge",
+            "pid_mode": "",
+            "ipc_mode": "private",
+            "gpu": "NONE",
+            "docker_socket_mounted": False,
+            "state": {
+                "Running": running,
+                "Status": "running" if running else "exited",
+                "Health": {"Status": "healthy" if running else "none"},
+            },
+            "mounts": [
+                {
+                    "Type": "bind",
+                    "Source": "/srv/gpu-platform/users/origin-pilot/home",
+                    "Destination": "/home/origin-pilot",
+                    "RW": True,
+                },
+                {
+                    "Type": "bind",
+                    "Source": "/srv/gpu-platform/users/origin-pilot/workspace",
+                    "Destination": "/workspace",
+                    "RW": True,
+                },
+                {
+                    "Type": "bind",
+                    "Source": "/srv/gpu-platform/users/origin-pilot/shared",
+                    "Destination": "/shared",
+                    "RW": True,
+                },
+                {
+                    "Type": "bind",
+                    "Source": "/srv/gpu-platform/container-data/origin-pilot/ssh-host-keys",
+                    "Destination": "/etc/ssh/persistent",
+                    "RW": True,
+                },
+            ],
+        },
+    }
+
+
+def managed_container_start_payload() -> dict[str, object]:
+    return {
+        "name": "gpu-dev-origin-pilot",
+        "username": "origin-pilot",
+        "managed_user_id": str(uuid.uuid4()),
+        "expected_compute_state": "ACTIVE",
+        "expected_container_state": "STOPPED",
+        "expected_ssh_key_state": "INSTALLED",
+    }
+
+
+def configure_managed_container_start_preconditions(
+    monkeypatch: pytest.MonkeyPatch,
+    inspected: dict[str, object],
+) -> None:
+    fingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    monkeypatch.setattr(
+        handlers,
+        "_read_active_pilot_state",
+        lambda _username: {
+            "UID": "20001",
+            "GID": "20001",
+            "CONTAINER_KEY_FINGERPRINTS": fingerprint,
+        },
+    )
+    monkeypatch.setattr(
+        handlers.pwd,
+        "getpwnam",
+        lambda _username: SimpleNamespace(pw_uid=20001, pw_gid=20001, pw_shell="/bin/bash"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "run_fixed",
+        lambda *_args, **_kwargs: {"ok": True, "stdout": "origin-pilot L 2026-08-08 0 99999 7 -1"},
+    )
+    monkeypatch.setattr(handlers, "_installed_key_fingerprints", lambda *_args: [fingerprint])
+    monkeypatch.setattr(handlers, "containers_inspect", lambda _payload: inspected)
+
+
+def test_managed_container_start_preconditions_accept_only_exact_safe_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inspected = managed_container_inspect()
+    configure_managed_container_start_preconditions(monkeypatch, inspected)
+    result = handlers._verify_managed_container_start_preconditions(
+        managed_container_start_payload()
+    )
+    assert result["container"]["gpu"] == "NONE"
+
+
+@pytest.mark.parametrize(
+    ("field", "unsafe_value"),
+    [
+        ("owner", "other-user"),
+        ("privileged", True),
+        ("network_mode", "host"),
+        ("pid_mode", "host"),
+        ("ipc_mode", "host"),
+        ("gpu", "REQUESTED"),
+        ("docker_socket_mounted", True),
+    ],
+)
+def test_managed_container_start_rejects_unsafe_runtime_properties(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    unsafe_value: object,
+) -> None:
+    inspected = managed_container_inspect()
+    container = inspected["container"]
+    assert isinstance(container, dict)
+    container[field] = unsafe_value
+    configure_managed_container_start_preconditions(monkeypatch, inspected)
+    with pytest.raises(
+        handlers.LifecycleValidationError, match="CONTAINER_START_SECURITY_REJECTED"
+    ):
+        handlers._verify_managed_container_start_preconditions(managed_container_start_payload())
+
+
+def test_managed_container_start_rejects_extra_or_sensitive_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inspected = managed_container_inspect()
+    container = inspected["container"]
+    assert isinstance(container, dict)
+    mounts = container["mounts"]
+    assert isinstance(mounts, list)
+    mounts.append(
+        {
+            "Type": "bind",
+            "Source": "/var/run/docker.sock",
+            "Destination": "/var/run/docker.sock",
+            "RW": True,
+        }
+    )
+    configure_managed_container_start_preconditions(monkeypatch, inspected)
+    with pytest.raises(
+        handlers.LifecycleValidationError, match="CONTAINER_START_SECURITY_REJECTED"
+    ):
+        handlers._verify_managed_container_start_preconditions(managed_container_start_payload())
+
+
+def test_managed_container_start_schema_rejects_cross_identity_and_staged_state() -> None:
+    payload = managed_container_start_payload()
+    with pytest.raises(ValueError, match="CONTAINER_OWNERSHIP_REJECTED"):
+        validate_payload("container.start", {**payload, "name": "gpu-dev-other-user"})
+    with pytest.raises(ValueError, match="CONTAINER_START_STATE_REJECTED"):
+        validate_payload("container.start", {**payload, "expected_compute_state": "STAGED"})
+
+
+def test_managed_container_start_executes_fixed_scripts_and_stops_on_unsafe_postcondition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = managed_container_start_payload()
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {
+            "h100-container-start": {"integrity_ok": True},
+            "h100-container-stop": {"integrity_ok": True},
+        },
+    )
+    monkeypatch.setattr(
+        handlers, "_verify_managed_container_start_preconditions", lambda _payload: {}
+    )
+    calls: list[list[str]] = []
+
+    def execute(argv: list[str], timeout: float) -> dict[str, object]:
+        del timeout
+        calls.append(argv)
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(handlers, "run_allowlisted_script", execute)
+    unsafe = managed_container_inspect(state="RUNNING")
+    unsafe_container = unsafe["container"]
+    assert isinstance(unsafe_container, dict)
+    unsafe_container["gpu"] = "REQUESTED"
+    safely_stopped = managed_container_inspect()
+    inspections = iter((unsafe, safely_stopped))
+    monkeypatch.setattr(handlers, "containers_inspect", lambda _payload: next(inspections))
+    token = str(uuid.uuid4())
+    result = handle(
+        request(
+            "container.start",
+            payload,
+            approved_by="origin-al",
+            idempotency_key=f"container-start:{payload['managed_user_id']}:{token}",
+        )
+    )
+
+    assert result["error"]["code"] == "CONTAINER_START_POSTCONDITION_FAILED"
+    assert calls == [
+        [handlers.SCRIPT_ALLOWLIST["h100-container-start"], "origin-pilot"],
+        [handlers.SCRIPT_ALLOWLIST["h100-container-stop"], "origin-pilot"],
+    ]
+
+
+def test_managed_container_start_reports_unproven_stop_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = managed_container_start_payload()
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {
+            "h100-container-start": {"integrity_ok": True},
+            "h100-container-stop": {"integrity_ok": True},
+        },
+    )
+    monkeypatch.setattr(
+        handlers, "_verify_managed_container_start_preconditions", lambda _payload: {}
+    )
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: {"ok": True, "stdout": "", "stderr": ""},
+    )
+    unsafe = managed_container_inspect(state="RUNNING")
+    unsafe_container = unsafe["container"]
+    assert isinstance(unsafe_container, dict)
+    unsafe_container["gpu"] = "REQUESTED"
+    monkeypatch.setattr(handlers, "containers_inspect", lambda _payload: unsafe)
+
+    token = str(uuid.uuid4())
+    result = handle(
+        request(
+            "container.start",
+            payload,
+            approved_by="origin-al",
+            idempotency_key=f"container-start:{payload['managed_user_id']}:{token}",
+        )
+    )
+
+    assert result["error"]["code"] == "CONTAINER_STOP_RECOVERY_FAILED"
 
 
 def test_dry_run_returns_plan_not_command(monkeypatch) -> None:  # type: ignore[no-untyped-def]
