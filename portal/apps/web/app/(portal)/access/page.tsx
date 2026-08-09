@@ -6,6 +6,7 @@ import { useState } from "react";
 
 import { Button, StatusBadge } from "@h100-portal/ui";
 import { SshKeyEnrollment } from "../../../components/SshKeyEnrollment";
+import { OrdinaryConnection } from "../../../components/OrdinaryUserPages";
 import {
   ErrorBlock,
   LoadingBlock,
@@ -25,6 +26,13 @@ type ConnectionView = "host" | "container" | "vscode" | null;
 const APPROVED_HOST = "10.82.36.1";
 
 export default function AccessPage() {
+  const current = useQuery({ queryKey: ["me"], queryFn: me, retry: false });
+  if (current.isPending) return <LoadingBlock />;
+  if (current.isError) return <ErrorBlock />;
+  return current.data.role === "user" ? <OrdinaryConnection /> : <AdminAccessPage />;
+}
+
+function AdminAccessPage() {
   const [setupOpen, setSetupOpen] = useState(false);
   const [connectionView, setConnectionView] = useState<ConnectionView>(null);
   const [gateMessage, setGateMessage] = useState<string | null>(null);

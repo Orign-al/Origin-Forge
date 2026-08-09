@@ -9,7 +9,7 @@ from h100_portal_api.database import get_db
 from h100_portal_api.dependencies import auth_context, permission_dependency
 from h100_portal_api.enums import OnboardingState, OperationStatus
 from h100_portal_api.models import PortalContainer, PortalManagedUser, PortalOperation, PortalUser
-from h100_portal_api.rbac import has_permission
+from h100_portal_api.rbac import has_permission, highest_role
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -241,6 +241,8 @@ def user_detail(
             status_code=403,
             detail={"code": "FORBIDDEN", "message": "当前账号无权查看该用户"},
         )
+    if user.id == context.user.id and highest_role(context.user) == "user":
+        return {"status": "OK", "user": serialize_user(user).model_dump(mode="json")}
     resource = db.scalar(
         select(PortalManagedUser).where(PortalManagedUser.portal_user_id == user.id)
     )

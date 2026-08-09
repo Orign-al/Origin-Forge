@@ -40,7 +40,9 @@ export default function LoginPage() {
     try {
       const result = await login(parsed.data);
       router.replace(
-        result.ssh_enrollment?.required && result.ssh_enrollment.setup_path
+        result.user.password_state === "RESET_REQUIRED"
+          ? "/change-password"
+          : result.ssh_enrollment?.required && result.ssh_enrollment.setup_path
           ? result.ssh_enrollment.setup_path
           : "/",
       );

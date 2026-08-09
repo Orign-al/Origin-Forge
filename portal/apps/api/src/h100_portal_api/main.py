@@ -16,6 +16,7 @@ from h100_portal_api.routes import (
     images,
     operations,
     platform,
+    self_service,
     slurm,
     ssh_keys,
     users,
@@ -88,6 +89,7 @@ def health_ready() -> JSONResponse:
 
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(platform.router, prefix="/api/v1")
+app.include_router(self_service.router, prefix="/api/v1")
 app.include_router(slurm.router, prefix="/api/v1")
 app.include_router(containers.router, prefix="/api/v1")
 app.include_router(images.router, prefix="/api/v1")

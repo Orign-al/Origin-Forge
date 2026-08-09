@@ -9,7 +9,9 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from h100_portal_api.config import get_settings
+from h100_portal_api.enums import PasswordState
 from h100_portal_api.models import (
+    PortalManagedUser,
     PortalPasswordSetupToken,
     PortalSession,
     PortalUser,
@@ -161,8 +163,12 @@ def create_session(
     session_raw = random_token(48)
     csrf_raw = signed_csrf_token()
     now = utcnow()
+    owner_managed_user_id = db.scalar(
+        select(PortalManagedUser.id).where(PortalManagedUser.portal_user_id == user.id)
+    )
     session = PortalSession(
         user_id=user.id,
+        owner_managed_user_id=owner_managed_user_id,
         session_hash=digest_secret(session_raw),
         csrf_hash=digest_secret(csrf_raw),
         source_ip=client_ip(request),
@@ -218,6 +224,18 @@ def load_context(db: Session, request: Request) -> AuthContext:
         db.commit()
         raise HTTPException(
             status_code=401, detail={"code": "AUTH_REQUIRED", "message": "请先登录"}
+        )
+    if user.password_state == PasswordState.RESET_REQUIRED and request.url.path not in {
+        "/api/v1/auth/me",
+        "/api/v1/auth/password",
+        "/api/v1/auth/logout",
+    }:
+        raise HTTPException(
+            status_code=428,
+            detail={
+                "code": "PASSWORD_CHANGE_REQUIRED",
+                "message": "首次登录必须先修改临时密码",
+            },
         )
     session.last_seen_at = now
     session.idle_expires_at = now + timedelta(minutes=get_settings().session_idle_minutes)

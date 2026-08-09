@@ -142,7 +142,7 @@ def login(
     if (
         user is None
         or user.account_state != AccountState.ACTIVE
-        or user.password_state != PasswordState.SET
+        or user.password_state not in {PasswordState.SET, PasswordState.RESET_REQUIRED}
         or (user.locked_until is not None and ensure_utc(user.locked_until) > utcnow())
     ):
         _auth_failure(db, request, user, normalized)
@@ -430,6 +430,7 @@ def change_password(
         ) from exc
     credential.password_hash = hash_password(body.new_password)
     credential.password_changed_at = utcnow()
+    context.user.password_state = PasswordState.SET
     # Revoke every pre-change session, including the current one, then issue a
     # fresh session in the same transaction. Keeping the old current session
     # alive would not be session rotation.

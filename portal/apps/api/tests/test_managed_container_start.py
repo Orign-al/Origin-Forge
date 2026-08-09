@@ -110,6 +110,7 @@ def active_container_owner(
         target_type="ssh_public_key",
         target_id=str(uuid.uuid4()),
         requested_by=user.id,
+        owner_managed_user_id=managed.id,
         approved_by=user.id,
         request_summary="Temporary public-key fixture",
         validated_payload={"public_material_only": True},
@@ -129,6 +130,7 @@ def active_container_owner(
         PortalSshKey(
             id=key_id,
             managed_user_id=managed.id,
+            owner_managed_user_id=managed.id,
             key_type=validated.key_type,
             fingerprint_sha256=validated.fingerprint_sha256,
             public_key=validated.public_key,
@@ -150,6 +152,7 @@ def active_container_owner(
     )
     container = PortalContainer(
         managed_user_id=managed.id,
+        owner_managed_user_id=managed.id,
         name=f"gpu-dev-{username}",
         image_digest="sha256:" + "a" * 64,
         ssh_port=port,

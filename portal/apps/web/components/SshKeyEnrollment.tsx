@@ -38,17 +38,22 @@ function keyStateLabel(key: SshKeyRecord): string {
 function ScopeControl({
   value,
   onChange,
+  containerOnly = false,
 }: {
   value: Scope;
   onChange: (scope: Scope) => void;
+  containerOnly?: boolean;
 }) {
+  const scopes: Scope[] = containerOnly
+    ? ["CONTAINER"]
+    : (Object.keys(SCOPE_LABELS) as Scope[]);
   return (
     <div
       className="segmented-control"
       role="radiogroup"
       aria-label="SSH Key 用途"
     >
-      {(Object.keys(SCOPE_LABELS) as Scope[]).map((scope) => (
+      {scopes.map((scope) => (
         <label
           className={value === scope ? "segment segment-active" : "segment"}
           key={scope}
@@ -108,6 +113,7 @@ export function SshKeyEnrollment({
   managedUserId,
   activateDryRun,
   onClose,
+  containerOnly = false,
 }: {
   userId: string;
   username: string;
@@ -115,11 +121,14 @@ export function SshKeyEnrollment({
   managedUserId?: string | null;
   activateDryRun?: Record<string, unknown> | null;
   onClose?: () => void;
+  containerOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
   const fileInput = useRef<HTMLInputElement>(null);
   const [mode, setMode] = useState<EnrollmentMode>("idle");
-  const [scope, setScope] = useState<Scope>("BOTH");
+  const [scope, setScope] = useState<Scope>(
+    containerOnly ? "CONTAINER" : "BOTH",
+  );
   const [comment, setComment] = useState("Origin laptop");
   const [generated, setGenerated] = useState<GeneratedSshKey | null>(null);
   const [privateDownloaded, setPrivateDownloaded] = useState(false);
@@ -439,7 +448,11 @@ export function SshKeyEnrollment({
           </div>
           <div className="form-field">
             <span className="field-label">用途</span>
-            <ScopeControl value={scope} onChange={setScope} />
+            <ScopeControl
+              value={scope}
+              onChange={setScope}
+              containerOnly={containerOnly}
+            />
           </div>
           {!generated ? (
             <div className="button-row">
@@ -591,7 +604,11 @@ export function SshKeyEnrollment({
           </div>
           <div className="form-field">
             <span className="field-label">用途</span>
-            <ScopeControl value={scope} onChange={setScope} />
+            <ScopeControl
+              value={scope}
+              onChange={setScope}
+              containerOnly={containerOnly}
+            />
           </div>
           {!imported ? (
             <div className="button-row">

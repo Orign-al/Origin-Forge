@@ -72,7 +72,24 @@ PERMISSIONS: dict[str, set[str]] = {
         "operations.read",
         "audit.read",
     },
-    "user": {"platform.read", "containers.read", "containers.write", "jobs.read", "gpu.read"},
+    "user": {
+        "self.environment.read",
+        "self.lease.read",
+        "self.lease.renew.request",
+        "self.recycle.read",
+        "self.restore.request",
+        "self.jobs.submit",
+        "self.jobs.read",
+        "self.jobs.cancel",
+        "self.container.read",
+        "self.container.start",
+        "self.container.stop",
+        "self.container.restart",
+        "self.ssh_keys.read",
+        "self.ssh_keys.write",
+        "self.storage.read",
+        "self.connection.read",
+    },
 }
 
 

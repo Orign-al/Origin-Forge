@@ -153,6 +153,62 @@ export type PortalSession = {
   source_ip: string;
 };
 
+export type ComputeLease = {
+  id?: string;
+  state: string;
+  active: boolean;
+  starts_at?: string;
+  expires_at?: string;
+  remaining_seconds?: number;
+  renewal_available: boolean;
+  renewal_available_from?: string;
+  gpu_count?: number;
+  max_duration_seconds: number;
+  renewal_window_seconds: number;
+  auto_renew: false;
+  restore_required?: boolean;
+  pending_renewal_id?: string | null;
+};
+
+export type SelfEnvironment = {
+  state: string;
+  gpu_max: number;
+  host_access: "DISABLED";
+  job_submission: string;
+  lease: ComputeLease;
+  container: {
+    id: string;
+    name: string;
+    state: string;
+    connection_state: string;
+    gpu: "NONE";
+    cpus: number;
+    memory_gb: number;
+    pids_limit: number;
+  };
+  storage: { quota_bytes: number | null; state: string };
+};
+
+export type SelfJob = {
+  id: string;
+  slurm_job_id: number | null;
+  name: string;
+  state: string;
+  cpus: number;
+  memory_mb: number;
+  gpu_count: 0 | 1;
+  time_limit_seconds: number;
+  script_path: string;
+  workdir: string;
+  stdout_path: string;
+  stderr_path: string;
+  lease_deadline_at: string;
+  created_at: string;
+  submitted_at: string | null;
+  finished_at: string | null;
+  exit_code: string | null;
+};
+
 export const getCsrf = () => apiFetch<{ csrf_token: string }>("/auth/csrf");
 export const login = (payload: { username: string; password: string }) =>
   apiFetch<{ user: User; ssh_enrollment: SshEnrollment }>("/auth/login", {
@@ -283,6 +339,110 @@ export const changePassword = (payload: {
     method: "POST",
     body: JSON.stringify(payload),
   });
+export const selfEnvironment = () =>
+  apiFetch<{ status: string; environment: SelfEnvironment }>("/self/environment");
+export const selfLease = () =>
+  apiFetch<{ status: string; lease: ComputeLease }>("/self/lease");
+export const requestLeaseRenewal = (payload: {
+  duration_seconds: number;
+  idempotency_key: string;
+}) =>
+  apiFetch<{ status: string; renewal_request_id: string }>("/self/lease/renewals", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+export const selfContainer = () =>
+  apiFetch<{ status: string; container: SelfEnvironment["container"] }>("/self/container");
+export const selfContainerConnection = () =>
+  apiFetch<{
+    status: string;
+    connection: {
+      available: boolean;
+      host: string;
+      port: number;
+      username: string;
+      authentication: string;
+      gpu: "NONE";
+      key_fingerprint: string | null;
+      command: string | null;
+      vscode: string | null;
+    };
+  }>("/self/container/connection");
+export const selfContainerAction = (action: "start" | "stop" | "restart") =>
+  apiFetch<{ status: string; operation_id: string; state: string }>(
+    `/self/container/${action}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ idempotency_key: crypto.randomUUID() }),
+    },
+  );
+export const selfJobs = () =>
+  apiFetch<{ status: string; jobs: SelfJob[]; count: number }>("/self/jobs");
+export const submitSelfJob = (payload: {
+  name: string;
+  script_path: string;
+  workdir: string;
+  cpus: number;
+  memory_mb: number;
+  gpu_count: 0 | 1;
+  time_limit_seconds: number;
+  image_ref: string | null;
+  idempotency_key: string;
+}) =>
+  apiFetch<{ status: string; job: SelfJob }>("/self/jobs", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+export const selfJobLogs = (id: string) =>
+  apiFetch<{ status: string; stdout: string; stderr: string }>(
+    `/self/jobs/${encodeURIComponent(id)}/logs`,
+  );
+export const cancelSelfJob = (id: string) =>
+  apiFetch<{ status: string; job: SelfJob }>(
+    `/self/jobs/${encodeURIComponent(id)}/cancel`,
+    {
+      method: "POST",
+      body: JSON.stringify({ idempotency_key: crypto.randomUUID() }),
+    },
+  );
+export const selfStorage = () =>
+  apiFetch<{
+    status: string;
+    storage: {
+      root: string;
+      quota_bytes: number | null;
+      used_bytes?: number | null;
+      available_bytes?: number | null;
+      state: string;
+      private: true;
+    };
+  }>("/self/storage");
+export const selfRecycleBin = () =>
+  apiFetch<{
+    status: string;
+    items: Array<{
+      id: string;
+      resource_name: string;
+      state: string;
+      expires_at: string;
+      recycled_at: string;
+      data_preserved: boolean;
+      auto_permanent_delete: false;
+      container: "STOPPED";
+    }>;
+    auto_permanent_delete: false;
+  }>("/self/recycle-bin");
+export const requestRestore = (itemId: string, durationSeconds = 345600) =>
+  apiFetch<{ status: string; restore_request_id: string }>(
+    `/self/recycle-bin/${encodeURIComponent(itemId)}/restore-requests`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        duration_seconds: durationSeconds,
+        idempotency_key: crypto.randomUUID(),
+      }),
+    },
+  );
 export const createOperation = (payload: Record<string, unknown>) =>
   apiFetch<Record<string, unknown>>("/operations", {
     method: "POST",

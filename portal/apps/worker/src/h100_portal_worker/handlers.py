@@ -60,6 +60,10 @@ BINARIES = {
     "ssh-keygen": "/usr/bin/ssh-keygen",
     "passwd": "/usr/bin/passwd",
     "sshd": "/usr/sbin/sshd",
+    "sbatch": "/usr/bin/sbatch",
+    "scancel": "/usr/bin/scancel",
+    "setpriv": "/usr/bin/setpriv",
+    "usermod": "/usr/sbin/usermod",
     "squeue-fallback": "/usr/bin/squeue",
 }
 SCRIPT_ALLOWLIST = {
@@ -3572,7 +3576,11 @@ def _verify_managed_container_start_preconditions(payload: dict[str, Any]) -> di
         raise LifecycleValidationError(
             "CONTAINER_START_STATE_REJECTED", "managed Linux identity is inconsistent"
         ) from exc
-    if account.pw_uid != uid or account.pw_gid != gid or account.pw_shell != "/bin/bash":
+    if (
+        account.pw_uid != uid
+        or account.pw_gid != gid
+        or account.pw_shell not in {"/bin/bash", "/usr/sbin/nologin"}
+    ):
         raise LifecycleValidationError(
             "CONTAINER_START_STATE_REJECTED", "managed Linux identity is not activated safely"
         )
@@ -4922,6 +4930,853 @@ def _user_activate_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _portal4a_account(payload: dict[str, Any]) -> pwd.struct_passwd:
+    username = str(payload["username"])
+    try:
+        account = pwd.getpwnam(username)
+    except KeyError as exc:
+        raise LifecycleValidationError(
+            "MANAGED_IDENTITY_NOT_FOUND", "managed Unix identity does not exist"
+        ) from exc
+    if (
+        account.pw_uid != int(payload["uid"])
+        or account.pw_gid != int(payload["gid"])
+        or account.pw_shell not in {"/bin/bash", "/usr/sbin/nologin"}
+    ):
+        raise LifecycleValidationError(
+            "MANAGED_IDENTITY_CHANGED", "managed Unix identity differs from its approved binding"
+        )
+    password = run_fixed("passwd", ["-S", username], timeout=10)
+    fields = str(password.get("stdout", "")).split()
+    if not password.get("ok") or len(fields) < 2 or fields[1] != "L":
+        raise LifecycleValidationError(
+            "LINUX_PASSWORD_NOT_LOCKED", "managed Unix password must remain locked"
+        )
+    forbidden = FORBIDDEN_PILOT_GROUPS.intersection(_group_names(username, account.pw_gid))
+    if forbidden:
+        raise LifecycleValidationError(
+            "PRIVILEGED_GROUP_REJECTED", "managed Unix identity has a privileged group"
+        )
+    return account
+
+
+def _portal4a_slurm_security_preflight(payload: dict[str, Any]) -> None:
+    _portal4a_account(payload)
+    integrity = script_integrity()
+    isolation_tool = "h100-user-gpu-isolation"
+    if not integrity.get(isolation_tool, {}).get("integrity_ok", False):
+        raise LifecycleValidationError(
+            "SCRIPT_INTEGRITY_FAILED", "GPU isolation verifier integrity failed"
+        )
+    isolation = run_allowlisted_script(
+        [SCRIPT_ALLOWLIST[isolation_tool], "verify", str(payload["username"])], timeout=60
+    )
+    if not isolation.get("ok"):
+        raise LifecycleValidationError(
+            "GPU_ISOLATION_FAILED", "per-user GPU isolation verification failed"
+        )
+    association = run_fixed(
+        "sacctmgr",
+        [
+            "-n",
+            "-P",
+            "show",
+            "assoc",
+            "where",
+            f"User={payload['username']}",
+            "Account=company",
+            "format=User,Account,QOS,DefaultQOS",
+        ],
+        timeout=20,
+    )
+    if not association.get("ok") or not any(
+        values[:2] == [payload["username"], "company"] and "general" in values[2:]
+        for values in (line.split("|") for line in str(association.get("stdout", "")).splitlines())
+    ):
+        raise LifecycleValidationError(
+            "SLURM_ASSOCIATION_REJECTED", "Slurm association is not company/general"
+        )
+    qos = run_fixed(
+        "sacctmgr",
+        ["-n", "-P", "show", "qos", "general", "format=Name,MaxTRESPerUser"],
+        timeout=20,
+    )
+    if not qos.get("ok") or not any(
+        line.startswith("general|") and "gres/gpu=1" in line
+        for line in str(qos.get("stdout", "")).splitlines()
+    ):
+        raise LifecycleValidationError("GPU_LIMIT_REJECTED", "Slurm GPU limit is not one")
+
+
+def _portal4a_user_path(relative: str, *, directory: bool, uid: int, gid: int) -> Path:
+    root = PILOT_DATA_ROOT / PILOT_USERNAME
+    try:
+        root_resolved = root.resolve(strict=True)
+        candidate = (root / relative).resolve(strict=True)
+        metadata = candidate.lstat()
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "USER_PATH_NOT_FOUND", "requested user path does not exist"
+        ) from exc
+    if not candidate.is_relative_to(root_resolved):
+        raise LifecycleValidationError(
+            "SYMLINK_ESCAPE_REJECTED", "requested user path escapes the owned workspace"
+        )
+    expected_type = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
+    if (
+        not expected_type
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != uid
+        or metadata.st_gid != gid
+    ):
+        raise LifecycleValidationError(
+            "USER_PATH_OWNERSHIP_REJECTED", "requested user path metadata is invalid"
+        )
+    return candidate
+
+
+def _read_user_script(path: Path, uid: int, gid: int) -> bytes:
+    before = path.lstat()
+    if before.st_size <= 0 or before.st_size > 1024 * 1024:
+        raise LifecycleValidationError("JOB_SCRIPT_REJECTED", "job script size is invalid")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or opened.st_uid != uid
+            or opened.st_gid != gid
+            or not stat.S_ISREG(opened.st_mode)
+        ):
+            raise LifecycleValidationError(
+                "JOB_SCRIPT_CHANGED", "job script changed during validation"
+            )
+        content = os.read(descriptor, 1024 * 1024 + 1)
+    finally:
+        os.close(descriptor)
+    if len(content) != before.st_size or b"\x00" in content:
+        raise LifecycleValidationError("JOB_SCRIPT_REJECTED", "job script content is invalid")
+    return content
+
+
+def _stage_user_job_script(payload: dict[str, Any], content: bytes) -> Path:
+    uid = int(payload["uid"])
+    gid = int(payload["gid"])
+    workspace = _portal4a_user_path("workspace", directory=True, uid=uid, gid=gid)
+    portal_dir = workspace / ".portal"
+    script_dir = portal_dir / "job-scripts"
+    output_dir = portal_dir / "jobs"
+    for directory in (portal_dir, script_dir, output_dir):
+        if directory.exists():
+            metadata = directory.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != uid
+                or metadata.st_gid != gid
+            ):
+                raise LifecycleValidationError(
+                    "JOB_STAGING_REJECTED", "job staging directory metadata is invalid"
+                )
+        else:
+            directory.mkdir(mode=0o700)
+            os.chown(directory, uid, gid)
+        os.chmod(directory, 0o700)
+    destination = script_dir / f"{payload['portal_job_id']}.sh"
+    if destination.exists():
+        existing = _read_user_script(destination, uid, gid)
+        if existing != content:
+            raise LifecycleValidationError(
+                "JOB_STAGING_CONFLICT", "staged job script differs from idempotent request"
+            )
+        return destination
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(destination, flags, 0o700)
+    try:
+        os.write(descriptor, content)
+        os.fsync(descriptor)
+        os.fchown(descriptor, uid, gid)
+        os.fchmod(descriptor, 0o700)
+    finally:
+        os.close(descriptor)
+    return destination
+
+
+def _slurm_time(seconds: int) -> str:
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    prefix = f"{days}-" if days else ""
+    return f"{prefix}{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _slurm_job_owner(job_id: int) -> str | None:
+    live = run_fixed("scontrol", ["show", "job", str(job_id), "-o"], timeout=15)
+    if live.get("ok"):
+        match = re.search(r"(?:^|\s)UserId=([^\s(]+)", str(live.get("stdout", "")))
+        if match:
+            return match.group(1)
+    history = run_fixed(
+        "sacct",
+        ["-X", "-n", "-P", "-j", str(job_id), "-o", "User"],
+        timeout=20,
+    )
+    if history.get("ok"):
+        users = [line.strip("|") for line in str(history.get("stdout", "")).splitlines() if line]
+        if users:
+            return users[0]
+    return None
+
+
+def _run_as_managed_user(
+    payload: dict[str, Any], command: list[str], timeout: float
+) -> dict[str, Any]:
+    setpriv = BINARIES["setpriv"]
+    if not os.path.exists(setpriv) or any("\x00" in item for item in command):
+        return {"ok": False, "error_code": "SETUID_EXECUTION_REJECTED", "stdout": "", "stderr": ""}
+    try:
+        completed = subprocess.run(
+            [
+                setpriv,
+                f"--reuid={payload['uid']}",
+                f"--regid={payload['gid']}",
+                "--clear-groups",
+                "--",
+                *command,
+            ],
+            cwd="/",
+            env=FIXED_ENV,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+            shell=False,
+            text=True,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "ok": False,
+            "error_code": "SETUID_EXECUTION_FAILED",
+            "stdout": "",
+            "stderr": str(exc)[:512],
+        }
+    return {
+        "ok": completed.returncode == 0,
+        "exit_code": completed.returncode,
+        "stdout": _truncate(completed.stdout),
+        "stderr": _truncate(completed.stderr),
+    }
+
+
+def _execute_self_job_submit(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        _portal4a_slurm_security_preflight(payload)
+        uid = int(payload["uid"])
+        gid = int(payload["gid"])
+        source = _portal4a_user_path(
+            str(payload["script_relative_path"]), directory=False, uid=uid, gid=gid
+        )
+        workdir = _portal4a_user_path(
+            str(payload["workdir_relative_path"]), directory=True, uid=uid, gid=gid
+        )
+        staged = _stage_user_job_script(payload, _read_user_script(source, uid, gid))
+        root = PILOT_DATA_ROOT / PILOT_USERNAME
+        stdout = root / str(payload["stdout_relative_path"])
+        stderr = root / str(payload["stderr_relative_path"])
+        output_parent = stdout.parent.resolve(strict=True)
+        if output_parent != stderr.parent.resolve(strict=True):
+            raise LifecycleValidationError(
+                "JOB_OUTPUT_REJECTED", "job output directories are inconsistent"
+            )
+        deadline = str(payload["lease_deadline_at"]).replace("+00:00", "")
+        argv = [
+            BINARIES["sbatch"],
+            "--parsable",
+            "--account=company",
+            "--qos=general",
+            f"--job-name={payload['name']}",
+            f"--cpus-per-task={payload['cpus']}",
+            f"--mem={payload['memory_mb']}M",
+            f"--time={_slurm_time(int(payload['time_limit_seconds']))}",
+            f"--deadline={deadline}",
+            f"--chdir={workdir}",
+            f"--output={stdout}",
+            f"--error={stderr}",
+        ]
+        if int(payload["gpu_count"]) == 1:
+            argv.append("--gres=gpu:1")
+        if payload.get("image_ref"):
+            argv.append(f"--container-image={payload['image_ref']}")
+        argv.append(str(staged))
+        submitted = _run_as_managed_user(payload, argv, timeout=30)
+        if not submitted.get("ok"):
+            return {
+                "status": "ERROR",
+                "error": {
+                    "code": "SBATCH_FAILED",
+                    "message": str(submitted.get("stderr", "Slurm submission failed"))[:512],
+                },
+            }
+        match = re.fullmatch(r"(\d+)(?:;[A-Za-z0-9_.-]+)?\s*", str(submitted.get("stdout", "")))
+        if match is None:
+            raise LifecycleValidationError(
+                "SBATCH_RESPONSE_REJECTED", "sbatch returned an invalid job ID"
+            )
+        job_id = int(match.group(1))
+        owner = _slurm_job_owner(job_id)
+        if owner != payload["username"]:
+            run_fixed("scancel", [str(job_id)], timeout=15)
+            raise LifecycleValidationError(
+                "JOB_OWNER_POSTCONDITION_FAILED", "submitted Slurm job owner is incorrect"
+            )
+        return {
+            "status": "SUCCEEDED",
+            "handler": "self.job.submit",
+            "request_id": request.request_id,
+            "slurm_job_id": job_id,
+            "slurm_user": owner,
+            "uid": uid,
+            "gid": gid,
+            "gpu_count": payload["gpu_count"],
+            "lease_deadline_at": payload["lease_deadline_at"],
+            "shell": False,
+        }
+    except LifecycleValidationError as exc:
+        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+
+
+def _execute_self_job_cancel(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        _portal4a_account(payload)
+        job_id = int(payload["slurm_job_id"])
+        if _slurm_job_owner(job_id) != payload["username"]:
+            raise LifecycleValidationError(
+                "JOB_OWNERSHIP_REJECTED", "Slurm job does not belong to the managed user"
+            )
+        cancelled = _run_as_managed_user(payload, [BINARIES["scancel"], str(job_id)], timeout=20)
+        if not cancelled.get("ok"):
+            raise LifecycleValidationError("JOB_CANCEL_FAILED", "Slurm job cancellation failed")
+        return {
+            "status": "SUCCEEDED",
+            "handler": "self.job.cancel",
+            "request_id": request.request_id,
+            "slurm_job_id": job_id,
+            "slurm_user": payload["username"],
+            "job_state": "CANCELLED",
+        }
+    except LifecycleValidationError as exc:
+        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+
+
+def _read_job_log(relative: str, uid: int, gid: int) -> str:
+    try:
+        path = _portal4a_user_path(relative, directory=False, uid=uid, gid=gid)
+    except LifecycleValidationError as exc:
+        if exc.code == "USER_PATH_NOT_FOUND":
+            return ""
+        raise
+    metadata = path.lstat()
+    start = metadata.st_size - MAX_OUTPUT if metadata.st_size > MAX_OUTPUT else 0
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        os.lseek(descriptor, start, os.SEEK_SET)
+        content = os.read(descriptor, MAX_OUTPUT)
+    finally:
+        os.close(descriptor)
+    return content.decode("utf-8", errors="replace")
+
+
+def _self_job_logs(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        _portal4a_account(payload)
+        uid = int(payload["uid"])
+        gid = int(payload["gid"])
+        return {
+            "status": "OK",
+            "handler": "self.job.logs.read",
+            "stdout": _read_job_log(str(payload["stdout_relative_path"]), uid, gid),
+            "stderr": _read_job_log(str(payload["stderr_relative_path"]), uid, gid),
+        }
+    except LifecycleValidationError as exc:
+        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+
+
+def _self_job_status(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        _portal4a_account(payload)
+        job_id = int(payload["slurm_job_id"])
+        if _slurm_job_owner(job_id) != payload["username"]:
+            raise LifecycleValidationError(
+                "JOB_OWNERSHIP_REJECTED", "Slurm job does not belong to the managed user"
+            )
+        live = run_fixed("scontrol", ["show", "job", str(job_id), "-o"], timeout=15)
+        if live.get("ok"):
+            line = str(live.get("stdout", ""))
+            state_match = re.search(r"(?:^|\s)JobState=([^\s]+)", line)
+            state = state_match.group(1) if state_match else "UNKNOWN"
+            exit_code = None
+        else:
+            history = run_fixed(
+                "sacct",
+                [
+                    "-X",
+                    "-n",
+                    "-P",
+                    "-j",
+                    str(job_id),
+                    "-o",
+                    "JobIDRaw,User,State,ExitCode,Elapsed,AllocTRES,StdOut,StdErr",
+                ],
+                timeout=20,
+            )
+            if not history.get("ok"):
+                raise LifecycleValidationError(
+                    "JOB_STATUS_FAILED", "Slurm job status is unavailable"
+                )
+            rows = [line.split("|") for line in str(history.get("stdout", "")).splitlines()]
+            row = next(
+                (
+                    values
+                    for values in rows
+                    if len(values) >= 8
+                    and values[0] == str(job_id)
+                    and values[1] == payload["username"]
+                ),
+                None,
+            )
+            if row is None:
+                raise LifecycleValidationError(
+                    "JOB_STATUS_FAILED", "Slurm job status is unavailable"
+                )
+            state = row[2]
+            exit_code = row[3]
+        return {
+            "status": "OK",
+            "handler": "self.job.status.read",
+            "slurm_job_id": job_id,
+            "slurm_user": payload["username"],
+            "job_state": state,
+            "exit_code": exit_code,
+        }
+    except LifecycleValidationError as exc:
+        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+
+
+def _self_storage(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        account = _portal4a_account(payload)
+        root = PILOT_DATA_ROOT / str(payload["username"])
+        resolved = root.resolve(strict=True)
+        metadata = resolved.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != account.pw_uid
+            or metadata.st_gid != account.pw_gid
+            or stat.S_IMODE(metadata.st_mode) & 0o007
+        ):
+            raise LifecycleValidationError(
+                "STORAGE_OWNERSHIP_REJECTED", "user storage ownership or mode is invalid"
+            )
+        usage = run_fixed("du", ["-s", "-B1", str(resolved)], timeout=60)
+        match = re.fullmatch(r"(\d+)\s+.+\n?", str(usage.get("stdout", "")))
+        if not usage.get("ok") or match is None:
+            raise LifecycleValidationError("STORAGE_USAGE_FAILED", "storage usage is unavailable")
+        return {
+            "status": "OK",
+            "handler": "self.storage.read",
+            "username": payload["username"],
+            "used_bytes": int(match.group(1)),
+            "private": True,
+        }
+    except (LifecycleValidationError, OSError) as exc:
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": getattr(exc, "code", "STORAGE_READ_FAILED"),
+                "message": str(exc),
+            },
+        }
+
+
+def _portal4a_container_security(
+    payload: dict[str, Any], *, require_running: bool | None
+) -> dict[str, Any]:
+    _portal4a_account(payload)
+    inspected = containers_inspect({"name": str(payload["name"])})
+    raw_container = inspected.get("container", {})
+    container: dict[str, Any] = raw_container if isinstance(raw_container, dict) else {}
+    state = container.get("state", {})
+    mounts = container.get("mounts", [])
+    forbidden_destinations = {"/", "/root", "/etc", "/var/run", "/var/run/docker.sock"}
+    forbidden_sources = {
+        "/var/run/docker.sock",
+        "/run/docker.sock",
+        "/etc/munge",
+        "/run/munge",
+        "/var/run/munge",
+    }
+    if not (
+        inspected.get("status") == "OK"
+        and container.get("owner") == payload["username"]
+        and container.get("privileged") is False
+        and container.get("network_mode") != "host"
+        and container.get("pid_mode") != "host"
+        and container.get("ipc_mode") != "host"
+        and container.get("gpu") == "NONE"
+        and not container.get("docker_socket_mounted")
+        and not any(
+            str(item.get("Destination", "")) in forbidden_destinations
+            or str(item.get("Source", "")) in forbidden_sources
+            or "munge" in str(item.get("Destination", "")).casefold()
+            for item in mounts
+            if isinstance(item, dict)
+        )
+    ):
+        raise LifecycleValidationError(
+            "CONTAINER_SECURITY_REJECTED", "managed container security contract changed"
+        )
+    running = bool(state.get("Running"))
+    if require_running is not None and running is not require_running:
+        raise LifecycleValidationError(
+            "CONTAINER_STATE_REJECTED", "managed container state differs from request"
+        )
+    return container
+
+
+def _execute_portal4a_container_lifecycle(
+    request: WorkerRequest, payload: dict[str, Any]
+) -> dict[str, Any]:
+    try:
+        action = request.operation_type.rsplit(".", 1)[-1]
+        if action in {"start", "restart"} and payload.get("lease_id") is None:
+            raise LifecycleValidationError(
+                "CONTAINER_OPERATION_DENIED_LEASE_INACTIVE", "active lease binding is required"
+            )
+        before = _portal4a_container_security(
+            payload, require_running=False if action == "start" else None
+        )
+        required_scripts = {"h100-container-stop"}
+        if action in {"start", "restart"}:
+            required_scripts.add("h100-container-start")
+        integrity = script_integrity()
+        if not all(integrity.get(name, {}).get("integrity_ok", False) for name in required_scripts):
+            raise LifecycleValidationError(
+                "SCRIPT_INTEGRITY_FAILED", "container lifecycle script integrity failed"
+            )
+        if action in {"stop", "restart"} and bool(before.get("state", {}).get("Running")):
+            stopped = run_allowlisted_script(
+                [SCRIPT_ALLOWLIST["h100-container-stop"], str(payload["username"])], timeout=90
+            )
+            if not stopped.get("ok"):
+                raise LifecycleValidationError("CONTAINER_STOP_FAILED", "container stop failed")
+        if action in {"start", "restart"}:
+            started = run_allowlisted_script(
+                [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])], timeout=150
+            )
+            if not started.get("ok"):
+                raise LifecycleValidationError("CONTAINER_START_FAILED", "container start failed")
+        expected_running = action != "stop"
+        _portal4a_container_security(payload, require_running=expected_running)
+        return {
+            "status": "SUCCEEDED",
+            "handler": request.operation_type,
+            "request_id": request.request_id,
+            "name": payload["name"],
+            "username": payload["username"],
+            "container_state": "RUNNING" if expected_running else "STOPPED",
+            "container_gpu": "NONE",
+        }
+    except LifecycleValidationError as exc:
+        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+
+
+def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        account = _portal4a_account(payload)
+        if account.pw_shell != "/usr/sbin/nologin":
+            raise LifecycleValidationError(
+                "HOST_ACCESS_POLICY_REJECTED", "restore requires host login to remain disabled"
+            )
+        host_keys = Path(f"/home/{payload['username']}/.ssh/authorized_keys")
+        if host_keys.exists():
+            raise LifecycleValidationError(
+                "HOST_ACCESS_POLICY_REJECTED", "restore must not reinstall host authorized_keys"
+            )
+        active = PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys"
+        suspended = active.with_name("authorized_keys.portal-recycle")
+        if active.exists():
+            _installed_key_fingerprints(active, int(payload["uid"]), int(payload["gid"]))
+        elif suspended.exists():
+            _installed_key_fingerprints(suspended, int(payload["uid"]), int(payload["gid"]))
+            os.replace(suspended, active)
+        else:
+            raise LifecycleValidationError(
+                "CONTAINER_KEY_RESTORE_FAILED", "suspended container public key is unavailable"
+            )
+        lifecycle_payload = {
+            **payload,
+            "name": payload["container_name"],
+            "lease_id": payload["restore_request_id"],
+            "lease_expires_at": "restored-by-approved-request",
+        }
+        _portal4a_container_security(lifecycle_payload, require_running=False)
+        integrity = script_integrity()
+        if not integrity.get("h100-container-start", {}).get("integrity_ok", False):
+            raise LifecycleValidationError(
+                "SCRIPT_INTEGRITY_FAILED", "container start script integrity failed"
+            )
+        started = run_allowlisted_script(
+            [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])], timeout=150
+        )
+        if not started.get("ok"):
+            os.replace(active, suspended)
+            raise LifecycleValidationError(
+                "CONTAINER_START_FAILED", "restored container failed to start"
+            )
+        _portal4a_container_security(lifecycle_payload, require_running=True)
+        return {
+            "status": "SUCCEEDED",
+            "handler": "resource.restore",
+            "request_id": request.request_id,
+            "container_state": "RUNNING",
+            "container_gpu": "NONE",
+            "host_access": "DISABLED",
+            "container_key_state": "INSTALLED",
+        }
+    except LifecycleValidationError as exc:
+        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+
+
+def _active_user_slurm_jobs(username: str) -> list[tuple[int, str]]:
+    result = run_fixed("squeue", ["-h", "-u", username, "-o", "%A|%T"], timeout=20)
+    if not result.get("ok"):
+        raise LifecycleValidationError(
+            "SLURM_JOB_QUERY_FAILED", "user Slurm jobs could not be read"
+        )
+    jobs: list[tuple[int, str]] = []
+    for line in str(result.get("stdout", "")).splitlines():
+        raw_id, separator, state = line.partition("|")
+        if not separator or not raw_id.isdigit():
+            raise LifecycleValidationError("SLURM_JOB_QUERY_FAILED", "Slurm job output is invalid")
+        jobs.append((int(raw_id), state.strip().upper()))
+    return jobs
+
+
+def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        account = _portal4a_account(payload)
+        if account.pw_shell != "/usr/sbin/nologin":
+            raise LifecycleValidationError(
+                "HOST_ACCESS_POLICY_REJECTED", "lease recycle requires host shell to be disabled"
+            )
+        host_keys = Path(f"/home/{payload['username']}/.ssh/authorized_keys")
+        if host_keys.exists():
+            raise LifecycleValidationError(
+                "HOST_ACCESS_POLICY_REJECTED", "lease recycle found active host authorized_keys"
+            )
+        jobs = _active_user_slurm_jobs(str(payload["username"]))
+        pending_ids = [job_id for job_id, state in jobs if state.startswith("PEND")]
+        running_ids = [job_id for job_id, state in jobs if not state.startswith("PEND")]
+        if pending_ids:
+            cancelled = run_fixed("scancel", [*(str(item) for item in pending_ids)], timeout=30)
+            if not cancelled.get("ok"):
+                raise LifecycleValidationError(
+                    "PENDING_JOB_CANCEL_FAILED", "pending jobs could not be cancelled"
+                )
+        if running_ids:
+            signalled = run_fixed(
+                "scancel",
+                ["--signal=TERM", "--full", *(str(item) for item in running_ids)],
+                timeout=30,
+            )
+            if not signalled.get("ok"):
+                raise LifecycleValidationError(
+                    "RUNNING_JOB_SIGNAL_FAILED", "running jobs could not be signalled"
+                )
+            time.sleep(2)
+            cancelled = run_fixed("scancel", [*(str(item) for item in running_ids)], timeout=30)
+            if not cancelled.get("ok"):
+                raise LifecycleValidationError(
+                    "RUNNING_JOB_CANCEL_FAILED", "running jobs could not be cancelled"
+                )
+        lifecycle_payload = {
+            **payload,
+            "name": payload["container_name"],
+        }
+        container = _portal4a_container_security(lifecycle_payload, require_running=None)
+        if bool(container.get("state", {}).get("Running")):
+            integrity = script_integrity()
+            if not integrity.get("h100-container-stop", {}).get("integrity_ok", False):
+                raise LifecycleValidationError(
+                    "SCRIPT_INTEGRITY_FAILED", "container stop script integrity failed"
+                )
+            stopped = run_allowlisted_script(
+                [SCRIPT_ALLOWLIST["h100-container-stop"], str(payload["username"])], timeout=90
+            )
+            if not stopped.get("ok"):
+                raise LifecycleValidationError("CONTAINER_STOP_FAILED", "container stop failed")
+        _portal4a_container_security(lifecycle_payload, require_running=False)
+        active = PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys"
+        suspended = active.with_name("authorized_keys.portal-recycle")
+        if active.exists():
+            fingerprints = _installed_key_fingerprints(
+                active, int(payload["uid"]), int(payload["gid"])
+            )
+            if suspended.exists():
+                raise LifecycleValidationError(
+                    "CONTAINER_KEY_SUSPEND_CONFLICT", "suspended key target already exists"
+                )
+            os.replace(active, suspended)
+        elif suspended.exists():
+            fingerprints = _installed_key_fingerprints(
+                suspended, int(payload["uid"]), int(payload["gid"])
+            )
+        else:
+            raise LifecycleValidationError(
+                "CONTAINER_KEY_SUSPEND_FAILED", "container authorized_keys is unavailable"
+            )
+        if (
+            active.exists()
+            or not suspended.exists()
+            or _active_user_slurm_jobs(str(payload["username"]))
+        ):
+            raise LifecycleValidationError(
+                "RECYCLE_POSTCONDITION_FAILED", "lease recycle postconditions are incomplete"
+            )
+        return {
+            "status": "SUCCEEDED",
+            "handler": "resource.recycle",
+            "request_id": request.request_id,
+            "lease_id": payload["lease_id"],
+            "cancelled_pending_job_ids": pending_ids,
+            "cancelled_running_job_ids": running_ids,
+            "container_state": "STOPPED",
+            "container_gpu": "NONE",
+            "container_key_state": "SUSPENDED_BY_RECYCLE",
+            "container_key_fingerprints": fingerprints,
+            "host_access": "DISABLED",
+            "data_preserved": True,
+            "container_definition_preserved": True,
+            "auto_permanent_delete": False,
+        }
+    except LifecycleValidationError as exc:
+        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+
+
+def _copy_root_only(source: Path, destination: Path) -> str:
+    content = source.read_bytes()
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=False)
+    os.chown(destination.parent, 0, 0)
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, content)
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o600)
+        os.fchown(descriptor, 0, 0)
+    finally:
+        os.close(descriptor)
+    return hashlib.sha256(content).hexdigest()
+
+
+def _execute_host_access_revoke(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        account = _portal4a_account(payload)
+        if account.pw_shell not in {"/bin/bash", "/usr/sbin/nologin"}:
+            raise LifecycleValidationError(
+                "HOST_ACCESS_STATE_REJECTED", "managed host shell is outside migration states"
+            )
+        management_before = {
+            MANAGEMENT_USERNAME: _sshd_effective_config(MANAGEMENT_USERNAME),
+            "codexops": _sshd_effective_config("codexops"),
+        }
+        host_keys = Path(f"/home/{payload['username']}/.ssh/authorized_keys")
+        container_keys = PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys"
+        container_fingerprints = _installed_key_fingerprints(
+            container_keys, int(payload["uid"]), int(payload["gid"])
+        )
+        if container_fingerprints != [payload["key_fingerprint"]]:
+            raise LifecycleValidationError(
+                "CONTAINER_KEY_CHANGED", "container public-key fingerprint differs from approval"
+            )
+        already_revoked = account.pw_shell == "/usr/sbin/nologin" and not host_keys.exists()
+        backup_path: Path | None = None
+        backup_sha256: str | None = None
+        if not already_revoked:
+            host_fingerprints = _installed_key_fingerprints(
+                host_keys, int(payload["uid"]), int(payload["gid"])
+            )
+            if host_fingerprints != [payload["key_fingerprint"]]:
+                raise LifecycleValidationError(
+                    "HOST_KEY_CHANGED", "host public-key fingerprint differs from approval"
+                )
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            backup_path = (
+                Path("/srv/gpu-platform/platform/backups")
+                / f"portal4a-host-access-{stamp}-{request.request_id[:8]}"
+                / "authorized_keys"
+            )
+            backup_sha256 = _copy_root_only(host_keys, backup_path)
+            changed = run_fixed(
+                "usermod", ["-s", "/usr/sbin/nologin", str(payload["username"])], timeout=20
+            )
+            if not changed.get("ok"):
+                raise LifecycleValidationError(
+                    "HOST_SHELL_REVOKE_FAILED", "managed host shell could not be disabled"
+                )
+            removed = host_keys.with_name(f".authorized_keys.portal4a-{request.request_id}")
+            os.replace(host_keys, removed)
+            removed.unlink()
+        refreshed = pwd.getpwnam(str(payload["username"]))
+        if refreshed.pw_shell != "/usr/sbin/nologin" or host_keys.exists():
+            raise LifecycleValidationError(
+                "HOST_ACCESS_POSTCONDITION_FAILED", "host access revocation is incomplete"
+            )
+        if _installed_key_fingerprints(
+            container_keys, int(payload["uid"]), int(payload["gid"])
+        ) != [payload["key_fingerprint"]]:
+            raise LifecycleValidationError(
+                "CONTAINER_KEY_CHANGED", "container public key changed during host revocation"
+            )
+        for username, before in management_before.items():
+            validate_ssh_policy_no_regression(username, before, _sshd_effective_config(username))
+        return {
+            "status": "SUCCEEDED",
+            "handler": "host_access.revoke_managed_user",
+            "request_id": request.request_id,
+            "username": payload["username"],
+            "shell": "/usr/sbin/nologin",
+            "password": "LOCKED",
+            "host_authorized_keys": "ABSENT",
+            "host_access": "DISABLED_BY_PLATFORM_POLICY",
+            "container_authorized_keys": "INSTALLED",
+            "container_key_fingerprint": payload["key_fingerprint"],
+            "key_scope": "CONTAINER",
+            "backup_path": str(backup_path) if backup_path else None,
+            "backup_sha256": backup_sha256,
+            "idempotent_replay": already_revoked,
+            "origin_al_policy": "UNCHANGED",
+            "codexops_policy": "UNCHANGED",
+        }
+    except (LifecycleValidationError, OSError) as exc:
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": getattr(exc, "code", "HOST_ACCESS_REVOKE_FAILED"),
+                "message": str(exc),
+            },
+        }
+
+
 def dry_run_plan(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
     if request.operation_type == "user.ssh_client_validation.record":
         return _portal3f_client_validation_plan(payload)
@@ -4994,6 +5849,21 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
         }
     if request.operation_type in KNOWN_WRITES:
         if not request.dry_run:
+            if request.operation_type == "self.job.submit":
+                return _execute_self_job_submit(request, payload)
+            if request.operation_type == "self.job.cancel":
+                return _execute_self_job_cancel(request, payload)
+            if (
+                request.operation_type in {"container.start", "container.stop", "container.restart"}
+                and "uid" in payload
+            ):
+                return _execute_portal4a_container_lifecycle(request, payload)
+            if request.operation_type == "resource.restore":
+                return _execute_resource_restore(request, payload)
+            if request.operation_type in {"lease.expire", "resource.recycle"}:
+                return _execute_resource_recycle(request, payload)
+            if request.operation_type == "host_access.revoke_managed_user":
+                return _execute_host_access_revoke(request, payload)
             if request.operation_type == "user.stage":
                 return _execute_origin_pilot_stage(request, payload)
             if request.operation_type == "user.activate":
@@ -5062,6 +5932,12 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
             return gpu_isolation_status()
         if request.operation_type == "ssh.policy.read":
             return ssh_policy_status()
+        if request.operation_type == "self.job.logs.read":
+            return _self_job_logs(payload)
+        if request.operation_type == "self.job.status.read":
+            return _self_job_status(payload)
+        if request.operation_type == "self.storage.read":
+            return _self_storage(payload)
     except Exception as exc:
         return {
             "status": "UNKNOWN",

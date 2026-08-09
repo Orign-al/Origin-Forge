@@ -19,16 +19,22 @@ from h100_portal_api.enums import (
     PasswordState,
     RiskLevel,
 )
+from h100_portal_api.lease_service import create_lease
 from h100_portal_api.models import (
+    PortalComputeLease,
     PortalContainer,
+    PortalJob,
     PortalManagedUser,
     PortalOperation,
     PortalOperationApproval,
     PortalOperationEvent,
+    PortalPasswordCredential,
     PortalPasswordSetupToken,
     PortalRole,
+    PortalSession,
     PortalSetting,
     PortalSshKey,
+    PortalStorageResource,
     PortalUser,
     utcnow,
 )
@@ -75,7 +81,14 @@ from h100_portal_api.routes.operations import (
     validate_portal3g_production_pilot_plan,
     validate_portal3g_production_pilot_result,
 )
-from h100_portal_api.security import digest_secret, normalize_login, random_token, safe_metadata
+from h100_portal_api.security import (
+    digest_secret,
+    hash_password,
+    normalize_login,
+    random_token,
+    safe_metadata,
+    validate_password,
+)
 from h100_portal_api.worker_client import WorkerClientError, call_worker
 
 ROLE_DESCRIPTIONS = {
@@ -102,6 +115,8 @@ def ensure_roles(db: Session) -> None:
                     permissions=sorted(permissions),
                 )
             )
+        else:
+            role.permissions = sorted(permissions)
     db.flush()
 
 
@@ -1925,6 +1940,332 @@ def portal3g_start_production_pilot(approval_text: str) -> int:
         return 2
 
 
+def portal4a_create_origin_pilot_user(base_url: str) -> int:
+    temporary_password = random_token(32)
+    validate_password(temporary_password, "origin-pilot")
+    with SessionLocal() as db:
+        ensure_roles(db)
+        existing = db.scalar(
+            select(PortalUser).where(PortalUser.normalized_login == "origin-pilot")
+        )
+        if existing is not None:
+            print(
+                "PORTAL-4A-R USER CREATE BLOCKED — origin-pilot Portal login already exists",
+                file=sys.stderr,
+            )
+            return 2
+        managed = db.scalar(
+            select(PortalManagedUser)
+            .where(PortalManagedUser.unix_username == "origin-pilot")
+            .with_for_update()
+        )
+        owner = db.scalar(select(PortalUser).where(PortalUser.normalized_login == "origin-al"))
+        role = db.scalar(select(PortalRole).where(PortalRole.name == "user"))
+        if managed is None or owner is None or role is None:
+            print(
+                "PORTAL-4A-R USER CREATE BLOCKED — platform identity baseline missing",
+                file=sys.stderr,
+            )
+            return 2
+        if (
+            managed.onboarding_state != OnboardingState.ACTIVE
+            or managed.uid != 20001
+            or managed.gid != 20001
+            or managed.container_name != "gpu-dev-origin-pilot"
+            or managed.quota_bytes != 300 * 1024**3
+        ):
+            print(
+                "PORTAL-4A-R USER CREATE BLOCKED — managed identity baseline changed",
+                file=sys.stderr,
+            )
+            return 2
+        if db.scalar(
+            select(PortalComputeLease.id).where(PortalComputeLease.managed_user_id == managed.id)
+        ):
+            print("PORTAL-4A-R USER CREATE BLOCKED — initial lease already exists", file=sys.stderr)
+            return 2
+        user = PortalUser(
+            login_name="origin-pilot",
+            normalized_login="origin-pilot",
+            display_name="Origin Pilot",
+            unix_username="origin-pilot",
+            account_state=AccountState.ACTIVE,
+            password_state=PasswordState.RESET_REQUIRED,
+            resource_onboarding_state=OnboardingState.ACTIVE,
+            activated_at=utcnow(),
+            roles=[role],
+        )
+        db.add(user)
+        db.flush()
+        db.add(
+            PortalPasswordCredential(
+                user_id=user.id,
+                password_hash=hash_password(temporary_password),
+                password_changed_at=utcnow(),
+            )
+        )
+        managed.portal_user_id = user.id
+        owner.resource_onboarding_state = OnboardingState.NOT_ENROLLED
+        db.execute(
+            update(PortalSession)
+            .where(PortalSession.user_id == owner.id)
+            .values(owner_managed_user_id=None)
+        )
+        for record in db.scalars(
+            select(PortalSshKey).where(PortalSshKey.managed_user_id == managed.id)
+        ):
+            record.owner_managed_user_id = managed.id
+        container = db.scalar(
+            select(PortalContainer).where(PortalContainer.managed_user_id == managed.id)
+        )
+        if container is None:
+            print("PORTAL-4A-R USER CREATE BLOCKED — managed container missing", file=sys.stderr)
+            return 2
+        container.owner_managed_user_id = managed.id
+        storage = PortalStorageResource(
+            owner_managed_user_id=managed.id,
+            root_path="/srv/gpu-platform/users/origin-pilot",
+            quota_bytes=300 * 1024**3,
+            state="ACTIVE",
+        )
+        db.add(storage)
+        lease_start = utcnow()
+        lease = create_lease(
+            managed_user_id=managed.id,
+            starts_at=lease_start,
+            duration_seconds=96 * 60 * 60,
+            gpu_count=1,
+            approved_by=owner.id,
+        )
+        db.add(lease)
+        db.flush()
+        record_audit(
+            db,
+            event_type="portal.ordinary_user.created",
+            actor="origin-al",
+            actor_role="platform_owner",
+            source_ip="local-console",
+            user_agent="h100-portal-admin",
+            object_type="portal_user",
+            object_id=str(user.id),
+            metadata={
+                "role": "user",
+                "managed_user_id": str(managed.id),
+                "password_change_required": True,
+                "credential_logged": False,
+            },
+        )
+        record_audit(
+            db,
+            event_type="LEASE_CREATED",
+            actor="origin-al",
+            actor_role="platform_owner",
+            source_ip="local-console",
+            user_agent="h100-portal-admin",
+            object_type="compute_lease",
+            object_id=str(lease.id),
+            metadata={
+                "duration_seconds": 345600,
+                "gpu_count": 1,
+                "migration_created_at": lease_start.isoformat(),
+                "auto_renew": False,
+            },
+        )
+        db.commit()
+        print("========================================")
+        print("ORDINARY USER TEST LOGIN")
+        print("========================================")
+        print(f"LOGIN URL: {base_url.rstrip('/')}/login")
+        print("USERNAME: origin-pilot")
+        print(f"TEMPORARY PASSWORD: {temporary_password}")
+        print("ROLE: user")
+        print("PASSWORD CHANGE REQUIRED: YES")
+        print(f"LEASE ID: {lease.id}")
+        print(f"LEASE START: {lease.starts_at.isoformat()}")
+        print(f"LEASE EXPIRES: {lease.expires_at.isoformat()}")
+        print("========================================")
+    return 0
+
+
+def _portal4a_completed_job(db: Session, managed: PortalManagedUser, gpu_count: int) -> PortalJob:
+    jobs = db.scalars(
+        select(PortalJob)
+        .where(
+            PortalJob.owner_managed_user_id == managed.id,
+            PortalJob.gpu_count == gpu_count,
+            PortalJob.slurm_job_id.is_not(None),
+        )
+        .order_by(PortalJob.created_at.desc())
+    ).all()
+    for job in jobs:
+        result = call_worker(
+            "self.job.status.read",
+            payload={
+                "portal_job_id": str(job.id),
+                "managed_user_id": str(managed.id),
+                "username": managed.unix_username,
+                "uid": managed.uid,
+                "gid": managed.gid,
+                "slurm_job_id": job.slurm_job_id,
+            },
+            requested_by="origin-al",
+            idempotency_key=f"portal4a-final-job-status:{job.id}",
+            dry_run=False,
+        )
+        if (
+            result.get("status") == "OK"
+            and result.get("slurm_user") == "origin-pilot"
+            and result.get("job_state") == "COMPLETED"
+            and result.get("exit_code") in {None, "0:0"}
+        ):
+            job.state = "COMPLETED"
+            job.exit_code = str(result.get("exit_code") or "0:0")
+            job.finished_at = job.finished_at or utcnow()
+            return job
+    raise RuntimeError(f"completed Portal job with gpu_count={gpu_count} is missing")
+
+
+def portal4a_revoke_origin_pilot_host_access(approval_text: str) -> int:
+    if approval_text != "批准 Portal-4A-R 撤销 origin-pilot 宿主访问":
+        print("PORTAL-4A-R HOST REVOKE BLOCKED — approval text mismatch", file=sys.stderr)
+        return 2
+    with SessionLocal() as db:
+        owner = db.scalar(select(PortalUser).where(PortalUser.normalized_login == "origin-al"))
+        user = db.scalar(select(PortalUser).where(PortalUser.normalized_login == "origin-pilot"))
+        managed = db.scalar(
+            select(PortalManagedUser)
+            .where(PortalManagedUser.unix_username == "origin-pilot")
+            .with_for_update()
+        )
+        if owner is None or user is None or managed is None or managed.portal_user_id != user.id:
+            print(
+                "PORTAL-4A-R HOST REVOKE BLOCKED — Portal ownership binding missing",
+                file=sys.stderr,
+            )
+            return 2
+        lease = db.scalar(
+            select(PortalComputeLease).where(
+                PortalComputeLease.owner_managed_user_id == managed.id,
+                PortalComputeLease.state.in_({"ACTIVE", "RENEWAL_WINDOW", "RENEWAL_PENDING"}),
+                PortalComputeLease.expires_at > utcnow(),
+            )
+        )
+        key = db.scalar(
+            select(PortalSshKey).where(
+                PortalSshKey.owner_managed_user_id == managed.id,
+                PortalSshKey.fingerprint_sha256 == PORTAL3E_FINAL_KEY_FINGERPRINT,
+                PortalSshKey.active.is_(True),
+            )
+        )
+        container = db.scalar(
+            select(PortalContainer).where(PortalContainer.owner_managed_user_id == managed.id)
+        )
+        if lease is None or key is None or container is None:
+            print(
+                "PORTAL-4A-R HOST REVOKE BLOCKED — lease/key/container baseline missing",
+                file=sys.stderr,
+            )
+            return 2
+        cpu_job = _portal4a_completed_job(db, managed, 0)
+        gpu_job = _portal4a_completed_job(db, managed, 1)
+        operation = PortalOperation(
+            operation_type="host_access.revoke_managed_user",
+            target_type="managed_user",
+            target_id="origin-pilot",
+            requested_by=owner.id,
+            owner_managed_user_id=managed.id,
+            approved_by=owner.id,
+            request_summary="Portal计算入口通过后按普通用户政策撤销宿主SSH",
+            validated_payload={
+                "managed_user_id": str(managed.id),
+                "key_record_id": str(key.id),
+                "key_fingerprint": key.fingerprint_sha256,
+                "cpu_job_id": cpu_job.slurm_job_id,
+                "gpu_job_id": gpu_job.slurm_job_id,
+            },
+            idempotency_key="portal4a-origin-pilot-host-access-revoke-v1",
+            risk_level=RiskLevel.HIGH,
+            status=OperationStatus.RUNNING,
+            approved_at=utcnow(),
+            started_at=utcnow(),
+        )
+        db.add(operation)
+        db.flush()
+        result = call_worker(
+            "host_access.revoke_managed_user",
+            payload={
+                "managed_user_id": str(managed.id),
+                "username": managed.unix_username,
+                "uid": managed.uid,
+                "gid": managed.gid,
+                "key_record_id": str(key.id),
+                "key_fingerprint": key.fingerprint_sha256,
+                "container_name": container.name,
+                "expected_scope": "BOTH",
+            },
+            requested_by="origin-al",
+            approved_by="origin-al",
+            idempotency_key="portal4a-origin-pilot-host-access-revoke-v1",
+            dry_run=False,
+            timeout_seconds=120,
+        )
+        if (
+            result.get("status") != "SUCCEEDED"
+            or result.get("shell") != "/usr/sbin/nologin"
+            or result.get("password") != "LOCKED"
+            or result.get("host_authorized_keys") != "ABSENT"
+            or result.get("container_authorized_keys") != "INSTALLED"
+        ):
+            operation.status = OperationStatus.FAILED
+            operation.error_code = str(result.get("error", {}).get("code", "HOST_REVOKE_FAILED"))
+            operation.finished_at = utcnow()
+            db.commit()
+            print("PORTAL-4A-R HOST REVOKE BLOCKED — Worker postcondition failed", file=sys.stderr)
+            return 2
+        managed.shell = "/usr/sbin/nologin"
+        managed.host_access_state = "DISABLED_BY_PLATFORM_POLICY"
+        managed.host_access_revoked_at = utcnow()
+        key.scope = "CONTAINER"
+        key.host_install_state = "REMOVED_BY_POLICY"
+        key.container_install_state = "INSTALLED"
+        operation.status = OperationStatus.SUCCEEDED
+        operation.finished_at = utcnow()
+        operation.worker_execution_id = str(result.get("request_id", ""))[:64] or None
+        operation.result_summary = (
+            "Host SSH removed by policy; container access and Portal jobs retained"
+        )
+        record_audit(
+            db,
+            event_type="HOST_ACCESS_REVOKED_BY_POLICY",
+            actor="origin-al",
+            actor_role="platform_owner",
+            source_ip="local-console",
+            user_agent="h100-portal-admin",
+            object_type="managed_user",
+            object_id=str(managed.id),
+            metadata={
+                "shell": "/usr/sbin/nologin",
+                "host_authorized_keys": "ABSENT",
+                "container_authorized_keys": "INSTALLED",
+                "key_scope": "CONTAINER",
+                "cpu_job_id": cpu_job.slurm_job_id,
+                "gpu_job_id": gpu_job.slurm_job_id,
+                "backup_path": result.get("backup_path"),
+                "backup_sha256": result.get("backup_sha256"),
+            },
+            operation_id=operation.id,
+        )
+        db.commit()
+        print(f"host_revoke_operation_id={operation.id}")
+        print("host_access=DISABLED_BY_PLATFORM_POLICY")
+        print("host_authorized_keys=ABSENT")
+        print("shell=/usr/sbin/nologin")
+        print("password=LOCKED")
+        print("container_authorized_keys=INSTALLED")
+        print("key_scope=CONTAINER")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="H100 Portal administrator bootstrap")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1944,6 +2285,10 @@ def main() -> int:
     portal3f.add_argument("--approval-text", required=True)
     portal3g = subparsers.add_parser("portal3g-start-production-pilot")
     portal3g.add_argument("--approval-text", required=True)
+    portal4a_user = subparsers.add_parser("portal4a-create-origin-pilot-user")
+    portal4a_user.add_argument("--base-url", default="http://10.10.10.2:18080")
+    portal4a_revoke = subparsers.add_parser("portal4a-revoke-origin-pilot-host-access")
+    portal4a_revoke.add_argument("--approval-text", required=True)
     args = parser.parse_args()
     if args.command == "prepare-origin-al":
         return prepare_origin_al()
@@ -1965,6 +2310,10 @@ def main() -> int:
         return portal3f_origin_pilot(args.approval_text)
     if args.command == "portal3g-start-production-pilot":
         return portal3g_start_production_pilot(args.approval_text)
+    if args.command == "portal4a-create-origin-pilot-user":
+        return portal4a_create_origin_pilot_user(args.base_url)
+    if args.command == "portal4a-revoke-origin-pilot-host-access":
+        return portal4a_revoke_origin_pilot_host_access(args.approval_text)
     return 2
 
 

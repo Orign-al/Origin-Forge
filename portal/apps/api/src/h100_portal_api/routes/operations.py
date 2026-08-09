@@ -1376,6 +1376,7 @@ def persist_portal3c_staged_identity(
     if container is None:
         container = PortalContainer(
             managed_user_id=managed.id,
+            owner_managed_user_id=managed.id,
             name="gpu-dev-origin-pilot",
             image_digest=image_digest,
             ssh_port=22023,
@@ -1388,6 +1389,7 @@ def persist_portal3c_staged_identity(
         if container.managed_user_id not in {None, managed.id}:
             raise RuntimeError("existing container record belongs to another identity")
         container.managed_user_id = managed.id
+        container.owner_managed_user_id = managed.id
         container.image_digest = image_digest
         container.ssh_port = 22023
         container.desired_state = "STOPPED"
@@ -2285,6 +2287,7 @@ def create_operation(
         target_type=body.target_type,
         target_id=target_id,
         requested_by=context.user.id,
+        owner_managed_user_id=(activate_records[0].managed_user_id if activate_records else None),
         request_summary=body.request_summary[:500],
         validated_payload=safe_metadata(validated),
         idempotency_key=body.idempotency_key,

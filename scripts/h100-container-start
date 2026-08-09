@@ -15,7 +15,6 @@ h100_acquire_lock
 h100_install_audit_trap container-start "${user_name}"
 h100_require_managed_user "${user_name}"
 h100_require_managed_compose "${user_name}"
-h100_require_slurm_drained
 h100_require_pilot_gpu_isolation_if_managed "${user_name}"
 
 pilot_state_value() {
@@ -50,8 +49,10 @@ require_activated_pilot_access() {
   [[ "$(id -u "${user_name}")" == "${state_uid}" \
     && "$(id -g "${user_name}")" == "${state_gid}" ]] \
     || h100_fail 'managed Pilot UID/GID is inconsistent'
-  [[ "$(getent passwd "${user_name}" | cut -d: -f7)" == /bin/bash ]] \
-    || h100_fail 'managed Pilot login shell is not activated'
+  case "$(getent passwd "${user_name}" | cut -d: -f7)" in
+    /bin/bash|/usr/sbin/nologin) ;;
+    *) h100_fail 'managed Pilot login shell is outside the approved policy' ;;
+  esac
   [[ "$(passwd -S "${user_name}" | awk '{print $2}')" == L ]] \
     || h100_fail 'managed Pilot password must remain locked'
 

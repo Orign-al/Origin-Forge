@@ -30,6 +30,7 @@ test = [
 [project.scripts]
 h100-portal-admin = "h100_portal_api.cli:main"
 h100-portal-worker = "h100_portal_worker.server:main"
+h100-portal-lease-expiry = "h100_portal_api.expiry_service:main"
 
 [tool.setuptools.packages.find]
 where = ["apps/api/src", "apps/worker/src"]

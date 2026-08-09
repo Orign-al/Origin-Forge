@@ -179,6 +179,7 @@ def start_owned_managed_container(
         target_type="container",
         target_id=name,
         requested_by=context.user.id,
+        owner_managed_user_id=managed.id,
         approved_by=context.user.id,
         request_summary=f"启动 {managed.unix_username} 的受管开发容器",
         validated_payload={

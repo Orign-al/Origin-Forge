@@ -17,6 +17,18 @@ const ROLE_LABELS: Record<string, string> = {
   user: "用户",
 };
 
+const USER_NAVIGATION = [
+  ["我的环境", "/"],
+  ["连接", "/access"],
+  ["作业", "/jobs"],
+  ["开发容器", "/containers"],
+  ["存储", "/storage"],
+  ["SSH密钥", "/ssh-keys"],
+  ["回收站", "/recycle-bin"],
+  ["账号与安全", "/account/security"],
+  ["帮助", "/help"],
+] as const;
+
 export function PortalShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
@@ -26,7 +38,7 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
   const alertQuery = useQuery({
     queryKey: ["shell-alerts"],
     queryFn: alerts,
-    enabled: current.isSuccess,
+    enabled: current.isSuccess && current.data?.role !== "user",
     retry: false,
     refetchInterval: 30_000,
   });
@@ -34,7 +46,18 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
     if (current.isError) router.replace("/login");
   }, [current.isError, router]);
   useEffect(() => {
-    if (current.isSuccess) {
+    if (
+      current.data?.user.password_state === "RESET_REQUIRED" &&
+      pathname !== "/change-password"
+    ) {
+      router.replace("/change-password");
+    }
+  }, [current.data?.user.password_state, pathname, router]);
+  useEffect(() => {
+    if (
+      current.isSuccess &&
+      current.data.user.password_state !== "RESET_REQUIRED"
+    ) {
       void recordPageAccess(pathname).catch(() => undefined);
     }
   }, [current.isSuccess, pathname]);
@@ -53,11 +76,12 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
   }
   const user = current.data.user;
   const role = current.data.role;
+  const activeNavigation = role === "user" ? USER_NAVIGATION : navigation;
   const alertData = alertQuery.data as { count?: unknown } | undefined;
   const alertCount =
     typeof alertData?.count === "number" ? alertData.count : "—";
   const searchResults = search.trim()
-    ? navigation.filter(([label]) =>
+    ? activeNavigation.filter(([label]) =>
         label.toLowerCase().includes(search.trim().toLowerCase()),
       )
     : [];
@@ -71,11 +95,13 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
       <aside className="portal-sidebar">
         <div className="brand">
           <div className="brand-title">H100 管理平台</div>
-          <div className="brand-subtitle">单机控制面 · Portal-3D-R</div>
+          <div className="brand-subtitle">
+            {role === "user" ? "个人计算环境 · Portal-4A-R" : "单机控制面 · Portal-4A-R"}
+          </div>
         </div>
         <nav className="nav-group" aria-label="主导航">
-          <div className="nav-label">平台</div>
-          {navigation.map(([label, href]) => (
+          <div className="nav-label">{role === "user" ? "我的资源" : "平台"}</div>
+          {activeNavigation.map(([label, href]) => (
             <Link
               key={href}
               href={href}
@@ -86,9 +112,17 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
           ))}
         </nav>
         <div className="sidebar-foot">
-          节点保持 DRAIN
-          <br />
-          写操作仅 dry-run
+          {role === "user" ? (
+            <>
+              Host SSH 已禁用
+              <br />GPU 上限 1 · 租约受控
+            </>
+          ) : (
+            <>
+              Production Pilot ACTIVE
+              <br />单节点 · 单受管用户
+            </>
+          )}
         </div>
       </aside>
       <div className="portal-main">
@@ -120,13 +154,12 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
             ) : null}
           </div>
           <div className="topbar-right">
-            <span className="muted">节点：sagsh100server</span>
-            <span
-              className="alert-count"
-              aria-label={`当前告警 ${alertCount} 个`}
-            >
-              告警 {alertCount}
-            </span>
+            {role !== "user" ? <span className="muted">节点：sagsh100server</span> : null}
+            {role !== "user" ? (
+              <span className="alert-count" aria-label={`当前告警 ${alertCount} 个`}>
+                告警 {alertCount}
+              </span>
+            ) : null}
             <Link className="user-chip" href="/account/security">
               <span className="avatar">O</span>
               {user.display_name}
@@ -136,7 +169,7 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
           </div>
         </header>
         <main className="content">
-          {current.data.ssh_enrollment?.required &&
+          {role !== "user" && current.data.ssh_enrollment?.required &&
           current.data.ssh_enrollment.setup_path ? (
             <div className="onboarding-banner" role="status">
               <div>

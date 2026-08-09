@@ -71,7 +71,9 @@ for unit in \
   h100-portal-worker.socket \
   h100-portal-worker.service \
   h100-portal-api.service \
-  h100-portal-web.service; do
+  h100-portal-web.service \
+  h100-portal-lease-expiry.service \
+  h100-portal-lease-expiry.timer; do
   install -o root -g root -m 0644 "$SOURCE_DIR/deploy/systemd/$unit" "$UNIT_DIR/$unit"
 done
 

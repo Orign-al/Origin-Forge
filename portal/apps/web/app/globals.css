@@ -964,6 +964,122 @@ button {
 .staged-waiting .table-link {
   margin-left: 8px;
 }
+
+.lease-band {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  border: 1px solid #b8ddc8;
+  border-left: 4px solid var(--success);
+  border-radius: 5px;
+  background: var(--success-soft);
+  padding: 16px 18px;
+  margin-bottom: 14px;
+}
+.lease-warning {
+  border-color: #efd99c;
+  border-left-color: var(--warning);
+  background: var(--warning-soft);
+}
+.lease-expiry {
+  margin: 3px 0;
+  font-size: 20px;
+  font-weight: 700;
+}
+.compact-help {
+  margin-top: 5px;
+  font-size: 11px;
+}
+.compact-stat {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+}
+.small-value {
+  font-size: 19px;
+}
+.job-form-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+.job-form-grid label {
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+.job-form-grid label .ui-input,
+.job-form-grid label select {
+  margin-top: 5px;
+}
+.job-submit-row {
+  display: flex;
+  align-items: flex-end;
+}
+.job-log {
+  min-height: 90px;
+  max-height: 280px;
+  overflow: auto;
+  border: 1px solid #cbd5dc;
+  border-radius: 4px;
+  background: #202b35;
+  color: #eaf0f3;
+  padding: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@media (max-width: 1100px) {
+  .grid-compact,
+  .job-form-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .topbar-search {
+    display: none;
+  }
+}
+
+@media (max-width: 760px) {
+  .portal-frame {
+    grid-template-columns: 1fr;
+  }
+  .portal-sidebar {
+    position: static;
+  }
+  .nav-group {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .nav-label {
+    grid-column: 1 / -1;
+  }
+  .sidebar-foot,
+  .topbar-left,
+  .topbar-right > .muted,
+  .alert-count {
+    display: none;
+  }
+  .topbar {
+    padding: 0 12px;
+  }
+  .content {
+    padding: 16px 12px 28px;
+  }
+  .grid-compact,
+  .job-form-grid,
+  .section-grid,
+  .kv-grid,
+  .access-target-grid {
+    grid-template-columns: 1fr;
+  }
+  .lease-band,
+  .page-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
 .drawer-backdrop {
   position: fixed;
   z-index: 50;
@@ -1068,5 +1184,26 @@ button {
   }
   .segment:last-child {
     border-bottom: 0;
+  }
+}
+
+@media (max-width: 760px) {
+  .portal-frame {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+  .portal-sidebar {
+    display: flex;
+  }
+  .nav-group {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .nav-label {
+    grid-column: 1 / -1;
+  }
+  .job-form-grid,
+  .grid-compact {
+    grid-template-columns: 1fr;
   }
 }

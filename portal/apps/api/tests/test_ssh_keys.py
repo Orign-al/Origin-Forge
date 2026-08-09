@@ -160,7 +160,7 @@ def _post_key(client, headers: dict[str, str], user: PortalUser, public_key: str
         "key_type": validated.key_type,
         "public_key": public_key,
         "comment": "Origin laptop",
-        "scope": "BOTH",
+        "scope": "CONTAINER",
         "generation_method": "IMPORTED",
         "client_fingerprint_sha256": validated.fingerprint_sha256,
         "confirmed_public_key": True,
@@ -188,7 +188,7 @@ def test_self_service_import_stores_only_public_material_and_metadata(
     assert payload["private_key_received"] is False
     assert payload["authorized_keys_installed"] is False
     assert "public_key" not in payload["key"]
-    assert payload["key"]["scope"] == "BOTH"
+    assert payload["key"]["scope"] == "CONTAINER"
     assert payload["key"]["state"] == "VALIDATED"
     database.expire_all()
     record = database.scalar(select(PortalSshKey))
@@ -228,7 +228,7 @@ def test_private_key_is_rejected_without_worker_db_or_audit_body(
             "public_key": temporary_key.public_key,
             "key_type": "ssh-ed25519",
             "private_key": temporary_key.private_key,
-            "scope": "BOTH",
+            "scope": "CONTAINER",
             "generation_method": "IMPORTED",
             "confirmed_public_key": True,
         },
@@ -297,7 +297,7 @@ def test_encrypted_private_key_armor_is_rejected_with_safe_audit(
                 "forbidden\n"
                 "-----END ENCRYPTED PRIVATE KEY-----"
             ),
-            "scope": "BOTH",
+            "scope": "CONTAINER",
             "generation_method": "IMPORTED",
             "confirmed_public_key": True,
         },
@@ -341,7 +341,7 @@ def test_empty_and_malformed_public_keys_are_rejected_before_worker(
         json={
             "key_type": "ssh-ed25519",
             "public_key": public_key,
-            "scope": "BOTH",
+            "scope": "CONTAINER",
             "generation_method": "IMPORTED",
             "confirmed_public_key": True,
         },
@@ -370,7 +370,7 @@ def test_declared_key_type_must_match_validated_public_key(
         json={
             "key_type": "ecdsa-sha2-nistp256",
             "public_key": temporary_key.public_key,
-            "scope": "BOTH",
+            "scope": "CONTAINER",
             "generation_method": "IMPORTED",
             "confirmed_public_key": True,
         },
@@ -445,6 +445,7 @@ def _existing_record(
         target_type="ssh_public_key",
         target_id=str(record_id),
         requested_by=user.id,
+        owner_managed_user_id=managed.id,
         approved_by=user.id,
         request_summary="test SSH key enrollment",
         validated_payload={"fingerprint_sha256": fingerprint},
@@ -458,6 +459,7 @@ def _existing_record(
     record = PortalSshKey(
         id=record_id,
         managed_user_id=managed.id,
+        owner_managed_user_id=managed.id,
         key_type="ssh-ed25519",
         fingerprint_sha256=fingerprint,
         public_key="ssh-ed25519 TEST-ONLY-NOT-A-REAL-KEY",
@@ -531,12 +533,12 @@ def test_same_user_can_enroll_a_second_distinct_key(
         user,
         second_key.public_key,
         comment="Second workstation",
-        scope="HOST",
+        scope="CONTAINER",
     )
 
     assert first.status_code == 201
     assert second.status_code == 201
-    assert second.json()["key"]["scope"] == "HOST"
+    assert second.json()["key"]["scope"] == "CONTAINER"
     records = database.scalars(
         select(PortalSshKey).where(PortalSshKey.managed_user_id == managed.id)
     ).all()
@@ -546,6 +548,33 @@ def test_same_user_can_enroll_a_second_distinct_key(
     refreshed = database.get(PortalManagedUser, managed.id)
     assert refreshed is not None
     assert refreshed.ssh_key_count == 2
+
+
+def test_ordinary_user_cannot_enroll_host_scoped_key(
+    client,
+    database: Session,
+    origin_headers: dict[str, str],
+    temporary_key: TemporaryKey,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    user, _managed = _staged_user(database)
+    headers = _login(client, origin_headers)
+    monkeypatch.setattr(
+        ssh_key_routes,
+        "call_worker",
+        lambda *_args, **_kwargs: pytest.fail("forbidden Host key must not reach Root Worker"),
+    )
+
+    response = _post_key(
+        client,
+        headers,
+        user,
+        temporary_key.public_key,
+        scope="HOST",
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "HOST_KEY_SCOPE_FORBIDDEN"
 
 
 def test_fingerprint_owned_by_another_user_is_rejected_globally(

@@ -215,6 +215,19 @@ def enroll_ssh_key(
         raise HTTPException(
             status_code=422, detail={"code": exc.code, "message": str(exc)}
         ) from exc
+    if highest_role(context.user) == "user" and enrollment.scope != "CONTAINER":
+        _record_rejection(
+            db,
+            request,
+            context,
+            target,
+            event_type="ssh_key.scope_rejected",
+            code="HOST_KEY_SCOPE_FORBIDDEN",
+        )
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "HOST_KEY_SCOPE_FORBIDDEN", "message": "普通用户密钥仅可用于开发容器"},
+        )
     if enrollment.key_type != validated.key_type:
         _record_rejection(
             db,
@@ -291,6 +304,7 @@ def enroll_ssh_key(
         target_type="ssh_public_key",
         target_id=str(record_id),
         requested_by=context.user.id,
+        owner_managed_user_id=managed.id,
         approved_by=context.user.id,
         request_summary=f"为 {managed.unix_username} 登记自助 SSH 公钥",
         validated_payload={
@@ -365,12 +379,15 @@ def enroll_ssh_key(
     record = PortalSshKey(
         id=record_id,
         managed_user_id=managed.id,
+        owner_managed_user_id=managed.id,
         key_type=validated.key_type,
         fingerprint_sha256=validated.fingerprint_sha256,
         public_key=validated.public_key,
         comment=validated.comment,
         scope=enrollment.scope,
         state="VALIDATED",
+        host_install_state="NOT_INSTALLED",
+        container_install_state="NOT_INSTALLED",
         generation_method=enrollment.generation_method,
         created_by=context.user.id,
         enrollment_operation_id=operation.id,

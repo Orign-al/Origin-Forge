@@ -1,5 +1,6 @@
 import re
 import uuid
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -23,6 +24,9 @@ KNOWN_READS = {
     "images.list",
     "gpu_isolation.status.read",
     "ssh.policy.read",
+    "self.job.logs.read",
+    "self.job.status.read",
+    "self.storage.read",
 }
 KNOWN_WRITES = {
     "user.plan",
@@ -45,6 +49,12 @@ KNOWN_WRITES = {
     "ssh_key.revoke",
     "ssh_key.prepare",
     "ssh_key.discard",
+    "self.job.submit",
+    "self.job.cancel",
+    "lease.expire",
+    "resource.recycle",
+    "resource.restore",
+    "host_access.revoke_managed_user",
 }
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,127}$")
 SAFE_USERNAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
@@ -141,6 +151,7 @@ APPROVED_PRODUCTION_PILOT_PAYLOAD: dict[str, Any] = {
     "target_node_state": "IDLE",
     "approval_reference": PORTAL3G_APPROVAL_REFERENCE,
 }
+APPROVED_JOB_IMAGE = PORTAL3F_IMAGE_REF
 
 
 class PayloadValidationError(ValueError):
@@ -435,6 +446,300 @@ def _validate_portal3g_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return dict(APPROVED_PRODUCTION_PILOT_PAYLOAD)
 
 
+def _portal4a_identity(payload: dict[str, Any]) -> dict[str, Any]:
+    expected = {
+        "managed_user_id": PORTAL3F_MANAGED_USER_ID,
+        "username": "origin-pilot",
+        "uid": 20001,
+        "gid": 20001,
+    }
+    for field, value in expected.items():
+        if payload.get(field) != value:
+            raise PayloadValidationError(
+                "RESOURCE_OWNERSHIP_REJECTED", "Portal-4A-R identity binding is invalid"
+            )
+    return expected
+
+
+def _relative_user_path(value: object, field: str) -> str:
+    if not isinstance(value, str) or not 1 <= len(value) <= 255 or "\x00" in value:
+        raise PayloadValidationError("ARBITRARY_PATH_REJECTED", f"invalid {field}")
+    if value.startswith("/") or any(part in {"", ".", ".."} for part in value.split("/")):
+        raise PayloadValidationError("ARBITRARY_PATH_REJECTED", f"invalid {field}")
+    return value
+
+
+def _future_timestamp(value: object, field: str) -> str:
+    if not isinstance(value, str) or len(value) > 64:
+        raise PayloadValidationError("PAYLOAD_REJECTED", f"invalid {field}")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PayloadValidationError("PAYLOAD_REJECTED", f"invalid {field}") from exc
+    if parsed.tzinfo is None or parsed.astimezone(UTC) <= datetime.now(UTC):
+        raise PayloadValidationError("LEASE_INACTIVE", "lease deadline is not in the future")
+    return parsed.astimezone(UTC).isoformat()
+
+
+def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "portal_job_id",
+        "managed_user_id",
+        "lease_id",
+        "username",
+        "uid",
+        "gid",
+        "name",
+        "script_relative_path",
+        "workdir_relative_path",
+        "stdout_relative_path",
+        "stderr_relative_path",
+        "cpus",
+        "memory_mb",
+        "gpu_count",
+        "time_limit_seconds",
+        "lease_deadline_at",
+        "image_ref",
+    }
+    if set(payload) != fields:
+        raise PayloadValidationError("JOB_SPEC_REJECTED", "job specification fields are incomplete")
+    result = _portal4a_identity(payload)
+    result.update(
+        {
+            "portal_job_id": _canonical_uuid(payload.get("portal_job_id"), "Portal job ID"),
+            "lease_id": _canonical_uuid(payload.get("lease_id"), "lease ID"),
+        }
+    )
+    name = payload.get("name")
+    if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name) is None:
+        raise PayloadValidationError("JOB_SPEC_REJECTED", "job name is invalid")
+    cpus = payload.get("cpus")
+    memory_mb = payload.get("memory_mb")
+    gpu_count = payload.get("gpu_count")
+    time_limit = payload.get("time_limit_seconds")
+    if not isinstance(cpus, int) or not 1 <= cpus <= 8:
+        raise PayloadValidationError("JOB_SPEC_REJECTED", "CPU request is invalid")
+    if not isinstance(memory_mb, int) or not 256 <= memory_mb <= 32768:
+        raise PayloadValidationError("JOB_SPEC_REJECTED", "memory request is invalid")
+    if gpu_count not in {0, 1}:
+        raise PayloadValidationError("GPU_LIMIT_EXCEEDED", "GPU request must be 0 or 1")
+    if not isinstance(time_limit, int) or not 60 <= time_limit <= 345600:
+        raise PayloadValidationError("JOB_SPEC_REJECTED", "time limit is invalid")
+    deadline = _future_timestamp(payload.get("lease_deadline_at"), "lease deadline")
+    remaining = (
+        datetime.fromisoformat(deadline).astimezone(UTC) - datetime.now(UTC)
+    ).total_seconds()
+    if time_limit > remaining:
+        raise PayloadValidationError("JOB_EXCEEDS_LEASE", "job time limit exceeds lease deadline")
+    image_ref = payload.get("image_ref")
+    if image_ref not in {None, APPROVED_JOB_IMAGE}:
+        raise PayloadValidationError("IMAGE_NOT_APPROVED", "container image is not approved")
+    result.update(
+        {
+            "name": name,
+            "script_relative_path": _relative_user_path(
+                payload.get("script_relative_path"), "script path"
+            ),
+            "workdir_relative_path": _relative_user_path(
+                payload.get("workdir_relative_path"), "workdir"
+            ),
+            "stdout_relative_path": _relative_user_path(
+                payload.get("stdout_relative_path"), "stdout path"
+            ),
+            "stderr_relative_path": _relative_user_path(
+                payload.get("stderr_relative_path"), "stderr path"
+            ),
+            "cpus": cpus,
+            "memory_mb": memory_mb,
+            "gpu_count": gpu_count,
+            "time_limit_seconds": time_limit,
+            "lease_deadline_at": deadline,
+            "image_ref": image_ref,
+        }
+    )
+    return result
+
+
+def _validate_self_job_target(payload: dict[str, Any], *, logs: bool = False) -> dict[str, Any]:
+    expected = (
+        {
+            "portal_job_id",
+            "managed_user_id",
+            "username",
+            "uid",
+            "gid",
+            "stdout_relative_path",
+            "stderr_relative_path",
+        }
+        if logs
+        else {
+            "portal_job_id",
+            "managed_user_id",
+            "username",
+            "uid",
+            "gid",
+            "slurm_job_id",
+        }
+    )
+    if set(payload) != expected:
+        raise PayloadValidationError("JOB_TARGET_REJECTED", "job target fields are invalid")
+    result = _portal4a_identity(payload)
+    result["portal_job_id"] = _canonical_uuid(payload.get("portal_job_id"), "Portal job ID")
+    if logs:
+        result["stdout_relative_path"] = _relative_user_path(
+            payload.get("stdout_relative_path"), "stdout path"
+        )
+        result["stderr_relative_path"] = _relative_user_path(
+            payload.get("stderr_relative_path"), "stderr path"
+        )
+    else:
+        job_id = payload.get("slurm_job_id")
+        if not isinstance(job_id, int) or not 0 < job_id < 2**63:
+            raise PayloadValidationError("JOB_TARGET_REJECTED", "Slurm job ID is invalid")
+        result["slurm_job_id"] = job_id
+    return result
+
+
+def _validate_container_lifecycle(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "managed_user_id",
+        "username",
+        "uid",
+        "gid",
+        "name",
+        "lease_id",
+        "lease_expires_at",
+        "expected_gpu",
+    }
+    if set(payload) != fields:
+        raise PayloadValidationError("CONTAINER_TARGET_REJECTED", "container fields are invalid")
+    result = _portal4a_identity(payload)
+    if payload.get("name") != "gpu-dev-origin-pilot" or payload.get("expected_gpu") != "NONE":
+        raise PayloadValidationError("CONTAINER_TARGET_REJECTED", "container target is invalid")
+    result["name"] = "gpu-dev-origin-pilot"
+    result["expected_gpu"] = "NONE"
+    if payload.get("lease_id") is None and payload.get("lease_expires_at") is None:
+        result["lease_id"] = None
+        result["lease_expires_at"] = None
+    else:
+        result["lease_id"] = _canonical_uuid(payload.get("lease_id"), "lease ID")
+        result["lease_expires_at"] = _future_timestamp(
+            payload.get("lease_expires_at"), "lease expiry"
+        )
+    return result
+
+
+def _validate_restore(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "restore_request_id",
+        "managed_user_id",
+        "username",
+        "uid",
+        "gid",
+        "container_name",
+        "expected_gpu",
+        "host_access",
+    }
+    if set(payload) != fields:
+        raise PayloadValidationError("RESTORE_PAYLOAD_REJECTED", "restore fields are invalid")
+    result = _portal4a_identity(payload)
+    if (
+        payload.get("container_name") != "gpu-dev-origin-pilot"
+        or payload.get("expected_gpu") != "NONE"
+        or payload.get("host_access") != "DISABLED_BY_PLATFORM_POLICY"
+    ):
+        raise PayloadValidationError("RESTORE_PAYLOAD_REJECTED", "restore target is invalid")
+    result.update(
+        {
+            "restore_request_id": _canonical_uuid(
+                payload.get("restore_request_id"), "restore request ID"
+            ),
+            "container_name": "gpu-dev-origin-pilot",
+            "expected_gpu": "NONE",
+            "host_access": "DISABLED_BY_PLATFORM_POLICY",
+        }
+    )
+    return result
+
+
+def _validate_recycle(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "lease_id",
+        "managed_user_id",
+        "username",
+        "uid",
+        "gid",
+        "container_name",
+        "expires_at",
+        "expected_gpu",
+        "host_access",
+    }
+    if set(payload) != fields:
+        raise PayloadValidationError("RECYCLE_PAYLOAD_REJECTED", "recycle fields are invalid")
+    result = _portal4a_identity(payload)
+    if (
+        payload.get("container_name") != "gpu-dev-origin-pilot"
+        or payload.get("expected_gpu") != "NONE"
+        or payload.get("host_access") != "DISABLED_BY_PLATFORM_POLICY"
+    ):
+        raise PayloadValidationError("RECYCLE_PAYLOAD_REJECTED", "recycle target is invalid")
+    expires_at = payload.get("expires_at")
+    if not isinstance(expires_at, str) or len(expires_at) > 64:
+        raise PayloadValidationError("RECYCLE_PAYLOAD_REJECTED", "lease expiry is invalid")
+    try:
+        parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PayloadValidationError("RECYCLE_PAYLOAD_REJECTED", "lease expiry is invalid") from exc
+    if parsed.tzinfo is None or parsed.astimezone(UTC) > datetime.now(UTC):
+        raise PayloadValidationError("LEASE_NOT_EXPIRED", "lease has not expired")
+    result.update(
+        {
+            "lease_id": _canonical_uuid(payload.get("lease_id"), "lease ID"),
+            "container_name": "gpu-dev-origin-pilot",
+            "expires_at": parsed.astimezone(UTC).isoformat(),
+            "expected_gpu": "NONE",
+            "host_access": "DISABLED_BY_PLATFORM_POLICY",
+        }
+    )
+    return result
+
+
+def _validate_host_revoke(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "managed_user_id",
+        "username",
+        "uid",
+        "gid",
+        "key_record_id",
+        "key_fingerprint",
+        "container_name",
+        "expected_scope",
+    }
+    if set(payload) != fields:
+        raise PayloadValidationError(
+            "HOST_REVOKE_PAYLOAD_REJECTED", "host revoke fields are invalid"
+        )
+    result = _portal4a_identity(payload)
+    fingerprint = payload.get("key_fingerprint")
+    if (
+        payload.get("container_name") != "gpu-dev-origin-pilot"
+        or payload.get("expected_scope") != "BOTH"
+        or fingerprint != PORTAL3F_KEY_FINGERPRINT
+    ):
+        raise PayloadValidationError(
+            "HOST_REVOKE_PAYLOAD_REJECTED", "host revoke target is invalid"
+        )
+    result.update(
+        {
+            "key_record_id": _canonical_uuid(payload.get("key_record_id"), "SSH key record ID"),
+            "key_fingerprint": fingerprint,
+            "container_name": "gpu-dev-origin-pilot",
+            "expected_scope": "BOTH",
+        }
+    )
+    return result
+
+
 def validate_payload(
     operation_type: str, payload: dict[str, Any], *, allow_legacy_stage: bool = False
 ) -> dict[str, Any]:
@@ -443,6 +748,31 @@ def validate_payload(
         if not isinstance(name, str) or not SAFE_IDENTIFIER.fullmatch(name):
             raise ValueError("invalid container name")
         return {"name": name}
+    if operation_type == "self.job.submit":
+        return _validate_self_job_submit(payload)
+    if operation_type == "self.job.cancel":
+        return _validate_self_job_target(payload)
+    if operation_type == "self.job.logs.read":
+        return _validate_self_job_target(payload, logs=True)
+    if operation_type == "self.job.status.read":
+        return _validate_self_job_target(payload)
+    if operation_type == "self.storage.read":
+        if set(payload) != {"managed_user_id", "username", "uid", "gid"}:
+            raise PayloadValidationError(
+                "STORAGE_TARGET_REJECTED", "storage target fields are invalid"
+            )
+        return _portal4a_identity(payload)
+    if (
+        operation_type in {"container.start", "container.stop", "container.restart"}
+        and "uid" in payload
+    ):
+        return _validate_container_lifecycle(payload)
+    if operation_type == "resource.restore":
+        return _validate_restore(payload)
+    if operation_type in {"lease.expire", "resource.recycle"}:
+        return _validate_recycle(payload)
+    if operation_type == "host_access.revoke_managed_user":
+        return _validate_host_revoke(payload)
     if operation_type in {"job.cancel"}:
         job_id = payload.get("job_id")
         if not isinstance(job_id, int) or not 0 < job_id < 2**63:

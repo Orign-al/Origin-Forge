@@ -332,6 +332,7 @@ def create_portal3e_database_state(
         target_type="ssh_public_key",
         target_id=str(PORTAL3E_FINAL_KEY_RECORD_ID),
         requested_by=owner.id,
+        owner_managed_user_id=managed.id,
         approved_by=owner.id,
         request_summary="Portal-3D-R approved key enrollment",
         validated_payload={"fingerprint_sha256": PORTAL3E_FINAL_KEY_FINGERPRINT},
@@ -344,6 +345,7 @@ def create_portal3e_database_state(
     key = PortalSshKey(
         id=PORTAL3E_FINAL_KEY_RECORD_ID,
         managed_user_id=managed.id,
+        owner_managed_user_id=managed.id,
         key_type="ssh-ed25519",
         fingerprint_sha256=PORTAL3E_FINAL_KEY_FINGERPRINT,
         public_key="ssh-ed25519 TEST-ONLY-NOT-A-REAL-KEY",
@@ -364,6 +366,7 @@ def create_portal3e_database_state(
     database.add(
         PortalContainer(
             managed_user_id=managed.id,
+            owner_managed_user_id=managed.id,
             name="gpu-dev-origin-pilot",
             image_digest="sha256:" + "b" * 64,
             ssh_port=22023,
@@ -378,6 +381,7 @@ def create_portal3e_database_state(
         target_type="compute_identity",
         target_id="origin-pilot",
         requested_by=owner.id,
+        owner_managed_user_id=managed.id,
         request_summary="Portal-3E-R dry-run",
         validated_payload={
             "managed_user_id": str(managed.id),
@@ -401,6 +405,7 @@ def create_portal3e_database_state(
         target_type="compute_identity",
         target_id="origin-pilot",
         requested_by=owner.id,
+        owner_managed_user_id=managed.id,
         approved_by=owner.id,
         request_summary="Portal-3E-FINAL real Activate",
         validated_payload={
@@ -762,6 +767,7 @@ def test_portal3e_final_execution_result_rejects_container_password_authenticati
     key = PortalSshKey(
         id=PORTAL3E_FINAL_KEY_RECORD_ID,
         managed_user_id=PORTAL3E_FINAL_MANAGED_USER_ID,
+        owner_managed_user_id=PORTAL3E_FINAL_MANAGED_USER_ID,
         key_type="ssh-ed25519",
         fingerprint_sha256=PORTAL3E_FINAL_KEY_FINGERPRINT,
         public_key="ssh-ed25519 TEST-ONLY-NOT-A-REAL-KEY",
@@ -815,6 +821,7 @@ def test_activate_ids_are_bound_to_the_owners_staged_identity(database: Session)
         target_type="ssh_public_key",
         target_id=str(key_id),
         requested_by=owner.id,
+        owner_managed_user_id=managed.id,
         approved_by=owner.id,
         request_summary="test self-service SSH key enrollment",
         validated_payload={"fingerprint_sha256": "SHA256:portal3br-test-fingerprint"},
@@ -827,6 +834,7 @@ def test_activate_ids_are_bound_to_the_owners_staged_identity(database: Session)
     key = PortalSshKey(
         id=key_id,
         managed_user_id=managed.id,
+        owner_managed_user_id=managed.id,
         key_type="ssh-ed25519",
         fingerprint_sha256="SHA256:portal3br-test-fingerprint",
         public_key="ssh-ed25519 TEST-ONLY-NOT-A-REAL-KEY",

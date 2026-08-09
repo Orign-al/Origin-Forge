@@ -3,6 +3,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { ACCESS_MODE_LABEL } from "@h100-portal/config";
 import { Card, StatusBadge } from "@h100-portal/ui";
+import { OrdinaryDashboard } from "../../components/OrdinaryUserPages";
 
 import {
   PageHeading,
@@ -12,7 +13,7 @@ import {
   StaleNotice,
   UnauthorizedBlock,
 } from "../../components/PortalShell";
-import { ApiError, overview } from "../../lib/api";
+import { ApiError, me, overview } from "../../lib/api";
 
 function value(item: unknown, fallback = "UNKNOWN") {
   return item === undefined || item === null || item === ""
@@ -21,6 +22,13 @@ function value(item: unknown, fallback = "UNKNOWN") {
 }
 
 export default function DashboardPage() {
+  const current = useQuery({ queryKey: ["me"], queryFn: me });
+  if (current.isPending) return <LoadingBlock />;
+  if (current.isError) return <ErrorBlock />;
+  return current.data.role === "user" ? <OrdinaryDashboard /> : <AdminDashboardPage />;
+}
+
+function AdminDashboardPage() {
   const query = useQuery({
     queryKey: ["overview"],
     queryFn: overview,

@@ -1,0 +1,12 @@
+[Unit]
+Description=Check H100 Portal compute leases every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Persistent=true
+Unit=h100-portal-lease-expiry.service
+
+[Install]
+WantedBy=timers.target

@@ -178,6 +178,42 @@ class ManagedContainerStartRequest(ApiModel):
     expected_ssh_key_state: Literal["INSTALLED"]
 
 
+class SelfContainerActionRequest(ApiModel):
+    idempotency_key: uuid.UUID
+
+
+class SelfJobSubmitRequest(ApiModel):
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+    script_path: str = Field(min_length=1, max_length=255)
+    workdir: str = Field(default="workspace", min_length=1, max_length=255)
+    cpus: int = Field(ge=1, le=8)
+    memory_mb: int = Field(ge=256, le=32768)
+    gpu_count: Literal[0, 1]
+    time_limit_seconds: int = Field(ge=60, le=345600)
+    image_ref: str | None = Field(default=None, max_length=512)
+    idempotency_key: uuid.UUID
+
+
+class LeaseRenewalCreateRequest(ApiModel):
+    duration_seconds: int = Field(ge=1, le=345600)
+    idempotency_key: uuid.UUID
+
+
+class LeaseDecisionRequest(ApiModel):
+    decision: Literal["APPROVE", "REJECT"]
+    comment: str | None = Field(default=None, max_length=500)
+
+
+class RestoreCreateRequest(ApiModel):
+    duration_seconds: int = Field(ge=1, le=345600)
+    idempotency_key: uuid.UUID
+
+
+class RestoreDecisionRequest(ApiModel):
+    decision: Literal["APPROVE", "REJECT"]
+    comment: str | None = Field(default=None, max_length=500)
+
+
 class OperationResponse(ApiModel):
     id: uuid.UUID
     operation_type: str
