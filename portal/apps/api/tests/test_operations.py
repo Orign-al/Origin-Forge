@@ -7,6 +7,7 @@ from h100_portal_api.models import (
     PortalContainer,
     PortalManagedUser,
     PortalOperation,
+    PortalOperationApproval,
     PortalRole,
     PortalSshKey,
     PortalUser,
@@ -16,10 +17,20 @@ from h100_portal_api.operations import can_transition, can_transition_onboarding
 from h100_portal_api.routes import operations as operations_route
 from h100_portal_api.routes.operations import (
     PORTAL3C_STAGE_IDEMPOTENCY_KEY,
+    PORTAL3E_FINAL_APPROVAL_REFERENCE,
+    PORTAL3E_FINAL_APPROVAL_TEXT,
+    PORTAL3E_FINAL_DRY_RUN_OPERATION_ID,
+    PORTAL3E_FINAL_IDEMPOTENCY_KEY,
+    PORTAL3E_FINAL_KEY_FINGERPRINT,
+    PORTAL3E_FINAL_KEY_RECORD_ID,
+    PORTAL3E_FINAL_MANAGED_USER_ID,
     OperationPayloadError,
     is_portal3c_real_stage,
+    is_portal3e_final_real_activate,
     persist_portal3c_staged_identity,
+    persist_portal3e_activated_identity,
     validate_activate_database_bindings,
+    validate_activate_execution_result,
     validate_activate_worker_result,
     validate_operation_payload,
 )
@@ -154,6 +165,305 @@ def test_activate_worker_result_requires_structured_host_ssh_policy() -> None:
     }
     with pytest.raises(OperationPayloadError, match="ACTIVATE_DRY_RUN_INCOMPLETE"):
         validate_activate_worker_result([], password_enabled)
+
+
+def portal3e_execution_result(record: PortalSshKey) -> dict[str, object]:
+    return {
+        "status": "SUCCEEDED",
+        "handler": "user.activate",
+        "execution_enabled": True,
+        "request_id": str(uuid.uuid4()),
+        "approved_ssh_keys": [
+            {
+                "record_id": str(record.id),
+                "key_type": record.key_type,
+                "fingerprint_sha256": record.fingerprint_sha256,
+                "content_sha256": record.content_sha256,
+                "scope": record.scope,
+                "managed_user_id": str(record.managed_user_id),
+                "operation_id": str(record.enrollment_operation_id),
+            }
+        ],
+        "activate": {
+            "username": "origin-pilot",
+            "uid": 20001,
+            "gid": 20001,
+            "onboarding_state": "ACTIVE",
+            "shell": "/bin/bash",
+            "password": "LOCKED",
+            "host_access": "ENABLED",
+            "ssh_key_state": "INSTALLED",
+            "host_authorized_keys": "INSTALLED",
+            "container_authorized_keys": "INSTALLED",
+            "host_key_fingerprints": [record.fingerprint_sha256],
+            "container_key_fingerprints": [record.fingerprint_sha256],
+            "host_ssh_policy": {
+                "pubkey_authentication": True,
+                "password_authentication": False,
+                "keyboard_interactive_authentication": False,
+                "authentication_methods": ["publickey"],
+                "status": "PASSING",
+            },
+            "container_ssh_policy": {
+                "pubkey_authentication": True,
+                "password_authentication": False,
+                "keyboard_interactive_authentication": False,
+                "authentication_methods": "publickey",
+                "permit_root_login": "no",
+                "authorized_keys_file": ".ssh/authorized_keys",
+                "status": "PASSING",
+            },
+            "host_ssh_server": {
+                "service_state": "ACTIVE",
+                "config_validation": "PASSED",
+                "approved_address": "10.82.36.1",
+                "port": 22,
+                "status": "READY_FOR_CLIENT_VALIDATION",
+            },
+            "container_ssh_server": {
+                "service_state": "ACTIVE",
+                "internal_port": 22,
+                "status": "READY_FOR_CLIENT_VALIDATION",
+                "bind": {"address": "10.82.36.1", "port": 22023, "status": "LISTENING"},
+            },
+            "host_server_fingerprint": "SHA256:test-host-server-fingerprint",
+            "container_server_fingerprint": "SHA256:test-container-server-fingerprint",
+            "management_ssh_policy": {"origin-al": "UNCHANGED", "codexops": "UNCHANGED"},
+            "gpu_policy": {
+                "unit": "user-20001.slice",
+                "device_policy": "closed",
+                "device_allow": [],
+                "status": "PASSING",
+                "out_of_job_gpu": "DENIED",
+            },
+            "quota": {"project_id": 30001, "hard_limit_gb": 300, "enforcement": "ON"},
+            "slurm": {
+                "account": "company",
+                "qos": "general",
+                "max_gpus": 1,
+                "node_state": "DRAIN",
+                "queue": "EMPTY",
+            },
+            "container": {
+                "name": "gpu-dev-origin-pilot",
+                "state": "RUNNING",
+                "gpu": "NONE",
+                "cpus": 8,
+                "memory_gb": 32,
+                "pids_limit": 4096,
+                "ssh_address": "10.82.36.1",
+                "ssh_port": 22023,
+            },
+            "guard": {
+                "status": "PASSING",
+                "managed_users": 1,
+                "users_verified": 1,
+                "nvidia_gpu_count": 4,
+                "slurm_gpu_count": 4,
+            },
+            "host_ssh_client_validation": "PENDING",
+            "container_ssh_client_validation": "PENDING",
+        },
+    }
+
+
+def create_portal3e_database_state(
+    database: Session,
+) -> tuple[PortalUser, PortalManagedUser, PortalSshKey, PortalOperation]:
+    owner_role = database.scalar(select(PortalRole).where(PortalRole.name == "platform_owner"))
+    assert owner_role is not None
+    owner = PortalUser(
+        login_name="Origin-al",
+        normalized_login="origin-al",
+        display_name="Origin-al",
+        unix_username="origin-al",
+        account_state=AccountState.ACTIVE,
+        resource_onboarding_state=OnboardingState.STAGED,
+        roles=[owner_role],
+    )
+    database.add(owner)
+    database.flush()
+    managed = PortalManagedUser(  # noqa: S604 -- ORM shell field, not a subprocess shell.
+        id=PORTAL3E_FINAL_MANAGED_USER_ID,
+        portal_user_id=owner.id,
+        unix_username="origin-pilot",
+        uid=20001,
+        gid=20001,
+        shell="/usr/sbin/nologin",
+        host_access_state="DISABLED",
+        gpu_isolation_state="VERIFIED",
+        slurm_account="company",
+        slurm_qos="general",
+        project_id=30001,
+        quota_bytes=300 * 1024**3,
+        container_name="gpu-dev-origin-pilot",
+        container_port=22023,
+        onboarding_state=OnboardingState.STAGED,
+        ssh_key_state="VALIDATED",
+        ssh_key_count=1,
+        staged_at=utcnow(),
+    )
+    database.add(managed)
+    database.flush()
+    enrollment = PortalOperation(
+        operation_type="ssh_key.enroll",
+        target_type="ssh_public_key",
+        target_id=str(PORTAL3E_FINAL_KEY_RECORD_ID),
+        requested_by=owner.id,
+        approved_by=owner.id,
+        request_summary="Portal-3D-R approved key enrollment",
+        validated_payload={"fingerprint_sha256": PORTAL3E_FINAL_KEY_FINGERPRINT},
+        idempotency_key=f"ssh-key-enroll:{PORTAL3E_FINAL_KEY_RECORD_ID}",
+        risk_level=RiskLevel.MEDIUM,
+        status=OperationStatus.SUCCEEDED,
+    )
+    database.add(enrollment)
+    database.flush()
+    key = PortalSshKey(
+        id=PORTAL3E_FINAL_KEY_RECORD_ID,
+        managed_user_id=managed.id,
+        key_type="ssh-ed25519",
+        fingerprint_sha256=PORTAL3E_FINAL_KEY_FINGERPRINT,
+        public_key="ssh-ed25519 TEST-ONLY-NOT-A-REAL-KEY",
+        comment="Portal-3D-R test record",
+        scope="BOTH",
+        state="VALIDATED",
+        generation_method="BROWSER_GENERATED",
+        created_by=owner.id,
+        enrollment_operation_id=enrollment.id,
+        staging_file_name=f"{PORTAL3E_FINAL_KEY_RECORD_ID}.pub",
+        content_sha256="a" * 64,
+        approved_by=owner.id,
+        approved_at=utcnow(),
+        validated_at=utcnow(),
+        active=True,
+    )
+    database.add(key)
+    database.add(
+        PortalContainer(
+            managed_user_id=managed.id,
+            name="gpu-dev-origin-pilot",
+            image_digest="sha256:" + "b" * 64,
+            ssh_port=22023,
+            desired_state="STOPPED",
+            observed_state="STOPPED",
+            safe_spec={"gpu": "NONE", "authorized_keys": "ABSENT", "max_gpus": 1},
+        )
+    )
+    dry_run = PortalOperation(
+        id=PORTAL3E_FINAL_DRY_RUN_OPERATION_ID,
+        operation_type="user.activate",
+        target_type="compute_identity",
+        target_id="origin-pilot",
+        requested_by=owner.id,
+        request_summary="Portal-3E-R dry-run",
+        validated_payload={
+            "managed_user_id": str(managed.id),
+            "approved_ssh_key_record_ids": [str(key.id)],
+            "expected_state": "STAGED",
+            "approval_reference": "portal3e-r-host-ssh-policy-v1",
+        },
+        idempotency_key=f"portal3e-r-activate:{uuid.uuid4()}",
+        risk_level=RiskLevel.CRITICAL,
+        status=OperationStatus.DRAFT,
+        dry_run_result={
+            "status": "DRY_RUN",
+            "activate_status": "READY",
+            "execution_enabled": False,
+        },
+    )
+    database.add(dry_run)
+    database.flush()
+    operation = PortalOperation(
+        operation_type="user.activate",
+        target_type="compute_identity",
+        target_id="origin-pilot",
+        requested_by=owner.id,
+        approved_by=owner.id,
+        request_summary="Portal-3E-FINAL real Activate",
+        validated_payload={
+            "managed_user_id": str(managed.id),
+            "approved_ssh_key_record_ids": [str(key.id)],
+            "expected_state": "STAGED",
+            "approval_reference": PORTAL3E_FINAL_APPROVAL_REFERENCE,
+            "dry_run_operation_id": str(PORTAL3E_FINAL_DRY_RUN_OPERATION_ID),
+        },
+        idempotency_key=PORTAL3E_FINAL_IDEMPOTENCY_KEY,
+        risk_level=RiskLevel.CRITICAL,
+        status=OperationStatus.QUEUED,
+        approved_at=utcnow(),
+    )
+    database.add(operation)
+    database.flush()
+    database.add(
+        PortalOperationApproval(
+            operation_id=operation.id,
+            approver_id=owner.id,
+            decision="APPROVE",
+            safe_comment=PORTAL3E_FINAL_APPROVAL_TEXT,
+        )
+    )
+    database.flush()
+    return owner, managed, key, operation
+
+
+def test_portal3e_final_binding_and_active_persistence(database: Session) -> None:
+    owner, managed, key, operation = create_portal3e_database_state(database)
+    assert is_portal3e_final_real_activate(database, operation, owner, owner) is True
+
+    result = portal3e_execution_result(key)
+    validate_activate_execution_result([key], result)
+    persisted = persist_portal3e_activated_identity(
+        database, owner=owner, operation=operation, worker_result=result
+    )
+    database.commit()
+
+    assert persisted.onboarding_state == OnboardingState.ACTIVE
+    assert persisted.shell == "/bin/bash"
+    assert persisted.host_access_state == "ENABLED"
+    assert persisted.ssh_key_state == "INSTALLED"
+    assert persisted.ssh_key_count == 1
+    assert owner.unix_username == "origin-al"
+    assert owner.resource_onboarding_state == OnboardingState.ACTIVE
+    assert key.state == "INSTALLED"
+    assert key.installed_at is not None
+    container = database.scalar(
+        select(PortalContainer).where(PortalContainer.managed_user_id == managed.id)
+    )
+    assert container is not None
+    assert container.observed_state == "RUNNING"
+    assert container.safe_spec["gpu"] == "NONE"
+    assert container.safe_spec["host_ssh_client_validation"] == "PENDING"
+    assert container.safe_spec["container_ssh_client_validation"] == "PENDING"
+    assert container.safe_spec["slurm_node_state"] == "DRAIN"
+
+
+def test_portal3e_final_execution_result_rejects_container_password_authentication() -> None:
+    key = PortalSshKey(
+        id=PORTAL3E_FINAL_KEY_RECORD_ID,
+        managed_user_id=PORTAL3E_FINAL_MANAGED_USER_ID,
+        key_type="ssh-ed25519",
+        fingerprint_sha256=PORTAL3E_FINAL_KEY_FINGERPRINT,
+        public_key="ssh-ed25519 TEST-ONLY-NOT-A-REAL-KEY",
+        comment="test",
+        scope="BOTH",
+        state="VALIDATED",
+        generation_method="IMPORTED",
+        created_by=uuid.uuid4(),
+        enrollment_operation_id=uuid.uuid4(),
+        staging_file_name=f"{PORTAL3E_FINAL_KEY_RECORD_ID}.pub",
+        content_sha256="a" * 64,
+        validated_at=utcnow(),
+        active=True,
+    )
+    result = portal3e_execution_result(key)
+    activate = result["activate"]
+    assert isinstance(activate, dict)
+    container_policy = activate["container_ssh_policy"]
+    assert isinstance(container_policy, dict)
+    container_policy["password_authentication"] = True
+    with pytest.raises(OperationPayloadError, match="ACTIVATE_RESULT_INCOMPLETE"):
+        validate_activate_execution_result([key], result)
 
 
 def test_activate_ids_are_bound_to_the_owners_staged_identity(database: Session) -> None:

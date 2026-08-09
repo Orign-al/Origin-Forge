@@ -25,6 +25,7 @@ from h100_portal_api.models import (
     PortalOperationEvent,
     PortalPasswordSetupToken,
     PortalRole,
+    PortalSshKey,
     PortalUser,
     utcnow,
 )
@@ -33,11 +34,19 @@ from h100_portal_api.routes.operations import (
     APPROVED_ORIGIN_PILOT_STAGE,
     PORTAL3C_STAGE_APPROVAL_REFERENCE,
     PORTAL3C_STAGE_IDEMPOTENCY_KEY,
+    PORTAL3E_FINAL_APPROVAL_REFERENCE,
+    PORTAL3E_FINAL_APPROVAL_TEXT,
+    PORTAL3E_FINAL_DRY_RUN_OPERATION_ID,
+    PORTAL3E_FINAL_IDEMPOTENCY_KEY,
+    PORTAL3E_FINAL_KEY_FINGERPRINT,
+    PORTAL3E_FINAL_KEY_RECORD_ID,
+    PORTAL3E_FINAL_MANAGED_USER_ID,
     OperationPayloadError,
     enrich_user_plan_with_portal_state,
     execute_operation,
     transition,
     validate_activate_database_bindings,
+    validate_activate_execution_result,
     validate_activate_worker_result,
     validate_operation_payload,
 )
@@ -788,6 +797,265 @@ def revalidate_origin_pilot_activate() -> int:
         return 0
 
 
+def activate_origin_pilot_final(approval_text: str) -> int:
+    """Execute the one Portal-3E-FINAL Activate authorized by the administrator."""
+    if approval_text != PORTAL3E_FINAL_APPROVAL_TEXT:
+        print("PORTAL-3E-FINAL BLOCKED — approval text mismatch", file=sys.stderr)
+        return 2
+    with SessionLocal() as db:
+        owner = db.scalar(select(PortalUser).where(PortalUser.normalized_login == "origin-al"))
+        if (
+            owner is None
+            or owner.account_state != AccountState.ACTIVE
+            or owner.unix_username != "origin-al"
+            or owner.resource_onboarding_state != OnboardingState.STAGED
+            or not any(role.name == "platform_owner" for role in owner.roles)
+        ):
+            print("PORTAL-3E-FINAL BLOCKED — Origin-al binding changed", file=sys.stderr)
+            return 2
+        managed = db.get(PortalManagedUser, PORTAL3E_FINAL_MANAGED_USER_ID)
+        if (
+            managed is None
+            or managed.portal_user_id != owner.id
+            or managed.unix_username != "origin-pilot"
+            or managed.uid != 20001
+            or managed.gid != 20001
+            or managed.shell != "/usr/sbin/nologin"
+            or managed.onboarding_state != OnboardingState.STAGED
+            or managed.host_access_state != "DISABLED"
+            or managed.project_id != 30001
+            or managed.quota_bytes != 300 * 1024**3
+            or managed.slurm_account != "company"
+            or managed.slurm_qos != "general"
+            or managed.container_name != "gpu-dev-origin-pilot"
+            or managed.container_port != 22023
+        ):
+            print(
+                "PORTAL-3E-FINAL BLOCKED — origin-pilot is not approved STAGED identity",
+                file=sys.stderr,
+            )
+            return 2
+        referenced_dry_run = db.get(PortalOperation, PORTAL3E_FINAL_DRY_RUN_OPERATION_ID)
+        dry_result = referenced_dry_run.dry_run_result if referenced_dry_run is not None else None
+        expected_dry_payload = {
+            "managed_user_id": str(PORTAL3E_FINAL_MANAGED_USER_ID),
+            "approved_ssh_key_record_ids": [str(PORTAL3E_FINAL_KEY_RECORD_ID)],
+            "expected_state": "STAGED",
+            "approval_reference": PORTAL3ER_APPROVAL_REFERENCE,
+        }
+        if not (
+            referenced_dry_run is not None
+            and referenced_dry_run.operation_type == "user.activate"
+            and referenced_dry_run.target_type == "compute_identity"
+            and referenced_dry_run.target_id == "origin-pilot"
+            and referenced_dry_run.requested_by == owner.id
+            and referenced_dry_run.approved_by is None
+            and referenced_dry_run.status == OperationStatus.DRAFT
+            and referenced_dry_run.validated_payload == expected_dry_payload
+            and isinstance(dry_result, dict)
+            and dry_result.get("status") == "DRY_RUN"
+            and dry_result.get("activate_status") == "READY"
+            and dry_result.get("execution_enabled") is False
+        ):
+            print("PORTAL-3E-FINAL BLOCKED — approved dry-run changed", file=sys.stderr)
+            return 2
+
+        existing = db.scalar(
+            select(PortalOperation).where(
+                PortalOperation.requested_by == owner.id,
+                PortalOperation.idempotency_key == PORTAL3E_FINAL_IDEMPOTENCY_KEY,
+            )
+        )
+        if existing is not None:
+            print(f"operation_id={existing.id}")
+            print(f"operation_status={existing.status}")
+            print(f"error_code={existing.error_code or 'NONE'}")
+            print(f"rollback_status={existing.rollback_status or 'NONE'}")
+            return 0 if existing.status == OperationStatus.SUCCEEDED else 2
+
+        payload = validate_operation_payload(
+            "user.activate",
+            {
+                "managed_user_id": str(PORTAL3E_FINAL_MANAGED_USER_ID),
+                "approved_ssh_key_record_ids": [str(PORTAL3E_FINAL_KEY_RECORD_ID)],
+                "expected_state": "STAGED",
+                "approval_reference": PORTAL3E_FINAL_APPROVAL_REFERENCE,
+                "dry_run_operation_id": str(PORTAL3E_FINAL_DRY_RUN_OPERATION_ID),
+            },
+        )
+        try:
+            records = validate_activate_database_bindings(
+                db, owner_id=owner.id, target_id="origin-pilot", payload=payload
+            )
+        except OperationPayloadError as exc:
+            print(f"PORTAL-3E-FINAL BLOCKED — {exc.code}", file=sys.stderr)
+            return 2
+        if (
+            len(records) != 1
+            or records[0].id != PORTAL3E_FINAL_KEY_RECORD_ID
+            or records[0].fingerprint_sha256 != PORTAL3E_FINAL_KEY_FINGERPRINT
+            or records[0].key_type != "ssh-ed25519"
+            or records[0].scope != "BOTH"
+            or records[0].state != "VALIDATED"
+        ):
+            print("PORTAL-3E-FINAL BLOCKED — approved SSH key changed", file=sys.stderr)
+            return 2
+        try:
+            preflight = call_worker(
+                "user.activate",
+                payload=payload,
+                requested_by="origin-al",
+                approved_by=None,
+                idempotency_key=f"portal3e-final-preflight:{uuid.uuid4()}",
+                dry_run=True,
+                timeout_seconds=60,
+            )
+            if preflight.get("status") != "DRY_RUN" or preflight.get("activate_status") != "READY":
+                error = preflight.get("error", {})
+                code = (
+                    error.get("code", "ACTIVATE_PREFLIGHT_BLOCKED")
+                    if isinstance(error, dict)
+                    else "ACTIVATE_PREFLIGHT_BLOCKED"
+                )
+                print(f"PORTAL-3E-FINAL BLOCKED — {code}", file=sys.stderr)
+                return 2
+            validate_activate_worker_result(records, preflight)
+        except (WorkerClientError, OperationPayloadError) as exc:
+            print(
+                f"PORTAL-3E-FINAL BLOCKED — {getattr(exc, 'code', 'WORKER_FAILED')}",
+                file=sys.stderr,
+            )
+            return 2
+
+        operation = PortalOperation(
+            operation_type="user.activate",
+            target_type="compute_identity",
+            target_id="origin-pilot",
+            requested_by=owner.id,
+            request_summary=(
+                "Portal-3E-FINAL activate origin-pilot Host/Container public-key SSH access"
+            ),
+            validated_payload=payload,
+            idempotency_key=PORTAL3E_FINAL_IDEMPOTENCY_KEY,
+            risk_level=RiskLevel.CRITICAL,
+            status=OperationStatus.DRAFT,
+            dry_run_result={
+                **cast(dict[str, Any], safe_metadata(preflight)),
+                "referenced_dry_run_operation_id": str(PORTAL3E_FINAL_DRY_RUN_OPERATION_ID),
+                "execution_enabled": False,
+            },
+            result_summary="Portal-3E-FINAL preflight READY; awaiting approved Worker execution",
+            created_at=utcnow(),
+        )
+        db.add(operation)
+        db.flush()
+        operation_id = operation.id
+        db.add(
+            PortalOperationEvent(
+                operation_id=operation.id,
+                from_status=None,
+                to_status=OperationStatus.DRAFT,
+                safe_message="Portal-3E-FINAL real Activate operation created",
+                created_at=utcnow(),
+            )
+        )
+        transition(
+            operation,
+            OperationStatus.PENDING_APPROVAL,
+            "submitted by current administrator console for real Activate",
+            db,
+        )
+        db.add(
+            PortalOperationApproval(
+                operation_id=operation.id,
+                approver_id=owner.id,
+                decision="APPROVE",
+                safe_comment=approval_text,
+                decided_at=utcnow(),
+            )
+        )
+        operation.approved_by = owner.id
+        operation.approved_at = utcnow()
+        transition(
+            operation,
+            OperationStatus.APPROVED,
+            "Portal-3E-FINAL administrator approval granted",
+            db,
+        )
+        transition(operation, OperationStatus.QUEUED, "queued for controlled real Activate", db)
+        record_audit(
+            db,
+            event_type="user.activate.request",
+            actor="origin-al",
+            actor_role="platform_owner",
+            source_ip="local-console",
+            user_agent="h100-portal-admin",
+            object_type="operation",
+            object_id=str(operation.id),
+            result="APPROVE",
+            metadata={
+                "target": "origin-pilot",
+                "managed_user_id": str(PORTAL3E_FINAL_MANAGED_USER_ID),
+                "key_record_id": str(PORTAL3E_FINAL_KEY_RECORD_ID),
+                "key_fingerprint": PORTAL3E_FINAL_KEY_FINGERPRINT,
+                "key_scope": "BOTH",
+                "dry_run_operation_id": str(PORTAL3E_FINAL_DRY_RUN_OPERATION_ID),
+                "execution_mode": "real-activate",
+            },
+            operation_id=operation.id,
+        )
+        db.commit()
+        print(f"operation_id={operation.id} status=QUEUED target=origin-pilot")
+
+    execute_operation(operation_id, "origin-al")
+    with SessionLocal() as db:
+        final_operation = db.get(PortalOperation, operation_id)
+        if final_operation is None:
+            print("PORTAL-3E-FINAL BLOCKED — Operation disappeared", file=sys.stderr)
+            return 2
+        print(f"operation_id={final_operation.id}")
+        print(f"operation_status={final_operation.status}")
+        print(f"error_code={final_operation.error_code or 'NONE'}")
+        print(f"rollback_status={final_operation.rollback_status or 'NONE'}")
+        if final_operation.status != OperationStatus.SUCCEEDED:
+            print("PORTAL USER ACTIVATE OPERATION DID NOT SUCCEED", file=sys.stderr)
+            return 2
+        execution = (
+            final_operation.dry_run_result.get("execution_result", {})
+            if isinstance(final_operation.dry_run_result, dict)
+            else {}
+        )
+        activate = execution.get("activate", {}) if isinstance(execution, dict) else {}
+        try:
+            final_records = validate_activate_database_bindings(
+                db,
+                owner_id=final_operation.requested_by,
+                target_id="origin-pilot",
+                payload=final_operation.validated_payload,
+            )
+        except OperationPayloadError:
+            # Installed records intentionally no longer satisfy the VALIDATED-only
+            # pre-write binding.  Reconstruct the exact approved record for the
+            # immutable Worker-result check below.
+            final_records = list(
+                db.scalars(
+                    select(PortalSshKey).where(PortalSshKey.id == PORTAL3E_FINAL_KEY_RECORD_ID)
+                ).all()
+            )
+        validate_activate_execution_result(final_records, execution)
+        print("compute_identity=ACTIVE")
+        print("ssh_key_state=INSTALLED")
+        print("host_ssh_server=READY_FOR_CLIENT_VALIDATION")
+        print("container_ssh_server=READY_FOR_CLIENT_VALIDATION")
+        print("host_ssh_client_validation=PENDING")
+        print("container_ssh_client_validation=PENDING")
+        print(f"host_server_fingerprint={activate.get('host_server_fingerprint')}")
+        print(f"container_server_fingerprint={activate.get('container_server_fingerprint')}")
+        print("slurm_node=DRAIN")
+        print("slurm_queue=EMPTY")
+        return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="H100 Portal administrator bootstrap")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -801,6 +1069,8 @@ def main() -> int:
     stage = subparsers.add_parser("stage-origin-pilot")
     stage.add_argument("--approval-text", required=True)
     subparsers.add_parser("revalidate-origin-pilot-activate")
+    activate = subparsers.add_parser("activate-origin-pilot-final")
+    activate.add_argument("--approval-text", required=True)
     args = parser.parse_args()
     if args.command == "prepare-origin-al":
         return prepare_origin_al()
@@ -816,6 +1086,8 @@ def main() -> int:
         return stage_origin_pilot(args.approval_text)
     if args.command == "revalidate-origin-pilot-activate":
         return revalidate_origin_pilot_activate()
+    if args.command == "activate-origin-pilot-final":
+        return activate_origin_pilot_final(args.approval_text)
     return 2
 
 

@@ -138,16 +138,22 @@ sudo h100-user-create --status USER
 
 `--stage` 不接受公钥参数，创建锁定密码、`/usr/sbin/nologin`、无 `authorized_keys` 的账号；隔离 self-test 通过后才创建 300GB quota、`general` QOS association 和默认无 GPU 的长期容器。Stage 成功只输出 STAGED，用户仍不能登录，SSH key 状态为 `REQUIRED_BEFORE_ACTIVATION`。传入 `--public-key-file` 必须以 `PUBLIC_KEY_NOT_ALLOWED_DURING_STAGE` 拒绝。任何失败都保持 nologin、停止容器、回滚 association/project 映射/精确策略并保留可能创建的数据供人工审计。
 
-独立复核 STAGED 报告和审批后才执行：
+独立复核 STAGED 报告和审批后，只允许 Root Worker 使用目标分离的受控 bundle 执行：
 
 ```bash
 sudo h100-user-create --activate USER \
-  --public-key-file /var/lib/h100-portal/ssh-key-staging/<UUID>.pub \
+  --host-public-key-file /var/lib/h100-portal/ssh-key-staging/<REQUEST_UUID>.host.pub \
+  --container-public-key-file /var/lib/h100-portal/ssh-key-staging/<REQUEST_UUID>.container.pub \
   --confirm-activate USER
 sudo h100-user-create --status USER
 ```
 
-Activate 缺少公钥时在任何修改前以 `PUBLIC_KEY_REQUIRED_FOR_ACTIVATION` 拒绝；只接受 Root Worker 受控 staging 目录中的 UUID 文件，不接受浏览器宿主路径、私钥、密码或占位密钥。Activate 再次验证策略、无高权组、容器无 GPU 和公钥指纹，安装 `authorized_keys` 后启动 Guard，最后才开放 `/bin/bash`。密码保持锁定。用户本人随后验证 SSH 与 Pilot Slurm 作业；管理员不得用用户私钥代测。
+上述命令是 Worker 与管理工具之间的契约，不是管理员手工旁路步骤。Activate 缺少公钥时在任何修改前以 `PUBLIC_KEY_REQUIRED_FOR_ACTIVATION` 拒绝；只接受 Root Worker 受控 staging 目录中的 UUID 文件，不接受浏览器宿主路径、私钥、密码或占位密钥。Activate 再次验证策略、无高权组、容器无 GPU 和公钥指纹，安装 `authorized_keys` 后启动 Guard，最后才开放 `/bin/bash`。密码保持锁定。用户本人随后验证 SSH；管理员不得用用户私钥代测。在 SSH 客户端 Gate 通过前，Slurm 保持 DRAIN，且不得提交 Pilot 作业。
+
+若服务器端后置条件或 Portal ACTIVE 持久化失败，Worker 使用固定
+`--rollback-activate USER --confirm-rollback-activate USER` 恢复 nologin、密码锁定、两处
+authorized_keys absent 与容器 stopped，同时保留 identity、GPU policy、quota、Slurm
+association 和用户数据。
 
 ## Guard 日常操作与失败
 

@@ -110,6 +110,8 @@ export default function UserDetailPage() {
   const validations = asRows(plan.validation_results);
   const conflicts = asRows(plan.conflicts);
   const isStaged = linux.onboarding_state === "STAGED";
+  const isActive = linux.onboarding_state === "ACTIVE";
+  const hostSshPolicy = asRecord(linux.host_ssh_policy);
   const canManageSshKeys = ["STAGED", "ACTIVE"].includes(
     String(linux.onboarding_state ?? ""),
   );
@@ -207,6 +209,30 @@ export default function UserDetailPage() {
               ["激活时间", user.activated_at],
               ["最近登录", user.last_login_at],
             ])}
+            {linux.unix_username === "origin-pilot"
+              ? kv([
+                  ["宿主 SSH 策略", hostSshPolicy.status],
+                  [
+                    "Public Key Authentication",
+                    hostSshPolicy.pubkey_authentication === true
+                      ? "ENABLED"
+                      : "UNKNOWN",
+                  ],
+                  [
+                    "Password Authentication",
+                    hostSshPolicy.password_authentication === false
+                      ? "DISABLED"
+                      : "UNKNOWN",
+                  ],
+                  [
+                    "Keyboard Interactive",
+                    hostSshPolicy.keyboard_interactive_authentication === false
+                      ? "DISABLED"
+                      : "UNKNOWN",
+                  ],
+                  ["Required Authentication", "PUBLICKEY"],
+                ])
+              : null}
             {user.normalized_login === "origin-al" ? (
               <Link className="table-link" href="/account/security">
                 打开当前账号安全设置
@@ -223,16 +249,70 @@ export default function UserDetailPage() {
                 <div>
                   <h2>独立计算身份 Onboarding</h2>
                   <p className="muted">
-                    {isStaged
-                      ? "管理映射 origin-al 保持不变；独立计算身份已安全 Stage，尚未激活登录。"
-                      : "管理映射 origin-al 保持不变；这里只创建数据库 DRAFT 和只读 dry-run。"}
+                    {isActive
+                      ? "管理映射 origin-al 保持不变；独立计算身份已 ACTIVE，等待用户客户端 SSH 验证。"
+                      : isStaged
+                        ? "管理映射 origin-al 保持不变；独立计算身份已安全 Stage，尚未激活登录。"
+                        : "管理映射 origin-al 保持不变；这里只创建数据库 DRAFT 和只读 dry-run。"}
                   </p>
                 </div>
                 <StatusBadge
                   value={compute?.draft_state ?? "DRAFT NOT CREATED"}
                 />
               </div>
-              {compute?.status === "STAGED" ? (
+              {compute?.status === "ACTIVE" ? (
+                <>
+                  <div className="plan-status-row">
+                    <StatusBadge value="ACTIVE" />
+                    <span className="mono">
+                      Operation {compute.operation_id}
+                    </span>
+                    <span>Client Validation PENDING</span>
+                  </div>
+                  {kv([
+                    ["Portal owner", "Origin-al"],
+                    ["管理 Linux 映射", "origin-al（保持不变）"],
+                    ["计算身份", linux.unix_username],
+                    ["UID/GID", `${String(linux.uid)}/${String(linux.gid)}`],
+                    ["Shell", linux.shell],
+                    ["Linux 密码", linux.password_state],
+                    ["authorized_keys", linux.authorized_keys_state],
+                    ["宿主访问", linux.host_access_state],
+                    ["SSH 公钥", linux.ssh_key_state],
+                    [
+                      "宿主 SSH Client Validation",
+                      linux.host_ssh_client_validation,
+                    ],
+                    [
+                      "容器 SSH Client Validation",
+                      linux.container_ssh_client_validation,
+                    ],
+                    ["GPU 隔离", linux.gpu_isolation_state],
+                    ["作业外 GPU", "DENIED"],
+                    [
+                      "Slurm",
+                      `${String(linux.slurm_account)} / ${String(linux.slurm_qos)} / ${String(linux.max_gpus)} GPU`,
+                    ],
+                    ["Node", linux.slurm_node_state],
+                    ["Queue", linux.slurm_queue],
+                    ["配额", "300GB hard limit"],
+                    [
+                      "容器",
+                      `${String(linux.container_name)} / ${String(linux.container_state)} / GPU ${String(linux.container_gpu)}`,
+                    ],
+                    ["Guard", linux.guard_state],
+                  ])}
+                  <div className="operation-actions">
+                    <Link className="table-link" href="/access">
+                      打开连接页面
+                    </Link>
+                  </div>
+                  <div className="notice">
+                    ACCOUNT ACTIVE；SCHEDULER CURRENTLY
+                    DRAINED。宿主与容器服务端已就绪，真实用户必须使用自己保存的私钥完成两项客户端验证。
+                  </div>
+                </>
+              ) : compute?.status === "STAGED" ? (
                 <>
                   <div className="plan-status-row">
                     <StatusBadge value="STAGED" />
@@ -534,11 +614,13 @@ export default function UserDetailPage() {
           不会因网页账号激活而自动执行。
         </SectionCard>
         <SectionCard title="当前阶段">
-          {isStaged
-            ? sshKeyCount > 0
-              ? "origin-pilot 已 STAGED；SSH 公钥已验证但未安装，登录、容器启动与 Activate 均未执行，Slurm 保持 DRAIN。"
-              : "origin-pilot 已 STAGED；SSH 公钥尚未登记，登录、容器启动与 Activate 均未执行，Slurm 保持 DRAIN。"
-            : "所有资源写操作只形成审批任务和 Worker dry-run，Slurm 保持 DRAIN。"}
+          {isActive
+            ? "origin-pilot 已 ACTIVE；Host/Container SSH 服务端 READY，客户端验证 PENDING；容器 RUNNING/GPU NONE，Slurm 保持 DRAIN。"
+            : isStaged
+              ? sshKeyCount > 0
+                ? "origin-pilot 已 STAGED；SSH 公钥已验证但未安装，登录、容器启动与 Activate 均未执行，Slurm 保持 DRAIN。"
+                : "origin-pilot 已 STAGED；SSH 公钥尚未登记，登录、容器启动与 Activate 均未执行，Slurm 保持 DRAIN。"
+              : "所有资源写操作只形成审批任务和 Worker dry-run，Slurm 保持 DRAIN。"}
         </SectionCard>
       </div>
     </>

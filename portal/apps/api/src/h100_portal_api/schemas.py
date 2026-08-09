@@ -120,6 +120,7 @@ class UserActivatePayload(ApiModel):
     approved_ssh_key_record_ids: list[uuid.UUID] = Field(min_length=1, max_length=5)
     expected_state: Literal["STAGED"]
     approval_reference: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    dry_run_operation_id: uuid.UUID | None = None
 
     @model_validator(mode="after")
     def key_records_are_unique(self) -> UserActivatePayload:

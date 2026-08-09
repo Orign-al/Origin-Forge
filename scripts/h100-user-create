@@ -65,6 +65,7 @@ usage() {
     '  sudo h100-user-create --stage USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS --confirm-stage USER' \
     '  sudo h100-user-create --activate USER --public-key-file ROOT_CONTROLLED_FILE --confirm-activate USER' \
     '  sudo h100-user-create --activate USER --host-public-key-file ROOT_CONTROLLED_HOST_FILE --container-public-key-file ROOT_CONTROLLED_CONTAINER_FILE --confirm-activate USER' \
+    '  sudo h100-user-create --rollback-activate USER --confirm-rollback-activate USER' \
     '  sudo h100-user-create --status USER' \
     '' \
     'Stage creates a locked nologin account, exact user-UID.slice policy, quota,' \
@@ -542,6 +543,32 @@ load_staged_state() {
     || h100_fail 'USER_NOT_IN_STAGED_STATE'
 }
 
+load_active_state_for_rollback() {
+  h100_validate_username "${user_name}"
+  [[ -f "${state_file}" && ! -L "${state_file}" ]] \
+    || h100_fail 'ACTIVE user state is unavailable for rollback'
+  [[ "$(stat -c '%U:%G:%a' "${state_file}")" == \
+    'root:gpu-platform-admin:640' ]] \
+    || h100_fail 'Pilot user state ownership or mode is invalid'
+  [[ "$(state_value VERSION)" == 2 \
+    && "$(state_value STATUS)" == ACTIVE \
+    && "$(state_value SSH_KEY_STATE)" == INSTALLED \
+    && "$(state_value USERNAME)" == "${user_name}" ]] \
+    || h100_fail 'ACTIVE user state is invalid for rollback'
+  user_uid="$(state_value UID)"
+  user_gid="$(state_value GID)"
+  project_id="$(state_value PROJECT_ID)"
+  ssh_port="$(state_value SSH_PORT)"
+  slurm_account="$(state_value SLURM_ACCOUNT)"
+  slurm_qos="$(state_value SLURM_QOS)"
+  project_name="h100_${user_name}"
+  user_root="${H100_DATA_ROOT}/users/${user_name}"
+  validate_identity_numbers
+  [[ "$(id -u "${user_name}")" == "${user_uid}" \
+    && "$(id -g "${user_name}")" == "${user_gid}" ]] \
+    || h100_fail 'managed identity changed before Activate rollback'
+}
+
 assert_forbidden_groups_absent() {
   local forbidden_group
   for forbidden_group in sudo docker video render gpu-platform-admin adm systemd-journal; do
@@ -884,6 +911,63 @@ run_activate() {
     "${user_name}" "${user_uid}"
 }
 
+run_activate_rollback() {
+  # This fixed recovery path is invoked only by the Root Worker when a real
+  # Activate cannot be committed end to end.  It preserves all staged
+  # resources and user data while fail-closing both SSH targets.
+  load_active_state_for_rollback
+  h100_require_slurm_drained
+  [[ "$(squeue -h | wc -l)" -eq 0 ]] || h100_fail 'Slurm queue must be empty'
+
+  local stamp container host_authorized_keys container_authorized_keys
+  stamp="$(date +%Y%m%d-%H%M%S-%N)"
+  backup_dir="${H100_PLATFORM_ROOT}/backups/user-activate-rollback-${user_name}-${stamp}"
+  report_file="${H100_PLATFORM_ROOT}/reports/user-activate-rollback-${user_name}-${stamp}.md"
+  install -d -o root -g gpu-platform-admin -m 0750 "${backup_dir}"
+  cp -a "${state_file}" "${backup_dir}/state.active.before"
+
+  # Disable the host login path before handling key files, then stop the
+  # container before removing its persistent authorization file.
+  usermod --shell /usr/sbin/nologin "${user_name}"
+  passwd -l "${user_name}" >/dev/null
+  container="$(h100_container_name "${user_name}")"
+  if docker container inspect "${container}" >/dev/null 2>&1; then
+    docker stop --time 30 "${container}" >/dev/null || true
+  fi
+
+  host_authorized_keys="/home/${user_name}/.ssh/authorized_keys"
+  container_authorized_keys="${user_root}/home/.ssh/authorized_keys"
+  if [[ -e "${host_authorized_keys}" || -L "${host_authorized_keys}" ]]; then
+    mv -fT -- "${host_authorized_keys}" "${backup_dir}/host-authorized_keys.rolled-back"
+  fi
+  if [[ -e "${container_authorized_keys}" || -L "${container_authorized_keys}" ]]; then
+    mv -fT -- "${container_authorized_keys}" \
+      "${backup_dir}/container-authorized_keys.rolled-back"
+  fi
+  rmdir -- "/home/${user_name}/.ssh" 2>/dev/null || true
+
+  write_state STAGED
+  [[ "$(getent passwd "${user_name}" | cut -d: -f7)" == /usr/sbin/nologin ]] \
+    || h100_fail 'Activate rollback did not restore nologin'
+  [[ "$(passwd -S "${user_name}" | awk '{print $2}')" == L ]] \
+    || h100_fail 'Activate rollback did not preserve the password lock'
+  validate_staged_resources
+  {
+    printf '# H100 Pilot user Activate rollback\n\n'
+    printf -- '- User: `%s`\n' "${user_name}"
+    printf -- '- Result: `ROLLED_BACK TO STAGED`\n'
+    printf -- '- Shell: `/usr/sbin/nologin`\n'
+    printf -- '- Password: locked\n'
+    printf -- '- Host authorized_keys: absent\n'
+    printf -- '- Container authorized_keys: absent\n'
+    printf -- '- Container: stopped\n'
+    printf -- '- Per-UID GPU policy, quota, Slurm association and user data: retained\n'
+    printf -- '- Slurm node: remains DRAIN\n'
+  } >"${report_file}"
+  printf 'ROLLED_BACK user=%s state=STAGED shell=/usr/sbin/nologin password=locked authorized_keys=absent container=stopped\n' \
+    "${user_name}"
+}
+
 run_status() {
   h100_validate_username "${user_name}"
   state_file="${STATE_DIR}/${user_name}.state"
@@ -984,6 +1068,13 @@ case "$1" in
       h100_fail 'PUBLIC_KEY_REQUIRED_FOR_ACTIVATION'
     fi
     ;;
+  --rollback-activate)
+    (($# == 4)) || { usage >&2; exit 2; }
+    [[ "$3" == --confirm-rollback-activate && "$4" == "$2" ]] \
+      || h100_fail 'Activate rollback confirmation must repeat the exact username'
+    mode=rollback-activate
+    user_name=$2
+    ;;
   --status)
     (($# == 2)) || { usage >&2; exit 2; }
     mode=status
@@ -1004,6 +1095,7 @@ case "${mode}" in
   plan) run_plan ;;
   stage) run_stage ;;
   activate) run_activate "$@" ;;
+  rollback-activate) run_activate_rollback ;;
   status) run_status ;;
 esac
 OUTCOME=SUCCESS

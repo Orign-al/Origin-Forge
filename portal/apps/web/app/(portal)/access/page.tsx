@@ -104,22 +104,27 @@ export default function AccessPage() {
   );
   const hostDisplayKey = hostInstalledKey ?? hostKeys[0];
   const containerDisplayKey = containerInstalledKey ?? containerKeys[0];
+  const approvedHost = String(linux.approved_host ?? APPROVED_HOST);
+  const hostServerState = String(linux.host_ssh_server ?? "NOT_READY");
+  const containerServerState = String(
+    linux.container_ssh_server ?? "NOT_READY",
+  );
   const hostConnectionDisabled =
     hostKeys.length > 0 && (computeState !== "ACTIVE" || !hostInstalledKey);
   const containerConnectionDisabled =
     containerKeys.length > 0 &&
     (computeState !== "ACTIVE" || !containerInstalledKey);
-  const hostCommand = `ssh -i <私钥路径> ${String(linux.unix_username)}@${APPROVED_HOST}`;
-  const containerCommand = `ssh -i <私钥路径> -p ${String(linux.container_port)} ${String(
+  const hostCommand = `ssh -i <你的私钥路径> ${String(linux.unix_username)}@${approvedHost}`;
+  const containerCommand = `ssh -i <你的私钥路径> -p ${String(linux.container_port)} ${String(
     linux.unix_username,
-  )}@${APPROVED_HOST}`;
+  )}@${approvedHost}`;
   const vscodeConfig = `Host h100-${String(linux.unix_username)}
-    HostName ${APPROVED_HOST}
+    HostName ${approvedHost}
     User ${String(linux.unix_username)}
     IdentityFile <你的私钥路径>
 
 Host h100-${String(linux.unix_username)}-dev
-    HostName ${APPROVED_HOST}
+    HostName ${approvedHost}
     Port ${String(linux.container_port)}
     User ${String(linux.unix_username)}
     IdentityFile <你的私钥路径>`;
@@ -179,8 +184,12 @@ Host h100-${String(linux.unix_username)}-dev
         >
           <dl className="kv-grid">
             <div className="kv">
+              <dt>状态</dt>
+              <dd>{hostServerState}</dd>
+            </div>
+            <div className="kv">
               <dt>Host</dt>
-              <dd>{APPROVED_HOST}</dd>
+              <dd>{approvedHost}</dd>
             </div>
             <div className="kv">
               <dt>Port</dt>
@@ -192,14 +201,18 @@ Host h100-${String(linux.unix_username)}-dev
             </div>
             <div className="kv">
               <dt>GPU</dt>
-              <dd>仅在 Slurm Job 内可用</dd>
+              <dd>OUTSIDE SLURM DENIED</dd>
             </div>
             <div className="kv">
               <dt>认证方式</dt>
               <dd>SSH 公钥</dd>
             </div>
+            <div className="kv">
+              <dt>用途</dt>
+              <dd>sbatch / srun / squeue / sacct / 文件管理</dd>
+            </div>
             <div className="kv access-key-row">
-              <dt>SSH User Public Key</dt>
+              <dt>USER AUTHENTICATION KEY FINGERPRINT</dt>
               <dd className="mono ssh-fingerprint-value access-key-fingerprint">
                 {hostDisplayKey?.fingerprint_sha256 ?? "未配置"}
               </dd>
@@ -209,8 +222,18 @@ Host h100-${String(linux.unix_username)}-dev
               <dd>{hostDisplayKey?.state ?? "NOT_CONFIGURED"}</dd>
             </div>
             <div className="kv">
-              <dt>SSH Server Host Key</dt>
-              <dd>等待 Activate 后受控探针</dd>
+              <dt>HOST SSH SERVER FINGERPRINT</dt>
+              <dd className="mono ssh-fingerprint-value">
+                {String(
+                  linux.host_server_fingerprint ?? "等待 Activate 后受控探针",
+                )}
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>Host SSH Client Validation</dt>
+              <dd>
+                {String(linux.host_ssh_client_validation ?? "NOT_STARTED")}
+              </dd>
             </div>
           </dl>
           <div className="button-row access-actions">
@@ -237,6 +260,10 @@ Host h100-${String(linux.unix_username)}-dev
               查看连接配置
             </Button>
           </div>
+          <div className="notice">
+            GPU 不能在宿主登录会话中直接访问。GPU 仅通过 Slurm
+            作业提供；当前调度节点保持 DRAIN。
+          </div>
         </SectionCard>
 
         <SectionCard
@@ -245,8 +272,12 @@ Host h100-${String(linux.unix_username)}-dev
         >
           <dl className="kv-grid">
             <div className="kv">
+              <dt>状态</dt>
+              <dd>{containerServerState}</dd>
+            </div>
+            <div className="kv">
               <dt>Host</dt>
-              <dd>{APPROVED_HOST}</dd>
+              <dd>{approvedHost}</dd>
             </div>
             <div className="kv">
               <dt>Port</dt>
@@ -263,11 +294,19 @@ Host h100-${String(linux.unix_username)}-dev
               </dd>
             </div>
             <div className="kv">
+              <dt>GPU</dt>
+              <dd>{String(linux.container_gpu ?? "NONE")}</dd>
+            </div>
+            <div className="kv">
               <dt>认证方式</dt>
               <dd>SSH 公钥</dd>
             </div>
+            <div className="kv">
+              <dt>用途</dt>
+              <dd>VS Code Remote SSH / Shell / 开发 / 编译 / 数据准备</dd>
+            </div>
             <div className="kv access-key-row">
-              <dt>SSH User Public Key</dt>
+              <dt>USER AUTHENTICATION KEY FINGERPRINT</dt>
               <dd className="mono ssh-fingerprint-value access-key-fingerprint">
                 {containerDisplayKey?.fingerprint_sha256 ?? "未配置"}
               </dd>
@@ -277,8 +316,19 @@ Host h100-${String(linux.unix_username)}-dev
               <dd>{containerDisplayKey?.state ?? "NOT_CONFIGURED"}</dd>
             </div>
             <div className="kv">
-              <dt>Container SSH Host Key</dt>
-              <dd>等待 Activate 后受控探针</dd>
+              <dt>CONTAINER SSH SERVER FINGERPRINT</dt>
+              <dd className="mono ssh-fingerprint-value">
+                {String(
+                  linux.container_server_fingerprint ??
+                    "等待 Activate 后受控探针",
+                )}
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>Container SSH Client Validation</dt>
+              <dd>
+                {String(linux.container_ssh_client_validation ?? "NOT_STARTED")}
+              </dd>
             </div>
           </dl>
           <div className="button-row access-actions">
@@ -331,7 +381,9 @@ Host h100-${String(linux.unix_username)}-dev
                   : "SSH 命令"}
               </h2>
               <p className="muted">
-                `&lt;私钥路径&gt;` 仅代表用户本机路径，不会保存到服务器。
+                `&lt;你的私钥路径&gt;`
+                仅代表用户本机路径。你需要使用生成该公钥时保存的私钥；Portal
+                不保存该私钥。
               </p>
             </div>
             <Button type="button" onClick={() => setConnectionView(null)}>

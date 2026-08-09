@@ -134,6 +134,8 @@ effective config 变化都必须 fail-closed，并发生在 authorized_keys、sh
 规则；Portal 不提供任意 Match 输入。只有现有、语义明确且无附带权限的 managed-compute
 group 经独立审批后，才可将精确用户规则迁移为 `Match Group`。
 
-Portal-3C 已真实 Stage `origin-pilot`。Stage 完成后仍没有 authorized_keys、普通 shell
-或运行中的用户容器。Portal-3D-R 可以登记用户自己的真实公钥并显示类型、fingerprint、
-注释、Scope 和时间，但不得因此安装 Key 或激活身份。Activate 继续受后续独立 Gate 阻断。
+Portal-3C 已真实 Stage `origin-pilot`；Portal-3D-R 已登记并重新验收用户自己的真实
+公钥与宿主 public-key-only policy。Portal-3E-FINAL 只允许固定审批绑定的 Root Worker
+事务完成两处 Key 安装、shell 切换与无 GPU 容器启动。服务器端成功只把两项 SSH 标记为
+`READY_FOR_CLIENT_VALIDATION` / `PENDING`；不得使用管理员或测试私钥代替真实用户验证，
+且 Slurm 继续保持 DRAIN。

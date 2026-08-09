@@ -41,11 +41,11 @@ key 分别安装到批准的 HOST/CONTAINER 目标。平台不会把宿主 `.ssh
 ## 连接
 
 ACTIVE 后，“连接”页显示真实 Host、Port、Username 和 fingerprint。命令模板中的
-`<私钥路径>` 是用户自己设备上的路径，Portal 不知道也不保存它。
+`<你的私钥路径>` 是用户自己设备上的路径，Portal 不知道也不保存它。
 
 ```text
-ssh -i <私钥路径> origin-pilot@<APPROVED_HOST>
-ssh -i <私钥路径> -p 22023 origin-pilot@<APPROVED_HOST>
+ssh -i <你的私钥路径> origin-pilot@<APPROVED_HOST>
+ssh -i <你的私钥路径> -p 22023 origin-pilot@<APPROVED_HOST>
 ```
 
 VS Code Remote SSH 配置同样使用本地 `IdentityFile <你的私钥路径>`。宿主环境的 GPU 只

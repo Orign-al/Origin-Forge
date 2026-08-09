@@ -28,6 +28,7 @@ KNOWN_WRITES = {
     "user.plan",
     "user.stage",
     "user.activate",
+    "user.activate.rollback",
     "user.suspend",
     "container.start",
     "container.stop",
@@ -188,7 +189,11 @@ def _validate_user_activate(payload: dict[str, Any]) -> dict[str, Any]:
         "expected_state",
         "approval_reference",
     }
-    if set(payload) != expected_fields:
+    optional_fields = {"dry_run_operation_id"}
+    if frozenset(payload) not in {
+        frozenset(expected_fields),
+        frozenset(expected_fields | optional_fields),
+    }:
         raise PayloadValidationError("ACTIVATE_PAYLOAD_REJECTED", "invalid user.activate fields")
     canonical_ids = [_canonical_uuid(item, "SSH key record ID") for item in key_ids]
     if len(set(canonical_ids)) != len(canonical_ids):
@@ -200,12 +205,17 @@ def _validate_user_activate(payload: dict[str, Any]) -> dict[str, Any]:
         approval_reference
     ):
         raise PayloadValidationError("ACTIVATE_PAYLOAD_REJECTED", "invalid approval reference")
-    return {
+    result = {
         "managed_user_id": _canonical_uuid(payload.get("managed_user_id"), "managed user ID"),
         "approved_ssh_key_record_ids": canonical_ids,
         "expected_state": "STAGED",
         "approval_reference": approval_reference,
     }
+    if "dry_run_operation_id" in payload:
+        result["dry_run_operation_id"] = _canonical_uuid(
+            payload.get("dry_run_operation_id"), "dry-run operation ID"
+        )
+    return result
 
 
 def _validate_ssh_key_prepare(payload: dict[str, Any]) -> dict[str, Any]:
@@ -355,7 +365,7 @@ def validate_payload(
         return {"job_id": job_id}
     if operation_type == "user.stage":
         return _validate_user_stage(payload, allow_legacy_stage)
-    if operation_type == "user.activate":
+    if operation_type in {"user.activate", "user.activate.rollback"}:
         return _validate_user_activate(payload)
     if operation_type == "ssh_key.prepare":
         return _validate_ssh_key_prepare(payload)

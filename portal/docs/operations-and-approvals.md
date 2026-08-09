@@ -21,10 +21,12 @@ Portal-2 的成功含义是“Worker dry-run 已验证”，不是宿主变更�
 - 用户名、容器名、节点名、job id 和 quota 在 API 与 Worker 两层验证。
 - `root`、`origin-al`、`codexops` 不能成为计算用户写操作目标。
 - Portal-3A 仅允许 `user.plan(origin-pilot)` 为 Origin-al 生成独立计算身份 DRAFT；
-  Worker 仍禁止真实 stage/activate，且 `origin-al` 始终保持 NOT_ENROLLED。
+  `origin-al` 始终保留为独立管理身份。
 - Portal-3C 只允许既有 `portal3b-r-origin-pilot-stage-v1` DRAFT 经当前管理员控制台的
-  精确批准文本进入真实 Stage；Stage 不要求公钥。Activate 仍关闭，且未来只能带已批准
-  key record UUID，不能带宿主路径、私钥、密码或任意 argv。
+  精确批准文本进入真实 Stage；Stage 不要求公钥。
+- Portal-3E-FINAL 只允许固定 `origin-pilot`、重新验收的 dry-run、唯一已批准 BOTH key
+  record、精确管理员批准文本和一次性幂等键进入真实 Activate。API 与 Worker 均不接受
+  宿主路径、私钥、密码、任意 argv 或其他计算身份。
 - 同一请求人和幂等键返回既有任务，不重复执行。
 
 ## Portal-3D-R 自助 Key Operation
@@ -40,8 +42,13 @@ Activate 审批。API 调用 `ssh_key.prepare` 将规范化 public key 写入 ro
 容器，也不改变 STAGED。
 
 有完整 HOST/CONTAINER Scope 后，Portal 可以创建 `user.activate` DRAFT 并调用 Worker
-dry-run。Operation 保存 `execution_enabled=false` 的结构化计划；此时不能提交为真实写，
-不能复用 Stage 审批。真正 Activate 必须等待新的明确管理员审批语句。
+dry-run。Operation 保存 `execution_enabled=false` 的结构化计划，且不能复用 Stage 审批。
+Portal-3E-FINAL 的真实 Operation 还必须引用重新验收的 dry-run；执行前重新运行同一
+effective-config 与资源 preflight，之后才经 Root Worker 完成事务式 Activate。
+
+真实 Activate 成功后，Key 为 `INSTALLED`、计算身份为 `ACTIVE`、Host/Container SSH
+服务端为 `READY_FOR_CLIENT_VALIDATION`，两项客户端验证仍为 `PENDING`。这不会自动
+RESUME Slurm，也不会把调度状态描述为可用。
 
 Activate 完成后的容器启动使用独立 `container.start` Operation，而不是复用 Activate 或
 接受任意容器参数。它只能由受管资源所有者发起，API 固定绑定当前 managed user、容器名

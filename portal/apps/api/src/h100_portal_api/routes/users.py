@@ -60,6 +60,19 @@ def resource_view(
         "container_memory_gb": safe_spec.get("memory_gb"),
         "container_pids_limit": safe_spec.get("pids_limit"),
         "container_image_digest": container.image_digest if container is not None else None,
+        "approved_host": safe_spec.get("approved_host"),
+        "host_ssh_port": safe_spec.get("host_ssh_port"),
+        "host_server_fingerprint": safe_spec.get("host_server_fingerprint"),
+        "container_server_fingerprint": safe_spec.get("container_server_fingerprint"),
+        "host_ssh_server": safe_spec.get("host_ssh_server"),
+        "container_ssh_server": safe_spec.get("container_ssh_server"),
+        "host_ssh_client_validation": safe_spec.get("host_ssh_client_validation"),
+        "container_ssh_client_validation": safe_spec.get("container_ssh_client_validation"),
+        "host_ssh_policy": safe_spec.get("host_ssh_policy"),
+        "container_ssh_policy": safe_spec.get("container_ssh_policy"),
+        "slurm_node_state": safe_spec.get("slurm_node_state"),
+        "slurm_queue": safe_spec.get("slurm_queue"),
+        "gpu_scheduling_available": safe_spec.get("gpu_scheduling_available"),
     }
 
 
@@ -105,7 +118,8 @@ def compute_plan_view(user: PortalUser, db: Session) -> dict[str, Any]:
             )
             .order_by(PortalOperation.created_at.desc())
         )
-        if managed is not None and managed.onboarding_state == OnboardingState.STAGED
+        if managed is not None
+        and managed.onboarding_state in {OnboardingState.STAGED, OnboardingState.ACTIVE}
         else None
     )
     if operation is None:
@@ -130,13 +144,17 @@ def compute_plan_view(user: PortalUser, db: Session) -> dict[str, Any]:
             "ssh_key_status": "NOT_REQUIRED_FOR_STAGE",
             "plan": None,
         }
-    staged = managed is not None and managed.onboarding_state == OnboardingState.STAGED
+    managed_state = (
+        managed.onboarding_state.value
+        if managed is not None and hasattr(managed.onboarding_state, "value")
+        else (str(managed.onboarding_state) if managed is not None else None)
+    )
     return {
-        "status": "STAGED"
-        if staged
+        "status": managed_state
+        if managed_state in {"STAGED", "ACTIVE"}
         else ("DRAFT" if operation.operation_type != "user.activate" else "ACTIVATE_DRAFT"),
         "compute_username": compute_username,
-        "draft_state": "STAGED" if staged else "DRAFT",
+        "draft_state": managed_state if managed_state in {"STAGED", "ACTIVE"} else "DRAFT",
         "operation_id": str(operation.id),
         "operation_status": operation.status.value
         if hasattr(operation.status, "value")
@@ -144,7 +162,7 @@ def compute_plan_view(user: PortalUser, db: Session) -> dict[str, Any]:
         "plan": operation.dry_run_result,
         "operation_type": operation.operation_type,
         "ssh_key_status": managed.ssh_key_state
-        if staged and managed is not None
+        if managed_state in {"STAGED", "ACTIVE"} and managed is not None
         else (
             "NOT_REQUIRED_FOR_STAGE"
             if operation.operation_type in {"user.plan", "user.stage"}

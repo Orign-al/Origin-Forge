@@ -68,8 +68,10 @@ HTTP 请求只创建 Operation，不等待宿主操作完成。危险操作需�
 Portal-3C 已只对精确 `origin-pilot` 参数开放并完成一次真实 `user.stage`；该路径保持
 hash、actor、approval、payload 和幂等键绑定。Portal-3D-R 增加自助 public-key record：
 API 保存 canonical public key/metadata，Worker 在 root-only 目录准备 UUID `.pub` 和绑定
-sidecar。`user.activate` 只返回 dry-run 计划；它验证 HOST/CONTAINER Scope 和 STAGED
-宿主状态，但不会安装 authorized_keys、切换 shell 或启动容器。
+sidecar。Portal-3E-FINAL 为唯一重新批准的 `origin-pilot` Operation 开放真实
+`user.activate`：固定绑定 dry-run、managed-user/key UUID、fingerprint、approval、actor
+和幂等键；Worker 重跑 STAGED/SSH policy/资源 Gate 后，才通过受控脚本安装两处公钥、
+切换 shell、启动无 GPU 容器并重新读取完整后置条件。失败走固定回滚并恢复 STAGED。
 
 连接页还定义了 Activate 后的专用“启动我的受管容器”路径：只有资源所有者的计算身份为
 ACTIVE、适用 CONTAINER Key 为 INSTALLED、容器为安全的 STOPPED/GPU NONE 时才显示。
@@ -77,8 +79,8 @@ API 从数据库生成闭合 Worker payload；Worker 再核对 root-owned 生命
 authorized_keys fingerprint、精确资源/挂载和脚本 hash。失败或后置条件不满足时固定停止
 容器。该路径不接受通用 Docker 参数，也不使当前 STAGED 用户可启动容器。
 
-其他用户写、真实 Activate、`quota.update`、`slurm.resume` 等仍不会执行。Slurm 保持
-DRAIN。
+其他用户 Activate、`quota.update`、`slurm.resume` 等仍不会执行。Slurm 保持 DRAIN，
+客户端 SSH 验证必须由持有对应私钥的用户完成。
 
 ## 现阶段基础设施约束
 

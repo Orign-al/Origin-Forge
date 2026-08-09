@@ -521,7 +521,7 @@ def test_real_stage_idempotent_replay_does_not_execute(monkeypatch, tmp_path) ->
     assert result["idempotent_replay"] is True
 
 
-def test_activate_real_write_remains_disabled() -> None:
+def test_unapproved_activate_real_write_is_rejected() -> None:
     payload = {
         "managed_user_id": str(uuid.uuid4()),
         "approved_ssh_key_record_ids": [str(uuid.uuid4())],
@@ -529,7 +529,7 @@ def test_activate_real_write_remains_disabled() -> None:
         "approval_reference": "portal3c-test-approval",
     }
     result = handle(request("user.activate", payload, approved_by="origin-al"))
-    assert result["error"]["code"] == "WRITE_EXECUTION_DISABLED"
+    assert result["error"]["code"] == "ACTIVATE_APPROVAL_BINDING_REJECTED"
 
 
 def test_stage_contract_defers_public_key() -> None:
@@ -622,6 +622,229 @@ def test_activate_rejects_arbitrary_path_and_private_key_field() -> None:
         validate_payload("user.activate", {**base, "private_key_password": "forbidden"})
     with pytest.raises(ValueError, match="PAYLOAD_REJECTED"):
         validate_payload("user.activate", {**base, "private_key_path": "/forbidden"})
+
+
+def portal3e_final_worker_payload() -> dict[str, object]:
+    return {
+        "managed_user_id": handlers.PORTAL3E_FINAL_MANAGED_USER_ID,
+        "approved_ssh_key_record_ids": [handlers.PORTAL3E_FINAL_KEY_RECORD_ID],
+        "expected_state": "STAGED",
+        "approval_reference": handlers.PORTAL3E_FINAL_APPROVAL_REFERENCE,
+        "dry_run_operation_id": handlers.PORTAL3E_FINAL_DRY_RUN_OPERATION_ID,
+    }
+
+
+def portal3e_final_key_record() -> dict[str, object]:
+    return {
+        "record_id": handlers.PORTAL3E_FINAL_KEY_RECORD_ID,
+        "key_type": "ssh-ed25519",
+        "fingerprint_sha256": handlers.PORTAL3E_FINAL_KEY_FINGERPRINT,
+        "content_sha256": "a" * 64,
+        "scope": "BOTH",
+        "operation_id": str(uuid.uuid4()),
+        "managed_user_id": handlers.PORTAL3E_FINAL_MANAGED_USER_ID,
+        "size_bytes": 96,
+    }
+
+
+def test_portal3e_final_activate_requires_every_exact_approval_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = portal3e_final_worker_payload()
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {name: {"integrity_ok": True} for name in handlers.ACTIVATE_REQUIRED_SCRIPTS},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_user_activate_dry_run",
+        lambda _payload: {"status": "DRY_RUN", "approved_ssh_keys": [portal3e_final_key_record()]},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_sshd_effective_config",
+        lambda _username: effective_ssh_config(),
+    )
+
+    @handlers.contextmanager
+    def bundles(request_id: str, _records: list[dict[str, object]]):  # type: ignore[no-untyped-def]
+        yield (
+            handlers.SSH_KEY_STAGING_ROOT / f"{request_id}.host.pub",
+            handlers.SSH_KEY_STAGING_ROOT / f"{request_id}.container.pub",
+        )
+
+    monkeypatch.setattr(handlers, "activation_key_bundles", bundles)
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: {"ok": True, "stdout": "ACTIVE"},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_activate_postcondition_summary",
+        lambda _records, _management: {"onboarding_state": "ACTIVE"},
+    )
+
+    approved = handle(
+        request(
+            "user.activate",
+            payload,
+            approved_by="origin-al",
+            idempotency_key=handlers.PORTAL3E_FINAL_IDEMPOTENCY_KEY,
+        )
+    )
+    wrong_idempotency = handle(
+        request(
+            "user.activate",
+            payload,
+            approved_by="origin-al",
+            idempotency_key="portal3e-final-wrong-binding",
+        )
+    )
+    wrong_dry_run = handle(
+        request(
+            "user.activate",
+            {**payload, "dry_run_operation_id": str(uuid.uuid4())},
+            approved_by="origin-al",
+            idempotency_key=handlers.PORTAL3E_FINAL_IDEMPOTENCY_KEY,
+        )
+    )
+
+    assert approved["status"] == "SUCCEEDED"
+    assert approved["execution_enabled"] is True
+    assert approved["activate"]["onboarding_state"] == "ACTIVE"
+    assert wrong_idempotency["error"]["code"] == "ACTIVATE_APPROVAL_BINDING_REJECTED"
+    assert wrong_dry_run["error"]["code"] == "ACTIVATE_APPROVAL_BINDING_REJECTED"
+
+
+def test_portal3e_final_activate_rolls_back_failed_postcondition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = portal3e_final_worker_payload()
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {name: {"integrity_ok": True} for name in handlers.ACTIVATE_REQUIRED_SCRIPTS},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_user_activate_dry_run",
+        lambda _payload: {"status": "DRY_RUN", "approved_ssh_keys": [portal3e_final_key_record()]},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_sshd_effective_config",
+        lambda _username: effective_ssh_config(),
+    )
+
+    @handlers.contextmanager
+    def bundles(request_id: str, _records: list[dict[str, object]]):  # type: ignore[no-untyped-def]
+        yield (
+            handlers.SSH_KEY_STAGING_ROOT / f"{request_id}.host.pub",
+            handlers.SSH_KEY_STAGING_ROOT / f"{request_id}.container.pub",
+        )
+
+    executed: list[list[str]] = []
+
+    def run_script(argv: list[str], timeout: float) -> dict[str, object]:
+        del timeout
+        executed.append(argv)
+        return {"ok": True, "stdout": "ok"}
+
+    monkeypatch.setattr(handlers, "activation_key_bundles", bundles)
+    monkeypatch.setattr(handlers, "run_allowlisted_script", run_script)
+    monkeypatch.setattr(
+        handlers,
+        "_activate_postcondition_summary",
+        lambda _records, _management: (_ for _ in ()).throw(
+            handlers.LifecycleValidationError(
+                "CONTAINER_SSH_POLICY_FAILED", "password authentication was enabled"
+            )
+        ),
+    )
+    monkeypatch.setattr(handlers, "_stage_postcondition_summary", lambda _payload: staged_result())
+
+    result = handle(
+        request(
+            "user.activate",
+            payload,
+            approved_by="origin-al",
+            idempotency_key=handlers.PORTAL3E_FINAL_IDEMPOTENCY_KEY,
+        )
+    )
+
+    assert result["status"] == "ERROR"
+    assert result["error"]["code"] == "CONTAINER_SSH_POLICY_FAILED"
+    assert result["rollback_status"] == "ROLLED_BACK"
+    assert executed[-1] == handlers.build_user_activate_rollback_argv("origin-pilot")
+
+
+def test_portal3e_final_internal_rollback_is_exact_and_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {"h100-user-create": {"integrity_ok": True}},
+    )
+    monkeypatch.setattr(handlers, "_stage_postcondition_summary", lambda _payload: staged_result())
+    result = handle(
+        request(
+            "user.activate.rollback",
+            portal3e_final_worker_payload(),
+            approved_by="origin-al",
+            idempotency_key=handlers.PORTAL3E_FINAL_ROLLBACK_IDEMPOTENCY_KEY,
+        )
+    )
+    rejected = handle(
+        request(
+            "user.activate.rollback",
+            portal3e_final_worker_payload(),
+            approved_by="origin-al",
+            idempotency_key="portal3e-final-unapproved-rollback",
+        )
+    )
+    assert result["status"] == "SUCCEEDED"
+    assert result["rollback_status"] == "ROLLED_BACK"
+    assert result["idempotent_replay"] is True
+    assert rejected["error"]["code"] == "ACTIVATE_ROLLBACK_BINDING_REJECTED"
+
+
+def test_container_ssh_effective_policy_fails_closed_on_password_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    effective = effective_ssh_config(
+        permitrootlogin="no",
+        authorizedkeysfile=".ssh/authorized_keys",
+        x11forwarding="no",
+    )
+
+    observed_args: list[str] = []
+
+    def docker_exec(_binary: str, args: list[str], timeout: float = 20.0) -> dict[str, object]:
+        del timeout
+        observed_args.extend(args)
+        return {
+            "ok": True,
+            "stdout": "".join(f"{key} {value}\n" for key, value in effective.items()),
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(handlers, "run_fixed", docker_exec)
+    assert handlers._container_ssh_effective_policy("gpu-dev-origin-pilot")["status"] == "PASSING"
+    assert observed_args == [
+        "exec",
+        "gpu-dev-origin-pilot",
+        "/usr/sbin/sshd",
+        "-T",
+        "-C",
+        "user=origin-pilot,host=sagsh100server,addr=10.20.18.10",
+    ]
+
+    effective["passwordauthentication"] = "yes"
+    with pytest.raises(handlers.LifecycleValidationError, match="public-key-only"):
+        handlers._container_ssh_effective_policy("gpu-dev-origin-pilot")
 
 
 def generate_worker_public_key(tmp_path: Path, name: str) -> str:

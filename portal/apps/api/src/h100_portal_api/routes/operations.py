@@ -4,7 +4,7 @@ from typing import Any, cast
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import ValidationError
 from sqlalchemy import or_, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from h100_portal_api.audit import record_audit
@@ -85,6 +85,15 @@ APPROVED_ORIGIN_PILOT_STAGE: dict[str, Any] = {
 }
 PORTAL3C_STAGE_IDEMPOTENCY_KEY = "portal3b-r-origin-pilot-stage-v1"
 PORTAL3C_STAGE_APPROVAL_REFERENCE = "portal3b-r-lifecycle-revalidated"
+PORTAL3E_FINAL_APPROVAL_TEXT = "允许按重新验证通过的 Activate 计划激活 origin-pilot"
+PORTAL3E_FINAL_APPROVAL_REFERENCE = "portal3e-final-origin-pilot-v1"
+PORTAL3E_FINAL_DRY_RUN_OPERATION_ID = uuid.UUID("f677d34a-4ef2-45ec-a323-99e4af148c0e")
+PORTAL3E_FINAL_MANAGED_USER_ID = uuid.UUID("3b95b4f0-95d9-444a-8f0b-46288195a807")
+PORTAL3E_FINAL_KEY_RECORD_ID = uuid.UUID("7427da72-37b9-4ac2-8ada-2f0c83b7718e")
+PORTAL3E_FINAL_KEY_FINGERPRINT = "SHA256:nek6vyEb3GT+UJAcY5y/8PgY4achF2ouNy+8C2JqUVc"
+PORTAL3E_FINAL_IDEMPOTENCY_KEY = "portal3e-final-origin-pilot-activate-v1"
+PORTAL3E_FINAL_ROLLBACK_IDEMPOTENCY_KEY = "portal3e-final-origin-pilot-rollback-v1"
+PORTAL3E_FINAL_APPROVED_HOST = "10.82.36.1"
 
 
 class OperationPayloadError(ValueError):
@@ -225,6 +234,146 @@ def validate_activate_worker_result(
         )
 
 
+def validate_activate_execution_result(
+    records: list[PortalSshKey], worker_result: dict[str, Any]
+) -> dict[str, Any]:
+    """Accept only the complete, host-re-read Portal-3E-FINAL postcondition."""
+    observed = worker_result.get("approved_ssh_keys")
+    if not isinstance(observed, list) or len(observed) != len(records):
+        raise OperationPayloadError(
+            "PUBLIC_KEY_WORKER_MISMATCH", "Worker did not return every installed SSH key"
+        )
+    by_id = {str(item.get("record_id")): item for item in observed if isinstance(item, dict)}
+    for record in records:
+        item = by_id.get(str(record.id))
+        if (
+            item is None
+            or item.get("key_type") != record.key_type
+            or item.get("fingerprint_sha256") != record.fingerprint_sha256
+            or item.get("content_sha256") != record.content_sha256
+            or item.get("scope") != record.scope
+            or item.get("managed_user_id") != str(record.managed_user_id)
+            or item.get("operation_id") != str(record.enrollment_operation_id)
+        ):
+            raise OperationPayloadError(
+                "PUBLIC_KEY_WORKER_MISMATCH",
+                "Worker installed-key bytes do not match the approved Portal record",
+            )
+    activate = worker_result.get("activate")
+    if not isinstance(activate, dict):
+        raise OperationPayloadError(
+            "ACTIVATE_RESULT_INCOMPLETE", "Worker returned no structured Activate result"
+        )
+    expected_host_fingerprints = [
+        record.fingerprint_sha256 for record in records if record.scope in {"HOST", "BOTH"}
+    ]
+    expected_container_fingerprints = [
+        record.fingerprint_sha256 for record in records if record.scope in {"CONTAINER", "BOTH"}
+    ]
+    host_policy = activate.get("host_ssh_policy")
+    container_policy = activate.get("container_ssh_policy")
+    host_server = activate.get("host_ssh_server")
+    container_server = activate.get("container_ssh_server")
+    management_policy = activate.get("management_ssh_policy")
+    gpu_policy = activate.get("gpu_policy")
+    quota = activate.get("quota")
+    slurm = activate.get("slurm")
+    container = activate.get("container")
+    guard = activate.get("guard")
+    server_fingerprints = (
+        activate.get("host_server_fingerprint"),
+        activate.get("container_server_fingerprint"),
+    )
+    if not (
+        worker_result.get("handler") == "user.activate"
+        and worker_result.get("execution_enabled") is True
+        and activate.get("username") == "origin-pilot"
+        and activate.get("uid") == 20001
+        and activate.get("gid") == 20001
+        and activate.get("onboarding_state") == "ACTIVE"
+        and activate.get("shell") == "/bin/bash"
+        and activate.get("password") == "LOCKED"
+        and activate.get("host_access") == "ENABLED"
+        and activate.get("ssh_key_state") == "INSTALLED"
+        and activate.get("host_authorized_keys") == "INSTALLED"
+        and activate.get("container_authorized_keys") == "INSTALLED"
+        and activate.get("host_key_fingerprints") == expected_host_fingerprints
+        and activate.get("container_key_fingerprints") == expected_container_fingerprints
+        and isinstance(host_policy, dict)
+        and host_policy.get("pubkey_authentication") is True
+        and host_policy.get("password_authentication") is False
+        and host_policy.get("keyboard_interactive_authentication") is False
+        and host_policy.get("authentication_methods") == ["publickey"]
+        and host_policy.get("status") == "PASSING"
+        and isinstance(container_policy, dict)
+        and container_policy.get("pubkey_authentication") is True
+        and container_policy.get("password_authentication") is False
+        and container_policy.get("keyboard_interactive_authentication") is False
+        and container_policy.get("authentication_methods") == "publickey"
+        and container_policy.get("permit_root_login") == "no"
+        and container_policy.get("authorized_keys_file") == ".ssh/authorized_keys"
+        and container_policy.get("status") == "PASSING"
+        and isinstance(host_server, dict)
+        and host_server.get("service_state") == "ACTIVE"
+        and host_server.get("config_validation") == "PASSED"
+        and host_server.get("approved_address") == PORTAL3E_FINAL_APPROVED_HOST
+        and host_server.get("port") == 22
+        and host_server.get("status") == "READY_FOR_CLIENT_VALIDATION"
+        and isinstance(container_server, dict)
+        and container_server.get("service_state") == "ACTIVE"
+        and container_server.get("internal_port") == 22
+        and container_server.get("status") == "READY_FOR_CLIENT_VALIDATION"
+        and isinstance(container_server.get("bind"), dict)
+        and container_server["bind"].get("address") == PORTAL3E_FINAL_APPROVED_HOST
+        and container_server["bind"].get("port") == 22023
+        and container_server["bind"].get("status") == "LISTENING"
+        and all(
+            isinstance(value, str) and value.startswith("SHA256:") and len(value) <= 128
+            for value in server_fingerprints
+        )
+        and isinstance(management_policy, dict)
+        and management_policy.get("origin-al") == "UNCHANGED"
+        and management_policy.get("codexops") == "UNCHANGED"
+        and isinstance(gpu_policy, dict)
+        and gpu_policy.get("unit") == "user-20001.slice"
+        and gpu_policy.get("device_policy") == "closed"
+        and gpu_policy.get("device_allow") == []
+        and gpu_policy.get("status") == "PASSING"
+        and gpu_policy.get("out_of_job_gpu") == "DENIED"
+        and isinstance(quota, dict)
+        and quota.get("project_id") == 30001
+        and quota.get("hard_limit_gb") == 300
+        and quota.get("enforcement") == "ON"
+        and isinstance(slurm, dict)
+        and slurm.get("account") == "company"
+        and slurm.get("qos") == "general"
+        and slurm.get("max_gpus") == 1
+        and slurm.get("node_state") == "DRAIN"
+        and slurm.get("queue") == "EMPTY"
+        and isinstance(container, dict)
+        and container.get("name") == "gpu-dev-origin-pilot"
+        and container.get("state") == "RUNNING"
+        and container.get("gpu") == "NONE"
+        and container.get("cpus") == 8
+        and container.get("memory_gb") == 32
+        and container.get("pids_limit") == 4096
+        and container.get("ssh_address") == PORTAL3E_FINAL_APPROVED_HOST
+        and container.get("ssh_port") == 22023
+        and isinstance(guard, dict)
+        and guard.get("status") == "PASSING"
+        and guard.get("managed_users") == 1
+        and guard.get("users_verified") == 1
+        and guard.get("nvidia_gpu_count") == 4
+        and guard.get("slurm_gpu_count") == 4
+        and activate.get("host_ssh_client_validation") == "PENDING"
+        and activate.get("container_ssh_client_validation") == "PENDING"
+    ):
+        raise OperationPayloadError(
+            "ACTIVATE_RESULT_INCOMPLETE", "Worker Activate postcondition differs from approval"
+        )
+    return activate
+
+
 def operation_response(operation: PortalOperation) -> OperationResponse:
     return OperationResponse(
         id=operation.id,
@@ -287,7 +436,9 @@ def validate_operation_payload(operation_type: str, payload: dict[str, Any]) -> 
                 "at least one approved SSH key record is required",
             )
         try:
-            return UserActivatePayload.model_validate(payload).model_dump(mode="json")
+            return UserActivatePayload.model_validate(payload).model_dump(
+                mode="json", exclude_none=True
+            )
         except ValidationError as exc:
             raise OperationPayloadError(
                 "ACTIVATE_PAYLOAD_REJECTED", "invalid user.activate payload"
@@ -404,6 +555,74 @@ def is_portal3c_real_stage(
     return (
         validated == operation.validated_payload
         and validated.get("approval_reference") == PORTAL3C_STAGE_APPROVAL_REFERENCE
+    )
+
+
+def is_portal3e_final_real_activate(
+    db: Session,
+    operation: PortalOperation,
+    requester: PortalUser | None,
+    approver: PortalUser | None,
+) -> bool:
+    """Recognize only the administrator-approved Portal-3E-FINAL transaction."""
+    if (
+        operation.operation_type != "user.activate"
+        or operation.target_type != "compute_identity"
+        or operation.target_id != "origin-pilot"
+        or operation.idempotency_key != PORTAL3E_FINAL_IDEMPOTENCY_KEY
+        or requester is None
+        or approver is None
+        or requester.id != approver.id
+        or requester.normalized_login != "origin-al"
+        or approver.normalized_login != "origin-al"
+        or requester.unix_username != "origin-al"
+        or requester.account_state.value != "ACTIVE"
+        or not any(role.name == "platform_owner" for role in requester.roles)
+    ):
+        return False
+    try:
+        validated = validate_operation_payload("user.activate", operation.validated_payload)
+    except ValueError, OperationPayloadError:
+        return False
+    expected_payload = {
+        "managed_user_id": str(PORTAL3E_FINAL_MANAGED_USER_ID),
+        "approved_ssh_key_record_ids": [str(PORTAL3E_FINAL_KEY_RECORD_ID)],
+        "expected_state": "STAGED",
+        "approval_reference": PORTAL3E_FINAL_APPROVAL_REFERENCE,
+        "dry_run_operation_id": str(PORTAL3E_FINAL_DRY_RUN_OPERATION_ID),
+    }
+    if validated != expected_payload or operation.validated_payload != expected_payload:
+        return False
+    approval = db.scalar(
+        select(PortalOperationApproval).where(
+            PortalOperationApproval.operation_id == operation.id,
+            PortalOperationApproval.approver_id == requester.id,
+            PortalOperationApproval.decision == "APPROVE",
+        )
+    )
+    dry_run = db.get(PortalOperation, PORTAL3E_FINAL_DRY_RUN_OPERATION_ID)
+    dry_result = dry_run.dry_run_result if dry_run is not None else None
+    return bool(
+        approval is not None
+        and approval.safe_comment == PORTAL3E_FINAL_APPROVAL_TEXT
+        and dry_run is not None
+        and dry_run.operation_type == "user.activate"
+        and dry_run.target_type == "compute_identity"
+        and dry_run.target_id == "origin-pilot"
+        and dry_run.requested_by == requester.id
+        and dry_run.status == OperationStatus.DRAFT
+        and dry_run.approved_by is None
+        and dry_run.validated_payload
+        == {
+            "managed_user_id": str(PORTAL3E_FINAL_MANAGED_USER_ID),
+            "approved_ssh_key_record_ids": [str(PORTAL3E_FINAL_KEY_RECORD_ID)],
+            "expected_state": "STAGED",
+            "approval_reference": "portal3e-r-host-ssh-policy-v1",
+        }
+        and isinstance(dry_result, dict)
+        and dry_result.get("status") == "DRY_RUN"
+        and dry_result.get("activate_status") == "READY"
+        and dry_result.get("execution_enabled") is False
     )
 
 
@@ -612,6 +831,440 @@ def persist_portal3c_staged_identity(
     return managed
 
 
+def persist_portal3e_activated_identity(
+    db: Session,
+    *,
+    owner: PortalUser,
+    operation: PortalOperation,
+    worker_result: dict[str, Any],
+) -> PortalManagedUser:
+    """Persist ACTIVE only after both SSH targets and every server Gate pass."""
+    records = validate_activate_database_bindings(
+        db,
+        owner_id=owner.id,
+        target_id="origin-pilot",
+        payload=operation.validated_payload,
+    )
+    activate = validate_activate_execution_result(records, worker_result)
+    managed = db.get(PortalManagedUser, PORTAL3E_FINAL_MANAGED_USER_ID)
+    if (
+        managed is None
+        or managed.portal_user_id != owner.id
+        or managed.unix_username != "origin-pilot"
+        or managed.uid != 20001
+        or managed.gid != 20001
+        or managed.shell != "/usr/sbin/nologin"
+        or managed.onboarding_state != OnboardingState.STAGED
+        or managed.ssh_key_state not in {"REQUIRED_BEFORE_ACTIVATION", "VALIDATED"}
+        or managed.project_id != 30001
+        or managed.quota_bytes != 300 * 1024**3
+        or managed.slurm_account != "company"
+        or managed.slurm_qos != "general"
+        or managed.container_name != "gpu-dev-origin-pilot"
+        or managed.container_port != 22023
+        or owner.unix_username != "origin-al"
+    ):
+        raise RuntimeError("Portal managed identity changed before Activate persistence")
+    container = db.scalar(
+        select(PortalContainer).where(
+            PortalContainer.managed_user_id == managed.id,
+            PortalContainer.name == "gpu-dev-origin-pilot",
+        )
+    )
+    if container is None or container.ssh_port != 22023:
+        raise RuntimeError("Portal container binding changed before Activate persistence")
+    if (
+        len(records) != 1
+        or records[0].id != PORTAL3E_FINAL_KEY_RECORD_ID
+        or records[0].fingerprint_sha256 != PORTAL3E_FINAL_KEY_FINGERPRINT
+        or records[0].key_type != "ssh-ed25519"
+        or records[0].scope != "BOTH"
+    ):
+        raise RuntimeError("Portal approved SSH key changed before Activate persistence")
+
+    now = utcnow()
+    for record in records:
+        record.state = "INSTALLED"
+        record.installed_at = now
+    managed.shell = "/bin/bash"
+    managed.host_access_state = "ENABLED"
+    managed.gpu_isolation_state = "VERIFIED"
+    managed.onboarding_state = OnboardingState.ACTIVE
+    managed.ssh_key_state = "INSTALLED"
+    managed.ssh_key_count = len(records)
+    managed.compute_activated_at = now
+    owner.resource_onboarding_state = OnboardingState.ACTIVE
+
+    host_server_fingerprint = str(activate["host_server_fingerprint"])
+    container_server_fingerprint = str(activate["container_server_fingerprint"])
+    container.desired_state = "RUNNING"
+    container.observed_state = "RUNNING"
+    container.safe_spec = {
+        "cpus": 8,
+        "memory_gb": 32,
+        "pids_limit": 4096,
+        "gpu": "NONE",
+        "privileged": False,
+        "host_network": False,
+        "host_pid": False,
+        "host_ipc": False,
+        "docker_socket": False,
+        "munge": False,
+        "password_authentication": False,
+        "keyboard_interactive_authentication": False,
+        "pubkey_authentication": True,
+        "authentication_methods": "publickey",
+        "root_login": False,
+        "authorized_keys": "INSTALLED",
+        "host_authorized_keys": "INSTALLED",
+        "container_authorized_keys": "INSTALLED",
+        "user_key_fingerprints": [record.fingerprint_sha256 for record in records],
+        "host_server_fingerprint": host_server_fingerprint,
+        "container_server_fingerprint": container_server_fingerprint,
+        "approved_host": PORTAL3E_FINAL_APPROVED_HOST,
+        "host_ssh_port": 22,
+        "container_ssh_port": 22023,
+        "container_ssh_bind": f"{PORTAL3E_FINAL_APPROVED_HOST}:22023",
+        "host_ssh_server": "READY_FOR_CLIENT_VALIDATION",
+        "container_ssh_server": "READY_FOR_CLIENT_VALIDATION",
+        "host_ssh_client_validation": "PENDING",
+        "container_ssh_client_validation": "PENDING",
+        "host_ssh_policy": activate["host_ssh_policy"],
+        "container_ssh_policy": activate["container_ssh_policy"],
+        "guard": "PASSING",
+        "gpu_open_probe": "DENIED",
+        "cuda_context_probe": "DENIED",
+        "max_gpus": 1,
+        "slurm_node_state": "DRAIN",
+        "slurm_queue": "EMPTY",
+        "gpu_scheduling_available": False,
+    }
+
+    audit_events: tuple[tuple[str, str, dict[str, Any]], ...] = (
+        (
+            "user.activate.approval",
+            "operation",
+            {
+                "actor": "Origin-al",
+                "dry_run_operation_id": str(PORTAL3E_FINAL_DRY_RUN_OPERATION_ID),
+            },
+        ),
+        (
+            "user.activate.host_key_install",
+            "ssh_key",
+            {
+                "key_record_id": str(records[0].id),
+                "fingerprint": records[0].fingerprint_sha256,
+                "status": "PASS",
+            },
+        ),
+        (
+            "user.activate.container_key_install",
+            "ssh_key",
+            {
+                "key_record_id": str(records[0].id),
+                "fingerprint": records[0].fingerprint_sha256,
+                "status": "PASS",
+            },
+        ),
+        ("user.activate.shell", "managed_user", {"from": "nologin", "to": "/bin/bash"}),
+        (
+            "user.activate.container_start",
+            "container",
+            {"state": "RUNNING", "gpu": "NONE", "bind": "10.82.36.1:22023"},
+        ),
+        (
+            "user.activate.host_ssh_server",
+            "ssh_server",
+            {"status": "READY_FOR_CLIENT_VALIDATION", "fingerprint": host_server_fingerprint},
+        ),
+        (
+            "user.activate.container_ssh_server",
+            "ssh_server",
+            {
+                "status": "READY_FOR_CLIENT_VALIDATION",
+                "fingerprint": container_server_fingerprint,
+            },
+        ),
+        (
+            "user.activate.completed",
+            "managed_user",
+            {"state": "ACTIVE", "client_validation": "PENDING", "slurm_node": "DRAIN"},
+        ),
+    )
+    for event_type, object_type, metadata in audit_events:
+        record_audit(
+            db,
+            event_type=event_type,
+            actor="h100-portal-worker",
+            actor_role="root_worker",
+            source_ip="local-worker-socket",
+            user_agent="h100-portal-api",
+            object_type=object_type,
+            object_id="origin-pilot",
+            result="SUCCESS",
+            metadata=metadata,
+            operation_id=operation.id,
+        )
+    return managed
+
+
+def _attempt_portal3e_activate_rollback() -> dict[str, Any]:
+    payload = {
+        "managed_user_id": str(PORTAL3E_FINAL_MANAGED_USER_ID),
+        "approved_ssh_key_record_ids": [str(PORTAL3E_FINAL_KEY_RECORD_ID)],
+        "expected_state": "STAGED",
+        "approval_reference": PORTAL3E_FINAL_APPROVAL_REFERENCE,
+        "dry_run_operation_id": str(PORTAL3E_FINAL_DRY_RUN_OPERATION_ID),
+    }
+    try:
+        return call_worker(
+            "user.activate.rollback",
+            payload=payload,
+            requested_by="origin-al",
+            approved_by="origin-al",
+            idempotency_key=PORTAL3E_FINAL_ROLLBACK_IDEMPOTENCY_KEY,
+            dry_run=False,
+            timeout_seconds=240,
+        )
+    except WorkerClientError as exc:
+        return {
+            "status": "ERROR",
+            "error": {"code": exc.code, "message": "controlled Activate rollback unavailable"},
+            "rollback_status": "REQUIRES_MANUAL_REVIEW",
+        }
+
+
+def _finish_portal3e_operation_event(db: Session, operation: PortalOperation) -> None:
+    operation.finished_at = utcnow()
+    db.add(
+        PortalOperationEvent(
+            operation_id=operation.id,
+            from_status=operation.status,
+            to_status=operation.status,
+            safe_message="Portal-3E-FINAL Worker execution recorded",
+            created_at=utcnow(),
+        )
+    )
+
+
+def _execute_portal3e_final_activate(
+    db: Session,
+    *,
+    operation: PortalOperation,
+    requester: PortalUser,
+    approver: PortalUser,
+    actor_login: str,
+) -> None:
+    transition(operation, OperationStatus.RUNNING, "Controlled Worker Activate started", db)
+    operation.started_at = utcnow()
+    db.commit()
+    try:
+        result = call_worker(
+            "user.activate",
+            payload=operation.validated_payload,
+            requested_by=requester.normalized_login,
+            approved_by=approver.normalized_login,
+            idempotency_key=operation.idempotency_key,
+            dry_run=False,
+            timeout_seconds=360,
+        )
+    except WorkerClientError as exc:
+        rollback = _attempt_portal3e_activate_rollback()
+        recovered_operation = db.get(PortalOperation, operation.id)
+        if recovered_operation is None or recovered_operation.status != OperationStatus.RUNNING:
+            return
+        if (
+            rollback.get("status") == "SUCCEEDED"
+            and rollback.get("rollback_status") == "ROLLED_BACK"
+        ):
+            transition(
+                recovered_operation, OperationStatus.ROLLING_BACK, "Worker recovery started", db
+            )
+            transition(
+                recovered_operation, OperationStatus.ROLLED_BACK, "Worker recovery verified", db
+            )
+            recovered_operation.rollback_status = "ROLLED_BACK"
+        else:
+            transition(
+                recovered_operation,
+                OperationStatus.FAILED,
+                "Worker unavailable during Activate",
+                db,
+            )
+            recovered_operation.rollback_status = "REQUIRES_MANUAL_REVIEW"
+        recovered_operation.error_code = exc.code[:64]
+        recovered_operation.result_summary = (
+            "Activate Worker 通信失败；受控回滚已验证，origin-pilot 保持 STAGED"
+            if recovered_operation.rollback_status == "ROLLED_BACK"
+            else "Activate Worker 通信失败；保持 Slurm DRAIN 并人工核查"
+        )
+        record_audit(
+            db,
+            event_type="user.activate.worker_unavailable",
+            actor=actor_login,
+            actor_role="platform_owner",
+            source_ip="local-worker-socket",
+            user_agent="h100-portal-api",
+            object_type="operation",
+            object_id=str(recovered_operation.id),
+            result="FAILED",
+            metadata={
+                "error_code": recovered_operation.error_code,
+                "rollback": recovered_operation.rollback_status,
+            },
+            operation_id=recovered_operation.id,
+        )
+        _finish_portal3e_operation_event(db, recovered_operation)
+        db.commit()
+        return
+
+    if result.get("status") != "SUCCEEDED":
+        rollback_status = str(result.get("rollback_status", ""))[:32]
+        if rollback_status == "ROLLED_BACK":
+            transition(operation, OperationStatus.ROLLING_BACK, "Worker rollback recorded", db)
+            transition(operation, OperationStatus.ROLLED_BACK, "Worker rollback verified", db)
+        else:
+            transition(operation, OperationStatus.FAILED, "Worker rejected Activate", db)
+        operation.rollback_status = rollback_status or None
+        error = result.get("error", {})
+        operation.error_code = str(
+            error.get("code", "ACTIVATE_WORKER_FAILED")
+            if isinstance(error, dict)
+            else "ACTIVATE_WORKER_FAILED"
+        )[:64]
+        operation.result_summary = (
+            "Activate 失败并已恢复 STAGED；两处 authorized_keys 缺失且容器停止"
+            if rollback_status == "ROLLED_BACK"
+            else "Activate 在写前或恢复验证期间失败；保持 Slurm DRAIN"
+        )
+        operation.worker_execution_id = str(result.get("request_id", "worker"))[:64]
+        record_audit(
+            db,
+            event_type="user.activate.failed",
+            actor=actor_login,
+            actor_role="platform_owner",
+            source_ip="local-worker-socket",
+            user_agent="h100-portal-api",
+            object_type="operation",
+            object_id=str(operation.id),
+            result="FAILED",
+            metadata={"error_code": operation.error_code, "rollback": rollback_status or "NONE"},
+            operation_id=operation.id,
+        )
+        _finish_portal3e_operation_event(db, operation)
+        db.commit()
+        return
+
+    try:
+        persist_portal3e_activated_identity(
+            db,
+            owner=requester,
+            operation=operation,
+            worker_result=result,
+        )
+        previous_plan = operation.dry_run_result or {}
+        operation.dry_run_result = {
+            **previous_plan,
+            "referenced_dry_run_operation_id": str(PORTAL3E_FINAL_DRY_RUN_OPERATION_ID),
+            "execution_result": cast(dict[str, Any], safe_metadata(result)),
+            "activate_status": "ACTIVE",
+            "execution_enabled": True,
+        }
+        transition(operation, OperationStatus.SUCCEEDED, "origin-pilot Activate verified", db)
+        operation.result_summary = (
+            "origin-pilot 已 ACTIVE；Host/Container 公钥已安装；容器 RUNNING/GPU NONE；"
+            "Client Validation PENDING；Slurm DRAIN"
+        )
+        operation.worker_execution_id = str(result.get("request_id", "worker"))[:64]
+        operation.rollback_status = "NOT_REQUIRED"
+        record_audit(
+            db,
+            event_type="worker.execute",
+            actor=actor_login,
+            actor_role="platform_owner",
+            source_ip="local-worker-socket",
+            user_agent="h100-portal-api",
+            object_type="operation",
+            object_id=str(operation.id),
+            result="SUCCESS",
+            metadata={
+                "operation_type": "user.activate",
+                "execution_mode": "portal3e-final-real-activate",
+                "client_validation": "PENDING",
+                "slurm_node": "DRAIN",
+            },
+            operation_id=operation.id,
+        )
+        _finish_portal3e_operation_event(db, operation)
+        db.flush()
+        db.commit()
+        return
+    except (OperationPayloadError, RuntimeError, SQLAlchemyError) as exc:
+        operation_id = operation.id
+        db.rollback()
+        recovered_operation = db.get(PortalOperation, operation_id)
+        # A database commit can report an ambiguous transport failure after the
+        # transaction became durable.  Never roll back a host whose Portal
+        # Operation is already durably SUCCEEDED.
+        if recovered_operation is None or recovered_operation.status == OperationStatus.SUCCEEDED:
+            return
+        if recovered_operation.status != OperationStatus.RUNNING:
+            return
+        rollback = _attempt_portal3e_activate_rollback()
+        if (
+            rollback.get("status") == "SUCCEEDED"
+            and rollback.get("rollback_status") == "ROLLED_BACK"
+        ):
+            transition(
+                recovered_operation,
+                OperationStatus.ROLLING_BACK,
+                "Portal persistence rollback",
+                db,
+            )
+            transition(
+                recovered_operation,
+                OperationStatus.ROLLED_BACK,
+                "Host rollback verified",
+                db,
+            )
+            recovered_operation.rollback_status = "ROLLED_BACK"
+            summary = "Portal ACTIVE 持久化失败；宿主已恢复 STAGED"
+        else:
+            transition(
+                recovered_operation,
+                OperationStatus.FAILED,
+                "Portal persistence rejected",
+                db,
+            )
+            recovered_operation.rollback_status = "REQUIRES_MANUAL_REVIEW"
+            summary = "Portal ACTIVE 持久化失败；保持 Slurm DRAIN 并人工核查"
+        recovered_operation.error_code = "PORTAL_ACTIVATE_STATE_REJECTED"
+        recovered_operation.result_summary = summary
+        record_audit(
+            db,
+            event_type="portal.activate_persist_failed",
+            actor=actor_login,
+            actor_role="platform_owner",
+            source_ip="local-worker-socket",
+            user_agent="h100-portal-api",
+            object_type="operation",
+            object_id=str(recovered_operation.id),
+            result="FAILED",
+            metadata={
+                "detail": (
+                    "database integrity constraint rejected Portal Activate state"
+                    if isinstance(exc, IntegrityError)
+                    else str(exc)[:255]
+                ),
+                "rollback": recovered_operation.rollback_status,
+            },
+            operation_id=recovered_operation.id,
+        )
+        _finish_portal3e_operation_event(db, recovered_operation)
+        db.commit()
+
+
 def execute_operation(operation_id: uuid.UUID, actor_login: str) -> None:
     with SessionLocal() as db:
         operation = db.get(PortalOperation, operation_id)
@@ -620,6 +1273,28 @@ def execute_operation(operation_id: uuid.UUID, actor_login: str) -> None:
         requester = db.get(PortalUser, operation.requested_by)
         approver = db.get(PortalUser, operation.approved_by) if operation.approved_by else None
         real_stage = is_portal3c_real_stage(operation, requester, approver)
+        real_activate = is_portal3e_final_real_activate(db, operation, requester, approver)
+        if real_activate and requester is not None and approver is not None:
+            _execute_portal3e_final_activate(
+                db,
+                operation=operation,
+                requester=requester,
+                approver=approver,
+                actor_login=actor_login,
+            )
+            return
+        if (
+            operation.operation_type == "user.activate"
+            and operation.idempotency_key == PORTAL3E_FINAL_IDEMPOTENCY_KEY
+        ):
+            transition(operation, OperationStatus.RUNNING, "Activate approval binding check", db)
+            transition(operation, OperationStatus.FAILED, "Activate approval binding rejected", db)
+            operation.started_at = utcnow()
+            operation.finished_at = utcnow()
+            operation.error_code = "ACTIVATE_APPROVAL_BINDING_REJECTED"
+            operation.result_summary = "Portal-3E-FINAL 审批或 dry-run 绑定发生变化；未执行宿主写入"
+            db.commit()
+            return
         transition(
             operation,
             OperationStatus.RUNNING,

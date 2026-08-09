@@ -136,11 +136,32 @@ MAX_APPROVED_SSH_KEYS = 5
 PORTAL3C_STAGE_IDEMPOTENCY_KEY = "portal3b-r-origin-pilot-stage-v1"
 PORTAL3C_STAGE_APPROVAL_REFERENCE = "portal3b-r-lifecycle-revalidated"
 STAGE_EXECUTION_TIMEOUT_SECONDS = 1800.0
+ACTIVATE_EXECUTION_TIMEOUT_SECONDS = 300.0
+PORTAL3E_FINAL_APPROVAL_REFERENCE = "portal3e-final-origin-pilot-v1"
+PORTAL3E_FINAL_DRY_RUN_OPERATION_ID = "f677d34a-4ef2-45ec-a323-99e4af148c0e"
+PORTAL3E_FINAL_MANAGED_USER_ID = "3b95b4f0-95d9-444a-8f0b-46288195a807"
+PORTAL3E_FINAL_KEY_RECORD_ID = "7427da72-37b9-4ac2-8ada-2f0c83b7718e"
+PORTAL3E_FINAL_KEY_FINGERPRINT = "SHA256:nek6vyEb3GT+UJAcY5y/8PgY4achF2ouNy+8C2JqUVc"
+PORTAL3E_FINAL_IDEMPOTENCY_KEY = "portal3e-final-origin-pilot-activate-v1"
+PORTAL3E_FINAL_ROLLBACK_IDEMPOTENCY_KEY = "portal3e-final-origin-pilot-rollback-v1"
+HOST_ED25519_PUBLIC_KEY = Path("/etc/ssh/ssh_host_ed25519_key.pub")
+CONTAINER_ED25519_PUBLIC_KEY = Path(
+    "/srv/gpu-platform/container-data/origin-pilot/ssh-host-keys/ssh_host_ed25519_key.pub"
+)
 STAGE_REQUIRED_SCRIPTS = frozenset(
     {
         "h100-user-create",
         "h100-user-gpu-isolation",
         "h100-container-create",
+        "h100-container-stop",
+        "h100-gpu-bypass-guard",
+    }
+)
+ACTIVATE_REQUIRED_SCRIPTS = frozenset(
+    {
+        "h100-user-create",
+        "h100-user-gpu-isolation",
+        "h100-container-start",
         "h100-container-stop",
         "h100-gpu-bypass-guard",
     }
@@ -731,6 +752,9 @@ def containers_inspect(payload: dict[str, Any]) -> dict[str, Any]:
     ssh_port = (
         ssh_ports[0].get("HostPort") if ssh_ports and isinstance(ssh_ports[0], dict) else None
     )
+    ssh_host_ip = (
+        ssh_ports[0].get("HostIp") if ssh_ports and isinstance(ssh_ports[0], dict) else None
+    )
     labels_value = config.get("Labels")
     labels: dict[str, Any] = labels_value if isinstance(labels_value, dict) else {}
     safe_labels = {
@@ -771,6 +795,7 @@ def containers_inspect(payload: dict[str, Any]) -> dict[str, Any]:
             "memory_limit_bytes": memory_limit,
             "pids_limit": pids_limit,
             "ssh_port": ssh_port,
+            "ssh_host_ip": ssh_host_ip,
             "privileged": host_config.get("Privileged"),
             "network_mode": host_config.get("NetworkMode"),
             "pid_mode": host_config.get("PidMode"),
@@ -2051,6 +2076,21 @@ def build_user_activate_argv(
         "--container-public-key-file",
         str(container_key_file),
         "--confirm-activate",
+        username,
+    ]
+
+
+def build_user_activate_rollback_argv(username: str) -> list[str]:
+    """Build the single fail-closed recovery command for Portal-3E-FINAL."""
+    if username != PILOT_USERNAME:
+        raise LifecycleValidationError(
+            "ACTIVATE_TARGET_REJECTED", "Activate rollback target is outside the approved Pilot"
+        )
+    return [
+        SCRIPT_ALLOWLIST["h100-user-create"],
+        "--rollback-activate",
+        username,
+        "--confirm-rollback-activate",
         username,
     ]
 
@@ -3697,6 +3737,596 @@ def _execute_managed_container_start(
         return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
 
 
+def _activation_fingerprints(
+    key_records: list[dict[str, Any]],
+) -> tuple[list[str], list[str]]:
+    host_records, container_records = _activation_target_records(key_records)
+    return (
+        [str(record["fingerprint_sha256"]) for record in host_records],
+        [str(record["fingerprint_sha256"]) for record in container_records],
+    )
+
+
+def _server_public_key_fingerprint(path: Path) -> str:
+    if path not in {HOST_ED25519_PUBLIC_KEY, CONTAINER_ED25519_PUBLIC_KEY}:
+        raise LifecycleValidationError(
+            "SSH_SERVER_FINGERPRINT_REJECTED", "SSH server public-key path is not approved"
+        )
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "SSH_SERVER_FINGERPRINT_FAILED", "SSH server public key is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_uid != 0
+        or before.st_gid != 0
+        or before.st_nlink != 1
+        or bool(before.st_mode & 0o022)
+        or not 0 < before.st_size <= MAX_SSH_KEY_FILE_BYTES
+    ):
+        raise LifecycleValidationError(
+            "SSH_SERVER_FINGERPRINT_FAILED", "SSH server public-key metadata is invalid"
+        )
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise LifecycleValidationError(
+                    "SSH_SERVER_FINGERPRINT_FAILED",
+                    "SSH server public key changed during verification",
+                )
+            content = os.read(descriptor, MAX_SSH_KEY_FILE_BYTES + 1)
+        finally:
+            os.close(descriptor)
+        public_key = content.decode("utf-8", errors="strict").rstrip("\n")
+    except LifecycleValidationError:
+        raise
+    except (OSError, UnicodeDecodeError) as exc:
+        raise LifecycleValidationError(
+            "SSH_SERVER_FINGERPRINT_FAILED", "SSH server public key could not be read safely"
+        ) from exc
+    if "\n" in public_key or "\r" in public_key:
+        raise LifecycleValidationError(
+            "SSH_SERVER_FINGERPRINT_FAILED", "SSH server public-key file is not canonical"
+        )
+    validated = _validate_public_key_content(public_key)
+    if validated["key_type"] != "ssh-ed25519":
+        raise LifecycleValidationError(
+            "SSH_SERVER_FINGERPRINT_FAILED", "approved SSH server identity key is not ED25519"
+        )
+    return str(validated["fingerprint_sha256"])
+
+
+def _container_ssh_effective_policy(name: str) -> dict[str, Any]:
+    if name != APPROVED_STAGE_PAYLOAD["container_name"]:
+        raise LifecycleValidationError(
+            "CONTAINER_SSH_POLICY_REJECTED", "container SSH policy target is not approved"
+        )
+    result = run_fixed(
+        "docker",
+        [
+            "exec",
+            name,
+            "/usr/sbin/sshd",
+            "-T",
+            "-C",
+            (
+                f"user={PILOT_USERNAME},host={SSH_REPRESENTATIVE_HOST},"
+                f"addr={SSH_REPRESENTATIVE_CLIENT_IP}"
+            ),
+        ],
+        timeout=15,
+    )
+    if not result.get("ok"):
+        raise LifecycleValidationError(
+            "CONTAINER_SSH_POLICY_FAILED", "container sshd effective policy is unavailable"
+        )
+    effective = _parse_sshd_effective_config(str(result.get("stdout", "")))
+    policy = {
+        "pubkey_authentication": effective["pubkeyauthentication"] == "yes",
+        "password_authentication": effective["passwordauthentication"] == "yes",
+        "keyboard_interactive_authentication": effective["kbdinteractiveauthentication"] == "yes",
+        "authentication_methods": effective["authenticationmethods"],
+        "permit_root_login": effective["permitrootlogin"],
+        "authorized_keys_file": effective["authorizedkeysfile"],
+        "status": "PASSING",
+        "source": "CONTAINER_SSHD_EFFECTIVE_CONFIG",
+        "representative_user": PILOT_USERNAME,
+        "representative_host": SSH_REPRESENTATIVE_HOST,
+        "representative_client_address": SSH_REPRESENTATIVE_CLIENT_IP,
+    }
+    if not (
+        policy["pubkey_authentication"] is True
+        and policy["password_authentication"] is False
+        and policy["keyboard_interactive_authentication"] is False
+        and policy["authentication_methods"] == "publickey"
+        and policy["permit_root_login"] == "no"
+        and policy["authorized_keys_file"] == ".ssh/authorized_keys"
+    ):
+        raise LifecycleValidationError(
+            "CONTAINER_SSH_POLICY_FAILED", "container SSH is not public-key-only"
+        )
+    return policy
+
+
+def _approved_container_listener() -> dict[str, Any]:
+    result = run_fixed(
+        "ss", ["-H", "-lnt", f"sport = :{APPROVED_STAGE_PAYLOAD['ssh_port']}"], timeout=10
+    )
+    lines = [line.split() for line in str(result.get("stdout", "")).splitlines() if line.strip()]
+    local_endpoints = [fields[3] for fields in lines if len(fields) >= 5]
+    expected = f"{MANAGEMENT_IP}:{APPROVED_STAGE_PAYLOAD['ssh_port']}"
+    if not result.get("ok") or local_endpoints != [expected]:
+        raise LifecycleValidationError(
+            "CONTAINER_SSH_LISTENER_FAILED", "container SSH listener differs from approval"
+        )
+    return {
+        "address": MANAGEMENT_IP,
+        "port": APPROVED_STAGE_PAYLOAD["ssh_port"],
+        "status": "LISTENING",
+    }
+
+
+def _host_ssh_server_status() -> dict[str, Any]:
+    syntax = run_fixed("sshd", ["-t"], timeout=10)
+    service = run_fixed("systemctl", ["is-active", "ssh.service"], timeout=10)
+    listeners = run_fixed("ss", ["-H", "-lnt", "sport = :22"], timeout=10)
+    if (
+        not syntax.get("ok")
+        or str(service.get("stdout", "")).strip() != "active"
+        or not listeners.get("ok")
+        or not str(listeners.get("stdout", "")).strip()
+    ):
+        raise LifecycleValidationError("HOST_SSH_SERVER_FAILED", "host SSH service is not ready")
+    return {
+        "service": "ssh.service",
+        "service_state": "ACTIVE",
+        "config_validation": "PASSED",
+        "approved_address": MANAGEMENT_IP,
+        "port": 22,
+        "status": "READY_FOR_CLIENT_VALIDATION",
+    }
+
+
+def _activate_postcondition_summary(
+    key_records: list[dict[str, Any]],
+    management_before: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    lifecycle = _read_active_pilot_state(PILOT_USERNAME)
+    host_fingerprints, container_fingerprints = _activation_fingerprints(key_records)
+    expected_state = {
+        "VERSION": "2",
+        "STATUS": "ACTIVE",
+        "USERNAME": PILOT_USERNAME,
+        "UID": str(APPROVED_STAGE_PAYLOAD["uid"]),
+        "GID": str(APPROVED_STAGE_PAYLOAD["gid"]),
+        "PROJECT_ID": str(APPROVED_STAGE_PAYLOAD["project_id"]),
+        "SSH_PORT": str(APPROVED_STAGE_PAYLOAD["ssh_port"]),
+        "SLURM_ACCOUNT": APPROVED_STAGE_PAYLOAD["slurm_account"],
+        "SLURM_QOS": APPROVED_STAGE_PAYLOAD["slurm_qos"],
+        "SSH_KEY_STATE": "INSTALLED",
+        "HOST_KEY_FINGERPRINTS": ",".join(host_fingerprints),
+        "CONTAINER_KEY_FINGERPRINTS": ",".join(container_fingerprints),
+    }
+    if any(lifecycle.get(field) != value for field, value in expected_state.items()):
+        raise LifecycleValidationError(
+            "ACTIVATE_POSTCONDITION_FAILED", "ACTIVE lifecycle state differs from approval"
+        )
+
+    try:
+        account = pwd.getpwnam(PILOT_USERNAME)
+        private_group = grp.getgrnam(PILOT_USERNAME)
+    except KeyError as exc:
+        raise LifecycleValidationError(
+            "ACTIVATE_POSTCONDITION_FAILED", "activated Linux identity is unavailable"
+        ) from exc
+    if (
+        account.pw_uid != APPROVED_STAGE_PAYLOAD["uid"]
+        or account.pw_gid != APPROVED_STAGE_PAYLOAD["gid"]
+        or private_group.gr_gid != APPROVED_STAGE_PAYLOAD["gid"]
+        or account.pw_dir != f"/home/{PILOT_USERNAME}"
+        or account.pw_shell != "/bin/bash"
+    ):
+        raise LifecycleValidationError(
+            "ACTIVATE_POSTCONDITION_FAILED", "activated Linux identity differs from approval"
+        )
+    groups = _group_names(PILOT_USERNAME, account.pw_gid)
+    if set(groups) != {PILOT_USERNAME} or set(groups) & FORBIDDEN_PILOT_GROUPS:
+        raise LifecycleValidationError(
+            "ACTIVATE_POSTCONDITION_FAILED", "activated identity has a privileged group"
+        )
+    password = run_fixed("passwd", ["-S", PILOT_USERNAME], timeout=10)
+    password_fields = str(password.get("stdout", "")).split()
+    if not password.get("ok") or len(password_fields) < 2 or password_fields[1] != "L":
+        raise LifecycleValidationError(
+            "ACTIVATE_POSTCONDITION_FAILED", "activated Linux password is not locked"
+        )
+
+    observed_host = _installed_key_fingerprints(
+        Path(account.pw_dir) / ".ssh" / "authorized_keys", account.pw_uid, account.pw_gid
+    )
+    observed_container = _installed_key_fingerprints(
+        PILOT_DATA_ROOT / PILOT_USERNAME / "home/.ssh/authorized_keys",
+        account.pw_uid,
+        account.pw_gid,
+    )
+    if observed_host != host_fingerprints or observed_container != container_fingerprints:
+        raise LifecycleValidationError(
+            "ACTIVATE_KEY_POSTCONDITION_FAILED", "installed SSH fingerprints differ from approval"
+        )
+
+    host_ssh_policy = managed_host_ssh_policy(PILOT_USERNAME)
+    management_after = {
+        MANAGEMENT_USERNAME: _sshd_effective_config(MANAGEMENT_USERNAME),
+        "codexops": _sshd_effective_config("codexops"),
+    }
+    for username, before in management_before.items():
+        validate_ssh_policy_no_regression(username, before, management_after[username])
+
+    isolation = run_allowlisted_script(
+        [SCRIPT_ALLOWLIST["h100-user-gpu-isolation"], "verify", PILOT_USERNAME], timeout=60
+    )
+    if not isolation.get("ok"):
+        raise LifecycleValidationError(
+            "ACTIVATE_GPU_POLICY_FAILED", "per-UID GPU isolation verification failed"
+        )
+    quota = _verified_project_quota(
+        APPROVED_STAGE_PAYLOAD["project_id"], APPROVED_STAGE_PAYLOAD["quota_gb"]
+    )
+    association = run_fixed(
+        "sacctmgr",
+        [
+            "-n",
+            "-P",
+            "show",
+            "assoc",
+            "where",
+            f"User={PILOT_USERNAME}",
+            f"Account={APPROVED_STAGE_PAYLOAD['slurm_account']}",
+            "format=User,Account,QOS,DefaultQOS",
+        ],
+        timeout=20,
+    )
+    if not association.get("ok") or not any(
+        fields[:2] == [PILOT_USERNAME, APPROVED_STAGE_PAYLOAD["slurm_account"]]
+        and APPROVED_STAGE_PAYLOAD["slurm_qos"] in fields[2:]
+        for fields in (line.split("|") for line in str(association.get("stdout", "")).splitlines())
+    ):
+        raise LifecycleValidationError(
+            "ACTIVATE_SLURM_ASSOCIATION_FAILED", "Slurm association differs from approval"
+        )
+    qos = run_fixed(
+        "sacctmgr",
+        [
+            "-n",
+            "-P",
+            "show",
+            "qos",
+            APPROVED_STAGE_PAYLOAD["slurm_qos"],
+            "format=Name,MaxTRESPerUser",
+        ],
+        timeout=20,
+    )
+    if not qos.get("ok") or not any(
+        line.startswith(f"{APPROVED_STAGE_PAYLOAD['slurm_qos']}|") and "gres/gpu=1" in line
+        for line in str(qos.get("stdout", "")).splitlines()
+    ):
+        raise LifecycleValidationError(
+            "ACTIVATE_SLURM_LIMIT_FAILED", "Slurm max GPU limit differs from approval"
+        )
+
+    guard_start = run_fixed("systemctl", ["start", "h100-gpu-bypass-guard.service"], timeout=90)
+    if not guard_start.get("ok"):
+        raise LifecycleValidationError("ACTIVATE_GUARD_FAILED", "GPU bypass Guard service failed")
+    guard = _verified_guard_metrics(APPROVED_STAGE_PAYLOAD["uid"])
+    node = slurm_node()
+    jobs = slurm_jobs()
+    if (
+        node.get("status") != "OK"
+        or not node.get("nodes")
+        or not all("DRAIN" in str(item.get("state", "")).upper() for item in node["nodes"])
+        or jobs.get("status") != "OK"
+        or jobs.get("jobs")
+    ):
+        raise LifecycleValidationError(
+            "ACTIVATE_SLURM_GATE_FAILED", "Slurm is not DRAIN with an empty queue"
+        )
+
+    inspected = containers_inspect({"name": APPROVED_STAGE_PAYLOAD["container_name"]})
+    container = inspected.get("container", {})
+    state = container.get("state", {}) if isinstance(container, dict) else {}
+    health = state.get("Health", {}) if isinstance(state, dict) else {}
+    mounts = container.get("mounts", []) if isinstance(container, dict) else []
+    expected_mounts = {
+        (str(PILOT_DATA_ROOT / PILOT_USERNAME / "home"), f"/home/{PILOT_USERNAME}"),
+        (str(PILOT_DATA_ROOT / PILOT_USERNAME / "workspace"), "/workspace"),
+        (str(PILOT_DATA_ROOT / PILOT_USERNAME / "shared"), "/shared"),
+        (
+            f"/srv/gpu-platform/container-data/{PILOT_USERNAME}/ssh-host-keys",
+            "/etc/ssh/persistent",
+        ),
+    }
+    observed_mounts = {
+        (str(item.get("Source", "")), str(item.get("Destination", "")))
+        for item in mounts
+        if isinstance(item, dict) and item.get("Type") == "bind" and item.get("RW") is True
+    }
+    if not (
+        inspected.get("status") == "OK"
+        and isinstance(container, dict)
+        and str(container.get("name", "")).lstrip("/") == APPROVED_STAGE_PAYLOAD["container_name"]
+        and container.get("owner") == PILOT_USERNAME
+        and container.get("cpu_limit") == float(APPROVED_STAGE_PAYLOAD["cpus"])
+        and container.get("memory_limit_bytes") == APPROVED_STAGE_PAYLOAD["memory_gb"] * 1024**3
+        and container.get("pids_limit") == APPROVED_STAGE_PAYLOAD["pids_limit"]
+        and container.get("ssh_port") == str(APPROVED_STAGE_PAYLOAD["ssh_port"])
+        and container.get("ssh_host_ip") == MANAGEMENT_IP
+        and container.get("privileged") is False
+        and container.get("network_mode") != "host"
+        and container.get("pid_mode") != "host"
+        and container.get("ipc_mode") != "host"
+        and container.get("gpu") == "NONE"
+        and not container.get("docker_socket_mounted")
+        and isinstance(state, dict)
+        and state.get("Running") is True
+        and state.get("Status") == "running"
+        and isinstance(health, dict)
+        and health.get("Status") == "healthy"
+        and len(mounts) == len(expected_mounts)
+        and observed_mounts == expected_mounts
+    ):
+        raise LifecycleValidationError(
+            "ACTIVATE_CONTAINER_POSTCONDITION_FAILED", "running container differs from approval"
+        )
+    container_ssh_policy = _container_ssh_effective_policy(APPROVED_STAGE_PAYLOAD["container_name"])
+    listener = _approved_container_listener()
+    host_server = _host_ssh_server_status()
+
+    return {
+        "username": PILOT_USERNAME,
+        "uid": APPROVED_STAGE_PAYLOAD["uid"],
+        "gid": APPROVED_STAGE_PAYLOAD["gid"],
+        "onboarding_state": "ACTIVE",
+        "shell": "/bin/bash",
+        "password": "LOCKED",
+        "host_access": "ENABLED",
+        "ssh_key_state": "INSTALLED",
+        "host_authorized_keys": "INSTALLED",
+        "container_authorized_keys": "INSTALLED",
+        "host_key_fingerprints": observed_host,
+        "container_key_fingerprints": observed_container,
+        "host_ssh_policy": host_ssh_policy,
+        "container_ssh_policy": container_ssh_policy,
+        "host_ssh_server": host_server,
+        "container_ssh_server": {
+            "service": "sshd",
+            "service_state": "ACTIVE",
+            "internal_port": 22,
+            "bind": listener,
+            "status": "READY_FOR_CLIENT_VALIDATION",
+        },
+        "host_server_fingerprint": _server_public_key_fingerprint(HOST_ED25519_PUBLIC_KEY),
+        "container_server_fingerprint": _server_public_key_fingerprint(
+            CONTAINER_ED25519_PUBLIC_KEY
+        ),
+        "management_ssh_policy": {
+            MANAGEMENT_USERNAME: "UNCHANGED",
+            "codexops": "UNCHANGED",
+        },
+        "gpu_policy": {
+            "unit": f"user-{APPROVED_STAGE_PAYLOAD['uid']}.slice",
+            "device_policy": "closed",
+            "device_allow": [],
+            "status": "PASSING",
+            "out_of_job_gpu": "DENIED",
+        },
+        "quota": quota,
+        "slurm": {
+            "account": APPROVED_STAGE_PAYLOAD["slurm_account"],
+            "qos": APPROVED_STAGE_PAYLOAD["slurm_qos"],
+            "max_gpus": APPROVED_STAGE_PAYLOAD["max_gpus"],
+            "node_state": "DRAIN",
+            "queue": "EMPTY",
+        },
+        "container": {
+            "name": APPROVED_STAGE_PAYLOAD["container_name"],
+            "state": "RUNNING",
+            "gpu": "NONE",
+            "cpus": APPROVED_STAGE_PAYLOAD["cpus"],
+            "memory_gb": APPROVED_STAGE_PAYLOAD["memory_gb"],
+            "pids_limit": APPROVED_STAGE_PAYLOAD["pids_limit"],
+            "ssh_address": MANAGEMENT_IP,
+            "ssh_port": APPROVED_STAGE_PAYLOAD["ssh_port"],
+        },
+        "guard": guard,
+        "host_ssh_client_validation": "PENDING",
+        "container_ssh_client_validation": "PENDING",
+    }
+
+
+def _portal3e_final_payload_matches(payload: dict[str, Any]) -> bool:
+    return payload == {
+        "managed_user_id": PORTAL3E_FINAL_MANAGED_USER_ID,
+        "approved_ssh_key_record_ids": [PORTAL3E_FINAL_KEY_RECORD_ID],
+        "expected_state": "STAGED",
+        "approval_reference": PORTAL3E_FINAL_APPROVAL_REFERENCE,
+        "dry_run_operation_id": PORTAL3E_FINAL_DRY_RUN_OPERATION_ID,
+    }
+
+
+def _execute_origin_pilot_activate_rollback(
+    request: WorkerRequest, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if (
+        request.requested_by != MANAGEMENT_USERNAME
+        or request.approved_by != MANAGEMENT_USERNAME
+        or request.idempotency_key != PORTAL3E_FINAL_ROLLBACK_IDEMPOTENCY_KEY
+        or not _portal3e_final_payload_matches(payload)
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "ACTIVATE_ROLLBACK_BINDING_REJECTED",
+                "message": "Activate rollback is not bound to Portal-3E-FINAL",
+            },
+        }
+    integrity = script_integrity()
+    if not integrity.get("h100-user-create", {}).get("integrity_ok", False):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "SCRIPT_INTEGRITY_FAILED",
+                "message": "fixed lifecycle script integrity check failed",
+            },
+        }
+    try:
+        summary = _stage_postcondition_summary(APPROVED_STAGE_PAYLOAD)
+        return {
+            "status": "SUCCEEDED",
+            "handler": "user.activate.rollback",
+            "rollback_status": "ROLLED_BACK",
+            "idempotent_replay": True,
+            "stage": summary,
+        }
+    except LifecycleValidationError:
+        pass
+    execution = run_allowlisted_script(
+        build_user_activate_rollback_argv(PILOT_USERNAME), timeout=180
+    )
+    if not execution.get("ok"):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": str(execution.get("error_code", "ACTIVATE_ROLLBACK_FAILED"))[:64],
+                "message": "controlled Activate rollback script failed",
+            },
+            "rollback_status": "REQUIRES_MANUAL_REVIEW",
+        }
+    try:
+        summary = _stage_postcondition_summary(APPROVED_STAGE_PAYLOAD)
+    except LifecycleValidationError as exc:
+        return {
+            "status": "ERROR",
+            "error": {"code": exc.code, "message": str(exc)},
+            "rollback_status": "REQUIRES_MANUAL_REVIEW",
+        }
+    return {
+        "status": "SUCCEEDED",
+        "handler": "user.activate.rollback",
+        "rollback_status": "ROLLED_BACK",
+        "idempotent_replay": False,
+        "stage": summary,
+    }
+
+
+def _execute_origin_pilot_activate(
+    request: WorkerRequest, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if (
+        request.requested_by != MANAGEMENT_USERNAME
+        or request.approved_by != MANAGEMENT_USERNAME
+        or request.idempotency_key != PORTAL3E_FINAL_IDEMPOTENCY_KEY
+        or not _portal3e_final_payload_matches(payload)
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "ACTIVATE_APPROVAL_BINDING_REJECTED",
+                "message": "real Activate is not bound to Portal-3E-FINAL approval",
+            },
+        }
+    integrity = script_integrity()
+    failed_scripts = sorted(
+        name
+        for name in ACTIVATE_REQUIRED_SCRIPTS
+        if not integrity.get(name, {}).get("integrity_ok", False)
+    )
+    if failed_scripts:
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "SCRIPT_INTEGRITY_FAILED",
+                "message": "fixed lifecycle script integrity check failed",
+                "scripts": failed_scripts,
+            },
+        }
+    try:
+        preflight = _user_activate_dry_run(payload)
+        key_records = list(preflight["approved_ssh_keys"])
+        if (
+            len(key_records) != 1
+            or key_records[0].get("record_id") != PORTAL3E_FINAL_KEY_RECORD_ID
+            or key_records[0].get("fingerprint_sha256") != PORTAL3E_FINAL_KEY_FINGERPRINT
+            or key_records[0].get("key_type") != "ssh-ed25519"
+            or key_records[0].get("scope") != "BOTH"
+        ):
+            raise LifecycleValidationError(
+                "ACTIVATE_APPROVED_KEY_CHANGED", "approved Portal-3E-FINAL key record changed"
+            )
+        management_before = {
+            MANAGEMENT_USERNAME: _sshd_effective_config(MANAGEMENT_USERNAME),
+            "codexops": _sshd_effective_config("codexops"),
+        }
+        with activation_key_bundles(request.request_id, key_records) as (
+            host_key_file,
+            container_key_file,
+        ):
+            execution = run_allowlisted_script(
+                build_user_activate_argv(PILOT_USERNAME, host_key_file, container_key_file),
+                timeout=ACTIVATE_EXECUTION_TIMEOUT_SECONDS,
+            )
+        if not execution.get("ok"):
+            try:
+                _stage_postcondition_summary(APPROVED_STAGE_PAYLOAD)
+                rollback_status = "ROLLED_BACK"
+            except LifecycleValidationError:
+                rollback_status = "REQUIRES_MANUAL_REVIEW"
+            return {
+                "status": "ERROR",
+                "error": {
+                    "code": str(execution.get("error_code", "ACTIVATE_EXECUTION_FAILED"))[:64],
+                    "message": "transactional Activate script failed",
+                    "exit_code": execution.get("exit_code"),
+                },
+                "rollback_status": rollback_status,
+            }
+        try:
+            activated = _activate_postcondition_summary(key_records, management_before)
+        except LifecycleValidationError as exc:
+            rollback_execution = run_allowlisted_script(
+                build_user_activate_rollback_argv(PILOT_USERNAME), timeout=180
+            )
+            rollback_status = "REQUIRES_MANUAL_REVIEW"
+            if rollback_execution.get("ok"):
+                try:
+                    _stage_postcondition_summary(APPROVED_STAGE_PAYLOAD)
+                    rollback_status = "ROLLED_BACK"
+                except LifecycleValidationError:
+                    pass
+            return {
+                "status": "ERROR",
+                "error": {"code": exc.code, "message": str(exc)},
+                "rollback_status": rollback_status,
+            }
+        return {
+            "status": "SUCCEEDED",
+            "handler": "user.activate",
+            "idempotent_replay": False,
+            "execution_enabled": True,
+            "approved_ssh_keys": key_records,
+            "activate": activated,
+        }
+    except LifecycleValidationError as exc:
+        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+
+
 def _user_activate_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
     # Key files are validated before consulting or mutating lifecycle state.
     key_records = validate_approved_ssh_key_records(payload["approved_ssh_key_record_ids"])
@@ -3798,6 +4428,14 @@ def dry_run_plan(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, A
         if failed_scripts:
             return result
         return _user_activate_dry_run(payload)
+    if request.operation_type == "user.activate.rollback":
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "ACTIVATE_ROLLBACK_DRY_RUN_REJECTED",
+                "message": "internal rollback is available only for a failed real Activate",
+            },
+        }
     return result
 
 
@@ -3819,6 +4457,10 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
         if not request.dry_run:
             if request.operation_type == "user.stage":
                 return _execute_origin_pilot_stage(request, payload)
+            if request.operation_type == "user.activate":
+                return _execute_origin_pilot_activate(request, payload)
+            if request.operation_type == "user.activate.rollback":
+                return _execute_origin_pilot_activate_rollback(request, payload)
             if request.operation_type == "ssh_key.prepare":
                 return _prepare_ssh_key_record(request, payload)
             if request.operation_type == "ssh_key.discard":

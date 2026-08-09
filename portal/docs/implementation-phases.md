@@ -127,3 +127,12 @@
   仍禁用。`user.activate` 仅允许 dry-run，并重新验证 STAGED 资源及两个安装目标计划。
 - 数据库 revision：`f4a91c3e7b20`。最终测试、部署、真实用户 Key 登记和验收结果记录在
   本阶段运行报告；在真实 Key 登记前不得声称 Activate dry-run READY。
+
+## Portal-3E-FINAL：服务器端 Activate
+
+- 唯一目标为 `origin-pilot`；真实 Operation 固定引用重新验收的 dry-run、managed-user
+  UUID、BOTH key record UUID/fingerprint、精确审批文本和新幂等键。
+- API 只负责 Operation/审批/Portal 状态事务；所有宿主写入经 Root Worker 与固定管理
+  工具执行。两处 authorized_keys、shell、容器或 Portal 持久化任一失败均回滚到 STAGED。
+- 成功状态为计算身份 ACTIVE、容器 RUNNING/GPU NONE、Host/Container 服务端 READY、
+  Client Validation PENDING。Slurm 仍为 DRAIN/EMPTY，本阶段不提交作业。

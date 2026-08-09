@@ -137,6 +137,34 @@ function stagedUser(state: Portal3dState) {
       container_memory_gb: 32,
       container_pids_limit: 4096,
       container_image_digest: `sha256:${"a".repeat(64)}`,
+      approved_host: "10.82.36.1",
+      host_ssh_port: 22,
+      host_ssh_server:
+        computeState === "ACTIVE"
+          ? "READY_FOR_CLIENT_VALIDATION"
+          : "NOT_READY",
+      container_ssh_server:
+        computeState === "ACTIVE"
+          ? "READY_FOR_CLIENT_VALIDATION"
+          : "NOT_READY",
+      host_server_fingerprint:
+        computeState === "ACTIVE" ? "SHA256:test-host-server" : null,
+      container_server_fingerprint:
+        computeState === "ACTIVE" ? "SHA256:test-container-server" : null,
+      host_ssh_client_validation:
+        computeState === "ACTIVE" ? "PENDING" : "NOT_STARTED",
+      container_ssh_client_validation:
+        computeState === "ACTIVE" ? "PENDING" : "NOT_STARTED",
+      host_ssh_policy: {
+        status: "PASSING",
+        pubkey_authentication: true,
+        password_authentication: false,
+        keyboard_interactive_authentication: false,
+        authentication_methods: ["publickey"],
+      },
+      slurm_node_state: "DRAIN",
+      slurm_queue: "EMPTY",
+      gpu_scheduling_available: false,
     },
     compute_onboarding: {
       status: computeState,
@@ -656,7 +684,7 @@ test("ACTIVE 且 Key 已安装后才显示 SSH 与 VS Code 配置", async ({ pag
   await page.goto("/access");
   await page.getByRole("button", { name: "连接宿主机" }).click();
   await expect(page.locator(".connection-command")).toContainText(
-    "ssh -i <私钥路径> origin-pilot@10.82.36.1",
+    "ssh -i <你的私钥路径> origin-pilot@10.82.36.1",
   );
   await page.getByRole("button", { name: "关闭" }).click();
   await page.getByRole("button", { name: "VS Code Remote SSH" }).click();
@@ -664,6 +692,21 @@ test("ACTIVE 且 Key 已安装后才显示 SSH 与 VS Code 配置", async ({ pag
     "IdentityFile <你的私钥路径>",
   );
   await expect(page.locator(".connection-command")).toContainText("Port 22023");
+  await expect(
+    page.getByText("USER AUTHENTICATION KEY FINGERPRINT").first(),
+  ).toBeVisible();
+  await expect(page.getByText("HOST SSH SERVER FINGERPRINT")).toBeVisible();
+  await expect(page.getByText("CONTAINER SSH SERVER FINGERPRINT")).toBeVisible();
+  await expect(page.getByText("SHA256:test-host-server")).toBeVisible();
+  await expect(page.getByText("SHA256:test-container-server")).toBeVisible();
+  await expect(page.getByText("PENDING", { exact: true })).toHaveCount(2);
+  await expect(page.getByText("OUTSIDE SLURM DENIED")).toBeVisible();
+  await expect(page.getByText("sbatch / srun / squeue / sacct / 文件管理")).toBeVisible();
+  await expect(
+    page.getByText("VS Code Remote SSH / Shell / 开发 / 编译 / 数据准备"),
+  ).toBeVisible();
+  await expect(page.getByText("NONE", { exact: true })).toBeVisible();
+  await expect(page.getByText(/当前调度节点保持 DRAIN/u)).toBeVisible();
 });
 
 test("ACTIVE + STOPPED 仅显示受控容器启动入口并在成功后开放连接", async ({
@@ -710,7 +753,7 @@ test("ACTIVE + STOPPED 仅显示受控容器启动入口并在成功后开放连
   );
   await page.getByRole("button", { name: "连接开发容器" }).click();
   await expect(page.locator(".connection-command")).toContainText(
-    "ssh -i <私钥路径> -p 22023 origin-pilot@10.82.36.1",
+    "ssh -i <你的私钥路径> -p 22023 origin-pilot@10.82.36.1",
   );
 });
 

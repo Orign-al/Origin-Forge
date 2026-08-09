@@ -110,11 +110,11 @@ SSH public-key staging 必须在启用自助登记前存在：
 配套 `.meta.json`，均为 `root:root 0600`。API 服务账号不得直接写该目录；Web 服务账号
 不得读取。部署脚本或 tmpfiles 规则必须保证目录 metadata，不得在运行时放宽权限。
 
-本轮同时修改 `h100-user-create` 与 `h100-container-start`。必须先以 root-only 方式备份
-已安装文件，再以同目录临时文件、`root:root`、批准 mode、fsync 和原子 rename 部署；随后
-把两个新 SHA-256 精确写入 `/etc/h100-portal/worker-scripts.json`。仓库
+Portal-3E-FINAL 修改 `h100-user-create`，增加固定 Activate 回滚入口。必须先以 root-only
+方式备份已安装文件，再以同目录临时文件、`root:root`、批准 mode、fsync 和原子 rename
+部署；随后把新 SHA-256 精确写入 `/etc/h100-portal/worker-scripts.json`。仓库
 `deploy/worker-scripts.json` 必须保存同一精确值。不得使用通配 hash、跳过校验或先启动
-Worker 再补 allowlist；Worker 重启后必须先证明两个脚本的 `integrity_ok=true`。
+Worker 再补 allowlist；Worker 重启后必须先证明相关脚本的 `integrity_ok=true`。
 
 ### Managed compute user SSH policy
 

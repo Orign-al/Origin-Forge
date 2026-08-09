@@ -76,8 +76,16 @@ Portal-3D-R 额外开放两个内部固定操作，它们只管理 public-key st
   Scope，Activate dry-run 逐项与 Portal 数据库记录交叉验证。
 
 自助登记只传 public key。Worker 若在任何字段发现私钥装甲，返回
-`SSH_PRIVATE_KEY_UPLOAD_REJECTED`，不得写 staging。真正 `user.activate dry_run=false`
-依然返回 `WRITE_EXECUTION_DISABLED`。
+`SSH_PRIVATE_KEY_UPLOAD_REJECTED`，不得写 staging。`user.activate dry_run=false` 仅对
+Portal-3E-FINAL 的固定 actor、approval、dry-run UUID、managed-user UUID、key UUID、
+fingerprint 和幂等键开放；任何其他绑定仍返回受控拒绝。
+
+真实 Activate 使用请求 UUID 生成 Host/Container 两个 root-only 临时 public-key bundle，
+调用固定 `h100-user-create` argv，并在一次调用后删除 bundle。Worker 随后重新验证两处
+authorized_keys、shell/password、Host/Container SSH effective policy、监听、服务器身份
+fingerprint、GPU isolation、Guard、quota、Slurm DRAIN/空队列及容器安全。后置条件失败时
+调用内部 `user.activate.rollback`，恢复 STAGED/nologin/两处 key absent/容器 stopped；
+该回滚 operation 不对浏览器开放。
 
 Portal-3D-R 同时定义了一个与通用容器管理分离的自助启动闭合路径。API 端点
 `POST /api/v1/containers/{name}/start` 只允许当前会话所属的受管容器，并只接收服务端
@@ -97,7 +105,8 @@ command、argv、路径或 Docker 参数；这些字段由数据库中的受管�
 证明容器确实 STOPPED 后才返回普通失败。无法证明停止时返回
 `CONTAINER_STOP_RECOVERY_FAILED`，Portal 将 observed state 降为 UNKNOWN，绝不显示虚假的
 STOPPED/RUNNING。旧式仅含 `{name}` 的通用 `container.start` payload 仍没有真实执行路径。
-当前 `origin-pilot` 为 STAGED，因此本阶段无法触发该自助启动路径。
+Portal-3E-FINAL 成功后容器已由 Activate 事务启动；后续单独停止后的自助启动仍使用这条
+闭合路径。
 
 真实 Stage 使用有界长超时并在脚本成功后重新读取 STAGED state、UID/GID、nologin、密码
 锁定、authorized_keys 缺失、精确 UID policy、project mapping、Slurm association、停止且
