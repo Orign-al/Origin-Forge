@@ -73,6 +73,13 @@ def resource_view(
         "slurm_node_state": safe_spec.get("slurm_node_state"),
         "slurm_queue": safe_spec.get("slurm_queue"),
         "gpu_scheduling_available": safe_spec.get("gpu_scheduling_available"),
+        "pilot_acceptance_status": safe_spec.get("pilot_acceptance_status"),
+        "pilot_acceptance_operation_id": safe_spec.get("pilot_acceptance_operation_id"),
+        "pilot_acceptance_accepted_at": safe_spec.get("pilot_acceptance_accepted_at"),
+        "pilot_cpu_job_id": safe_spec.get("pilot_cpu_job_id"),
+        "pilot_gpu_job_id": safe_spec.get("pilot_gpu_job_id"),
+        "pilot_allocated_gpu_uuid": safe_spec.get("pilot_allocated_gpu_uuid"),
+        "pilot_final_node_state": safe_spec.get("pilot_final_node_state"),
     }
 
 

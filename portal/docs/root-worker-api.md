@@ -50,6 +50,7 @@ Prometheus/Grafana。GPU minor 只按 UUID + PCI Bus ID 与 NVIDIA driver procfs
 写框架 operation：
 
 - `user.plan`、`user.stage`、`user.activate`、`user.suspend`
+- `user.ssh_client_validation.record`、`user.pilot.acceptance`
 - `container.start`、`container.stop`、`container.restart`、`container.rebuild`
 - `slurm.drain`、`slurm.resume`、`job.cancel`、`quota.update`
 - `ssh_key.add`、`ssh_key.revoke`
@@ -108,6 +109,22 @@ STOPPED/RUNNING。旧式仅含 `{name}` 的通用 `container.start` payload 仍�
 Portal-3E-FINAL 成功后容器已由 Activate 事务启动；后续单独停止后的自助启动仍使用这条
 闭合路径。
 
+Portal-3F 的两个写 operation 只对固定管理员 CLI 开放，浏览器通用 Operation 入口明确
+拒绝。`user.ssh_client_validation.record` 只接受固定 managed-user/key UUID、已批准
+fingerprint、Host/Container 两项 `PASS` 和 `USER_CONFIRMED_REAL_CLIENT_CONNECTIONS`
+证据类型；Worker 只重读 ACTIVE 身份、两处 key、SSH server policy、容器、GPU policy、
+Guard、quota、Slurm DRAIN/空队列及 GPU/DCGM/systemd 健康，不执行或模拟私钥认证。
+
+`user.pilot.acceptance` 只接受固定节点 `sagsh100server`、`notebook`、`company/general`、
+max GPU 1、GPU-less 长期容器和固定 NGC digest 镜像。Worker 只能调用 hash-pinned
+`h100-origin-pilot-acceptance --execute <worker-request-uuid>`；脚本临时 RESUME 后以真实
+UID/GID 20001/20001 提交一个 CPU job 和一个单 GPU Pyxis/Enroot job。固定 C 探针证明
+allocated minor 可打开、三个 unallocated minor 被拒绝及 CUDA context 成功；同一 GPU
+context 存活期间，两个独立 `user-20001.slice` transient probe 证明作业外设备打开与
+CUDA context 均被拒绝。任意失败先恢复 DRAIN，再只取消本次唯一命名的测试作业；成功
+也恢复 DRAIN，等待独立最终上线审批。payload 不接受 command、argv、路径、分区、镜像
+或资源覆盖。
+
 真实 Stage 使用有界长超时并在脚本成功后重新读取 STAGED state、UID/GID、nologin、密码
 锁定、authorized_keys 缺失、精确 UID policy、project mapping、Slurm association、停止且
 无 GPU 的容器、Guard timer、Slurm DRAIN 和空队列。相同幂等键只在这些后置条件仍精确
@@ -150,7 +167,7 @@ Docker inspect 只允许受管名称前缀并只返回白名单字段。
 
 ## 管理脚本完整性
 
-写 dry-run 前检查十个既有 `h100-*` 脚本：
+写 dry-run 前检查既有 `h100-*` 脚本；Portal-3F 还检查其固定 acceptance 脚本：
 
 - `lstat` 必须是普通文件且不是 symlink；
 - owner UID 必须为 0；

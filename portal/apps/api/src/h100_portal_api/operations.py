@@ -26,6 +26,8 @@ WRITE_OPERATION_TYPES = {
     "user.plan",
     "user.stage",
     "user.activate",
+    "user.ssh_client_validation.record",
+    "user.pilot.acceptance",
     "user.suspend",
     "container.start",
     "container.stop",
@@ -42,6 +44,7 @@ WRITE_OPERATION_TYPES = {
 HIGH_RISK_OPERATION_TYPES = {
     "user.stage",
     "user.activate",
+    "user.pilot.acceptance",
     "user.suspend",
     "slurm.drain",
     "slurm.resume",
@@ -55,6 +58,8 @@ OPERATION_PERMISSIONS = {
     "user.plan": "users.write",
     "user.stage": "users.write",
     "user.activate": "users.write",
+    "user.ssh_client_validation.record": "users.write",
+    "user.pilot.acceptance": "slurm.write",
     "user.suspend": "users.write",
     "container.start": "containers.write",
     "container.stop": "containers.write",
@@ -70,7 +75,12 @@ OPERATION_PERMISSIONS = {
 
 
 def risk_for(operation_type: str) -> RiskLevel:
-    if operation_type in {"slurm.resume", "user.activate", "user.suspend"}:
+    if operation_type in {
+        "slurm.resume",
+        "user.activate",
+        "user.suspend",
+        "user.pilot.acceptance",
+    }:
         return RiskLevel.CRITICAL
     if operation_type in HIGH_RISK_OPERATION_TYPES:
         return RiskLevel.HIGH

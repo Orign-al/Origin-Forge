@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from h100_portal_worker.schemas import (
+    APPROVED_CLIENT_VALIDATION_PAYLOAD,
+    APPROVED_PILOT_ACCEPTANCE_PAYLOAD,
     APPROVED_STAGE_PAYLOAD,
     KNOWN_WRITES,
     WorkerRequest,
@@ -70,6 +72,7 @@ SCRIPT_ALLOWLIST = {
     "h100-container-status": "/usr/local/sbin/h100-container-status",
     "h100-quota-show": "/usr/local/sbin/h100-quota-show",
     "h100-gpu-bypass-guard": "/usr/local/sbin/h100-gpu-bypass-guard",
+    "h100-origin-pilot-acceptance": ("/opt/h100-portal/scripts/h100-origin-pilot-acceptance"),
 }
 SCRIPT_HASH_CONFIG = Path("/etc/h100-portal/worker-scripts.json")
 GPU_ISOLATED_USERS = Path("/etc/h100-platform/gpu-isolated-users")
@@ -144,6 +147,8 @@ PORTAL3E_FINAL_KEY_RECORD_ID = "7427da72-37b9-4ac2-8ada-2f0c83b7718e"
 PORTAL3E_FINAL_KEY_FINGERPRINT = "SHA256:nek6vyEb3GT+UJAcY5y/8PgY4achF2ouNy+8C2JqUVc"
 PORTAL3E_FINAL_IDEMPOTENCY_KEY = "portal3e-final-origin-pilot-activate-v1"
 PORTAL3E_FINAL_ROLLBACK_IDEMPOTENCY_KEY = "portal3e-final-origin-pilot-rollback-v1"
+PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY = "portal3f-origin-pilot-client-validation-v1"
+PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY = "portal3f-origin-pilot-acceptance-v1"
 HOST_ED25519_PUBLIC_KEY = Path("/etc/ssh/ssh_host_ed25519_key.pub")
 CONTAINER_ED25519_PUBLIC_KEY = Path(
     "/srv/gpu-platform/container-data/origin-pilot/ssh-host-keys/ssh_host_ed25519_key.pub"
@@ -166,6 +171,7 @@ ACTIVATE_REQUIRED_SCRIPTS = frozenset(
         "h100-gpu-bypass-guard",
     }
 )
+PORTAL3F_REQUIRED_SCRIPTS = ACTIVATE_REQUIRED_SCRIPTS | frozenset({"h100-origin-pilot-acceptance"})
 FORBIDDEN_PILOT_GROUPS = frozenset(
     {"sudo", "docker", "video", "render", "adm", "systemd-journal", "gpu-platform-admin"}
 )
@@ -4161,6 +4167,302 @@ def _portal3e_final_payload_matches(payload: dict[str, Any]) -> bool:
     }
 
 
+def _portal3f_active_preflight() -> dict[str, Any]:
+    """Re-read every ACTIVE identity boundary before a Portal-3F decision."""
+    management_before = {
+        MANAGEMENT_USERNAME: _sshd_effective_config(MANAGEMENT_USERNAME),
+        "codexops": _sshd_effective_config("codexops"),
+    }
+    active = _activate_postcondition_summary(
+        [{"scope": "BOTH", "fingerprint_sha256": PORTAL3E_FINAL_KEY_FINGERPRINT}],
+        management_before,
+    )
+    gpus = gpu_list()
+    health = gpu_health()
+    failed = systemd_failed()
+    gpu_rows = gpus.get("gpus", [])
+    dcgm_rows = health.get("per_gpu", [])
+    if not (
+        gpus.get("status") == "OK"
+        and gpus.get("count") == 4
+        and isinstance(gpu_rows, list)
+        and len(gpu_rows) == 4
+        and all(
+            isinstance(row, dict) and str(row.get("mig.mode.current", "")).lower() == "disabled"
+            for row in gpu_rows
+        )
+        and health.get("status") == "OK"
+        and isinstance(dcgm_rows, list)
+        and len(dcgm_rows) == 4
+        and all(
+            isinstance(row, dict) and str(row.get("dcgm_status", "")).casefold() == "pass"
+            for row in dcgm_rows
+        )
+        and isinstance(health.get("kernel_errors"), dict)
+        and health["kernel_errors"].get("status") == "CLEAR"
+        and failed.get("status") == "OK"
+        and failed.get("count") == 0
+    ):
+        raise LifecycleValidationError(
+            "PORTAL3F_HEALTH_PREFLIGHT_FAILED",
+            "GPU/DCGM/kernel/systemd health differs from the approved Pilot baseline",
+        )
+    return {
+        "username": active["username"],
+        "uid": active["uid"],
+        "gid": active["gid"],
+        "onboarding_state": active["onboarding_state"],
+        "shell": active["shell"],
+        "password": active["password"],
+        "ssh_key_state": active["ssh_key_state"],
+        "host_authorized_keys": active["host_authorized_keys"],
+        "container_authorized_keys": active["container_authorized_keys"],
+        "host_key_fingerprints": active["host_key_fingerprints"],
+        "container_key_fingerprints": active["container_key_fingerprints"],
+        "host_ssh_policy": active["host_ssh_policy"],
+        "container_ssh_policy": active["container_ssh_policy"],
+        "host_ssh_server": active["host_ssh_server"],
+        "container_ssh_server": active["container_ssh_server"],
+        "management_ssh_policy": active["management_ssh_policy"],
+        "gpu_policy": active["gpu_policy"],
+        "quota": active["quota"],
+        "slurm": active["slurm"],
+        "container": active["container"],
+        "guard": active["guard"],
+        "gpu_health": {
+            "count": 4,
+            "mig": "DISABLED",
+            "dcgm": "4/4 PASS",
+            "kernel_errors": "CLEAR",
+        },
+        "systemd_failed_units": 0,
+    }
+
+
+def build_origin_pilot_acceptance_argv(request_id: str) -> list[str]:
+    try:
+        canonical = str(uuid.UUID(request_id))
+    except ValueError as exc:
+        raise LifecycleValidationError(
+            "PORTAL3F_REQUEST_ID_REJECTED", "Portal-3F Worker request ID is invalid"
+        ) from exc
+    if canonical != request_id:
+        raise LifecycleValidationError(
+            "PORTAL3F_REQUEST_ID_REJECTED", "Portal-3F Worker request ID is not canonical"
+        )
+    return [SCRIPT_ALLOWLIST["h100-origin-pilot-acceptance"], "--execute", canonical]
+
+
+def _portal3f_script_result(stdout: str, request_id: str) -> dict[str, Any]:
+    accepted_fields = {
+        "PORTAL3F_RESULT",
+        "CPU_JOB_ID",
+        "GPU_JOB_ID",
+        "ALLOCATED_GPU_UUID",
+        "OUT_OF_JOB_GPU_OPEN",
+        "OUT_OF_JOB_CUDA_CONTEXT",
+        "IN_JOB_ALLOCATED_GPU",
+        "IN_JOB_UNALLOCATED_GPUS",
+        "IN_JOB_CUDA_CONTEXT",
+        "FINAL_NODE_STATE",
+        "WORKER_LOG_DIR",
+    }
+    values: dict[str, str] = {}
+    for line in stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key not in accepted_fields:
+            continue
+        if key in values:
+            raise LifecycleValidationError(
+                "PORTAL3F_RESULT_REJECTED", "Portal-3F script returned duplicate fields"
+            )
+        values[key] = value
+    expected_log_dir = f"/srv/gpu-platform/platform/logs/portal3f-worker-{request_id}"
+    if not (
+        values.get("PORTAL3F_RESULT") == "PASSED"
+        and re.fullmatch(r"[1-9][0-9]*", values.get("CPU_JOB_ID", ""))
+        and re.fullmatch(r"[1-9][0-9]*", values.get("GPU_JOB_ID", ""))
+        and values.get("CPU_JOB_ID") != values.get("GPU_JOB_ID")
+        and re.fullmatch(r"GPU-[0-9a-f-]{36}", values.get("ALLOCATED_GPU_UUID", ""))
+        and values.get("OUT_OF_JOB_GPU_OPEN") == "DENIED"
+        and values.get("OUT_OF_JOB_CUDA_CONTEXT") == "DENIED"
+        and values.get("IN_JOB_ALLOCATED_GPU") == "ALLOWED"
+        and values.get("IN_JOB_UNALLOCATED_GPUS") == "DENIED"
+        and values.get("IN_JOB_CUDA_CONTEXT") == "PASSED"
+        and values.get("FINAL_NODE_STATE") == "DRAIN"
+        and values.get("WORKER_LOG_DIR") == expected_log_dir
+    ):
+        raise LifecycleValidationError(
+            "PORTAL3F_RESULT_REJECTED", "Portal-3F script result is incomplete"
+        )
+    return {
+        "cpu_job_id": int(values["CPU_JOB_ID"]),
+        "gpu_job_id": int(values["GPU_JOB_ID"]),
+        "allocated_gpu_uuid": values["ALLOCATED_GPU_UUID"],
+        "out_of_job_gpu_open": "DENIED",
+        "out_of_job_cuda_context": "DENIED",
+        "in_job_allocated_gpu": "ALLOWED",
+        "in_job_unallocated_gpus": "DENIED",
+        "in_job_cuda_context": "PASSED",
+        "final_node_state": "DRAIN",
+        "worker_log_dir": expected_log_dir,
+    }
+
+
+def _portal3f_drain_recovery_status() -> str:
+    node = slurm_node()
+    jobs = slurm_jobs()
+    if (
+        node.get("status") == "OK"
+        and node.get("nodes")
+        and all("DRAIN" in str(item.get("state", "")).upper() for item in node["nodes"])
+        and jobs.get("status") == "OK"
+        and not jobs.get("jobs")
+    ):
+        return "DRAIN_RESTORED"
+    return "REQUIRES_MANUAL_REVIEW"
+
+
+def _portal3f_client_validation_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    preflight = _portal3f_active_preflight()
+    return {
+        "status": "DRY_RUN",
+        "handler": "user.ssh_client_validation.record",
+        "execution_enabled": False,
+        "validated_username": payload["username"],
+        "confirmation_source": payload["confirmation_source"],
+        "host_client_validation": "PASS",
+        "container_client_validation": "PASS",
+        "server_preflight": preflight,
+        "private_key_handling": "NOT_ACCESSED",
+        "slurm_execution": "NOT_PERFORMED",
+    }
+
+
+def _execute_portal3f_client_validation(
+    request: WorkerRequest, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if (
+        request.requested_by != MANAGEMENT_USERNAME
+        or request.approved_by != MANAGEMENT_USERNAME
+        or request.idempotency_key != PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY
+        or payload != APPROVED_CLIENT_VALIDATION_PAYLOAD
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "PORTAL3F_CLIENT_VALIDATION_BINDING_REJECTED",
+                "message": "client validation is not bound to the fixed Portal-3F approval",
+            },
+        }
+    try:
+        preflight = _portal3f_active_preflight()
+    except LifecycleValidationError as exc:
+        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+    return {
+        "status": "SUCCEEDED",
+        "handler": "user.ssh_client_validation.record",
+        "execution_enabled": True,
+        "username": PILOT_USERNAME,
+        "host_client_validation": "PASS",
+        "container_client_validation": "PASS",
+        "confirmation_source": payload["confirmation_source"],
+        "private_key_handling": "NOT_ACCESSED",
+        "server_preflight": preflight,
+    }
+
+
+def _portal3f_pilot_acceptance_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    integrity = script_integrity()
+    failed_scripts = sorted(
+        name
+        for name in PORTAL3F_REQUIRED_SCRIPTS
+        if not integrity.get(name, {}).get("integrity_ok", False)
+    )
+    if failed_scripts:
+        raise LifecycleValidationError(
+            "SCRIPT_INTEGRITY_FAILED",
+            f"Portal-3F required script integrity failed: {','.join(failed_scripts)}",
+        )
+    preflight = _portal3f_active_preflight()
+    return {
+        "status": "DRY_RUN",
+        "handler": "user.pilot.acceptance",
+        "execution_enabled": False,
+        "validated_username": payload["username"],
+        "node_name": payload["node_name"],
+        "partition": payload["partition"],
+        "account": payload["account"],
+        "qos": payload["qos"],
+        "max_gpus": payload["max_gpus"],
+        "image_ref": payload["image_ref"],
+        "tests": [
+            "CPU_JOB",
+            "SINGLE_GPU_PYXIS_ENROOT",
+            "IN_JOB_ALLOCATED_GPU_ALLOW",
+            "IN_JOB_UNALLOCATED_GPU_DENY",
+            "IN_JOB_CUDA_CONTEXT",
+            "OUT_OF_JOB_GPU_OPEN_DENY_CONCURRENT",
+            "OUT_OF_JOB_CUDA_CONTEXT_DENY_CONCURRENT",
+        ],
+        "final_node_state": "DRAIN",
+        "preflight": preflight,
+    }
+
+
+def _execute_portal3f_pilot_acceptance(
+    request: WorkerRequest, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if (
+        request.requested_by != MANAGEMENT_USERNAME
+        or request.approved_by != MANAGEMENT_USERNAME
+        or request.idempotency_key != PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY
+        or payload != APPROVED_PILOT_ACCEPTANCE_PAYLOAD
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "PORTAL3F_ACCEPTANCE_BINDING_REJECTED",
+                "message": "Pilot acceptance is not bound to the fixed Portal-3F approval",
+            },
+        }
+    try:
+        plan = _portal3f_pilot_acceptance_plan(payload)
+        execution = run_allowlisted_script(
+            build_origin_pilot_acceptance_argv(request.request_id), timeout=1500
+        )
+        if not execution.get("ok"):
+            return {
+                "status": "ERROR",
+                "error": {
+                    "code": str(execution.get("error_code", "PORTAL3F_EXECUTION_FAILED"))[:64],
+                    "message": "fixed Portal-3F acceptance tooling failed",
+                    "exit_code": execution.get("exit_code"),
+                },
+                "rollback_status": _portal3f_drain_recovery_status(),
+            }
+        acceptance = _portal3f_script_result(str(execution.get("stdout", "")), request.request_id)
+        postflight = _portal3f_active_preflight()
+        return {
+            "status": "SUCCEEDED",
+            "handler": "user.pilot.acceptance",
+            "execution_enabled": True,
+            "username": PILOT_USERNAME,
+            "approval_reference": payload["approval_reference"],
+            "client_validation": {"host": "PASS", "container": "PASS"},
+            "acceptance": acceptance,
+            "preflight": plan["preflight"],
+            "postflight": postflight,
+            "rollback_status": "NOT_REQUIRED",
+        }
+    except LifecycleValidationError as exc:
+        return {
+            "status": "ERROR",
+            "error": {"code": exc.code, "message": str(exc)},
+            "rollback_status": _portal3f_drain_recovery_status(),
+        }
+
+
 def _execute_origin_pilot_activate_rollback(
     request: WorkerRequest, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -4390,6 +4692,10 @@ def _user_activate_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def dry_run_plan(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    if request.operation_type == "user.ssh_client_validation.record":
+        return _portal3f_client_validation_plan(payload)
+    if request.operation_type == "user.pilot.acceptance":
+        return _portal3f_pilot_acceptance_plan(payload)
     if request.operation_type in {"ssh_key.prepare", "ssh_key.discard"}:
         return {
             "status": "DRY_RUN",
@@ -4461,6 +4767,10 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
                 return _execute_origin_pilot_activate(request, payload)
             if request.operation_type == "user.activate.rollback":
                 return _execute_origin_pilot_activate_rollback(request, payload)
+            if request.operation_type == "user.ssh_client_validation.record":
+                return _execute_portal3f_client_validation(request, payload)
+            if request.operation_type == "user.pilot.acceptance":
+                return _execute_portal3f_pilot_acceptance(request, payload)
             if request.operation_type == "ssh_key.prepare":
                 return _prepare_ssh_key_record(request, payload)
             if request.operation_type == "ssh_key.discard":

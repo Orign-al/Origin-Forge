@@ -29,6 +29,8 @@ KNOWN_WRITES = {
     "user.stage",
     "user.activate",
     "user.activate.rollback",
+    "user.ssh_client_validation.record",
+    "user.pilot.acceptance",
     "user.suspend",
     "container.start",
     "container.stop",
@@ -85,6 +87,42 @@ APPROVED_STAGE_PAYLOAD: dict[str, Any] = {
     "pids_limit": 4096,
     "gpu": "none",
     "expected_state": "DRAFT",
+}
+PORTAL3F_APPROVAL_REFERENCE = "portal3f-origin-pilot-first-acceptance-v1"
+PORTAL3F_MANAGED_USER_ID = "3b95b4f0-95d9-444a-8f0b-46288195a807"
+PORTAL3F_KEY_RECORD_ID = "7427da72-37b9-4ac2-8ada-2f0c83b7718e"
+PORTAL3F_KEY_FINGERPRINT = "SHA256:nek6vyEb3GT+UJAcY5y/8PgY4achF2ouNy+8C2JqUVc"
+PORTAL3F_IMAGE_REF = (
+    "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
+    "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
+)
+APPROVED_CLIENT_VALIDATION_PAYLOAD: dict[str, Any] = {
+    "managed_user_id": PORTAL3F_MANAGED_USER_ID,
+    "username": "origin-pilot",
+    "expected_compute_state": "ACTIVE",
+    "expected_ssh_key_state": "INSTALLED",
+    "key_record_id": PORTAL3F_KEY_RECORD_ID,
+    "key_fingerprint": PORTAL3F_KEY_FINGERPRINT,
+    "host_client_validation": "PASS",
+    "container_client_validation": "PASS",
+    "confirmation_source": "USER_CONFIRMED_REAL_CLIENT_CONNECTIONS",
+    "approval_reference": PORTAL3F_APPROVAL_REFERENCE,
+}
+APPROVED_PILOT_ACCEPTANCE_PAYLOAD: dict[str, Any] = {
+    "managed_user_id": PORTAL3F_MANAGED_USER_ID,
+    "username": "origin-pilot",
+    "node_name": "sagsh100server",
+    "partition": "notebook",
+    "account": "company",
+    "qos": "general",
+    "max_gpus": 1,
+    "container_name": "gpu-dev-origin-pilot",
+    "container_gpu": "NONE",
+    "image_ref": PORTAL3F_IMAGE_REF,
+    "expected_host_client_validation": "PASS",
+    "expected_container_client_validation": "PASS",
+    "final_node_state": "DRAIN",
+    "approval_reference": PORTAL3F_APPROVAL_REFERENCE,
 }
 
 
@@ -350,6 +388,23 @@ def _validate_container_start(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validate_portal3f_payload(operation_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+        raise PayloadValidationError(
+            "PORTAL3F_PAYLOAD_REJECTED", "secret, command, argv, and path fields are forbidden"
+        )
+    expected = (
+        APPROVED_CLIENT_VALIDATION_PAYLOAD
+        if operation_type == "user.ssh_client_validation.record"
+        else APPROVED_PILOT_ACCEPTANCE_PAYLOAD
+    )
+    if payload != expected:
+        raise PayloadValidationError(
+            "PORTAL3F_PLAN_MISMATCH", "Portal-3F payload differs from the fixed approved plan"
+        )
+    return dict(expected)
+
+
 def validate_payload(
     operation_type: str, payload: dict[str, Any], *, allow_legacy_stage: bool = False
 ) -> dict[str, Any]:
@@ -373,6 +428,8 @@ def validate_payload(
         return _validate_ssh_key_discard(payload)
     if operation_type == "container.start":
         return _validate_container_start(payload)
+    if operation_type in {"user.ssh_client_validation.record", "user.pilot.acceptance"}:
+        return _validate_portal3f_payload(operation_type, payload)
     if operation_type.startswith("user."):
         username = payload.get("username")
         if not isinstance(username, str) or not SAFE_USERNAME.fullmatch(username):

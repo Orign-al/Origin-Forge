@@ -208,3 +208,24 @@ UID 禁止原地改号。按迁移处理：创建新 UID 的 STAGED 账号和新
 每名用户分别验证 CPU job、单 GPU Pyxis job、两 GPU 超额申请被 QOS 拒绝/保持 Pending 后取消、sacct Account/QOS 正确、GPU 释放、目录隔离、无 sudo/docker 高权组、容器无 GPU/敏感 socket。最终复核 4 GPU、MIG Disabled、DCGM Pass、无 Xid/AER、队列、systemd、监控、quota、监听端口及 Git secret 扫描。
 
 只有提交入口技术 Gate、作业外拒绝、作业内 open/CUDA、上述验收全部通过，且管理员再次明确批准后，才可打印 `CONTROLLED SINGLE-NODE PILOT STARTED`。这不代表平台全面生产就绪。
+
+### Portal-3F 首名真实用户验收
+
+真实用户本人使用其保存的私钥完成 Host 与 Container 两项连接后，管理员才可使用固定
+CLI 记录确认并运行首个 Pilot 验收：
+
+```bash
+h100-portal-admin portal3f-origin-pilot \
+  --approval-text '允许进入 Portal-3F，记录 SSH Client Validation PASS 并执行首个 Slurm/GPU Pilot 验收。'
+```
+
+该入口不接收私钥、命令、路径、分区、镜像或资源参数。它创建两条独立 Operation：先在
+Worker 重新验证 ACTIVE/INSTALLED、SSH public-key-only、容器 GPU NONE、Guard、quota、
+association、DRAIN/空队列和健康状态后记录 Host/Container Client Validation `PASS`；再
+执行固定的 CPU job 与单 GPU Pyxis/Enroot job。GPU job 使用固定 NGC digest 镜像和固定 C
+探针，并在 CUDA context 存活期间从 `user-20001.slice` 并发验证作业外 GPU open/CUDA
+均被拒绝。
+
+所有路径最终都必须回到 DRAIN。成功只记录 `pilot_acceptance_status=PASSED`，不得输出
+`CONTROLLED SINGLE-NODE PILOT STARTED`；正式保持 IDLE 仍需下一次明确审批。失败时只取消
+本次唯一命名作业，保留用户数据、ACTIVE 身份、SSH Client Validation 记录和其他既有资源。

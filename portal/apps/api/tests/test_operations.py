@@ -16,6 +16,8 @@ from h100_portal_api.models import (
 from h100_portal_api.operations import can_transition, can_transition_onboarding, risk_for
 from h100_portal_api.routes import operations as operations_route
 from h100_portal_api.routes.operations import (
+    APPROVED_PORTAL3F_CLIENT_VALIDATION,
+    APPROVED_PORTAL3F_PILOT_ACCEPTANCE,
     PORTAL3C_STAGE_IDEMPOTENCY_KEY,
     PORTAL3E_FINAL_APPROVAL_REFERENCE,
     PORTAL3E_FINAL_APPROVAL_TEXT,
@@ -24,16 +26,24 @@ from h100_portal_api.routes.operations import (
     PORTAL3E_FINAL_KEY_FINGERPRINT,
     PORTAL3E_FINAL_KEY_RECORD_ID,
     PORTAL3E_FINAL_MANAGED_USER_ID,
+    PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY,
+    PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY,
     OperationPayloadError,
     is_portal3c_real_stage,
     is_portal3e_final_real_activate,
     persist_portal3c_staged_identity,
     persist_portal3e_activated_identity,
+    persist_portal3f_client_validation,
+    persist_portal3f_pilot_acceptance,
     validate_activate_database_bindings,
     validate_activate_execution_result,
     validate_activate_worker_result,
     validate_operation_payload,
     validate_persisted_activate_execution_result,
+    validate_portal3f_client_validation_plan,
+    validate_portal3f_client_validation_result,
+    validate_portal3f_pilot_acceptance_plan,
+    validate_portal3f_pilot_acceptance_result,
 )
 from h100_portal_api.security import safe_metadata
 from sqlalchemy import select
@@ -56,6 +66,7 @@ def test_operation_state_machine() -> None:
 
 def test_risk_classification() -> None:
     assert risk_for("slurm.resume") == RiskLevel.CRITICAL
+    assert risk_for("user.pilot.acceptance") == RiskLevel.CRITICAL
     assert risk_for("quota.update") == RiskLevel.HIGH
     assert risk_for("user.plan") == RiskLevel.MEDIUM
 
@@ -438,6 +449,178 @@ def test_portal3e_final_binding_and_active_persistence(database: Session) -> Non
     assert container.safe_spec["host_ssh_client_validation"] == "PENDING"
     assert container.safe_spec["container_ssh_client_validation"] == "PENDING"
     assert container.safe_spec["slurm_node_state"] == "DRAIN"
+
+
+def portal3f_server_snapshot(record: PortalSshKey) -> dict[str, object]:
+    activate = portal3e_execution_result(record)["activate"]
+    assert isinstance(activate, dict)
+    return {
+        **activate,
+        "gpu_health": {
+            "count": 4,
+            "mig": "DISABLED",
+            "dcgm": "4/4 PASS",
+            "kernel_errors": "CLEAR",
+        },
+        "systemd_failed_units": 0,
+    }
+
+
+def test_portal3f_payloads_and_worker_results_are_structured() -> None:
+    assert (
+        validate_operation_payload(
+            "user.ssh_client_validation.record", APPROVED_PORTAL3F_CLIENT_VALIDATION
+        )
+        == APPROVED_PORTAL3F_CLIENT_VALIDATION
+    )
+    assert (
+        validate_operation_payload("user.pilot.acceptance", APPROVED_PORTAL3F_PILOT_ACCEPTANCE)
+        == APPROVED_PORTAL3F_PILOT_ACCEPTANCE
+    )
+    with pytest.raises(OperationPayloadError, match="PORTAL3F_PLAN_MISMATCH"):
+        validate_operation_payload(
+            "user.pilot.acceptance",
+            {**APPROVED_PORTAL3F_PILOT_ACCEPTANCE, "max_gpus": 2},
+        )
+    with pytest.raises(OperationPayloadError, match="PORTAL3F_PAYLOAD_REJECTED"):
+        validate_operation_payload(
+            "user.pilot.acceptance",
+            {**APPROVED_PORTAL3F_PILOT_ACCEPTANCE, "argv": ["nvidia-smi"]},
+        )
+
+
+def test_portal3f_client_and_pilot_persistence(database: Session) -> None:
+    owner, _managed, key, activate_operation = create_portal3e_database_state(database)
+    persist_portal3e_activated_identity(
+        database,
+        owner=owner,
+        operation=activate_operation,
+        worker_result=portal3e_execution_result(key),
+    )
+    snapshot = portal3f_server_snapshot(key)
+    client_plan = {
+        "status": "DRY_RUN",
+        "handler": "user.ssh_client_validation.record",
+        "execution_enabled": False,
+        "validated_username": "origin-pilot",
+        "confirmation_source": "USER_CONFIRMED_REAL_CLIENT_CONNECTIONS",
+        "host_client_validation": "PASS",
+        "container_client_validation": "PASS",
+        "private_key_handling": "NOT_ACCESSED",
+        "slurm_execution": "NOT_PERFORMED",
+        "server_preflight": snapshot,
+    }
+    validate_portal3f_client_validation_plan(client_plan)
+    client_result = {
+        "status": "SUCCEEDED",
+        "handler": "user.ssh_client_validation.record",
+        "execution_enabled": True,
+        "username": "origin-pilot",
+        "host_client_validation": "PASS",
+        "container_client_validation": "PASS",
+        "confirmation_source": "USER_CONFIRMED_REAL_CLIENT_CONNECTIONS",
+        "private_key_handling": "NOT_ACCESSED",
+        "server_preflight": snapshot,
+    }
+    validate_portal3f_client_validation_result(client_result)
+    client_operation = PortalOperation(
+        operation_type="user.ssh_client_validation.record",
+        target_type="compute_identity",
+        target_id="origin-pilot",
+        requested_by=owner.id,
+        approved_by=owner.id,
+        request_summary="Portal-3F client validation",
+        validated_payload=APPROVED_PORTAL3F_CLIENT_VALIDATION,
+        idempotency_key=PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY,
+        risk_level=RiskLevel.MEDIUM,
+        status=OperationStatus.RUNNING,
+    )
+    database.add(client_operation)
+    database.flush()
+    container = persist_portal3f_client_validation(
+        database,
+        owner=owner,
+        operation=client_operation,
+        worker_result=client_result,
+    )
+    assert container.safe_spec["host_ssh_client_validation"] == "PASS"
+    assert container.safe_spec["container_ssh_client_validation"] == "PASS"
+
+    pilot_plan = {
+        "status": "DRY_RUN",
+        "handler": "user.pilot.acceptance",
+        "execution_enabled": False,
+        "validated_username": "origin-pilot",
+        "node_name": "sagsh100server",
+        "partition": "notebook",
+        "account": "company",
+        "qos": "general",
+        "max_gpus": 1,
+        "image_ref": APPROVED_PORTAL3F_PILOT_ACCEPTANCE["image_ref"],
+        "tests": [
+            "CPU_JOB",
+            "SINGLE_GPU_PYXIS_ENROOT",
+            "IN_JOB_ALLOCATED_GPU_ALLOW",
+            "IN_JOB_UNALLOCATED_GPU_DENY",
+            "IN_JOB_CUDA_CONTEXT",
+            "OUT_OF_JOB_GPU_OPEN_DENY_CONCURRENT",
+            "OUT_OF_JOB_CUDA_CONTEXT_DENY_CONCURRENT",
+        ],
+        "final_node_state": "DRAIN",
+        "preflight": snapshot,
+    }
+    validate_portal3f_pilot_acceptance_plan(pilot_plan)
+    request_id = str(uuid.uuid4())
+    pilot_result = {
+        "status": "SUCCEEDED",
+        "handler": "user.pilot.acceptance",
+        "execution_enabled": True,
+        "request_id": request_id,
+        "username": "origin-pilot",
+        "approval_reference": APPROVED_PORTAL3F_PILOT_ACCEPTANCE["approval_reference"],
+        "client_validation": {"host": "PASS", "container": "PASS"},
+        "acceptance": {
+            "cpu_job_id": 201,
+            "gpu_job_id": 202,
+            "allocated_gpu_uuid": "GPU-11111111-2222-3333-4444-555555555555",
+            "out_of_job_gpu_open": "DENIED",
+            "out_of_job_cuda_context": "DENIED",
+            "in_job_allocated_gpu": "ALLOWED",
+            "in_job_unallocated_gpus": "DENIED",
+            "in_job_cuda_context": "PASSED",
+            "final_node_state": "DRAIN",
+            "worker_log_dir": f"/srv/gpu-platform/platform/logs/portal3f-worker-{request_id}",
+        },
+        "preflight": snapshot,
+        "postflight": snapshot,
+        "rollback_status": "NOT_REQUIRED",
+    }
+    validate_portal3f_pilot_acceptance_result(pilot_result)
+    pilot_operation = PortalOperation(
+        operation_type="user.pilot.acceptance",
+        target_type="compute_identity",
+        target_id="origin-pilot",
+        requested_by=owner.id,
+        approved_by=owner.id,
+        request_summary="Portal-3F Pilot acceptance",
+        validated_payload=APPROVED_PORTAL3F_PILOT_ACCEPTANCE,
+        idempotency_key=PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY,
+        risk_level=RiskLevel.CRITICAL,
+        status=OperationStatus.RUNNING,
+    )
+    database.add(pilot_operation)
+    database.flush()
+    container = persist_portal3f_pilot_acceptance(
+        database,
+        owner=owner,
+        operation=pilot_operation,
+        worker_result=pilot_result,
+    )
+    assert container.safe_spec["pilot_acceptance_status"] == "PASSED"
+    assert container.safe_spec["pilot_cpu_job_id"] == 201
+    assert container.safe_spec["pilot_gpu_job_id"] == 202
+    assert container.safe_spec["pilot_final_node_state"] == "DRAIN"
+    assert container.safe_spec["gpu_scheduling_available"] is False
 
 
 def test_portal3e_persisted_result_revalidates_redacted_password_state(

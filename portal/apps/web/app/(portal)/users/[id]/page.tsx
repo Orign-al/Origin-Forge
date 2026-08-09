@@ -111,6 +111,10 @@ export default function UserDetailPage() {
   const conflicts = asRows(plan.conflicts);
   const isStaged = linux.onboarding_state === "STAGED";
   const isActive = linux.onboarding_state === "ACTIVE";
+  const clientValidationPassed =
+    linux.host_ssh_client_validation === "PASS" &&
+    linux.container_ssh_client_validation === "PASS";
+  const pilotAcceptancePassed = linux.pilot_acceptance_status === "PASSED";
   const hostSshPolicy = asRecord(linux.host_ssh_policy);
   const canManageSshKeys = ["STAGED", "ACTIVE"].includes(
     String(linux.onboarding_state ?? ""),
@@ -250,7 +254,9 @@ export default function UserDetailPage() {
                   <h2>独立计算身份 Onboarding</h2>
                   <p className="muted">
                     {isActive
-                      ? "管理映射 origin-al 保持不变；独立计算身份已 ACTIVE，等待用户客户端 SSH 验证。"
+                      ? clientValidationPassed
+                        ? "管理映射 origin-al 保持不变；独立计算身份已 ACTIVE，两项真实客户端 SSH 验证已确认。"
+                        : "管理映射 origin-al 保持不变；独立计算身份已 ACTIVE，等待用户客户端 SSH 验证。"
                       : isStaged
                         ? "管理映射 origin-al 保持不变；独立计算身份已安全 Stage，尚未激活登录。"
                         : "管理映射 origin-al 保持不变；这里只创建数据库 DRAFT 和只读 dry-run。"}
@@ -267,7 +273,9 @@ export default function UserDetailPage() {
                     <span className="mono">
                       Operation {compute.operation_id}
                     </span>
-                    <span>Client Validation PENDING</span>
+                    <span>
+                      Client Validation {clientValidationPassed ? "PASS" : "PENDING"}
+                    </span>
                   </div>
                   {kv([
                     ["Portal owner", "Origin-al"],
@@ -301,6 +309,10 @@ export default function UserDetailPage() {
                       `${String(linux.container_name)} / ${String(linux.container_state)} / GPU ${String(linux.container_gpu)}`,
                     ],
                     ["Guard", linux.guard_state],
+                    ["Pilot 验收", linux.pilot_acceptance_status],
+                    ["CPU Job ID", linux.pilot_cpu_job_id],
+                    ["单 GPU Job ID", linux.pilot_gpu_job_id],
+                    ["Allocated GPU UUID", linux.pilot_allocated_gpu_uuid],
                   ])}
                   <div className="operation-actions">
                     <Link className="table-link" href="/access">
@@ -308,8 +320,12 @@ export default function UserDetailPage() {
                     </Link>
                   </div>
                   <div className="notice">
-                    ACCOUNT ACTIVE；SCHEDULER CURRENTLY
-                    DRAINED。宿主与容器服务端已就绪，真实用户必须使用自己保存的私钥完成两项客户端验证。
+                    ACCOUNT ACTIVE；SCHEDULER CURRENTLY DRAINED。
+                    {clientValidationPassed
+                      ? pilotAcceptancePassed
+                        ? "两项真实客户端 SSH 验证与首个 CPU/单 GPU Pilot 验收均已通过；节点仍等待最终上线审批。"
+                        : "两项真实客户端 SSH 验证已通过；节点仍等待 Pilot 验收。"
+                      : "宿主与容器服务端已就绪，真实用户必须使用自己保存的私钥完成两项客户端验证。"}
                   </div>
                 </>
               ) : compute?.status === "STAGED" ? (
@@ -615,7 +631,11 @@ export default function UserDetailPage() {
         </SectionCard>
         <SectionCard title="当前阶段">
           {isActive
-            ? "origin-pilot 已 ACTIVE；Host/Container SSH 服务端 READY，客户端验证 PENDING；容器 RUNNING/GPU NONE，Slurm 保持 DRAIN。"
+            ? clientValidationPassed
+              ? pilotAcceptancePassed
+                ? "origin-pilot 已 ACTIVE；Host/Container SSH Client Validation PASS；首个 CPU/单 GPU Pyxis Pilot 验收 PASSED；Slurm 保持 DRAIN，等待最终上线审批。"
+                : "origin-pilot 已 ACTIVE；Host/Container SSH Client Validation PASS；容器 RUNNING/GPU NONE，Slurm 保持 DRAIN。"
+              : "origin-pilot 已 ACTIVE；Host/Container SSH 服务端 READY，客户端验证 PENDING；容器 RUNNING/GPU NONE，Slurm 保持 DRAIN。"
             : isStaged
               ? sshKeyCount > 0
                 ? "origin-pilot 已 STAGED；SSH 公钥已验证但未安装，登录、容器启动与 Activate 均未执行，Slurm 保持 DRAIN。"

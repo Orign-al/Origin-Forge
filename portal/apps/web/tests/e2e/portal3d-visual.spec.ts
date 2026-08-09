@@ -36,6 +36,8 @@ type Portal3dState = {
   startBodies?: Array<Record<string, unknown>>;
   computeState?: "STAGED" | "ACTIVE";
   containerState?: "STOPPED" | "RUNNING";
+  clientValidation?: "PENDING" | "PASS";
+  pilotAcceptance?: "PASSED";
 };
 
 const USER_ID = "00000000-0000-4000-8000-000000000001";
@@ -152,9 +154,13 @@ function stagedUser(state: Portal3dState) {
       container_server_fingerprint:
         computeState === "ACTIVE" ? "SHA256:test-container-server" : null,
       host_ssh_client_validation:
-        computeState === "ACTIVE" ? "PENDING" : "NOT_STARTED",
+        computeState === "ACTIVE"
+          ? (state.clientValidation ?? "PENDING")
+          : "NOT_STARTED",
       container_ssh_client_validation:
-        computeState === "ACTIVE" ? "PENDING" : "NOT_STARTED",
+        computeState === "ACTIVE"
+          ? (state.clientValidation ?? "PENDING")
+          : "NOT_STARTED",
       host_ssh_policy: {
         status: "PASSING",
         pubkey_authentication: true,
@@ -165,6 +171,13 @@ function stagedUser(state: Portal3dState) {
       slurm_node_state: "DRAIN",
       slurm_queue: "EMPTY",
       gpu_scheduling_available: false,
+      pilot_acceptance_status: state.pilotAcceptance,
+      pilot_cpu_job_id: state.pilotAcceptance ? 201 : null,
+      pilot_gpu_job_id: state.pilotAcceptance ? 202 : null,
+      pilot_allocated_gpu_uuid: state.pilotAcceptance
+        ? "GPU-11111111-2222-3333-4444-555555555555"
+        : null,
+      pilot_final_node_state: state.pilotAcceptance ? "DRAIN" : null,
     },
     compute_onboarding: {
       status: computeState,
@@ -707,6 +720,49 @@ test("ACTIVE 且 Key 已安装后才显示 SSH 与 VS Code 配置", async ({ pag
   ).toBeVisible();
   await expect(page.getByText("NONE", { exact: true })).toBeVisible();
   await expect(page.getByText(/当前调度节点保持 DRAIN/u)).toBeVisible();
+});
+
+test("Portal-3F 显示两项真实客户端 PASS 与首个 Pilot 验收结果", async ({ page }) => {
+  const publicKey = temporaryPublicKey("Portal-3F installed key");
+  const state: Portal3dState = {
+    authenticated: true,
+    computeState: "ACTIVE",
+    containerState: "RUNNING",
+    clientValidation: "PASS",
+    pilotAcceptance: "PASSED",
+    enrollmentBodies: [],
+    activateBodies: [],
+    keys: [
+      {
+        id: "00000000-0000-4000-8000-000000000052",
+        managed_user_id: MANAGED_USER_ID,
+        key_type: "ssh-ed25519",
+        fingerprint_sha256: fingerprint(publicKey),
+        comment: "Portal-3F installed key",
+        scope: "BOTH",
+        state: "INSTALLED",
+        generation_method: "BROWSER_GENERATED",
+        created_at: "2026-08-09T00:00:00Z",
+        created_by: USER_ID,
+        validated_at: "2026-08-09T00:00:00Z",
+        installed_at: "2026-08-09T00:05:00Z",
+        revoked_at: null,
+      },
+    ],
+  };
+  await installPortal3dApi(page, state);
+  await page.goto(`/users/${USER_ID}`);
+  await page.getByRole("tab", { name: "计算资源" }).click();
+  await expect(
+    page.getByText("Client Validation PASS", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("PASSED", { exact: true })).toBeVisible();
+  await expect(page.getByText("201", { exact: true })).toBeVisible();
+  await expect(page.getByText("202", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("GPU-11111111-2222-3333-4444-555555555555"),
+  ).toBeVisible();
+  await expect(page.getByText(/节点仍等待最终上线审批/u)).toBeVisible();
 });
 
 test("ACTIVE + STOPPED 仅显示受控容器启动入口并在成功后开放连接", async ({

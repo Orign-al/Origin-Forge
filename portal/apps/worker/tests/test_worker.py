@@ -122,6 +122,124 @@ def test_origin_pilot_is_the_only_portal3a_plan_target() -> None:
         validate_payload("slurm.resume", {"node_name": "other-node"})
 
 
+def test_portal3f_payloads_are_exact_and_reject_injection() -> None:
+    client = dict(handlers.APPROVED_CLIENT_VALIDATION_PAYLOAD)
+    pilot = dict(handlers.APPROVED_PILOT_ACCEPTANCE_PAYLOAD)
+    assert validate_payload("user.ssh_client_validation.record", client) == client
+    assert validate_payload("user.pilot.acceptance", pilot) == pilot
+
+    with pytest.raises(ValueError, match="PORTAL3F_PLAN_MISMATCH"):
+        validate_payload("user.pilot.acceptance", {**pilot, "partition": "train"})
+    with pytest.raises(ValueError, match="PORTAL3F_PAYLOAD_REJECTED"):
+        validate_payload("user.pilot.acceptance", {**pilot, "command": "nvidia-smi"})
+    with pytest.raises(ValueError, match="PORTAL3F_PAYLOAD_REJECTED"):
+        validate_payload("user.ssh_client_validation.record", {**client, "path": "/etc/shadow"})
+
+
+def test_portal3f_client_validation_records_user_confirmation_without_private_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = {"onboarding_state": "ACTIVE", "slurm": {"node_state": "DRAIN"}}
+    monkeypatch.setattr(handlers, "_portal3f_active_preflight", lambda: snapshot)
+    result = handle(
+        request(
+            "user.ssh_client_validation.record",
+            dict(handlers.APPROVED_CLIENT_VALIDATION_PAYLOAD),
+            approved_by="origin-al",
+            idempotency_key=handlers.PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY,
+        )
+    )
+    assert result["status"] == "SUCCEEDED"
+    assert result["host_client_validation"] == "PASS"
+    assert result["container_client_validation"] == "PASS"
+    assert result["private_key_handling"] == "NOT_ACCESSED"
+    assert '"private_key":' not in json.dumps(result).casefold()
+
+
+def test_portal3f_pilot_acceptance_uses_only_fixed_script_and_restores_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = {"onboarding_state": "ACTIVE", "slurm": {"node_state": "DRAIN"}}
+    request_value = request(
+        "user.pilot.acceptance",
+        dict(handlers.APPROVED_PILOT_ACCEPTANCE_PAYLOAD),
+        approved_by="origin-al",
+        idempotency_key=handlers.PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY,
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_portal3f_pilot_acceptance_plan",
+        lambda _payload: {"preflight": snapshot},
+    )
+    monkeypatch.setattr(handlers, "_portal3f_active_preflight", lambda: snapshot)
+    executed: list[list[str]] = []
+
+    def execute(argv: list[str], timeout: float) -> dict[str, object]:
+        executed.append(argv)
+        assert timeout == 1500
+        return {
+            "ok": True,
+            "stdout": "\n".join(
+                [
+                    "PORTAL3F_RESULT=PASSED",
+                    "CPU_JOB_ID=101",
+                    "GPU_JOB_ID=102",
+                    "ALLOCATED_GPU_UUID=GPU-11111111-2222-3333-4444-555555555555",
+                    "OUT_OF_JOB_GPU_OPEN=DENIED",
+                    "OUT_OF_JOB_CUDA_CONTEXT=DENIED",
+                    "IN_JOB_ALLOCATED_GPU=ALLOWED",
+                    "IN_JOB_UNALLOCATED_GPUS=DENIED",
+                    "IN_JOB_CUDA_CONTEXT=PASSED",
+                    "FINAL_NODE_STATE=DRAIN",
+                    (
+                        "/srv/gpu-platform/platform/logs/portal3f-worker-"
+                        f"{request_value.request_id}"
+                    ).join(("WORKER_LOG_DIR=", "")),
+                ]
+            ),
+        }
+
+    monkeypatch.setattr(handlers, "run_allowlisted_script", execute)
+    result = handle(request_value)
+    assert result["status"] == "SUCCEEDED"
+    assert result["acceptance"]["cpu_job_id"] == 101
+    assert result["acceptance"]["gpu_job_id"] == 102
+    assert result["acceptance"]["final_node_state"] == "DRAIN"
+    assert executed == [
+        [
+            handlers.SCRIPT_ALLOWLIST["h100-origin-pilot-acceptance"],
+            "--execute",
+            request_value.request_id,
+        ]
+    ]
+
+
+def test_portal3f_pilot_failure_reports_verified_drain_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        handlers,
+        "_portal3f_pilot_acceptance_plan",
+        lambda _payload: {"preflight": {}},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda _argv, timeout: {"ok": False, "exit_code": 1},
+    )
+    monkeypatch.setattr(handlers, "_portal3f_drain_recovery_status", lambda: "DRAIN_RESTORED")
+    result = handle(
+        request(
+            "user.pilot.acceptance",
+            dict(handlers.APPROVED_PILOT_ACCEPTANCE_PAYLOAD),
+            approved_by="origin-al",
+            idempotency_key=handlers.PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY,
+        )
+    )
+    assert result["status"] == "ERROR"
+    assert result["rollback_status"] == "DRAIN_RESTORED"
+
+
 def approved_stage_payload() -> dict[str, object]:
     return {
         "username": "origin-pilot",

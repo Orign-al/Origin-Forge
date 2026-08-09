@@ -17,7 +17,7 @@ from h100_portal_api.auth import (
 )
 from h100_portal_api.database import SessionLocal, get_db
 from h100_portal_api.dependencies import permission_dependency
-from h100_portal_api.enums import OnboardingState, OperationStatus
+from h100_portal_api.enums import AccountState, OnboardingState, OperationStatus
 from h100_portal_api.models import (
     PortalAuditEvent,
     PortalContainer,
@@ -94,6 +94,44 @@ PORTAL3E_FINAL_KEY_FINGERPRINT = "SHA256:nek6vyEb3GT+UJAcY5y/8PgY4achF2ouNy+8C2J
 PORTAL3E_FINAL_IDEMPOTENCY_KEY = "portal3e-final-origin-pilot-activate-v1"
 PORTAL3E_FINAL_ROLLBACK_IDEMPOTENCY_KEY = "portal3e-final-origin-pilot-rollback-v1"
 PORTAL3E_FINAL_APPROVED_HOST = "10.82.36.1"
+PORTAL3F_APPROVAL_TEXT = (
+    "允许进入 Portal-3F，记录 SSH Client Validation PASS 并执行首个 Slurm/GPU Pilot 验收。"
+)
+PORTAL3F_APPROVAL_REFERENCE = "portal3f-origin-pilot-first-acceptance-v1"
+PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY = "portal3f-origin-pilot-client-validation-v1"
+PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY = "portal3f-origin-pilot-acceptance-v1"
+PORTAL3F_IMAGE_REF = (
+    "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
+    "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
+)
+APPROVED_PORTAL3F_CLIENT_VALIDATION: dict[str, Any] = {
+    "managed_user_id": str(PORTAL3E_FINAL_MANAGED_USER_ID),
+    "username": "origin-pilot",
+    "expected_compute_state": "ACTIVE",
+    "expected_ssh_key_state": "INSTALLED",
+    "key_record_id": str(PORTAL3E_FINAL_KEY_RECORD_ID),
+    "key_fingerprint": PORTAL3E_FINAL_KEY_FINGERPRINT,
+    "host_client_validation": "PASS",
+    "container_client_validation": "PASS",
+    "confirmation_source": "USER_CONFIRMED_REAL_CLIENT_CONNECTIONS",
+    "approval_reference": PORTAL3F_APPROVAL_REFERENCE,
+}
+APPROVED_PORTAL3F_PILOT_ACCEPTANCE: dict[str, Any] = {
+    "managed_user_id": str(PORTAL3E_FINAL_MANAGED_USER_ID),
+    "username": "origin-pilot",
+    "node_name": "sagsh100server",
+    "partition": "notebook",
+    "account": "company",
+    "qos": "general",
+    "max_gpus": 1,
+    "container_name": "gpu-dev-origin-pilot",
+    "container_gpu": "NONE",
+    "image_ref": PORTAL3F_IMAGE_REF,
+    "expected_host_client_validation": "PASS",
+    "expected_container_client_validation": "PASS",
+    "final_node_state": "DRAIN",
+    "approval_reference": PORTAL3F_APPROVAL_REFERENCE,
+}
 
 
 class OperationPayloadError(ValueError):
@@ -401,6 +439,316 @@ def validate_persisted_activate_execution_result(
     return validate_activate_execution_result(records, normalized_result)
 
 
+def _validate_portal3f_server_snapshot(snapshot: object) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        raise OperationPayloadError(
+            "PORTAL3F_SERVER_PREFLIGHT_INCOMPLETE", "Worker returned no server snapshot"
+        )
+    host_policy = snapshot.get("host_ssh_policy")
+    container_policy = snapshot.get("container_ssh_policy")
+    host_server = snapshot.get("host_ssh_server")
+    container_server = snapshot.get("container_ssh_server")
+    management_policy = snapshot.get("management_ssh_policy")
+    gpu_policy = snapshot.get("gpu_policy")
+    quota = snapshot.get("quota")
+    slurm = snapshot.get("slurm")
+    container = snapshot.get("container")
+    guard = snapshot.get("guard")
+    gpu_health_snapshot = snapshot.get("gpu_health")
+    if not (
+        snapshot.get("username") == "origin-pilot"
+        and snapshot.get("uid") == 20001
+        and snapshot.get("gid") == 20001
+        and snapshot.get("onboarding_state") == "ACTIVE"
+        and snapshot.get("shell") == "/bin/bash"
+        and snapshot.get("password") == "LOCKED"
+        and snapshot.get("ssh_key_state") == "INSTALLED"
+        and snapshot.get("host_authorized_keys") == "INSTALLED"
+        and snapshot.get("container_authorized_keys") == "INSTALLED"
+        and snapshot.get("host_key_fingerprints") == [PORTAL3E_FINAL_KEY_FINGERPRINT]
+        and snapshot.get("container_key_fingerprints") == [PORTAL3E_FINAL_KEY_FINGERPRINT]
+        and isinstance(host_policy, dict)
+        and host_policy.get("pubkey_authentication") is True
+        and host_policy.get("password_authentication") is False
+        and host_policy.get("keyboard_interactive_authentication") is False
+        and host_policy.get("authentication_methods") == ["publickey"]
+        and host_policy.get("status") == "PASSING"
+        and isinstance(container_policy, dict)
+        and container_policy.get("pubkey_authentication") is True
+        and container_policy.get("password_authentication") is False
+        and container_policy.get("keyboard_interactive_authentication") is False
+        and container_policy.get("authentication_methods") == "publickey"
+        and container_policy.get("permit_root_login") == "no"
+        and container_policy.get("status") == "PASSING"
+        and isinstance(host_server, dict)
+        and host_server.get("status") == "READY_FOR_CLIENT_VALIDATION"
+        and host_server.get("approved_address") == PORTAL3E_FINAL_APPROVED_HOST
+        and host_server.get("port") == 22
+        and isinstance(container_server, dict)
+        and container_server.get("status") == "READY_FOR_CLIENT_VALIDATION"
+        and isinstance(container_server.get("bind"), dict)
+        and container_server["bind"].get("address") == PORTAL3E_FINAL_APPROVED_HOST
+        and container_server["bind"].get("port") == 22023
+        and isinstance(management_policy, dict)
+        and management_policy.get("origin-al") == "UNCHANGED"
+        and management_policy.get("codexops") == "UNCHANGED"
+        and isinstance(gpu_policy, dict)
+        and gpu_policy.get("unit") == "user-20001.slice"
+        and gpu_policy.get("device_policy") == "closed"
+        and gpu_policy.get("device_allow") == []
+        and gpu_policy.get("status") == "PASSING"
+        and gpu_policy.get("out_of_job_gpu") == "DENIED"
+        and isinstance(quota, dict)
+        and quota.get("project_id") == 30001
+        and quota.get("hard_limit_gb") == 300
+        and quota.get("enforcement") == "ON"
+        and isinstance(slurm, dict)
+        and slurm.get("account") == "company"
+        and slurm.get("qos") == "general"
+        and slurm.get("max_gpus") == 1
+        and slurm.get("node_state") == "DRAIN"
+        and slurm.get("queue") == "EMPTY"
+        and isinstance(container, dict)
+        and container.get("name") == "gpu-dev-origin-pilot"
+        and container.get("state") == "RUNNING"
+        and container.get("gpu") == "NONE"
+        and isinstance(guard, dict)
+        and guard.get("status") == "PASSING"
+        and guard.get("managed_users") == 1
+        and guard.get("users_verified") == 1
+        and isinstance(gpu_health_snapshot, dict)
+        and gpu_health_snapshot.get("count") == 4
+        and gpu_health_snapshot.get("mig") == "DISABLED"
+        and gpu_health_snapshot.get("dcgm") == "4/4 PASS"
+        and gpu_health_snapshot.get("kernel_errors") == "CLEAR"
+        and snapshot.get("systemd_failed_units") == 0
+    ):
+        raise OperationPayloadError(
+            "PORTAL3F_SERVER_PREFLIGHT_INCOMPLETE",
+            "Worker server snapshot differs from the approved ACTIVE baseline",
+        )
+    return snapshot
+
+
+def validate_portal3f_client_validation_result(worker_result: dict[str, Any]) -> dict[str, Any]:
+    if not (
+        worker_result.get("status") == "SUCCEEDED"
+        and worker_result.get("handler") == "user.ssh_client_validation.record"
+        and worker_result.get("execution_enabled") is True
+        and worker_result.get("username") == "origin-pilot"
+        and worker_result.get("host_client_validation") == "PASS"
+        and worker_result.get("container_client_validation") == "PASS"
+        and worker_result.get("confirmation_source") == "USER_CONFIRMED_REAL_CLIENT_CONNECTIONS"
+        and worker_result.get("private_key_handling") == "NOT_ACCESSED"
+    ):
+        raise OperationPayloadError(
+            "PORTAL3F_CLIENT_VALIDATION_RESULT_REJECTED",
+            "Worker client-validation result is incomplete",
+        )
+    return _validate_portal3f_server_snapshot(worker_result.get("server_preflight"))
+
+
+def validate_portal3f_client_validation_plan(worker_result: dict[str, Any]) -> dict[str, Any]:
+    if not (
+        worker_result.get("status") == "DRY_RUN"
+        and worker_result.get("handler") == "user.ssh_client_validation.record"
+        and worker_result.get("execution_enabled") is False
+        and worker_result.get("validated_username") == "origin-pilot"
+        and worker_result.get("host_client_validation") == "PASS"
+        and worker_result.get("container_client_validation") == "PASS"
+        and worker_result.get("confirmation_source") == "USER_CONFIRMED_REAL_CLIENT_CONNECTIONS"
+        and worker_result.get("private_key_handling") == "NOT_ACCESSED"
+        and worker_result.get("slurm_execution") == "NOT_PERFORMED"
+    ):
+        raise OperationPayloadError(
+            "PORTAL3F_CLIENT_VALIDATION_PLAN_REJECTED",
+            "Worker client-validation plan is incomplete",
+        )
+    return _validate_portal3f_server_snapshot(worker_result.get("server_preflight"))
+
+
+def persist_portal3f_client_validation(
+    db: Session,
+    *,
+    owner: PortalUser,
+    operation: PortalOperation,
+    worker_result: dict[str, Any],
+) -> PortalContainer:
+    validate_portal3f_client_validation_result(worker_result)
+    managed = db.get(PortalManagedUser, PORTAL3E_FINAL_MANAGED_USER_ID)
+    key = db.get(PortalSshKey, PORTAL3E_FINAL_KEY_RECORD_ID)
+    container = db.scalar(
+        select(PortalContainer).where(
+            PortalContainer.managed_user_id == PORTAL3E_FINAL_MANAGED_USER_ID,
+            PortalContainer.name == "gpu-dev-origin-pilot",
+        )
+    )
+    if not (
+        owner.normalized_login == "origin-al"
+        and owner.unix_username == "origin-al"
+        and owner.account_state == AccountState.ACTIVE
+        and owner.resource_onboarding_state == OnboardingState.ACTIVE
+        and managed is not None
+        and managed.portal_user_id == owner.id
+        and managed.onboarding_state == OnboardingState.ACTIVE
+        and managed.shell == "/bin/bash"
+        and managed.host_access_state == "ENABLED"
+        and managed.ssh_key_state == "INSTALLED"
+        and key is not None
+        and key.managed_user_id == managed.id
+        and key.state == "INSTALLED"
+        and key.active is True
+        and key.fingerprint_sha256 == PORTAL3E_FINAL_KEY_FINGERPRINT
+        and container is not None
+        and container.observed_state == "RUNNING"
+        and isinstance(container.safe_spec, dict)
+        and container.safe_spec.get("gpu") == "NONE"
+        and container.safe_spec.get("host_ssh_client_validation") in {"PENDING", "PASS"}
+        and container.safe_spec.get("container_ssh_client_validation") in {"PENDING", "PASS"}
+        and operation.operation_type == "user.ssh_client_validation.record"
+        and operation.target_id == "origin-pilot"
+        and operation.idempotency_key == PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY
+        and operation.validated_payload == APPROVED_PORTAL3F_CLIENT_VALIDATION
+        and operation.status == OperationStatus.RUNNING
+    ):
+        raise OperationPayloadError(
+            "PORTAL3F_DATABASE_BINDING_REJECTED",
+            "Portal ACTIVE identity no longer matches the approved validation record",
+        )
+    confirmed_at = utcnow()
+    container.safe_spec = {
+        **container.safe_spec,
+        "host_ssh_client_validation": "PASS",
+        "container_ssh_client_validation": "PASS",
+        "client_validation_source": "USER_CONFIRMED_REAL_CLIENT_CONNECTIONS",
+        "client_validation_operation_id": str(operation.id),
+        "client_validation_confirmed_at": confirmed_at.isoformat(),
+    }
+    return container
+
+
+def validate_portal3f_pilot_acceptance_result(worker_result: dict[str, Any]) -> dict[str, Any]:
+    acceptance = worker_result.get("acceptance")
+    client_validation = worker_result.get("client_validation")
+    request_id = worker_result.get("request_id")
+    if not (
+        worker_result.get("status") == "SUCCEEDED"
+        and worker_result.get("handler") == "user.pilot.acceptance"
+        and worker_result.get("execution_enabled") is True
+        and worker_result.get("username") == "origin-pilot"
+        and worker_result.get("approval_reference") == PORTAL3F_APPROVAL_REFERENCE
+        and client_validation == {"host": "PASS", "container": "PASS"}
+        and isinstance(request_id, str)
+        and isinstance(acceptance, dict)
+        and isinstance(acceptance.get("cpu_job_id"), int)
+        and acceptance.get("cpu_job_id", 0) > 0
+        and isinstance(acceptance.get("gpu_job_id"), int)
+        and acceptance.get("gpu_job_id", 0) > 0
+        and acceptance.get("cpu_job_id") != acceptance.get("gpu_job_id")
+        and isinstance(acceptance.get("allocated_gpu_uuid"), str)
+        and acceptance["allocated_gpu_uuid"].startswith("GPU-")
+        and acceptance.get("out_of_job_gpu_open") == "DENIED"
+        and acceptance.get("out_of_job_cuda_context") == "DENIED"
+        and acceptance.get("in_job_allocated_gpu") == "ALLOWED"
+        and acceptance.get("in_job_unallocated_gpus") == "DENIED"
+        and acceptance.get("in_job_cuda_context") == "PASSED"
+        and acceptance.get("final_node_state") == "DRAIN"
+        and acceptance.get("worker_log_dir")
+        == f"/srv/gpu-platform/platform/logs/portal3f-worker-{request_id}"
+        and worker_result.get("rollback_status") == "NOT_REQUIRED"
+    ):
+        raise OperationPayloadError(
+            "PORTAL3F_ACCEPTANCE_RESULT_REJECTED",
+            "Worker Pilot acceptance result is incomplete",
+        )
+    _validate_portal3f_server_snapshot(worker_result.get("preflight"))
+    _validate_portal3f_server_snapshot(worker_result.get("postflight"))
+    return acceptance
+
+
+def validate_portal3f_pilot_acceptance_plan(worker_result: dict[str, Any]) -> dict[str, Any]:
+    expected_tests = [
+        "CPU_JOB",
+        "SINGLE_GPU_PYXIS_ENROOT",
+        "IN_JOB_ALLOCATED_GPU_ALLOW",
+        "IN_JOB_UNALLOCATED_GPU_DENY",
+        "IN_JOB_CUDA_CONTEXT",
+        "OUT_OF_JOB_GPU_OPEN_DENY_CONCURRENT",
+        "OUT_OF_JOB_CUDA_CONTEXT_DENY_CONCURRENT",
+    ]
+    if not (
+        worker_result.get("status") == "DRY_RUN"
+        and worker_result.get("handler") == "user.pilot.acceptance"
+        and worker_result.get("execution_enabled") is False
+        and worker_result.get("validated_username") == "origin-pilot"
+        and worker_result.get("node_name") == "sagsh100server"
+        and worker_result.get("partition") == "notebook"
+        and worker_result.get("account") == "company"
+        and worker_result.get("qos") == "general"
+        and worker_result.get("max_gpus") == 1
+        and worker_result.get("image_ref") == PORTAL3F_IMAGE_REF
+        and worker_result.get("tests") == expected_tests
+        and worker_result.get("final_node_state") == "DRAIN"
+    ):
+        raise OperationPayloadError(
+            "PORTAL3F_ACCEPTANCE_PLAN_REJECTED", "Worker Pilot acceptance plan is incomplete"
+        )
+    return _validate_portal3f_server_snapshot(worker_result.get("preflight"))
+
+
+def persist_portal3f_pilot_acceptance(
+    db: Session,
+    *,
+    owner: PortalUser,
+    operation: PortalOperation,
+    worker_result: dict[str, Any],
+) -> PortalContainer:
+    acceptance = validate_portal3f_pilot_acceptance_result(worker_result)
+    managed = db.get(PortalManagedUser, PORTAL3E_FINAL_MANAGED_USER_ID)
+    container = db.scalar(
+        select(PortalContainer).where(
+            PortalContainer.managed_user_id == PORTAL3E_FINAL_MANAGED_USER_ID,
+            PortalContainer.name == "gpu-dev-origin-pilot",
+        )
+    )
+    if not (
+        owner.normalized_login == "origin-al"
+        and managed is not None
+        and managed.portal_user_id == owner.id
+        and managed.onboarding_state == OnboardingState.ACTIVE
+        and container is not None
+        and isinstance(container.safe_spec, dict)
+        and container.safe_spec.get("host_ssh_client_validation") == "PASS"
+        and container.safe_spec.get("container_ssh_client_validation") == "PASS"
+        and container.safe_spec.get("gpu") == "NONE"
+        and operation.operation_type == "user.pilot.acceptance"
+        and operation.target_id == "origin-pilot"
+        and operation.idempotency_key == PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY
+        and operation.validated_payload == APPROVED_PORTAL3F_PILOT_ACCEPTANCE
+        and operation.status == OperationStatus.RUNNING
+    ):
+        raise OperationPayloadError(
+            "PORTAL3F_DATABASE_BINDING_REJECTED",
+            "Portal client validation or ACTIVE identity changed during acceptance",
+        )
+    accepted_at = utcnow()
+    container.safe_spec = {
+        **container.safe_spec,
+        "pilot_acceptance_status": "PASSED",
+        "pilot_acceptance_operation_id": str(operation.id),
+        "pilot_acceptance_accepted_at": accepted_at.isoformat(),
+        "pilot_cpu_job_id": acceptance["cpu_job_id"],
+        "pilot_gpu_job_id": acceptance["gpu_job_id"],
+        "pilot_allocated_gpu_uuid": acceptance["allocated_gpu_uuid"],
+        "pilot_image_ref": PORTAL3F_IMAGE_REF,
+        "pilot_final_node_state": "DRAIN",
+        "slurm_node_state": "DRAIN",
+        "slurm_queue": "EMPTY",
+        "gpu_scheduling_available": False,
+    }
+    return container
+
+
 def operation_response(operation: PortalOperation) -> OperationResponse:
     return OperationResponse(
         id=operation.id,
@@ -423,6 +771,23 @@ def operation_response(operation: PortalOperation) -> OperationResponse:
 
 
 def validate_operation_payload(operation_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if operation_type in {"user.ssh_client_validation.record", "user.pilot.acceptance"}:
+        if set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+            raise OperationPayloadError(
+                "PORTAL3F_PAYLOAD_REJECTED",
+                "secret, command, argv, and path fields are forbidden",
+            )
+        expected = (
+            APPROVED_PORTAL3F_CLIENT_VALIDATION
+            if operation_type == "user.ssh_client_validation.record"
+            else APPROVED_PORTAL3F_PILOT_ACCEPTANCE
+        )
+        if payload != expected:
+            raise OperationPayloadError(
+                "PORTAL3F_PLAN_MISMATCH",
+                "Portal-3F payload differs from the fixed approved plan",
+            )
+        return dict(expected)
     if operation_type == "user.stage":
         if set(payload) & STAGE_PUBLIC_KEY_FIELDS:
             raise OperationPayloadError(
@@ -1638,6 +2003,14 @@ def create_operation(
         raise HTTPException(
             status_code=422,
             detail={"code": "OPERATION_NOT_WRITABLE", "message": "仅允许受控写操作"},
+        )
+    if operation_type in {"user.ssh_client_validation.record", "user.pilot.acceptance"}:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PORTAL3F_FIXED_CONSOLE_ONLY",
+                "message": "Portal-3F 首次验收仅允许固定管理员流程执行",
+            },
         )
     permission = OPERATION_PERMISSIONS.get(operation_type)
     if permission is None:

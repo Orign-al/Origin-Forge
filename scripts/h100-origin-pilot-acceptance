@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly PILOT_USER=origin-pilot
+readonly PILOT_UID=20001
+readonly PILOT_GID=20001
+readonly NODE_NAME=sagsh100server
+readonly PARTITION=notebook
+readonly ACCOUNT=company
+readonly QOS=general
+readonly IMAGE_REF='nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a'
+readonly GPU_OPEN_PROBE=/usr/local/libexec/h100-gpu-open-probe
+readonly CUDA_CONTEXT_PROBE=/usr/local/libexec/h100-cuda-context-probe
+readonly GPU_PROBE_SOURCE=/opt/h100-portal/tests/gpu-device-mapping/gpu-device-context-probe.c
+readonly ACCEPTANCE_SCRIPT=/opt/h100-portal/scripts/h100-origin-pilot-acceptance
+readonly GPU_OPEN_PROBE_SHA256=8f3946ec69de82b50a6b77c3068f09bb8683d08453d20b056ac0f3762f09dace
+readonly CUDA_CONTEXT_PROBE_SHA256=310f2982d452cbed27271ed03789bae0c624b8e9239d64b8daf2876157f1599a
+readonly GPU_PROBE_SOURCE_SHA256=120fc85413226ba4c106e5e1a291882900a20ec40f31bebea21643f152fcf4d1
+readonly LOCK_FILE=/run/h100-portal/portal3f-origin-pilot.lock
+
+fail() {
+    printf 'PORTAL3F_ERROR=%s\n' "$1" >&2
+    exit 1
+}
+
+cpu_probe() {
+    [[ $# -eq 0 ]] || fail 'CPU_PROBE_ARGUMENT_REJECTED'
+    [[ ${EUID} -eq ${PILOT_UID} ]] || fail 'CPU_PROBE_UID_MISMATCH'
+    [[ $(id -g) -eq ${PILOT_GID} ]] || fail 'CPU_PROBE_GID_MISMATCH'
+    [[ -n ${SLURM_JOB_ID:-} ]] || fail 'CPU_PROBE_NOT_IN_SLURM_JOB'
+    printf 'CPU_PROBE_USER=%s\n' "$(id -un)"
+    printf 'CPU_PROBE_UID_GID=%s/%s\n' "$(id -u)" "$(id -g)"
+    printf 'CPU_PROBE_HOST=%s\n' "$(hostname -s)"
+    printf 'CPU_PROBE_SLURM_JOB_ID=%s\n' "${SLURM_JOB_ID}"
+    printf 'CPU_PROBE_CGROUP=%s\n' "$(tr '\n' ',' </proc/self/cgroup)"
+    printf '%s\n' 'CPU_PROBE_RESULT=PASSED'
+    sleep 15
+}
+
+if [[ ${1:-} == --cpu-probe ]]; then
+    shift
+    cpu_probe "$@"
+    exit 0
+fi
+
+[[ ${EUID} -eq 0 ]] || fail 'ROOT_REQUIRED'
+[[ $# -eq 2 && $1 == --execute ]] || fail 'FIXED_ARGUMENTS_REQUIRED'
+request_id=$2
+[[ ${request_id} =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+    || fail 'REQUEST_ID_REJECTED'
+
+umask 077
+readonly request_id
+readonly log_dir="/srv/gpu-platform/platform/logs/portal3f-worker-${request_id}"
+readonly scratch_dir="/srv/gpu-platform/scratch/.portal3f-${request_id}"
+readonly gpu_probe="${scratch_dir}/gpu-device-context-probe"
+readonly cpu_job_name="portal3f-cpu-${request_id:0:8}"
+readonly gpu_job_name="portal3f-gpu-${request_id:0:8}"
+
+success=0
+active_launcher_pid=
+cpu_job_id=
+gpu_job_id=
+gpu_uuid=
+final_node_state=UNKNOWN
+final_reason='portal3f origin-pilot acceptance failed'
+
+exec 9>"${LOCK_FILE}"
+flock -n 9 || fail 'ANOTHER_PORTAL3F_ACCEPTANCE_IS_RUNNING'
+[[ ! -e ${log_dir} && ! -e ${scratch_dir} ]] || fail 'RUN_DIRECTORY_ALREADY_EXISTS'
+install -d -o root -g root -m 0700 "${log_dir}"
+install -d -o root -g root -m 0711 "${scratch_dir}"
+
+node_state() {
+    sinfo -h -n "${NODE_NAME}" -o '%T' | sed -n '1p'
+}
+
+# Invoked indirectly from the EXIT/INT/TERM trap.
+# shellcheck disable=SC2329
+ensure_drain() {
+    local state
+    state=$(node_state 2>/dev/null || true)
+    if [[ ${state} != drain* && ${state} != drained* ]]; then
+        scontrol update NodeName="${NODE_NAME}" State=DRAIN Reason="${final_reason}" \
+            >"${log_dir}/cleanup-drain.txt" 2>&1 || true
+    fi
+    for _attempt in $(seq 1 30); do
+        state=$(node_state 2>/dev/null || true)
+        if [[ ${state} == drain* || ${state} == drained* ]]; then
+            final_node_state=DRAIN
+            return 0
+        fi
+        sleep 1
+    done
+    final_node_state=UNKNOWN
+    return 1
+}
+
+# Invoked indirectly by trap.
+# shellcheck disable=SC2329
+cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM
+    set +e
+    ensure_drain
+    scancel --user="${PILOT_USER}" --name="${cpu_job_name}" >/dev/null 2>&1 || true
+    scancel --user="${PILOT_USER}" --name="${gpu_job_name}" >/dev/null 2>&1 || true
+    if [[ ${active_launcher_pid} =~ ^[0-9]+$ ]]; then
+        kill "${active_launcher_pid}" >/dev/null 2>&1 || true
+        wait "${active_launcher_pid}" >/dev/null 2>&1 || true
+    fi
+    squeue -a >"${log_dir}/squeue-cleanup.txt" 2>&1 || true
+    sinfo -Nel >"${log_dir}/sinfo-cleanup.txt" 2>&1 || true
+    rm -f -- "${gpu_probe}"
+    rmdir -- "${scratch_dir}" >/dev/null 2>&1 || true
+    if (( success == 1 && rc == 0 )) && [[ ${final_node_state} == DRAIN ]]; then
+        printf '%s\n' 'PORTAL3F_RESULT=PASSED'
+        printf 'CPU_JOB_ID=%s\n' "${cpu_job_id}"
+        printf 'GPU_JOB_ID=%s\n' "${gpu_job_id}"
+        printf 'ALLOCATED_GPU_UUID=%s\n' "${gpu_uuid}"
+        printf 'OUT_OF_JOB_GPU_OPEN=DENIED\n'
+        printf 'OUT_OF_JOB_CUDA_CONTEXT=DENIED\n'
+        printf 'IN_JOB_ALLOCATED_GPU=ALLOWED\n'
+        printf 'IN_JOB_UNALLOCATED_GPUS=DENIED\n'
+        printf 'IN_JOB_CUDA_CONTEXT=PASSED\n'
+        printf 'FINAL_NODE_STATE=%s\n' "${final_node_state}"
+        printf 'WORKER_LOG_DIR=%s\n' "${log_dir}"
+        exit 0
+    fi
+    printf '%s\n' 'PORTAL3F_RESULT=FAILED'
+    printf 'CPU_JOB_ID=%s\n' "${cpu_job_id:-NONE}"
+    printf 'GPU_JOB_ID=%s\n' "${gpu_job_id:-NONE}"
+    printf 'FINAL_NODE_STATE=%s\n' "${final_node_state}"
+    printf 'WORKER_LOG_DIR=%s\n' "${log_dir}"
+    if (( rc == 0 )); then
+        rc=1
+    fi
+    exit "${rc}"
+}
+trap cleanup EXIT INT TERM
+
+wait_for_job_id() {
+    local name=$1 candidate
+    for _attempt in $(seq 1 90); do
+        candidate=$(squeue -h -u "${PILOT_USER}" -n "${name}" -o '%A' | sed -n '1p')
+        if [[ ${candidate} =~ ^[0-9]+$ ]]; then
+            printf '%s' "${candidate}"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+wait_for_running() {
+    local job_id=$1 state
+    for _attempt in $(seq 1 180); do
+        state=$(squeue -h -j "${job_id}" -o '%T' | sed -n '1p')
+        [[ ${state} == RUNNING ]] && return 0
+        [[ -n ${state} ]] || return 1
+        sleep 1
+    done
+    return 1
+}
+
+wait_for_accounting() {
+    local label=$1 job_id=$2 line state
+    for _attempt in $(seq 1 60); do
+        line=$(sacct -X -n -P -j "${job_id}" \
+            --format=JobIDRaw,JobName,User,Account,Partition,QOS,State,ExitCode,AllocTRES \
+            | awk -F'|' -v expected="${job_id}" '$1 == expected {print; exit}')
+        IFS='|' read -r observed_id _name observed_user observed_account observed_partition \
+            observed_qos state exit_code _alloc_tres <<<"${line}"
+        if [[ ${observed_id:-} == "${job_id}" && ${state:-} == COMPLETED ]]; then
+            break
+        fi
+        sleep 1
+    done
+    sacct -j "${job_id}" --parsable2 \
+        --format=JobIDRaw,JobName,User,Account,Partition,QOS,State,Elapsed,AllocCPUS,ReqTRES,AllocTRES,ExitCode \
+        >"${log_dir}/${label}-sacct.txt"
+    [[ ${observed_id:-} == "${job_id}" ]]
+    [[ ${observed_user:-} == "${PILOT_USER}" ]]
+    [[ ${observed_account:-} == "${ACCOUNT}" ]]
+    [[ ${observed_partition:-} == "${PARTITION}" ]]
+    [[ ${observed_qos:-} == "${QOS}" ]]
+    [[ ${state:-} == COMPLETED ]]
+    [[ ${exit_code:-} == '0:0' ]]
+}
+
+check_dcgm() {
+    local label=$1
+    local output="${log_dir}/${label}-dcgm.json"
+    dcgmi diag -r 1 -j >"${output}"
+    jq -e \
+        '[."DCGM Diagnostic".test_categories[]?.tests[]?.results[]? | select(.entity_group == "GPU") | .status] as $statuses | (($statuses | length) == 4 and all($statuses[]; . == "Pass"))' \
+        "${output}" >/dev/null
+}
+
+check_gpu_baseline() {
+    local label=$1
+    local mig_file="${log_dir}/${label}-mig.txt"
+    nvidia-smi -L >"${log_dir}/${label}-gpu-list.txt"
+    [[ $(grep -c '^GPU ' "${log_dir}/${label}-gpu-list.txt") -eq 4 ]]
+    nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader,nounits >"${mig_file}"
+    [[ $(wc -l <"${mig_file}") -eq 4 ]]
+    [[ $(grep -c '^Disabled$' "${mig_file}") -eq 4 ]]
+    nvidia-smi --query-compute-apps=pid,gpu_uuid,process_name,used_memory \
+        --format=csv,noheader >"${log_dir}/${label}-compute-processes.txt" 2>/dev/null || true
+    [[ ! -s ${log_dir}/${label}-compute-processes.txt ]]
+    check_dcgm "${label}"
+}
+
+run_out_of_job_denial_round() {
+    local round=$1 open_unit cuda_unit open_file cgroup
+    open_unit="h100-portal3f-open-${request_id:0:8}-${round}"
+    cuda_unit="h100-portal3f-cuda-${request_id:0:8}-${round}"
+    open_file="${log_dir}/out-of-job-open-${round}.json"
+    [[ $(squeue -h -j "${gpu_job_id}" -o '%T' | sed -n '1p') == RUNNING ]]
+    systemd-run --system --wait --pipe --collect --quiet \
+        --unit="${open_unit}" \
+        --slice="user-${PILOT_UID}.slice" \
+        --uid="${PILOT_UID}" \
+        --property=Type=exec \
+        --property=NoNewPrivileges=yes \
+        --property=TimeoutStartSec=45 \
+        "${GPU_OPEN_PROBE}" --expect-denied-all --json >"${open_file}"
+    cgroup=$(jq -er '.cgroup' "${open_file}")
+    [[ ${cgroup} == *"/user.slice/user-${PILOT_UID}.slice/"* ]]
+    systemd-run --system --wait --pipe --collect --quiet \
+        --unit="${cuda_unit}" \
+        --slice="user-${PILOT_UID}.slice" \
+        --uid="${PILOT_UID}" \
+        --property=Type=exec \
+        --property=NoNewPrivileges=yes \
+        --property=TimeoutStartSec=45 \
+        "${CUDA_CONTEXT_PROBE}" --expect-denied --quiet \
+        >"${log_dir}/out-of-job-cuda-${round}.txt"
+    [[ $(squeue -h -j "${gpu_job_id}" -o '%T' | sed -n '1p') == RUNNING ]]
+}
+
+date --iso-8601=seconds >"${log_dir}/started-at.txt"
+git -C /srv/gpu-platform/platform rev-parse HEAD >"${log_dir}/git-head.txt"
+[[ $(<"${log_dir}/git-head.txt") == 145ded3864f99f5af0c9549fba7004d2784c4dea \
+    || $(<"${log_dir}/git-head.txt") =~ ^[0-9a-f]{40}$ ]] || fail 'GIT_HEAD_INVALID'
+
+read -r installed_hash _ < <(sha256sum "${GPU_OPEN_PROBE}")
+[[ ${installed_hash} == "${GPU_OPEN_PROBE_SHA256}" ]] || fail 'GPU_OPEN_PROBE_HASH_MISMATCH'
+read -r installed_hash _ < <(sha256sum "${CUDA_CONTEXT_PROBE}")
+[[ ${installed_hash} == "${CUDA_CONTEXT_PROBE_SHA256}" ]] \
+    || fail 'CUDA_CONTEXT_PROBE_HASH_MISMATCH'
+read -r installed_hash _ < <(sha256sum "${GPU_PROBE_SOURCE}")
+[[ ${installed_hash} == "${GPU_PROBE_SOURCE_SHA256}" ]] \
+    || fail 'GPU_PROBE_SOURCE_HASH_MISMATCH'
+
+passwd -S "${PILOT_USER}" >"${log_dir}/passwd-status.txt"
+[[ $(awk '{print $2}' "${log_dir}/passwd-status.txt") == L ]]
+IFS=: read -r observed_user _ observed_uid observed_gid _ observed_home observed_shell \
+    < <(getent passwd "${PILOT_USER}")
+[[ ${observed_user} == "${PILOT_USER}" && ${observed_uid} == "${PILOT_UID}" \
+    && ${observed_gid} == "${PILOT_GID}" && ${observed_home} == "/home/${PILOT_USER}" \
+    && ${observed_shell} == /bin/bash ]]
+
+h100-user-gpu-isolation verify "${PILOT_USER}" >"${log_dir}/gpu-isolation-before.txt"
+h100-gpu-bypass-guard >"${log_dir}/guard-before.txt"
+for service in munge slurmdbd slurmctld slurmd; do
+    [[ $(systemctl is-active "${service}") == active ]]
+done
+systemctl --failed --no-legend --plain >"${log_dir}/systemd-failed-before.txt"
+[[ ! -s ${log_dir}/systemd-failed-before.txt ]]
+[[ $(node_state) == drain* || $(node_state) == drained* ]]
+[[ -z $(squeue -h) ]]
+scontrol show node "${NODE_NAME}" >"${log_dir}/node-before.txt"
+sacctmgr -n -P show assoc where User="${PILOT_USER}" Account="${ACCOUNT}" \
+    format=User,Account,QOS,DefaultQOS >"${log_dir}/association.txt"
+grep -Fxq "${PILOT_USER}|${ACCOUNT}|${QOS}|${QOS}|" "${log_dir}/association.txt"
+sacctmgr -n -P show qos "${QOS}" format=Name,MaxTRESPerUser >"${log_dir}/qos.txt"
+grep -Fq "${QOS}|gres/gpu=1|" "${log_dir}/qos.txt"
+[[ $(enroot version) == 4.2.1 ]]
+[[ $(srun --version) == 'slurm 25.11.7' ]]
+srun --help >"${log_dir}/srun-help.txt" 2>&1
+grep -Fq -- '--container-image' "${log_dir}/srun-help.txt"
+check_gpu_baseline before
+
+gcc -O2 -Wall -Wextra -Werror -o "${gpu_probe}" "${GPU_PROBE_SOURCE}" -ldl \
+    >"${log_dir}/gpu-probe-build.txt" 2>&1
+chown root:root "${gpu_probe}"
+chmod 0555 "${gpu_probe}"
+sha256sum "${gpu_probe}" >"${log_dir}/gpu-probe-binary.sha256"
+
+scontrol update NodeName="${NODE_NAME}" State=RESUME
+for _attempt in $(seq 1 60); do
+    [[ $(node_state) == idle ]] && break
+    sleep 1
+done
+[[ $(node_state) == idle ]]
+[[ -z $(squeue -h) ]]
+sinfo -Nel >"${log_dir}/sinfo-after-resume.txt"
+
+/usr/sbin/runuser --user "${PILOT_USER}" -- \
+    srun --partition="${PARTITION}" --account="${ACCOUNT}" --qos="${QOS}" \
+    --job-name="${cpu_job_name}" --nodes=1 --ntasks=1 --cpus-per-task=1 \
+    --mem=1G --time=00:03:00 \
+    "${ACCEPTANCE_SCRIPT}" --cpu-probe \
+    >"${log_dir}/cpu-stdout.txt" 2>"${log_dir}/cpu-stderr.txt" &
+active_launcher_pid=$!
+cpu_job_id=$(wait_for_job_id "${cpu_job_name}") || fail 'CPU_JOB_ID_UNAVAILABLE'
+wait_for_running "${cpu_job_id}" || fail 'CPU_JOB_DID_NOT_RUN'
+scontrol show job -dd "${cpu_job_id}" >"${log_dir}/cpu-job-running.txt"
+grep -Fq "UserId=${PILOT_USER}(${PILOT_UID})" "${log_dir}/cpu-job-running.txt"
+grep -Fq "Account=${ACCOUNT}" "${log_dir}/cpu-job-running.txt"
+grep -Fq "QOS=${QOS}" "${log_dir}/cpu-job-running.txt"
+wait "${active_launcher_pid}"
+active_launcher_pid=
+grep -Fxq 'CPU_PROBE_RESULT=PASSED' "${log_dir}/cpu-stdout.txt"
+grep -Fxq "CPU_PROBE_USER=${PILOT_USER}" "${log_dir}/cpu-stdout.txt"
+grep -Fxq "CPU_PROBE_UID_GID=${PILOT_UID}/${PILOT_GID}" "${log_dir}/cpu-stdout.txt"
+grep -Fxq "CPU_PROBE_HOST=${NODE_NAME}" "${log_dir}/cpu-stdout.txt"
+grep -Fq '/system.slice/slurmstepd.scope/job_' "${log_dir}/cpu-stdout.txt"
+wait_for_accounting cpu "${cpu_job_id}"
+[[ -z $(squeue -h -j "${cpu_job_id}") ]]
+
+/usr/sbin/runuser --user "${PILOT_USER}" -- \
+    srun --partition="${PARTITION}" --account="${ACCOUNT}" --qos="${QOS}" \
+    --job-name="${gpu_job_name}" --nodes=1 --ntasks=1 --cpus-per-task=2 \
+    --mem=4G --gres=gpu:h100:1 --time=00:08:00 --mpi=none \
+    --container-image="${IMAGE_REF}" --no-container-mount-home \
+    --container-mounts="${gpu_probe}:/opt/h100-gpu-device-context-probe:ro" \
+    /opt/h100-gpu-device-context-probe \
+    --expect-allocated 1 --assert-slurm-isolation --expect-cuda success --hold-seconds 60 \
+    >"${log_dir}/gpu-stdout.txt" 2>"${log_dir}/gpu-stderr.txt" &
+active_launcher_pid=$!
+gpu_job_id=$(wait_for_job_id "${gpu_job_name}") || fail 'GPU_JOB_ID_UNAVAILABLE'
+wait_for_running "${gpu_job_id}" || fail 'GPU_JOB_DID_NOT_RUN'
+scontrol show job -dd "${gpu_job_id}" >"${log_dir}/gpu-job-running.txt"
+grep -Fq "UserId=${PILOT_USER}(${PILOT_UID})" "${log_dir}/gpu-job-running.txt"
+grep -Fq "Account=${ACCOUNT}" "${log_dir}/gpu-job-running.txt"
+grep -Fq "QOS=${QOS}" "${log_dir}/gpu-job-running.txt"
+grep -Fq 'TresPerNode=gres/gpu:h100:1' "${log_dir}/gpu-job-running.txt"
+for _attempt in $(seq 1 180); do
+    nvidia-smi --query-compute-apps=pid,gpu_uuid,process_name,used_memory \
+        --format=csv,noheader >"${log_dir}/gpu-compute-running.txt" 2>/dev/null || true
+    [[ -s ${log_dir}/gpu-compute-running.txt ]] && break
+    [[ $(squeue -h -j "${gpu_job_id}" -o '%T' | sed -n '1p') == RUNNING ]] \
+        || fail 'GPU_JOB_ENDED_BEFORE_CUDA_CONTEXT'
+    sleep 1
+done
+[[ -s ${log_dir}/gpu-compute-running.txt ]] || fail 'GPU_CUDA_CONTEXT_NOT_OBSERVED'
+run_out_of_job_denial_round 1
+run_out_of_job_denial_round 2
+wait "${active_launcher_pid}"
+active_launcher_pid=
+grep -Fxq 'GPU_DEVICE_CONTEXT_PROBE_RESULT=PASSED' "${log_dir}/gpu-stdout.txt"
+grep -Fxq 'NVML_DEVICE_COUNT=result=0 count=1' "${log_dir}/gpu-stdout.txt"
+grep -Fxq 'CUDA_CONTEXT_RESULT=PASSED' "${log_dir}/gpu-stdout.txt"
+grep -Fq '/system.slice/slurmstepd.scope/job_' "${log_dir}/gpu-stdout.txt"
+[[ $(grep -Ec '^DEVICE_OPEN path=/dev/nvidia[0-3] role=ALLOCATED flags=O_RDWR result=OPENED ' "${log_dir}/gpu-stdout.txt") -eq 1 ]]
+[[ $(grep -Ec '^DEVICE_OPEN path=/dev/nvidia[0-3] role=UNALLOCATED flags=O_RDWR result=DENIED ' "${log_dir}/gpu-stdout.txt") -eq 3 ]]
+gpu_uuid=$(sed -nE 's/^VISIBLE_GPU .* uuid_result=0 uuid=(GPU-[^ ]+) .*/\1/p' \
+    "${log_dir}/gpu-stdout.txt" | sed -n '1p')
+[[ ${gpu_uuid} =~ ^GPU-[0-9a-f-]{36}$ ]]
+wait_for_accounting gpu "${gpu_job_id}"
+[[ -z $(squeue -h -j "${gpu_job_id}") ]]
+
+final_reason='portal3f origin-pilot acceptance passed awaiting production approval'
+scontrol update NodeName="${NODE_NAME}" State=DRAIN Reason="${final_reason}"
+for _attempt in $(seq 1 60); do
+    state=$(node_state)
+    [[ ${state} == drain* || ${state} == drained* ]] && break
+    sleep 1
+done
+[[ ${state} == drain* || ${state} == drained* ]]
+final_node_state=DRAIN
+[[ -z $(squeue -h) ]]
+h100-user-gpu-isolation verify "${PILOT_USER}" >"${log_dir}/gpu-isolation-after.txt"
+h100-gpu-bypass-guard >"${log_dir}/guard-after.txt"
+systemctl --failed --no-legend --plain >"${log_dir}/systemd-failed-after.txt"
+[[ ! -s ${log_dir}/systemd-failed-after.txt ]]
+check_gpu_baseline after
+scontrol show node "${NODE_NAME}" >"${log_dir}/node-after.txt"
+sinfo -Nel >"${log_dir}/sinfo-after.txt"
+squeue -a >"${log_dir}/squeue-after.txt"
+date --iso-8601=seconds >"${log_dir}/finished-at.txt"
+
+success=1
+exit 0

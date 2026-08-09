@@ -6,6 +6,7 @@ from datetime import timedelta
 from typing import Any, cast
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from h100_portal_api.audit import record_audit
@@ -19,6 +20,7 @@ from h100_portal_api.enums import (
     RiskLevel,
 )
 from h100_portal_api.models import (
+    PortalContainer,
     PortalManagedUser,
     PortalOperation,
     PortalOperationApproval,
@@ -32,6 +34,8 @@ from h100_portal_api.models import (
 from h100_portal_api.rbac import PERMISSIONS
 from h100_portal_api.routes.operations import (
     APPROVED_ORIGIN_PILOT_STAGE,
+    APPROVED_PORTAL3F_CLIENT_VALIDATION,
+    APPROVED_PORTAL3F_PILOT_ACCEPTANCE,
     PORTAL3C_STAGE_APPROVAL_REFERENCE,
     PORTAL3C_STAGE_IDEMPOTENCY_KEY,
     PORTAL3E_FINAL_APPROVAL_REFERENCE,
@@ -41,14 +45,23 @@ from h100_portal_api.routes.operations import (
     PORTAL3E_FINAL_KEY_FINGERPRINT,
     PORTAL3E_FINAL_KEY_RECORD_ID,
     PORTAL3E_FINAL_MANAGED_USER_ID,
+    PORTAL3F_APPROVAL_TEXT,
+    PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY,
+    PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY,
     OperationPayloadError,
     enrich_user_plan_with_portal_state,
     execute_operation,
+    persist_portal3f_client_validation,
+    persist_portal3f_pilot_acceptance,
     transition,
     validate_activate_database_bindings,
     validate_activate_worker_result,
     validate_operation_payload,
     validate_persisted_activate_execution_result,
+    validate_portal3f_client_validation_plan,
+    validate_portal3f_client_validation_result,
+    validate_portal3f_pilot_acceptance_plan,
+    validate_portal3f_pilot_acceptance_result,
 )
 from h100_portal_api.security import digest_secret, normalize_login, random_token, safe_metadata
 from h100_portal_api.worker_client import WorkerClientError, call_worker
@@ -1056,6 +1069,489 @@ def activate_origin_pilot_final(approval_text: str) -> int:
         return 0
 
 
+def _portal3f_database_baseline(
+    db: Session,
+) -> tuple[PortalUser, PortalManagedUser, PortalSshKey, PortalContainer]:
+    owner = db.scalar(select(PortalUser).where(PortalUser.normalized_login == "origin-al"))
+    managed = db.get(PortalManagedUser, PORTAL3E_FINAL_MANAGED_USER_ID)
+    key = db.get(PortalSshKey, PORTAL3E_FINAL_KEY_RECORD_ID)
+    container = db.scalar(
+        select(PortalContainer).where(
+            PortalContainer.managed_user_id == PORTAL3E_FINAL_MANAGED_USER_ID,
+            PortalContainer.name == "gpu-dev-origin-pilot",
+        )
+    )
+    activate = (
+        db.scalar(
+            select(PortalOperation).where(
+                PortalOperation.requested_by == owner.id,
+                PortalOperation.idempotency_key == PORTAL3E_FINAL_IDEMPOTENCY_KEY,
+            )
+        )
+        if owner is not None
+        else None
+    )
+    safe_spec = container.safe_spec if container is not None else None
+    if not (
+        owner is not None
+        and owner.account_state == AccountState.ACTIVE
+        and owner.unix_username == "origin-al"
+        and owner.resource_onboarding_state == OnboardingState.ACTIVE
+        and any(role.name == "platform_owner" for role in owner.roles)
+        and managed is not None
+        and managed.portal_user_id == owner.id
+        and managed.unix_username == "origin-pilot"
+        and managed.uid == 20001
+        and managed.gid == 20001
+        and managed.shell == "/bin/bash"
+        and managed.host_access_state == "ENABLED"
+        and managed.onboarding_state == OnboardingState.ACTIVE
+        and managed.ssh_key_state == "INSTALLED"
+        and managed.slurm_account == "company"
+        and managed.slurm_qos == "general"
+        and key is not None
+        and key.managed_user_id == managed.id
+        and key.state == "INSTALLED"
+        and key.active is True
+        and key.fingerprint_sha256 == PORTAL3E_FINAL_KEY_FINGERPRINT
+        and key.scope == "BOTH"
+        and key.installed_at is not None
+        and container is not None
+        and container.observed_state == "RUNNING"
+        and container.desired_state == "RUNNING"
+        and isinstance(safe_spec, dict)
+        and safe_spec.get("gpu") == "NONE"
+        and safe_spec.get("authorized_keys") == "INSTALLED"
+        and safe_spec.get("container_authorized_keys") == "INSTALLED"
+        and safe_spec.get("slurm_node_state") == "DRAIN"
+        and safe_spec.get("slurm_queue") == "EMPTY"
+        and activate is not None
+        and activate.status == OperationStatus.SUCCEEDED
+    ):
+        raise RuntimeError("Portal-3F ACTIVE database baseline changed")
+    return owner, managed, key, container
+
+
+def _portal3f_approved_operation(
+    db: Session,
+    *,
+    owner: PortalUser,
+    operation_type: str,
+    payload: dict[str, Any],
+    idempotency_key: str,
+    risk_level: RiskLevel,
+    summary: str,
+    dry_run_result: dict[str, Any],
+) -> PortalOperation:
+    operation = PortalOperation(
+        operation_type=operation_type,
+        target_type="compute_identity",
+        target_id="origin-pilot",
+        requested_by=owner.id,
+        request_summary=summary,
+        validated_payload=payload,
+        idempotency_key=idempotency_key,
+        risk_level=risk_level,
+        status=OperationStatus.DRAFT,
+        dry_run_result=cast(dict[str, Any], safe_metadata(dry_run_result)),
+        result_summary="Portal-3F fixed preflight passed; approved execution queued",
+        created_at=utcnow(),
+    )
+    db.add(operation)
+    db.flush()
+    db.add(
+        PortalOperationEvent(
+            operation_id=operation.id,
+            from_status=None,
+            to_status=OperationStatus.DRAFT,
+            safe_message="Portal-3F fixed operation created after Worker preflight",
+            created_at=utcnow(),
+        )
+    )
+    transition(
+        operation,
+        OperationStatus.PENDING_APPROVAL,
+        "submitted under the current Portal-3F administrator approval",
+        db,
+    )
+    db.add(
+        PortalOperationApproval(
+            operation_id=operation.id,
+            approver_id=owner.id,
+            decision="APPROVE",
+            safe_comment=PORTAL3F_APPROVAL_TEXT,
+            decided_at=utcnow(),
+        )
+    )
+    operation.approved_by = owner.id
+    operation.approved_at = utcnow()
+    transition(operation, OperationStatus.APPROVED, "Portal-3F approval bound", db)
+    transition(operation, OperationStatus.QUEUED, "queued for the fixed Root Worker", db)
+    record_audit(
+        db,
+        event_type=f"{operation_type}.request",
+        actor="origin-al",
+        actor_role="platform_owner",
+        source_ip="local-console",
+        user_agent="h100-portal-admin",
+        object_type="operation",
+        object_id=str(operation.id),
+        result="APPROVE",
+        metadata={
+            "target": "origin-pilot",
+            "operation_type": operation_type,
+            "approval_reference": APPROVED_PORTAL3F_CLIENT_VALIDATION["approval_reference"],
+            "private_key_handling": "NOT_ACCESSED",
+        },
+        operation_id=operation.id,
+    )
+    return operation
+
+
+def _portal3f_record_client_validation() -> uuid.UUID:
+    with SessionLocal() as db:
+        owner, _managed, _key, container = _portal3f_database_baseline(db)
+        existing = db.scalar(
+            select(PortalOperation).where(
+                PortalOperation.requested_by == owner.id,
+                PortalOperation.idempotency_key == PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY,
+            )
+        )
+        if existing is not None:
+            if not (
+                existing.status == OperationStatus.SUCCEEDED
+                and container.safe_spec.get("host_ssh_client_validation") == "PASS"
+                and container.safe_spec.get("container_ssh_client_validation") == "PASS"
+            ):
+                raise RuntimeError(
+                    "existing Portal-3F client-validation operation is not successful"
+                )
+            return existing.id
+        payload = validate_operation_payload(
+            "user.ssh_client_validation.record", APPROVED_PORTAL3F_CLIENT_VALIDATION
+        )
+        preflight = call_worker(
+            "user.ssh_client_validation.record",
+            payload=payload,
+            requested_by="origin-al",
+            approved_by=None,
+            idempotency_key=f"portal3f-client-preflight:{uuid.uuid4()}",
+            dry_run=True,
+            timeout_seconds=180,
+        )
+        validate_portal3f_client_validation_plan(preflight)
+        created_operation = _portal3f_approved_operation(
+            db,
+            owner=owner,
+            operation_type="user.ssh_client_validation.record",
+            payload=payload,
+            idempotency_key=PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY,
+            risk_level=RiskLevel.MEDIUM,
+            summary="Record user-confirmed Host and Container SSH client validation PASS",
+            dry_run_result=preflight,
+        )
+        operation_id = created_operation.id
+        db.commit()
+
+    with SessionLocal() as db:
+        operation = db.get(PortalOperation, operation_id)
+        if operation is None or operation.status != OperationStatus.QUEUED:
+            raise RuntimeError("Portal-3F client-validation operation disappeared")
+        transition(operation, OperationStatus.RUNNING, "server readiness revalidation started", db)
+        operation.started_at = utcnow()
+        db.commit()
+    try:
+        result = call_worker(
+            "user.ssh_client_validation.record",
+            payload=APPROVED_PORTAL3F_CLIENT_VALIDATION,
+            requested_by="origin-al",
+            approved_by="origin-al",
+            idempotency_key=PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY,
+            dry_run=False,
+            timeout_seconds=180,
+        )
+    except WorkerClientError as exc:
+        with SessionLocal() as db:
+            operation = db.get(PortalOperation, operation_id)
+            if operation is not None and operation.status == OperationStatus.RUNNING:
+                transition(
+                    operation, OperationStatus.FAILED, "client validation Worker unavailable", db
+                )
+                operation.error_code = exc.code[:64]
+                operation.finished_at = utcnow()
+                operation.result_summary = "SSH client confirmation was not persisted"
+                db.commit()
+        raise
+
+    with SessionLocal() as db:
+        operation = db.get(PortalOperation, operation_id)
+        owner, _managed, _key, _container = _portal3f_database_baseline(db)
+        if operation is None or operation.status != OperationStatus.RUNNING:
+            raise RuntimeError("Portal-3F client-validation operation state changed")
+        if result.get("status") != "SUCCEEDED":
+            transition(
+                operation, OperationStatus.FAILED, "server readiness revalidation failed", db
+            )
+            error = result.get("error", {})
+            operation.error_code = str(
+                error.get("code", "PORTAL3F_CLIENT_VALIDATION_FAILED")
+                if isinstance(error, dict)
+                else "PORTAL3F_CLIENT_VALIDATION_FAILED"
+            )[:64]
+            operation.finished_at = utcnow()
+            operation.dry_run_result = {
+                **(operation.dry_run_result or {}),
+                "execution_result": cast(dict[str, Any], safe_metadata(result)),
+            }
+            operation.result_summary = "Server revalidation failed; client PASS was not persisted"
+            db.commit()
+            raise RuntimeError(operation.error_code)
+        validate_portal3f_client_validation_result(result)
+        persist_portal3f_client_validation(
+            db, owner=owner, operation=operation, worker_result=result
+        )
+        operation.dry_run_result = {
+            **(operation.dry_run_result or {}),
+            "execution_result": cast(dict[str, Any], safe_metadata(result)),
+            "client_validation_status": "PASS",
+            "execution_enabled": True,
+        }
+        transition(
+            operation, OperationStatus.SUCCEEDED, "both real-client confirmations recorded", db
+        )
+        operation.worker_execution_id = str(result.get("request_id", "worker"))[:64]
+        operation.finished_at = utcnow()
+        operation.result_summary = (
+            "Host and Container SSH Client Validation PASS; no private key was accessed"
+        )
+        record_audit(
+            db,
+            event_type="user.ssh_client_validation.recorded",
+            actor="origin-al",
+            actor_role="platform_owner",
+            source_ip="local-console",
+            user_agent="h100-portal-admin",
+            object_type="managed_user",
+            object_id="origin-pilot",
+            result="SUCCESS",
+            metadata={
+                "host": "PASS",
+                "container": "PASS",
+                "confirmation_source": "USER_CONFIRMED_REAL_CLIENT_CONNECTIONS",
+                "private_key_handling": "NOT_ACCESSED",
+            },
+            operation_id=operation.id,
+        )
+        db.commit()
+        return operation.id
+
+
+def _portal3f_run_pilot_acceptance() -> uuid.UUID:
+    with SessionLocal() as db:
+        owner, _managed, _key, container = _portal3f_database_baseline(db)
+        if not (
+            container.safe_spec.get("host_ssh_client_validation") == "PASS"
+            and container.safe_spec.get("container_ssh_client_validation") == "PASS"
+        ):
+            raise RuntimeError("SSH client validation PASS is required before Pilot acceptance")
+        existing = db.scalar(
+            select(PortalOperation).where(
+                PortalOperation.requested_by == owner.id,
+                PortalOperation.idempotency_key == PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY,
+            )
+        )
+        if existing is not None:
+            if not (
+                existing.status == OperationStatus.SUCCEEDED
+                and container.safe_spec.get("pilot_acceptance_status") == "PASSED"
+                and container.safe_spec.get("pilot_final_node_state") == "DRAIN"
+            ):
+                raise RuntimeError("existing Portal-3F Pilot acceptance is not successful")
+            return existing.id
+        payload = validate_operation_payload(
+            "user.pilot.acceptance", APPROVED_PORTAL3F_PILOT_ACCEPTANCE
+        )
+        preflight = call_worker(
+            "user.pilot.acceptance",
+            payload=payload,
+            requested_by="origin-al",
+            approved_by=None,
+            idempotency_key=f"portal3f-pilot-preflight:{uuid.uuid4()}",
+            dry_run=True,
+            timeout_seconds=240,
+        )
+        validate_portal3f_pilot_acceptance_plan(preflight)
+        created_operation = _portal3f_approved_operation(
+            db,
+            owner=owner,
+            operation_type="user.pilot.acceptance",
+            payload=payload,
+            idempotency_key=PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY,
+            risk_level=RiskLevel.CRITICAL,
+            summary="Run first origin-pilot CPU, single-GPU, Pyxis/Enroot isolation acceptance",
+            dry_run_result=preflight,
+        )
+        operation_id = created_operation.id
+        db.commit()
+
+    with SessionLocal() as db:
+        operation = db.get(PortalOperation, operation_id)
+        if operation is None or operation.status != OperationStatus.QUEUED:
+            raise RuntimeError("Portal-3F Pilot acceptance operation disappeared")
+        transition(operation, OperationStatus.RUNNING, "fixed Pilot acceptance started", db)
+        operation.started_at = utcnow()
+        db.commit()
+    try:
+        result = call_worker(
+            "user.pilot.acceptance",
+            payload=APPROVED_PORTAL3F_PILOT_ACCEPTANCE,
+            requested_by="origin-al",
+            approved_by="origin-al",
+            idempotency_key=PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY,
+            dry_run=False,
+            timeout_seconds=1600,
+        )
+    except WorkerClientError as exc:
+        with SessionLocal() as db:
+            operation = db.get(PortalOperation, operation_id)
+            if operation is not None and operation.status == OperationStatus.RUNNING:
+                transition(
+                    operation, OperationStatus.FAILED, "Pilot acceptance Worker unavailable", db
+                )
+                operation.error_code = exc.code[:64]
+                operation.rollback_status = "REQUIRES_MANUAL_REVIEW"
+                operation.finished_at = utcnow()
+                operation.result_summary = (
+                    "Worker response unknown; verify and preserve Slurm DRAIN"
+                )
+                db.commit()
+        raise
+
+    with SessionLocal() as db:
+        operation = db.get(PortalOperation, operation_id)
+        owner, _managed, _key, _container = _portal3f_database_baseline(db)
+        if operation is None or operation.status != OperationStatus.RUNNING:
+            raise RuntimeError("Portal-3F Pilot acceptance operation state changed")
+        if result.get("status") != "SUCCEEDED":
+            rollback_status = str(result.get("rollback_status", ""))[:32]
+            if rollback_status == "DRAIN_RESTORED":
+                transition(
+                    operation, OperationStatus.ROLLING_BACK, "Slurm DRAIN recovery recorded", db
+                )
+                transition(
+                    operation, OperationStatus.ROLLED_BACK, "Slurm DRAIN recovery verified", db
+                )
+            else:
+                transition(operation, OperationStatus.FAILED, "Pilot acceptance failed closed", db)
+            error = result.get("error", {})
+            operation.error_code = str(
+                error.get("code", "PORTAL3F_ACCEPTANCE_FAILED")
+                if isinstance(error, dict)
+                else "PORTAL3F_ACCEPTANCE_FAILED"
+            )[:64]
+            operation.rollback_status = rollback_status or "REQUIRES_MANUAL_REVIEW"
+            operation.finished_at = utcnow()
+            operation.dry_run_result = {
+                **(operation.dry_run_result or {}),
+                "execution_result": cast(dict[str, Any], safe_metadata(result)),
+            }
+            operation.result_summary = "Pilot acceptance failed; node recovery status recorded"
+            record_audit(
+                db,
+                event_type="user.pilot.acceptance.failed",
+                actor="origin-al",
+                actor_role="platform_owner",
+                source_ip="local-worker-socket",
+                user_agent="h100-portal-admin",
+                object_type="managed_user",
+                object_id="origin-pilot",
+                result="FAILED",
+                metadata={
+                    "error_code": operation.error_code,
+                    "rollback_status": operation.rollback_status,
+                },
+                operation_id=operation.id,
+            )
+            db.commit()
+            raise RuntimeError(operation.error_code)
+        acceptance = validate_portal3f_pilot_acceptance_result(result)
+        persist_portal3f_pilot_acceptance(
+            db, owner=owner, operation=operation, worker_result=result
+        )
+        operation.dry_run_result = {
+            **(operation.dry_run_result or {}),
+            "execution_result": cast(dict[str, Any], safe_metadata(result)),
+            "pilot_acceptance_status": "PASSED",
+            "execution_enabled": True,
+        }
+        transition(operation, OperationStatus.SUCCEEDED, "first Pilot acceptance verified", db)
+        operation.worker_execution_id = str(result.get("request_id", "worker"))[:64]
+        operation.rollback_status = "NOT_REQUIRED"
+        operation.finished_at = utcnow()
+        operation.result_summary = (
+            "origin-pilot CPU and single-GPU Pyxis acceptance PASSED; final Slurm state DRAIN"
+        )
+        record_audit(
+            db,
+            event_type="user.pilot.acceptance.passed",
+            actor="origin-al",
+            actor_role="platform_owner",
+            source_ip="local-worker-socket",
+            user_agent="h100-portal-admin",
+            object_type="managed_user",
+            object_id="origin-pilot",
+            result="SUCCESS",
+            metadata={
+                "cpu_job_id": acceptance["cpu_job_id"],
+                "gpu_job_id": acceptance["gpu_job_id"],
+                "allocated_gpu_uuid": acceptance["allocated_gpu_uuid"],
+                "account": "company",
+                "qos": "general",
+                "max_gpus": 1,
+                "final_node_state": "DRAIN",
+            },
+            operation_id=operation.id,
+        )
+        db.commit()
+        return operation.id
+
+
+def portal3f_origin_pilot(approval_text: str) -> int:
+    """Record real-client confirmations and run the fixed first Pilot acceptance."""
+    if approval_text != PORTAL3F_APPROVAL_TEXT:
+        print("PORTAL-3F BLOCKED — approval text mismatch", file=sys.stderr)
+        return 2
+    try:
+        client_operation_id = _portal3f_record_client_validation()
+        print(f"client_validation_operation_id={client_operation_id}")
+        print("host_ssh_client_validation=PASS")
+        print("container_ssh_client_validation=PASS")
+        pilot_operation_id = _portal3f_run_pilot_acceptance()
+    except (OperationPayloadError, WorkerClientError, RuntimeError, SQLAlchemyError) as exc:
+        code = getattr(exc, "code", exc.__class__.__name__)
+        print(f"PORTAL-3F PILOT ACCEPTANCE BLOCKED — {code}", file=sys.stderr)
+        return 2
+    with SessionLocal() as db:
+        operation = db.get(PortalOperation, pilot_operation_id)
+        _owner, _managed, _key, container = _portal3f_database_baseline(db)
+        if operation is None or operation.status != OperationStatus.SUCCEEDED:
+            print("PORTAL-3F PILOT ACCEPTANCE DID NOT SUCCEED", file=sys.stderr)
+            return 2
+        print(f"pilot_acceptance_operation_id={operation.id}")
+        print(f"pilot_acceptance_status={container.safe_spec.get('pilot_acceptance_status')}")
+        print(f"cpu_job_id={container.safe_spec.get('pilot_cpu_job_id')}")
+        print(f"gpu_job_id={container.safe_spec.get('pilot_gpu_job_id')}")
+        print(f"allocated_gpu_uuid={container.safe_spec.get('pilot_allocated_gpu_uuid')}")
+        print("out_of_job_gpu_access=DENIED")
+        print("in_job_allocated_gpu=ALLOWED")
+        print("in_job_unallocated_gpus=DENIED")
+        print("in_job_cuda_context=PASSED")
+        print("slurm_node=DRAIN")
+        print("slurm_queue=EMPTY")
+        print("controlled_single_node_pilot_started=NO_AWAITING_FINAL_APPROVAL")
+        return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="H100 Portal administrator bootstrap")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1071,6 +1567,8 @@ def main() -> int:
     subparsers.add_parser("revalidate-origin-pilot-activate")
     activate = subparsers.add_parser("activate-origin-pilot-final")
     activate.add_argument("--approval-text", required=True)
+    portal3f = subparsers.add_parser("portal3f-origin-pilot")
+    portal3f.add_argument("--approval-text", required=True)
     args = parser.parse_args()
     if args.command == "prepare-origin-al":
         return prepare_origin_al()
@@ -1088,6 +1586,8 @@ def main() -> int:
         return revalidate_origin_pilot_activate()
     if args.command == "activate-origin-pilot-final":
         return activate_origin_pilot_final(args.approval_text)
+    if args.command == "portal3f-origin-pilot":
+        return portal3f_origin_pilot(args.approval_text)
     return 2
 
 
