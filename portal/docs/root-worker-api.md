@@ -152,6 +152,15 @@ Portal-3A 将 `user.plan` 进一步限制为精确目标 `origin-pilot`。Worker
 结构化计划，所有候选值标记为 `PROPOSED — NOT RESERVED`。它不接受任意 argv、任意
 路径或其他用户名；`origin-al` 仍是禁止的计算用户目标。
 
+Portal-3G 的 `slurm.production_pilot.start` 同样只允许固定管理员 CLI。payload 精确绑定
+Portal-3F 的 SSH Client Validation 与 Pilot Acceptance Operation、`origin-pilot`、唯一节点
+`sagsh100server`、单受管用户和 `max_gpus=1`，不接受任意 `scontrol` 参数。Worker 在完整
+ACTIVE/DRAIN/空队列/Guard/GPU/DCGM/systemd/container preflight 后只执行固定
+`scontrol update NodeName=sagsh100server State=RESUME`，等待精确 `IDLE` 且无 DRAIN reason，
+再重复完整健康检查；不提交任何作业。任一执行或 postflight 失败只调用固定 safety DRAIN，
+reason 为 `production pilot safety gate failed`，且不会自动重试 RESUME。API 仅在 Worker
+postflight 通过后写入非敏感 `production_pilot` setting 和审计记录。
+
 ## 固定命令适配器
 
 命令只从代码内绝对路径 allowlist 选择，`shell=False`，固定 `PATH`/locale/cwd，stdin

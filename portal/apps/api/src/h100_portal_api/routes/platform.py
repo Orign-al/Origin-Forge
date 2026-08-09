@@ -11,6 +11,7 @@ from h100_portal_api.models import (
     PortalAuditEvent,
     PortalManagedUser,
     PortalOperation,
+    PortalSetting,
     PortalSystemSnapshot,
     PortalUser,
     utcnow,
@@ -18,6 +19,25 @@ from h100_portal_api.models import (
 from h100_portal_api.worker_client import WorkerClientError, call_worker
 
 router = APIRouter(prefix="/platform", tags=["platform"])
+
+
+def production_pilot_state(db: Session) -> dict[str, Any]:
+    setting = db.get(PortalSetting, "production_pilot")
+    if setting is None or not isinstance(setting.value, dict):
+        return {
+            "status": "OK",
+            "state": "NOT_STARTED",
+            "mode": "SINGLE_NODE",
+            "managed_users": 1,
+            "active_managed_user": "origin-pilot",
+            "node_name": "sagsh100server",
+            "node_state": "DRAIN",
+            "scheduler": "UNAVAILABLE",
+            "queue": "EMPTY",
+            "gpu_capacity": 4,
+            "per_user_max_gpu": 1,
+        }
+    return {"status": "OK", **setting.value, "updated_at": setting.updated_at.isoformat()}
 
 
 def adapter(
@@ -85,6 +105,7 @@ def overview(
         **extras,
         "identity": identity,
         "tasks": tasks,
+        "production_pilot": production_pilot_state(db),
     }
     recent_audit = db.scalars(
         select(PortalAuditEvent).order_by(PortalAuditEvent.timestamp.desc()).limit(12)

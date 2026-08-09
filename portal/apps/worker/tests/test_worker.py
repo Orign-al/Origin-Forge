@@ -240,6 +240,133 @@ def test_portal3f_pilot_failure_reports_verified_drain_recovery(
     assert result["rollback_status"] == "DRAIN_RESTORED"
 
 
+def test_portal3g_payload_is_exact_and_rejects_command_injection() -> None:
+    payload = dict(handlers.APPROVED_PRODUCTION_PILOT_PAYLOAD)
+    assert validate_payload("slurm.production_pilot.start", payload) == payload
+    with pytest.raises(ValueError, match="PORTAL3G_PLAN_MISMATCH"):
+        validate_payload("slurm.production_pilot.start", {**payload, "max_gpus": 2})
+    with pytest.raises(ValueError, match="PORTAL3G_PAYLOAD_REJECTED"):
+        validate_payload(
+            "slurm.production_pilot.start",
+            {**payload, "argv": ["update", "NodeName=other"]},
+        )
+
+
+def test_portal3g_start_uses_only_fixed_resume_and_submits_no_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drain_snapshot = {"slurm": {"node_state": "DRAIN"}}
+    idle_snapshot = {"slurm": {"node_state": "IDLE"}}
+    monkeypatch.setattr(
+        handlers,
+        "_portal3g_production_pilot_plan",
+        lambda _payload: {
+            "preflight": drain_snapshot,
+            "production_pilot_scope": {
+                "mode": "SINGLE_NODE",
+                "managed_users": ["origin-pilot"],
+                "max_gpus": 1,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_portal3g_wait_for_node",
+        lambda state, timeout_seconds=20: {
+            "name": "sagsh100server",
+            "state": state,
+            "queue": "EMPTY",
+            "reason": "NONE",
+            "jobs_submitted": 0,
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_portal3f_active_preflight",
+        lambda expected_state="DRAIN": (
+            idle_snapshot if expected_state == "IDLE" else drain_snapshot
+        ),
+    )
+    commands: list[tuple[str, list[str]]] = []
+
+    def fixed(binary: str, args: list[str], timeout: float = 20) -> dict[str, object]:
+        commands.append((binary, args))
+        return {"ok": True, "stdout": ""}
+
+    monkeypatch.setattr(handlers, "run_fixed", fixed)
+    result = handle(
+        request(
+            "slurm.production_pilot.start",
+            dict(handlers.APPROVED_PRODUCTION_PILOT_PAYLOAD),
+            approved_by="origin-al",
+            idempotency_key=handlers.PORTAL3G_PRODUCTION_PILOT_IDEMPOTENCY_KEY,
+        )
+    )
+    assert result["status"] == "SUCCEEDED"
+    assert result["node"]["state"] == "IDLE"
+    assert result["jobs_submitted"] == 0
+    assert commands == [
+        (
+            "scontrol",
+            ["update", "NodeName=sagsh100server", "State=RESUME"],
+        )
+    ]
+
+
+def test_portal3g_postflight_failure_drains_and_does_not_retry_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        handlers,
+        "_portal3g_production_pilot_plan",
+        lambda _payload: {
+            "preflight": {},
+            "production_pilot_scope": {
+                "mode": "SINGLE_NODE",
+                "managed_users": ["origin-pilot"],
+                "max_gpus": 1,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_portal3g_wait_for_node",
+        lambda state, timeout_seconds=20: {
+            "name": "sagsh100server",
+            "state": state,
+            "queue": "EMPTY",
+            "reason": "NONE",
+            "jobs_submitted": 0,
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_portal3f_active_preflight",
+        lambda _state="DRAIN": (_ for _ in ()).throw(
+            handlers.LifecycleValidationError("PORTAL3G_POSTFLIGHT_FAILED", "health failed")
+        ),
+    )
+    monkeypatch.setattr(handlers, "_portal3g_safety_drain", lambda: "DRAIN_RESTORED")
+    commands: list[list[str]] = []
+
+    def fixed(_binary: str, args: list[str], timeout: float = 20) -> dict[str, object]:
+        commands.append(args)
+        return {"ok": True, "stdout": ""}
+
+    monkeypatch.setattr(handlers, "run_fixed", fixed)
+    result = handle(
+        request(
+            "slurm.production_pilot.start",
+            dict(handlers.APPROVED_PRODUCTION_PILOT_PAYLOAD),
+            approved_by="origin-al",
+            idempotency_key=handlers.PORTAL3G_PRODUCTION_PILOT_IDEMPOTENCY_KEY,
+        )
+    )
+    assert result["status"] == "ERROR"
+    assert result["rollback_status"] == "DRAIN_RESTORED"
+    assert commands == [["update", "NodeName=sagsh100server", "State=RESUME"]]
+
+
 def approved_stage_payload() -> dict[str, object]:
     return {
         "username": "origin-pilot",

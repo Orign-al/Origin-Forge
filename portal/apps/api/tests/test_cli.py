@@ -2,6 +2,7 @@ import pytest
 from h100_portal_api.cli import (
     ensure_origin_al_record,
     portal3f_origin_pilot,
+    portal3g_start_production_pilot,
     reopen_portal3c_stage_retry,
     stage_origin_pilot,
 )
@@ -54,6 +55,10 @@ def test_portal3c_console_stage_requires_exact_approval_text() -> None:
 
 def test_portal3f_console_requires_exact_approval_text() -> None:
     assert portal3f_origin_pilot("run pilot") == 2
+
+
+def test_portal3g_console_requires_exact_approval_text() -> None:
+    assert portal3g_start_production_pilot("resume all nodes") == 2
 
 
 def test_portal3c_retry_reopens_only_the_exact_rolled_back_operation(database) -> None:  # type: ignore[no-untyped-def]

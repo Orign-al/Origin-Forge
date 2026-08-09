@@ -27,6 +27,7 @@ from h100_portal_api.models import (
     PortalOperationEvent,
     PortalPasswordSetupToken,
     PortalRole,
+    PortalSetting,
     PortalSshKey,
     PortalUser,
     utcnow,
@@ -36,6 +37,7 @@ from h100_portal_api.routes.operations import (
     APPROVED_ORIGIN_PILOT_STAGE,
     APPROVED_PORTAL3F_CLIENT_VALIDATION,
     APPROVED_PORTAL3F_PILOT_ACCEPTANCE,
+    APPROVED_PORTAL3G_PRODUCTION_PILOT,
     PORTAL3C_STAGE_APPROVAL_REFERENCE,
     PORTAL3C_STAGE_IDEMPOTENCY_KEY,
     PORTAL3E_FINAL_APPROVAL_REFERENCE,
@@ -48,11 +50,19 @@ from h100_portal_api.routes.operations import (
     PORTAL3F_APPROVAL_TEXT,
     PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY,
     PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY,
+    PORTAL3G_APPROVAL_REFERENCE,
+    PORTAL3G_APPROVAL_TEXT,
+    PORTAL3G_CLIENT_VALIDATION_OPERATION_ID,
+    PORTAL3G_DRAIN_IDEMPOTENCY_KEY,
+    PORTAL3G_PILOT_ACCEPTANCE_OPERATION_ID,
+    PORTAL3G_PRODUCTION_PILOT_IDEMPOTENCY_KEY,
+    PORTAL3G_SETTING_KEY,
     OperationPayloadError,
     enrich_user_plan_with_portal_state,
     execute_operation,
     persist_portal3f_client_validation,
     persist_portal3f_pilot_acceptance,
+    persist_portal3g_production_pilot,
     transition,
     validate_activate_database_bindings,
     validate_activate_worker_result,
@@ -62,6 +72,8 @@ from h100_portal_api.routes.operations import (
     validate_portal3f_client_validation_result,
     validate_portal3f_pilot_acceptance_plan,
     validate_portal3f_pilot_acceptance_result,
+    validate_portal3g_production_pilot_plan,
+    validate_portal3g_production_pilot_result,
 )
 from h100_portal_api.security import digest_secret, normalize_login, random_token, safe_metadata
 from h100_portal_api.worker_client import WorkerClientError, call_worker
@@ -1071,7 +1083,11 @@ def activate_origin_pilot_final(approval_text: str) -> int:
 
 def _portal3f_database_baseline(
     db: Session,
+    *,
+    expected_slurm_node_state: str = "DRAIN",
 ) -> tuple[PortalUser, PortalManagedUser, PortalSshKey, PortalContainer]:
+    if expected_slurm_node_state not in {"DRAIN", "IDLE"}:
+        raise RuntimeError("unsupported Portal Pilot Slurm state")
     owner = db.scalar(select(PortalUser).where(PortalUser.normalized_login == "origin-al"))
     managed = db.get(PortalManagedUser, PORTAL3E_FINAL_MANAGED_USER_ID)
     key = db.get(PortalSshKey, PORTAL3E_FINAL_KEY_RECORD_ID)
@@ -1123,7 +1139,7 @@ def _portal3f_database_baseline(
         and safe_spec.get("gpu") == "NONE"
         and safe_spec.get("authorized_keys") == "INSTALLED"
         and safe_spec.get("container_authorized_keys") == "INSTALLED"
-        and safe_spec.get("slurm_node_state") == "DRAIN"
+        and safe_spec.get("slurm_node_state") == expected_slurm_node_state
         and safe_spec.get("slurm_queue") == "EMPTY"
         and activate is not None
         and activate.status == OperationStatus.SUCCEEDED
@@ -1552,6 +1568,363 @@ def portal3f_origin_pilot(approval_text: str) -> int:
         return 0
 
 
+def _portal3g_database_baseline(
+    db: Session,
+    *,
+    expected_slurm_node_state: str = "DRAIN",
+) -> tuple[PortalUser, PortalManagedUser, PortalContainer]:
+    owner, managed, _key, container = _portal3f_database_baseline(
+        db, expected_slurm_node_state=expected_slurm_node_state
+    )
+    client_validation = db.get(PortalOperation, PORTAL3G_CLIENT_VALIDATION_OPERATION_ID)
+    pilot_acceptance = db.get(PortalOperation, PORTAL3G_PILOT_ACCEPTANCE_OPERATION_ID)
+    if not (
+        client_validation is not None
+        and client_validation.status == OperationStatus.SUCCEEDED
+        and client_validation.operation_type == "user.ssh_client_validation.record"
+        and client_validation.target_id == "origin-pilot"
+        and pilot_acceptance is not None
+        and pilot_acceptance.status == OperationStatus.SUCCEEDED
+        and pilot_acceptance.operation_type == "user.pilot.acceptance"
+        and pilot_acceptance.target_id == "origin-pilot"
+        and container.safe_spec.get("host_ssh_client_validation") == "PASS"
+        and container.safe_spec.get("container_ssh_client_validation") == "PASS"
+        and container.safe_spec.get("client_validation_operation_id")
+        == str(PORTAL3G_CLIENT_VALIDATION_OPERATION_ID)
+        and container.safe_spec.get("pilot_acceptance_status") == "PASSED"
+        and container.safe_spec.get("pilot_acceptance_operation_id")
+        == str(PORTAL3G_PILOT_ACCEPTANCE_OPERATION_ID)
+        and container.safe_spec.get("gpu") == "NONE"
+    ):
+        raise RuntimeError("Portal-3G database evidence differs from approved Portal-3F results")
+    return owner, managed, container
+
+
+def _portal3g_mark_failed(
+    operation_id: uuid.UUID,
+    *,
+    error_code: str,
+    rollback_status: str,
+    result: dict[str, Any] | None = None,
+) -> None:
+    with SessionLocal() as db:
+        operation = db.get(PortalOperation, operation_id)
+        if operation is None or operation.status != OperationStatus.RUNNING:
+            return
+        if rollback_status in {"DRAIN_RESTORED", "NOT_REQUIRED_NODE_REMAINS_DRAINED"}:
+            transition(operation, OperationStatus.ROLLING_BACK, "Production Pilot safety DRAIN", db)
+            transition(
+                operation,
+                OperationStatus.ROLLED_BACK,
+                "Production Pilot did not start; Slurm DRAIN verified",
+                db,
+            )
+        else:
+            transition(operation, OperationStatus.FAILED, "Production Pilot failed closed", db)
+        operation.error_code = error_code[:64]
+        operation.rollback_status = rollback_status[:32]
+        operation.finished_at = utcnow()
+        operation.result_summary = "Production Pilot not started; Slurm safety state recorded"
+        if result is not None:
+            operation.dry_run_result = {
+                **(operation.dry_run_result or {}),
+                "execution_result": cast(dict[str, Any], safe_metadata(result)),
+            }
+        record_audit(
+            db,
+            event_type="slurm.production_pilot.start.failed",
+            actor="origin-al",
+            actor_role="platform_owner",
+            source_ip="local-worker-socket",
+            user_agent="h100-portal-admin",
+            object_type="slurm_node",
+            object_id="sagsh100server",
+            result="FAILED",
+            metadata={"error_code": error_code, "rollback_status": rollback_status},
+            operation_id=operation.id,
+        )
+        db.commit()
+
+
+def _portal3g_request_safety_drain() -> str:
+    try:
+        result = call_worker(
+            "slurm.drain",
+            payload={"node_name": "sagsh100server"},
+            requested_by="origin-al",
+            approved_by="origin-al",
+            idempotency_key=PORTAL3G_DRAIN_IDEMPOTENCY_KEY,
+            dry_run=False,
+            timeout_seconds=90,
+        )
+    except WorkerClientError:
+        return "REQUIRES_MANUAL_REVIEW"
+    return str(result.get("rollback_status", "REQUIRES_MANUAL_REVIEW"))[:32]
+
+
+def _portal3g_create_operation(
+    db: Session,
+    *,
+    owner: PortalUser,
+    payload: dict[str, Any],
+    preflight: dict[str, Any],
+) -> PortalOperation:
+    operation = PortalOperation(
+        operation_type="slurm.production_pilot.start",
+        target_type="slurm_node",
+        target_id="sagsh100server",
+        requested_by=owner.id,
+        request_summary=("Start the approved single-node, single-managed-user Production Pilot"),
+        validated_payload=payload,
+        idempotency_key=PORTAL3G_PRODUCTION_PILOT_IDEMPOTENCY_KEY,
+        risk_level=RiskLevel.CRITICAL,
+        status=OperationStatus.DRAFT,
+        dry_run_result=cast(dict[str, Any], safe_metadata(preflight)),
+        result_summary="Portal-3G fixed preflight passed; approved RESUME queued",
+        created_at=utcnow(),
+    )
+    db.add(operation)
+    db.flush()
+    db.add(
+        PortalOperationEvent(
+            operation_id=operation.id,
+            from_status=None,
+            to_status=OperationStatus.DRAFT,
+            safe_message="Portal-3G operation created after fixed Worker preflight",
+            created_at=utcnow(),
+        )
+    )
+    transition(
+        operation,
+        OperationStatus.PENDING_APPROVAL,
+        "submitted under the current Portal-3G administrator approval",
+        db,
+    )
+    db.add(
+        PortalOperationApproval(
+            operation_id=operation.id,
+            approver_id=owner.id,
+            decision="APPROVE",
+            safe_comment=PORTAL3G_APPROVAL_TEXT,
+            decided_at=utcnow(),
+        )
+    )
+    operation.approved_by = owner.id
+    operation.approved_at = utcnow()
+    transition(operation, OperationStatus.APPROVED, "Portal-3G approval bound", db)
+    transition(operation, OperationStatus.QUEUED, "queued for fixed Slurm RESUME handler", db)
+    record_audit(
+        db,
+        event_type="slurm.production_pilot.start.request",
+        actor="origin-al",
+        actor_role="platform_owner",
+        source_ip="local-console",
+        user_agent="h100-portal-admin",
+        object_type="slurm_node",
+        object_id="sagsh100server",
+        result="APPROVE",
+        metadata={
+            "approval_reference": PORTAL3G_APPROVAL_REFERENCE,
+            "previous_state": "DRAIN",
+            "requested_state": "IDLE",
+            "scope": "single-node/single-managed-user/max-1-gpu",
+        },
+        operation_id=operation.id,
+    )
+    return operation
+
+
+def portal3g_start_production_pilot(approval_text: str) -> int:
+    """Start the fixed Portal-3G Production Pilot without submitting a job."""
+    if approval_text != PORTAL3G_APPROVAL_TEXT:
+        print("PORTAL-3G BLOCKED — approval text mismatch", file=sys.stderr)
+        return 2
+    try:
+        with SessionLocal() as db:
+            owner, _managed, _container = _portal3g_database_baseline(db)
+            existing = db.scalar(
+                select(PortalOperation).where(
+                    PortalOperation.requested_by == owner.id,
+                    PortalOperation.idempotency_key == PORTAL3G_PRODUCTION_PILOT_IDEMPOTENCY_KEY,
+                )
+            )
+            setting = db.get(PortalSetting, PORTAL3G_SETTING_KEY)
+            if existing is not None:
+                if not (
+                    existing.status == OperationStatus.SUCCEEDED
+                    and setting is not None
+                    and setting.value.get("state") == "ACTIVE"
+                    and setting.value.get("node_state") == "IDLE"
+                ):
+                    raise RuntimeError("existing Portal-3G operation is not successful")
+                print(f"production_pilot_operation_id={existing.id}")
+                print("production_pilot_state=ACTIVE")
+                print("slurm_node=IDLE")
+                print("slurm_queue=EMPTY")
+                return 0
+            if setting is not None:
+                raise RuntimeError("unexpected Production Pilot setting exists before start")
+            payload = validate_operation_payload(
+                "slurm.production_pilot.start", APPROVED_PORTAL3G_PRODUCTION_PILOT
+            )
+            preflight = call_worker(
+                "slurm.production_pilot.start",
+                payload=payload,
+                requested_by="origin-al",
+                approved_by=None,
+                idempotency_key=f"portal3g-production-preflight:{uuid.uuid4()}",
+                dry_run=True,
+                timeout_seconds=360,
+            )
+            validate_portal3g_production_pilot_plan(preflight)
+            operation = _portal3g_create_operation(
+                db, owner=owner, payload=payload, preflight=preflight
+            )
+            operation_id = operation.id
+            db.commit()
+
+        with SessionLocal() as db:
+            running_operation = db.get(PortalOperation, operation_id)
+            if running_operation is None or running_operation.status != OperationStatus.QUEUED:
+                raise RuntimeError("Portal-3G operation disappeared before execution")
+            transition(
+                running_operation,
+                OperationStatus.RUNNING,
+                "fixed Production Pilot start began",
+                db,
+            )
+            running_operation.started_at = utcnow()
+            db.commit()
+
+        try:
+            result = call_worker(
+                "slurm.production_pilot.start",
+                payload=APPROVED_PORTAL3G_PRODUCTION_PILOT,
+                requested_by="origin-al",
+                approved_by="origin-al",
+                idempotency_key=PORTAL3G_PRODUCTION_PILOT_IDEMPOTENCY_KEY,
+                dry_run=False,
+                timeout_seconds=480,
+            )
+        except WorkerClientError as exc:
+            rollback_status = _portal3g_request_safety_drain()
+            _portal3g_mark_failed(
+                operation_id,
+                error_code=exc.code,
+                rollback_status=rollback_status,
+            )
+            raise
+        if result.get("status") != "SUCCEEDED":
+            error = result.get("error", {})
+            error_code = str(
+                error.get("code", "PORTAL3G_START_FAILED")
+                if isinstance(error, dict)
+                else "PORTAL3G_START_FAILED"
+            )
+            rollback_status = str(result.get("rollback_status", "REQUIRES_MANUAL_REVIEW"))[:32]
+            _portal3g_mark_failed(
+                operation_id,
+                error_code=error_code,
+                rollback_status=rollback_status,
+                result=result,
+            )
+            raise RuntimeError(error_code)
+        validate_portal3g_production_pilot_result(result)
+
+        try:
+            with SessionLocal() as db:
+                persisted_operation = db.get(PortalOperation, operation_id)
+                owner, _managed, _container = _portal3g_database_baseline(db)
+                if (
+                    persisted_operation is None
+                    or persisted_operation.status != OperationStatus.RUNNING
+                ):
+                    raise RuntimeError("Portal-3G operation state changed during execution")
+                persist_portal3g_production_pilot(
+                    db, owner=owner, operation=persisted_operation, worker_result=result
+                )
+                persisted_operation.dry_run_result = {
+                    **(persisted_operation.dry_run_result or {}),
+                    "execution_result": cast(dict[str, Any], safe_metadata(result)),
+                    "production_pilot_state": "ACTIVE",
+                    "execution_enabled": True,
+                }
+                transition(
+                    persisted_operation,
+                    OperationStatus.SUCCEEDED,
+                    "Slurm IDLE and Production Pilot ACTIVE verified",
+                    db,
+                )
+                persisted_operation.worker_execution_id = str(result.get("request_id", "worker"))[
+                    :64
+                ]
+                persisted_operation.rollback_status = "NOT_REQUIRED"
+                persisted_operation.finished_at = utcnow()
+                persisted_operation.result_summary = (
+                    "Single-node single-managed-user Production Pilot ACTIVE; Slurm IDLE"
+                )
+                record_audit(
+                    db,
+                    event_type="slurm.production_pilot.started",
+                    actor="origin-al",
+                    actor_role="platform_owner",
+                    source_ip="local-worker-socket",
+                    user_agent="h100-portal-admin",
+                    object_type="slurm_node",
+                    object_id="sagsh100server",
+                    result="SUCCESS",
+                    metadata={
+                        "previous_state": "DRAIN",
+                        "new_state": "IDLE",
+                        "production_pilot": "ACTIVE",
+                        "scope": "single-node/single-managed-user/max-1-gpu",
+                        "guard": "PASSING",
+                        "gpu_health": "4/4 PASS",
+                        "jobs_submitted": 0,
+                    },
+                    operation_id=persisted_operation.id,
+                )
+                db.commit()
+        except OperationPayloadError, RuntimeError, SQLAlchemyError:
+            rollback_status = _portal3g_request_safety_drain()
+            _portal3g_mark_failed(
+                operation_id,
+                error_code="PORTAL3G_PERSISTENCE_FAILED",
+                rollback_status=rollback_status,
+                result=result,
+            )
+            raise
+
+        with SessionLocal() as db:
+            _owner, _managed, _container = _portal3g_database_baseline(
+                db, expected_slurm_node_state="IDLE"
+            )
+            final_operation = db.get(PortalOperation, operation_id)
+            setting = db.get(PortalSetting, PORTAL3G_SETTING_KEY)
+            if not (
+                final_operation is not None
+                and final_operation.status == OperationStatus.SUCCEEDED
+                and setting is not None
+                and setting.value.get("state") == "ACTIVE"
+                and setting.value.get("node_state") == "IDLE"
+            ):
+                raise RuntimeError("Portal-3G persisted state is incomplete")
+            print(f"production_pilot_operation_id={final_operation.id}")
+            print("production_pilot_state=ACTIVE")
+            print("production_pilot_mode=SINGLE_NODE_SINGLE_MANAGED_USER")
+            print("active_managed_user=origin-pilot")
+            print("max_gpus=1")
+            print("slurm_node=IDLE")
+            print("slurm_scheduler=AVAILABLE")
+            print("slurm_queue=EMPTY")
+            print("jobs_submitted=0")
+            return 0
+    except (OperationPayloadError, WorkerClientError, RuntimeError, SQLAlchemyError) as exc:
+        code = getattr(exc, "code", exc.__class__.__name__)
+        print(f"PORTAL-3G PRODUCTION PILOT START BLOCKED — {code}", file=sys.stderr)
+        return 2
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="H100 Portal administrator bootstrap")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1569,6 +1942,8 @@ def main() -> int:
     activate.add_argument("--approval-text", required=True)
     portal3f = subparsers.add_parser("portal3f-origin-pilot")
     portal3f.add_argument("--approval-text", required=True)
+    portal3g = subparsers.add_parser("portal3g-start-production-pilot")
+    portal3g.add_argument("--approval-text", required=True)
     args = parser.parse_args()
     if args.command == "prepare-origin-al":
         return prepare_origin_al()
@@ -1588,6 +1963,8 @@ def main() -> int:
         return activate_origin_pilot_final(args.approval_text)
     if args.command == "portal3f-origin-pilot":
         return portal3f_origin_pilot(args.approval_text)
+    if args.command == "portal3g-start-production-pilot":
+        return portal3g_start_production_pilot(args.approval_text)
     return 2
 
 

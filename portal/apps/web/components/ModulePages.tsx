@@ -18,6 +18,7 @@ import {
   imageInventory,
   monitoring,
   operations,
+  productionPilot,
   quotas,
   registries,
   slurmAccounts,
@@ -273,12 +274,13 @@ export function SlurmModule() {
   const query = useQuery({
     queryKey: ["slurm-summary"],
     queryFn: async () => {
-      const [nodes, accounts, history] = await Promise.all([
+      const [nodes, accounts, history, production] = await Promise.all([
         slurmNodes(),
         slurmAccounts(),
         slurmHistory(),
+        productionPilot(),
       ]);
-      return { nodes, accounts, history };
+      return { nodes, accounts, history, production };
     },
     refetchInterval: 30_000,
   });
@@ -287,6 +289,7 @@ export function SlurmModule() {
   const qosRows = rowsAt(query.data?.accounts, "qos");
   const assocRows = rowsAt(query.data?.accounts, "associations");
   const historyRows = rowsAt(query.data?.history, "jobs");
+  const production = query.data?.production ?? {};
   return (
     <ModuleFrame
       title="Slurm"
@@ -311,13 +314,39 @@ export function SlurmModule() {
         />
       </Card>
       <div className="section-grid">
-        <SectionCard title="调度保护" subtitle="当前阶段保持底层状态不变">
-          <div className="notice notice-danger">
-            当前阶段禁止通过 Portal RESUME Slurm；需要单独审批后才可恢复调度。
+        <SectionCard
+          title="Production Pilot"
+          subtitle="固定单节点、单受管用户边界"
+        >
+          <dl className="kv-grid">
+            <div className="kv">
+              <dt>状态</dt>
+              <dd>
+                <StatusBadge value={scalar(production.state, "UNKNOWN")} />
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>Scheduler</dt>
+              <dd>
+                <StatusBadge value={scalar(production.scheduler, "UNKNOWN")} />
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>受管用户</dt>
+              <dd>{scalar(production.active_managed_user)}</dd>
+            </div>
+            <div className="kv">
+              <dt>每用户最大 GPU</dt>
+              <dd>{scalar(production.per_user_max_gpu)}</dd>
+            </div>
+            <div className="kv">
+              <dt>队列</dt>
+              <dd>{scalar(production.queue)}</dd>
+            </div>
+          </dl>
+          <div className="notice">
+            GPU 仅通过 Slurm / Pyxis / Enroot 分配；长期开发容器保持 GPU NONE。
           </div>
-          <Button disabled title="Portal-2 禁止执行 Slurm RESUME">
-            RESUME Slurm（禁用）
-          </Button>
         </SectionCard>
         <SectionCard title="Accounting / QOS">
           <Table
@@ -964,9 +993,11 @@ export function SystemModule() {
   const node =
     rowsAt((query.data as Row | undefined)?.platform, "nodes")[0] ??
     ((query.data as Row | undefined)?.platform as Row | undefined)?.node;
-  const sshPolicy = (query.data as Row | undefined)?.ssh_policy as Row | undefined;
+  const sshPolicy = (query.data as Row | undefined)?.ssh_policy as
+    Row | undefined;
   const globalSshPolicy = sshPolicy?.global_ssh_policy as Row | undefined;
-  const managedSshPolicy = sshPolicy?.managed_compute_user_policy as Row | undefined;
+  const managedSshPolicy = sshPolicy?.managed_compute_user_policy as
+    Row | undefined;
   return (
     <ModuleFrame
       title="系统"
@@ -1056,7 +1087,9 @@ export function SystemModule() {
             <div className="kv">
               <dt>状态</dt>
               <dd>
-                <StatusBadge value={scalar(managedSshPolicy?.status, "UNKNOWN")} />
+                <StatusBadge
+                  value={scalar(managedSshPolicy?.status, "UNKNOWN")}
+                />
               </dd>
             </div>
             <div className="kv">

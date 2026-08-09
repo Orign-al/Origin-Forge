@@ -127,6 +127,20 @@ export type Overview = {
     failed: number;
     total: number;
   };
+  production_pilot: {
+    status: string;
+    state: string;
+    mode: string;
+    managed_users: number;
+    active_managed_user: string;
+    node_name: string;
+    node_state: string;
+    scheduler: string;
+    queue: string;
+    gpu_capacity: number;
+    per_user_max_gpu: number;
+    started_at?: string;
+  };
 };
 
 export type PortalSession = {
@@ -208,6 +222,8 @@ export const slurmHistory = () =>
   apiFetch<Record<string, unknown>>("/slurm/history");
 export const slurmAccounts = () =>
   apiFetch<Record<string, unknown>>("/slurm/accounts");
+export const productionPilot = () =>
+  apiFetch<Record<string, unknown>>("/slurm/production-pilot");
 export const containers = () =>
   apiFetch<Record<string, unknown>>("/containers");
 export const containerInspect = (name: string) =>

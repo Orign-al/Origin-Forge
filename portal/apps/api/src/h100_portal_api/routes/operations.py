@@ -25,6 +25,7 @@ from h100_portal_api.models import (
     PortalOperation,
     PortalOperationApproval,
     PortalOperationEvent,
+    PortalSetting,
     PortalSshKey,
     PortalUser,
     utcnow,
@@ -133,6 +134,29 @@ APPROVED_PORTAL3F_PILOT_ACCEPTANCE: dict[str, Any] = {
     "expected_container_client_validation": "PASS",
     "final_node_state": "DRAIN",
     "approval_reference": PORTAL3F_APPROVAL_REFERENCE,
+}
+PORTAL3G_APPROVAL_TEXT = (
+    "批准正式结束 Portal-3F Gate，允许正式 RESUME Slurm 节点并保持 IDLE，"
+    "启动 origin-pilot 单用户 Production Pilot。"
+)
+PORTAL3G_APPROVAL_REFERENCE = "portal3g-single-user-production-pilot-v1"
+PORTAL3G_CLIENT_VALIDATION_OPERATION_ID = uuid.UUID("a168cf96-c54d-4e68-b040-5516cae66518")
+PORTAL3G_PILOT_ACCEPTANCE_OPERATION_ID = uuid.UUID("94399c95-1a17-47a1-bd41-43a0c242ccc1")
+PORTAL3G_PRODUCTION_PILOT_IDEMPOTENCY_KEY = "portal3g-origin-pilot-production-pilot-v1"
+PORTAL3G_DRAIN_IDEMPOTENCY_KEY = "portal3g-origin-pilot-safety-drain-v1"
+PORTAL3G_SETTING_KEY = "production_pilot"
+APPROVED_PORTAL3G_PRODUCTION_PILOT: dict[str, Any] = {
+    "managed_user_id": str(PORTAL3E_FINAL_MANAGED_USER_ID),
+    "username": "origin-pilot",
+    "node_name": "sagsh100server",
+    "mode": "single-node",
+    "managed_users": ["origin-pilot"],
+    "max_gpus": 1,
+    "client_validation_operation_id": str(PORTAL3G_CLIENT_VALIDATION_OPERATION_ID),
+    "pilot_acceptance_operation_id": str(PORTAL3G_PILOT_ACCEPTANCE_OPERATION_ID),
+    "expected_node_state": "DRAIN",
+    "target_node_state": "IDLE",
+    "approval_reference": PORTAL3G_APPROVAL_REFERENCE,
 }
 
 
@@ -441,7 +465,13 @@ def validate_persisted_activate_execution_result(
     return validate_activate_execution_result(records, normalized_result)
 
 
-def _validate_portal3f_server_snapshot(snapshot: object) -> dict[str, Any]:
+def _validate_portal3f_server_snapshot(
+    snapshot: object, *, expected_node_state: str = "DRAIN"
+) -> dict[str, Any]:
+    if expected_node_state not in {"DRAIN", "IDLE"}:
+        raise OperationPayloadError(
+            "PORTAL3F_SERVER_PREFLIGHT_INCOMPLETE", "unsupported Slurm state expectation"
+        )
     if not isinstance(snapshot, dict):
         raise OperationPayloadError(
             "PORTAL3F_SERVER_PREFLIGHT_INCOMPLETE", "Worker returned no server snapshot"
@@ -508,7 +538,7 @@ def _validate_portal3f_server_snapshot(snapshot: object) -> dict[str, Any]:
         and slurm.get("account") == "company"
         and slurm.get("qos") == "general"
         and slurm.get("max_gpus") == 1
-        and slurm.get("node_state") == "DRAIN"
+        and slurm.get("node_state") == expected_node_state
         and slurm.get("queue") == "EMPTY"
         and isinstance(container, dict)
         and container.get("name") == "gpu-dev-origin-pilot"
@@ -751,6 +781,172 @@ def persist_portal3f_pilot_acceptance(
     return container
 
 
+def validate_portal3g_production_pilot_plan(worker_result: dict[str, Any]) -> dict[str, Any]:
+    scope = worker_result.get("production_pilot_scope")
+    if not (
+        worker_result.get("status") == "DRY_RUN"
+        and worker_result.get("handler") == "slurm.production_pilot.start"
+        and worker_result.get("execution_enabled") is False
+        and worker_result.get("validated_username") == "origin-pilot"
+        and worker_result.get("node_name") == "sagsh100server"
+        and worker_result.get("action") == "RESUME"
+        and worker_result.get("expected_node_state") == "DRAIN"
+        and worker_result.get("target_node_state") == "IDLE"
+        and worker_result.get("jobs_submitted") == 0
+        and worker_result.get("failure_action") == "DRAIN"
+        and worker_result.get("client_validation_operation_id")
+        == str(PORTAL3G_CLIENT_VALIDATION_OPERATION_ID)
+        and worker_result.get("pilot_acceptance_operation_id")
+        == str(PORTAL3G_PILOT_ACCEPTANCE_OPERATION_ID)
+        and scope
+        == {
+            "mode": "SINGLE_NODE",
+            "managed_users": ["origin-pilot"],
+            "max_gpus": 1,
+        }
+    ):
+        raise OperationPayloadError(
+            "PORTAL3G_PLAN_REJECTED", "Worker Production Pilot plan is incomplete"
+        )
+    return _validate_portal3f_server_snapshot(worker_result.get("preflight"))
+
+
+def validate_portal3g_production_pilot_result(
+    worker_result: dict[str, Any],
+) -> dict[str, Any]:
+    scope = worker_result.get("production_pilot_scope")
+    node = worker_result.get("node")
+    if not (
+        worker_result.get("status") == "SUCCEEDED"
+        and worker_result.get("handler") == "slurm.production_pilot.start"
+        and worker_result.get("execution_enabled") is True
+        and worker_result.get("username") == "origin-pilot"
+        and worker_result.get("node_name") == "sagsh100server"
+        and worker_result.get("action") == "RESUME"
+        and worker_result.get("previous_node_state") == "DRAIN"
+        and worker_result.get("scheduler") == "AVAILABLE"
+        and worker_result.get("production_pilot_state") == "ACTIVE"
+        and worker_result.get("approval_reference") == PORTAL3G_APPROVAL_REFERENCE
+        and worker_result.get("client_validation_operation_id")
+        == str(PORTAL3G_CLIENT_VALIDATION_OPERATION_ID)
+        and worker_result.get("pilot_acceptance_operation_id")
+        == str(PORTAL3G_PILOT_ACCEPTANCE_OPERATION_ID)
+        and worker_result.get("jobs_submitted") == 0
+        and worker_result.get("rollback_status") == "NOT_REQUIRED"
+        and scope
+        == {
+            "mode": "SINGLE_NODE",
+            "managed_users": ["origin-pilot"],
+            "max_gpus": 1,
+        }
+        and node
+        == {
+            "name": "sagsh100server",
+            "state": "IDLE",
+            "queue": "EMPTY",
+            "reason": "NONE",
+            "jobs_submitted": 0,
+        }
+    ):
+        raise OperationPayloadError(
+            "PORTAL3G_RESULT_REJECTED", "Worker Production Pilot result is incomplete"
+        )
+    _validate_portal3f_server_snapshot(worker_result.get("preflight"))
+    return _validate_portal3f_server_snapshot(
+        worker_result.get("postflight"), expected_node_state="IDLE"
+    )
+
+
+def persist_portal3g_production_pilot(
+    db: Session,
+    *,
+    owner: PortalUser,
+    operation: PortalOperation,
+    worker_result: dict[str, Any],
+) -> PortalSetting:
+    postflight = validate_portal3g_production_pilot_result(worker_result)
+    managed = db.get(PortalManagedUser, PORTAL3E_FINAL_MANAGED_USER_ID)
+    container = db.scalar(
+        select(PortalContainer).where(
+            PortalContainer.managed_user_id == PORTAL3E_FINAL_MANAGED_USER_ID,
+            PortalContainer.name == "gpu-dev-origin-pilot",
+        )
+    )
+    client_validation = db.get(PortalOperation, PORTAL3G_CLIENT_VALIDATION_OPERATION_ID)
+    pilot_acceptance = db.get(PortalOperation, PORTAL3G_PILOT_ACCEPTANCE_OPERATION_ID)
+    existing_setting = db.get(PortalSetting, PORTAL3G_SETTING_KEY)
+    if not (
+        owner.normalized_login == "origin-al"
+        and owner.unix_username == "origin-al"
+        and owner.account_state == AccountState.ACTIVE
+        and managed is not None
+        and managed.portal_user_id == owner.id
+        and managed.unix_username == "origin-pilot"
+        and managed.onboarding_state == OnboardingState.ACTIVE
+        and managed.slurm_account == "company"
+        and managed.slurm_qos == "general"
+        and container is not None
+        and container.observed_state == "RUNNING"
+        and isinstance(container.safe_spec, dict)
+        and container.safe_spec.get("gpu") == "NONE"
+        and container.safe_spec.get("host_ssh_client_validation") == "PASS"
+        and container.safe_spec.get("container_ssh_client_validation") == "PASS"
+        and container.safe_spec.get("pilot_acceptance_status") == "PASSED"
+        and client_validation is not None
+        and client_validation.status == OperationStatus.SUCCEEDED
+        and client_validation.operation_type == "user.ssh_client_validation.record"
+        and pilot_acceptance is not None
+        and pilot_acceptance.status == OperationStatus.SUCCEEDED
+        and pilot_acceptance.operation_type == "user.pilot.acceptance"
+        and operation.operation_type == "slurm.production_pilot.start"
+        and operation.target_id == "sagsh100server"
+        and operation.idempotency_key == PORTAL3G_PRODUCTION_PILOT_IDEMPOTENCY_KEY
+        and operation.validated_payload == APPROVED_PORTAL3G_PRODUCTION_PILOT
+        and operation.status == OperationStatus.RUNNING
+        and existing_setting is None
+    ):
+        raise OperationPayloadError(
+            "PORTAL3G_DATABASE_BINDING_REJECTED",
+            "Portal-3F evidence or ACTIVE identity changed before Production Pilot persistence",
+        )
+    started_at = utcnow()
+    setting = PortalSetting(
+        key=PORTAL3G_SETTING_KEY,
+        sensitive=False,
+        value={
+            "state": "ACTIVE",
+            "mode": "SINGLE_NODE",
+            "managed_users": 1,
+            "active_managed_user": "origin-pilot",
+            "node_name": "sagsh100server",
+            "node_state": "IDLE",
+            "scheduler": "AVAILABLE",
+            "queue": "EMPTY",
+            "gpu_capacity": 4,
+            "gpu_model": "H100 PCIe 80GB",
+            "per_user_max_gpu": 1,
+            "guard": postflight["guard"],
+            "container": {"name": "gpu-dev-origin-pilot", "state": "RUNNING", "gpu": "NONE"},
+            "operation_id": str(operation.id),
+            "client_validation_operation_id": str(client_validation.id),
+            "pilot_acceptance_operation_id": str(pilot_acceptance.id),
+            "started_at": started_at.isoformat(),
+        },
+    )
+    db.add(setting)
+    container.safe_spec = {
+        **container.safe_spec,
+        "production_pilot_state": "ACTIVE",
+        "production_pilot_operation_id": str(operation.id),
+        "production_pilot_started_at": started_at.isoformat(),
+        "pilot_final_node_state": "IDLE",
+        "slurm_node_state": "IDLE",
+        "slurm_queue": "EMPTY",
+        "gpu_scheduling_available": True,
+    }
+    return setting
+
+
 def operation_response(operation: PortalOperation) -> OperationResponse:
     return OperationResponse(
         id=operation.id,
@@ -773,6 +969,18 @@ def operation_response(operation: PortalOperation) -> OperationResponse:
 
 
 def validate_operation_payload(operation_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if operation_type == "slurm.production_pilot.start":
+        if set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+            raise OperationPayloadError(
+                "PORTAL3G_PAYLOAD_REJECTED",
+                "secret, command, argv, and path fields are forbidden",
+            )
+        if payload != APPROVED_PORTAL3G_PRODUCTION_PILOT:
+            raise OperationPayloadError(
+                "PORTAL3G_PLAN_MISMATCH",
+                "Production Pilot payload differs from the fixed approved plan",
+            )
+        return dict(APPROVED_PORTAL3G_PRODUCTION_PILOT)
     if operation_type in {"user.ssh_client_validation.record", "user.pilot.acceptance"}:
         if set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
             raise OperationPayloadError(
@@ -2012,6 +2220,14 @@ def create_operation(
             detail={
                 "code": "PORTAL3F_FIXED_CONSOLE_ONLY",
                 "message": "Portal-3F 首次验收仅允许固定管理员流程执行",
+            },
+        )
+    if operation_type == "slurm.production_pilot.start":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PORTAL3G_FIXED_CONSOLE_ONLY",
+                "message": "Portal-3G Production Pilot 仅允许固定管理员流程执行",
             },
         )
     permission = OPERATION_PERMISSIONS.get(operation_type)

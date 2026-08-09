@@ -63,6 +63,14 @@ export default function DashboardPage() {
     onboarding_states: {},
   };
   const tasks = data.tasks ?? { pending_approval: 0, failed: 0, total: 0 };
+  const productionPilot = data.production_pilot ?? {
+    state: "UNKNOWN",
+    mode: "SINGLE_NODE",
+    scheduler: "UNKNOWN",
+    node_state: "UNKNOWN",
+    active_managed_user: "origin-pilot",
+    per_user_max_gpu: 1,
+  };
   const jobList = Array.isArray((jobs as { jobs?: unknown[] }).jobs)
     ? (jobs as { jobs: Array<Record<string, unknown>> }).jobs
     : Array.isArray((jobs as { data?: { jobs?: unknown[] } }).data?.jobs)
@@ -111,7 +119,9 @@ export default function DashboardPage() {
               )}
             />
           </div>
-          <div className="stat-detail">sagsh100server · 不自动 RESUME</div>
+          <div className="stat-detail">
+            sagsh100server · Scheduler {productionPilot.scheduler}
+          </div>
         </Card>
         <Card className="stat-panel">
           <div className="stat-label">GPU</div>
@@ -121,7 +131,12 @@ export default function DashboardPage() {
               H100
             </span>
           </div>
-          <div className="stat-detail">MIG Disabled · 数据源 {gpu.status}</div>
+          <div className="stat-detail">
+            {productionPilot.node_state === "IDLE"
+              ? `${gpu.count ?? 0} AVAILABLE`
+              : "Scheduler unavailable"}{" "}
+            · Max {productionPilot.per_user_max_gpu} GPU
+          </div>
         </Card>
         <Card className="stat-panel">
           <div className="stat-label">队列 / 运行</div>
@@ -148,6 +163,15 @@ export default function DashboardPage() {
           <div className="stat-detail">
             ACTIVE {identity.account_states.ACTIVE ?? 0} · STAGED{" "}
             {identity.onboarding_states.STAGED ?? 0}
+          </div>
+        </Card>
+        <Card className="stat-panel">
+          <div className="stat-label">Production Pilot</div>
+          <div className="stat-value">
+            <StatusBadge value={productionPilot.state} />
+          </div>
+          <div className="stat-detail">
+            {productionPilot.mode} · {productionPilot.active_managed_user}
           </div>
         </Card>
         <Card className="stat-panel">

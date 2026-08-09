@@ -35,6 +35,7 @@ WRITE_OPERATION_TYPES = {
     "container.rebuild",
     "slurm.drain",
     "slurm.resume",
+    "slurm.production_pilot.start",
     "job.cancel",
     "quota.update",
     "ssh_key.add",
@@ -48,6 +49,7 @@ HIGH_RISK_OPERATION_TYPES = {
     "user.suspend",
     "slurm.drain",
     "slurm.resume",
+    "slurm.production_pilot.start",
     "quota.update",
     "container.stop",
     "container.rebuild",
@@ -67,6 +69,7 @@ OPERATION_PERMISSIONS = {
     "container.rebuild": "containers.write",
     "slurm.drain": "slurm.write",
     "slurm.resume": "slurm.write",
+    "slurm.production_pilot.start": "slurm.write",
     "job.cancel": "jobs.write",
     "quota.update": "users.write",
     "ssh_key.add": "users.write",
@@ -77,6 +80,7 @@ OPERATION_PERMISSIONS = {
 def risk_for(operation_type: str) -> RiskLevel:
     if operation_type in {
         "slurm.resume",
+        "slurm.production_pilot.start",
         "user.activate",
         "user.suspend",
         "user.pilot.acceptance",

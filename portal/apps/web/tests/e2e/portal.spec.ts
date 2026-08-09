@@ -10,6 +10,7 @@ type MockState = {
   draftCreated?: boolean;
   planConflict?: boolean;
   staged?: boolean;
+  productionPilot?: boolean;
 };
 
 const MOCK_SETUP_TOKEN = "test-only-portal-setup-token-with-forty-eight-bytes";
@@ -248,6 +249,19 @@ const overview = {
     onboarding_states: {},
   },
   tasks: { status: "OK", pending_approval: 0, failed: 0, total: 0 },
+  production_pilot: {
+    status: "OK",
+    state: "NOT_STARTED",
+    mode: "SINGLE_NODE",
+    managed_users: 1,
+    active_managed_user: "origin-pilot",
+    node_name: "sagsh100server",
+    node_state: "DRAIN",
+    scheduler: "UNAVAILABLE",
+    queue: "EMPTY",
+    gpu_capacity: 4,
+    per_user_max_gpu: 1,
+  },
   ssh_policy: {
     status: "OK",
     global_ssh_policy: {
@@ -397,7 +411,33 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
       return;
     }
     if (path === "/platform/overview") {
-      await json(route, overview);
+      await json(
+        route,
+        state.productionPilot
+          ? {
+              ...overview,
+              platform: {
+                ...overview.platform,
+                node: {
+                  status: "OK",
+                  nodes: [
+                    {
+                      name: "sagsh100server",
+                      state: "IDLE",
+                      reason: "",
+                    },
+                  ],
+                },
+              },
+              production_pilot: {
+                ...overview.production_pilot,
+                state: "ACTIVE",
+                node_state: "IDLE",
+                scheduler: "AVAILABLE",
+              },
+            }
+          : overview,
+      );
       return;
     }
     if (path === "/platform/gpus") {
@@ -460,9 +500,10 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
         nodes: [
           {
             name: "sagsh100server",
-            state: "IDLE+DRAIN",
-            reason:
-              "gpu device mapping and transient isolation validation complete",
+            state: state.productionPilot ? "IDLE" : "IDLE+DRAIN",
+            reason: state.productionPilot
+              ? ""
+              : "gpu device mapping and transient isolation validation complete",
             cpus: 256,
             real_memory: 486377,
             gres: "gpu:h100:4",
@@ -471,6 +512,15 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
             partitions: "notebook,train",
           },
         ],
+      });
+      return;
+    }
+    if (path === "/slurm/production-pilot") {
+      await json(route, {
+        ...overview.production_pilot,
+        state: state.productionPilot ? "ACTIVE" : "NOT_STARTED",
+        node_state: state.productionPilot ? "IDLE" : "DRAIN",
+        scheduler: state.productionPilot ? "AVAILABLE" : "UNAVAILABLE",
       });
       return;
     }
@@ -734,7 +784,9 @@ test("系统页显示管理员接受的内部 HTTP 状态", async ({ page }) => 
     page.getByText("NOT ENABLED — NOT REQUIRED FOR CURRENT PILOT SCOPE"),
   ).toBeVisible();
   await expect(page.getByText(/HTTPS/)).toHaveCount(0);
-  await expect(page.getByText("Global SSH Policy", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Global SSH Policy", { exact: true }),
+  ).toBeVisible();
   await expect(
     page.getByText("Managed Compute User Policy", { exact: true }),
   ).toBeVisible();
@@ -742,11 +794,35 @@ test("系统页显示管理员接受的内部 HTTP 状态", async ({ page }) => 
   await expect(page.getByText("Global Password Authentication")).toBeVisible();
 });
 
-test("Slurm 页面明确显示 DRAIN 和禁止 RESUME", async ({ page }) => {
+test("Slurm 页面在启用前显示 DRAIN 和固定 Pilot 边界", async ({ page }) => {
   await installMockApi(page, { authenticated: true });
   await page.goto("/slurm");
   await expect(page.getByText("IDLE+DRAIN", { exact: true })).toBeVisible();
-  await expect(page.getByText(/禁止通过 Portal RESUME Slurm/)).toBeVisible();
+  await expect(page.getByText("NOT_STARTED", { exact: true })).toBeVisible();
+  await expect(page.getByText(/长期开发容器保持 GPU NONE/)).toBeVisible();
+  await expect(page.getByRole("button", { name: /RESUME Slurm/ })).toHaveCount(
+    0,
+  );
+});
+
+test("Portal-3G 显示 ACTIVE Production Pilot、IDLE 和单 GPU 限制", async ({
+  page,
+}) => {
+  await installMockApi(page, {
+    authenticated: true,
+    productionPilot: true,
+  });
+  await page.goto("/");
+  await expect(
+    page.locator(".stat-panel").filter({ hasText: "Production Pilot" }),
+  ).toContainText("ACTIVE");
+  await expect(page.getByText("4 AVAILABLE", { exact: false })).toBeVisible();
+  await page.goto("/slurm");
+  await expect(page.getByText("IDLE", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("ACTIVE", { exact: true })).toBeVisible();
+  await expect(page.getByText("AVAILABLE", { exact: true })).toBeVisible();
+  await expect(page.getByText("origin-pilot", { exact: true })).toBeVisible();
+  await expect(page.getByText("1", { exact: true })).toBeVisible();
 });
 
 test("GPU 页面展示四卡物理身份映射", async ({ page }) => {

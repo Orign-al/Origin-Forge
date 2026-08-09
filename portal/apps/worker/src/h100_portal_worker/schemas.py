@@ -38,6 +38,7 @@ KNOWN_WRITES = {
     "container.rebuild",
     "slurm.drain",
     "slurm.resume",
+    "slurm.production_pilot.start",
     "job.cancel",
     "quota.update",
     "ssh_key.add",
@@ -96,6 +97,9 @@ PORTAL3F_IMAGE_REF = (
     "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
     "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
 )
+PORTAL3G_APPROVAL_REFERENCE = "portal3g-single-user-production-pilot-v1"
+PORTAL3G_CLIENT_VALIDATION_OPERATION_ID = "a168cf96-c54d-4e68-b040-5516cae66518"
+PORTAL3G_PILOT_ACCEPTANCE_OPERATION_ID = "94399c95-1a17-47a1-bd41-43a0c242ccc1"
 APPROVED_CLIENT_VALIDATION_PAYLOAD: dict[str, Any] = {
     "managed_user_id": PORTAL3F_MANAGED_USER_ID,
     "username": "origin-pilot",
@@ -123,6 +127,19 @@ APPROVED_PILOT_ACCEPTANCE_PAYLOAD: dict[str, Any] = {
     "expected_container_client_validation": "PASS",
     "final_node_state": "DRAIN",
     "approval_reference": PORTAL3F_APPROVAL_REFERENCE,
+}
+APPROVED_PRODUCTION_PILOT_PAYLOAD: dict[str, Any] = {
+    "managed_user_id": PORTAL3F_MANAGED_USER_ID,
+    "username": "origin-pilot",
+    "node_name": "sagsh100server",
+    "mode": "single-node",
+    "managed_users": ["origin-pilot"],
+    "max_gpus": 1,
+    "client_validation_operation_id": PORTAL3G_CLIENT_VALIDATION_OPERATION_ID,
+    "pilot_acceptance_operation_id": PORTAL3G_PILOT_ACCEPTANCE_OPERATION_ID,
+    "expected_node_state": "DRAIN",
+    "target_node_state": "IDLE",
+    "approval_reference": PORTAL3G_APPROVAL_REFERENCE,
 }
 
 
@@ -405,6 +422,19 @@ def _validate_portal3f_payload(operation_type: str, payload: dict[str, Any]) -> 
     return dict(expected)
 
 
+def _validate_portal3g_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+        raise PayloadValidationError(
+            "PORTAL3G_PAYLOAD_REJECTED", "secret, command, argv, and path fields are forbidden"
+        )
+    if payload != APPROVED_PRODUCTION_PILOT_PAYLOAD:
+        raise PayloadValidationError(
+            "PORTAL3G_PLAN_MISMATCH",
+            "Production Pilot payload differs from the fixed approved plan",
+        )
+    return dict(APPROVED_PRODUCTION_PILOT_PAYLOAD)
+
+
 def validate_payload(
     operation_type: str, payload: dict[str, Any], *, allow_legacy_stage: bool = False
 ) -> dict[str, Any]:
@@ -430,6 +460,8 @@ def validate_payload(
         return _validate_container_start(payload)
     if operation_type in {"user.ssh_client_validation.record", "user.pilot.acceptance"}:
         return _validate_portal3f_payload(operation_type, payload)
+    if operation_type == "slurm.production_pilot.start":
+        return _validate_portal3g_payload(payload)
     if operation_type.startswith("user."):
         username = payload.get("username")
         if not isinstance(username, str) or not SAFE_USERNAME.fullmatch(username):

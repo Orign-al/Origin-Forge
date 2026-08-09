@@ -26,6 +26,7 @@ from typing import Any
 from h100_portal_worker.schemas import (
     APPROVED_CLIENT_VALIDATION_PAYLOAD,
     APPROVED_PILOT_ACCEPTANCE_PAYLOAD,
+    APPROVED_PRODUCTION_PILOT_PAYLOAD,
     APPROVED_STAGE_PAYLOAD,
     KNOWN_WRITES,
     WorkerRequest,
@@ -151,6 +152,8 @@ PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY = "portal3f-origin-pilot-client-valid
 # v1-v6 remain immutable ROLLED_BACK audit records. v7 verifies the GPU task's
 # Slurm cgroup from the host because Pyxis intentionally uses a cgroup namespace.
 PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY = "portal3f-origin-pilot-acceptance-v7"
+PORTAL3G_PRODUCTION_PILOT_IDEMPOTENCY_KEY = "portal3g-origin-pilot-production-pilot-v1"
+PORTAL3G_DRAIN_IDEMPOTENCY_KEY = "portal3g-origin-pilot-safety-drain-v1"
 HOST_ED25519_PUBLIC_KEY = Path("/etc/ssh/ssh_host_ed25519_key.pub")
 CONTAINER_ED25519_PUBLIC_KEY = Path(
     "/srv/gpu-platform/container-data/origin-pilot/ssh-host-keys/ssh_host_ed25519_key.pub"
@@ -3906,7 +3909,13 @@ def _host_ssh_server_status() -> dict[str, Any]:
 def _activate_postcondition_summary(
     key_records: list[dict[str, Any]],
     management_before: dict[str, dict[str, str]],
+    *,
+    expected_slurm_state: str = "DRAIN",
 ) -> dict[str, Any]:
+    if expected_slurm_state not in {"DRAIN", "IDLE"}:
+        raise LifecycleValidationError(
+            "ACTIVATE_SLURM_GATE_FAILED", "unsupported fixed Slurm state expectation"
+        )
     lifecycle = _read_active_pilot_state(PILOT_USERNAME)
     host_fingerprints, container_fingerprints = _activation_fingerprints(key_records)
     expected_state = {
@@ -4036,15 +4045,35 @@ def _activate_postcondition_summary(
     guard = _verified_guard_metrics(APPROVED_STAGE_PAYLOAD["uid"])
     node = slurm_node()
     jobs = slurm_jobs()
+    node_rows = node.get("nodes")
+    single_node = (
+        node_rows[0]
+        if isinstance(node_rows, list) and len(node_rows) == 1 and isinstance(node_rows[0], dict)
+        else None
+    )
+    observed_node_state = (
+        str(single_node.get("state", "")).upper() if isinstance(single_node, dict) else ""
+    )
+    observed_reason = (
+        str(single_node.get("reason") or "").strip() if isinstance(single_node, dict) else ""
+    )
+    state_matches = (
+        "DRAIN" in observed_node_state
+        if expected_slurm_state == "DRAIN"
+        else observed_node_state == "IDLE"
+        and observed_reason.casefold() in {"", "none", "(null)", "n/a"}
+    )
     if (
         node.get("status") != "OK"
-        or not node.get("nodes")
-        or not all("DRAIN" in str(item.get("state", "")).upper() for item in node["nodes"])
+        or not isinstance(single_node, dict)
+        or single_node.get("name") != "sagsh100server"
+        or not state_matches
         or jobs.get("status") != "OK"
         or jobs.get("jobs")
     ):
         raise LifecycleValidationError(
-            "ACTIVATE_SLURM_GATE_FAILED", "Slurm is not DRAIN with an empty queue"
+            "ACTIVATE_SLURM_GATE_FAILED",
+            f"Slurm is not exactly {expected_slurm_state} with an empty queue",
         )
 
     inspected = containers_inspect({"name": APPROVED_STAGE_PAYLOAD["container_name"]})
@@ -4140,8 +4169,9 @@ def _activate_postcondition_summary(
             "account": APPROVED_STAGE_PAYLOAD["slurm_account"],
             "qos": APPROVED_STAGE_PAYLOAD["slurm_qos"],
             "max_gpus": APPROVED_STAGE_PAYLOAD["max_gpus"],
-            "node_state": "DRAIN",
+            "node_state": expected_slurm_state,
             "queue": "EMPTY",
+            "drain_reason": observed_reason or "NONE",
         },
         "container": {
             "name": APPROVED_STAGE_PAYLOAD["container_name"],
@@ -4169,7 +4199,7 @@ def _portal3e_final_payload_matches(payload: dict[str, Any]) -> bool:
     }
 
 
-def _portal3f_active_preflight() -> dict[str, Any]:
+def _portal3f_active_preflight(expected_slurm_state: str = "DRAIN") -> dict[str, Any]:
     """Re-read every ACTIVE identity boundary before a Portal-3F decision."""
     management_before = {
         MANAGEMENT_USERNAME: _sshd_effective_config(MANAGEMENT_USERNAME),
@@ -4178,6 +4208,7 @@ def _portal3f_active_preflight() -> dict[str, Any]:
     active = _activate_postcondition_summary(
         [{"scope": "BOTH", "fingerprint_sha256": PORTAL3E_FINAL_KEY_FINGERPRINT}],
         management_before,
+        expected_slurm_state=expected_slurm_state,
     )
     gpus = gpu_list()
     health = gpu_health()
@@ -4465,6 +4496,204 @@ def _execute_portal3f_pilot_acceptance(
         }
 
 
+def _portal3g_node_snapshot(expected_state: str) -> dict[str, Any] | None:
+    node = slurm_node()
+    jobs = slurm_jobs()
+    rows = node.get("nodes")
+    if (
+        node.get("status") != "OK"
+        or not isinstance(rows, list)
+        or len(rows) != 1
+        or not isinstance(rows[0], dict)
+        or rows[0].get("name") != "sagsh100server"
+        or jobs.get("status") != "OK"
+        or jobs.get("jobs")
+    ):
+        return None
+    state = str(rows[0].get("state", "")).upper()
+    reason = str(rows[0].get("reason") or "").strip()
+    if expected_state == "IDLE":
+        if state != "IDLE" or reason.casefold() not in {"", "none", "(null)", "n/a"}:
+            return None
+    elif expected_state == "DRAIN":
+        if "DRAIN" not in state:
+            return None
+    else:
+        return None
+    return {
+        "name": "sagsh100server",
+        "state": expected_state,
+        "queue": "EMPTY",
+        "reason": reason or "NONE",
+        "jobs_submitted": 0,
+    }
+
+
+def _portal3g_wait_for_node(
+    expected_state: str, timeout_seconds: int = 20
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        snapshot = _portal3g_node_snapshot(expected_state)
+        if snapshot is not None:
+            return snapshot
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(1)
+
+
+def _portal3g_safety_drain() -> str:
+    drained = run_fixed(
+        "scontrol",
+        [
+            "update",
+            "NodeName=sagsh100server",
+            "State=DRAIN",
+            "Reason=production pilot safety gate failed",
+        ],
+        timeout=20,
+    )
+    if not drained.get("ok"):
+        return "REQUIRES_MANUAL_REVIEW"
+    return (
+        "DRAIN_RESTORED"
+        if _portal3g_wait_for_node("DRAIN", timeout_seconds=20) is not None
+        else "REQUIRES_MANUAL_REVIEW"
+    )
+
+
+def _portal3g_production_pilot_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    preflight = _portal3f_active_preflight("DRAIN")
+    return {
+        "status": "DRY_RUN",
+        "handler": "slurm.production_pilot.start",
+        "execution_enabled": False,
+        "validated_username": payload["username"],
+        "node_name": payload["node_name"],
+        "action": "RESUME",
+        "production_pilot_scope": {
+            "mode": "SINGLE_NODE",
+            "managed_users": ["origin-pilot"],
+            "max_gpus": 1,
+        },
+        "client_validation_operation_id": payload["client_validation_operation_id"],
+        "pilot_acceptance_operation_id": payload["pilot_acceptance_operation_id"],
+        "expected_node_state": "DRAIN",
+        "target_node_state": "IDLE",
+        "jobs_submitted": 0,
+        "preflight": preflight,
+        "failure_action": "DRAIN",
+    }
+
+
+def _execute_portal3g_production_pilot(
+    request: WorkerRequest, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if (
+        request.requested_by != MANAGEMENT_USERNAME
+        or request.approved_by != MANAGEMENT_USERNAME
+        or request.idempotency_key != PORTAL3G_PRODUCTION_PILOT_IDEMPOTENCY_KEY
+        or payload != APPROVED_PRODUCTION_PILOT_PAYLOAD
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "PORTAL3G_PRODUCTION_PILOT_BINDING_REJECTED",
+                "message": "Production Pilot start is not bound to the fixed approval",
+            },
+            "rollback_status": "NOT_REQUIRED_NODE_REMAINS_DRAINED",
+        }
+    try:
+        plan = _portal3g_production_pilot_plan(payload)
+    except LifecycleValidationError as exc:
+        return {
+            "status": "ERROR",
+            "error": {"code": exc.code, "message": str(exc)},
+            "rollback_status": "NOT_REQUIRED_NODE_REMAINS_DRAINED",
+        }
+
+    resumed = run_fixed(
+        "scontrol",
+        ["update", "NodeName=sagsh100server", "State=RESUME"],
+        timeout=20,
+    )
+    if not resumed.get("ok"):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "PORTAL3G_RESUME_FAILED",
+                "message": "fixed Slurm RESUME handler failed",
+            },
+            "rollback_status": _portal3g_safety_drain(),
+        }
+    node = _portal3g_wait_for_node("IDLE", timeout_seconds=20)
+    if node is None:
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "PORTAL3G_IDLE_NOT_REACHED",
+                "message": "Slurm did not reach exact IDLE with an empty queue",
+            },
+            "rollback_status": _portal3g_safety_drain(),
+        }
+    try:
+        postflight = _portal3f_active_preflight("IDLE")
+    except LifecycleValidationError as exc:
+        return {
+            "status": "ERROR",
+            "error": {"code": exc.code, "message": str(exc)},
+            "rollback_status": _portal3g_safety_drain(),
+        }
+    return {
+        "status": "SUCCEEDED",
+        "handler": "slurm.production_pilot.start",
+        "execution_enabled": True,
+        "username": PILOT_USERNAME,
+        "node_name": "sagsh100server",
+        "action": "RESUME",
+        "previous_node_state": "DRAIN",
+        "node": node,
+        "scheduler": "AVAILABLE",
+        "production_pilot_state": "ACTIVE",
+        "production_pilot_scope": plan["production_pilot_scope"],
+        "client_validation_operation_id": payload["client_validation_operation_id"],
+        "pilot_acceptance_operation_id": payload["pilot_acceptance_operation_id"],
+        "approval_reference": payload["approval_reference"],
+        "jobs_submitted": 0,
+        "preflight": plan["preflight"],
+        "postflight": postflight,
+        "rollback_status": "NOT_REQUIRED",
+    }
+
+
+def _execute_portal3g_safety_drain(
+    request: WorkerRequest, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if (
+        request.requested_by != MANAGEMENT_USERNAME
+        or request.approved_by != MANAGEMENT_USERNAME
+        or request.idempotency_key != PORTAL3G_DRAIN_IDEMPOTENCY_KEY
+        or payload != {"node_name": "sagsh100server"}
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "PORTAL3G_SAFETY_DRAIN_BINDING_REJECTED",
+                "message": "safety DRAIN is not bound to the fixed Portal-3G rollback",
+            },
+        }
+    rollback_status = _portal3g_safety_drain()
+    return {
+        "status": "SUCCEEDED" if rollback_status == "DRAIN_RESTORED" else "ERROR",
+        "handler": "slurm.drain",
+        "execution_enabled": True,
+        "node_name": "sagsh100server",
+        "reason": "production pilot safety gate failed",
+        "rollback_status": rollback_status,
+        "jobs_submitted": 0,
+    }
+
+
 def _execute_origin_pilot_activate_rollback(
     request: WorkerRequest, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -4698,6 +4927,8 @@ def dry_run_plan(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, A
         return _portal3f_client_validation_plan(payload)
     if request.operation_type == "user.pilot.acceptance":
         return _portal3f_pilot_acceptance_plan(payload)
+    if request.operation_type == "slurm.production_pilot.start":
+        return _portal3g_production_pilot_plan(payload)
     if request.operation_type in {"ssh_key.prepare", "ssh_key.discard"}:
         return {
             "status": "DRY_RUN",
@@ -4773,6 +5004,10 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
                 return _execute_portal3f_client_validation(request, payload)
             if request.operation_type == "user.pilot.acceptance":
                 return _execute_portal3f_pilot_acceptance(request, payload)
+            if request.operation_type == "slurm.production_pilot.start":
+                return _execute_portal3g_production_pilot(request, payload)
+            if request.operation_type == "slurm.drain":
+                return _execute_portal3g_safety_drain(request, payload)
             if request.operation_type == "ssh_key.prepare":
                 return _prepare_ssh_key_record(request, payload)
             if request.operation_type == "ssh_key.discard":
