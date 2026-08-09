@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly SOURCE_DIR=/srv/gpu-platform/platform/portal
+readonly PLATFORM_DIR=/srv/gpu-platform/platform
+readonly SOURCE_DIR="${PLATFORM_DIR}/portal"
 readonly RUNTIME_DIR=/opt/h100-portal
 readonly UNIT_DIR=/etc/systemd/system
 readonly CONFIG_DIR=/etc/h100-portal
 readonly SSH_KEY_STAGING_DIR=/var/lib/h100-portal/ssh-key-staging
+readonly PORTAL3F_ACCEPTANCE_SOURCE="${PLATFORM_DIR}/scripts/h100-origin-pilot-acceptance"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "install-runtime.sh must run as root" >&2
   exit 1
 fi
 
-for required in "$SOURCE_DIR" "$RUNTIME_DIR/venv" "$CONFIG_DIR/portal.env"; do
+for required in \
+  "$SOURCE_DIR" \
+  "$RUNTIME_DIR/venv" \
+  "$CONFIG_DIR/portal.env" \
+  "$PORTAL3F_ACCEPTANCE_SOURCE"; do
   if [[ ! -e $required ]]; then
     echo "required deployment input missing: $required" >&2
     exit 1
@@ -33,7 +39,8 @@ rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
   "$SOURCE_DIR/" "$RUNTIME_DIR/"
 
 install -d -o root -g root -m 0755 \
-  "$RUNTIME_DIR/apps/web/.next/standalone/apps/web/.next/static"
+  "$RUNTIME_DIR/apps/web/.next/standalone/apps/web/.next/static" \
+  "$RUNTIME_DIR/scripts"
 rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
   "$SOURCE_DIR/apps/web/.next/static/" \
   "$RUNTIME_DIR/apps/web/.next/standalone/apps/web/.next/static/"
@@ -48,6 +55,10 @@ install -d -o root -g root -m 0700 "${SSH_KEY_STAGING_DIR}"
 install -o root -g root -m 0640 \
   "$SOURCE_DIR/deploy/worker-scripts.json" \
   "$CONFIG_DIR/worker-scripts.json"
+
+install -o root -g root -m 0755 \
+  "$PORTAL3F_ACCEPTANCE_SOURCE" \
+  "$RUNTIME_DIR/scripts/h100-origin-pilot-acceptance"
 
 for unit in \
   h100-portal-worker.socket \
