@@ -30,3 +30,10 @@ def test_portal3f_acceptance_tool_is_integrity_bound_and_installed() -> None:
     assert 'PORTAL3F_GPU_PROBE_SOURCE="${PLATFORM_DIR}/tests/' in install_text
     assert '"$PORTAL3F_GPU_PROBE_SOURCE"' in install_text
     assert '"$RUNTIME_DIR/tests/gpu-device-mapping/gpu-device-context-probe.c"' in install_text
+
+
+def test_portal3f_worker_can_write_only_the_guard_metrics_directory() -> None:
+    unit = (PORTAL_ROOT / "deploy/systemd/h100-portal-worker.service").read_text()
+
+    assert "ProtectSystem=strict" in unit
+    assert "ReadWritePaths=/var/lib/node_exporter/textfile_collector" in unit

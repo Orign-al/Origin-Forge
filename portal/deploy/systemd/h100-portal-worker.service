@@ -31,6 +31,9 @@ SystemCallArchitectures=native
 # systemd/project mappings under /etc, managed homes, platform data, and the
 # fixed lifecycle-script audit log.
 ReadWritePaths=/etc /home /srv/gpu-platform /run/h100-portal /var/lib/h100-portal /var/log/h100-portal /var/log/h100-platform-audit.log
+# Portal-3F invokes the integrity-pinned GPU bypass guard inside the Worker
+# namespace. Permit only its Node Exporter textfile output directory.
+ReadWritePaths=/var/lib/node_exporter/textfile_collector
 UMask=0077
 
 [Install]
