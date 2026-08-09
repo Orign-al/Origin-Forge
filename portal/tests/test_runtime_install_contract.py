@@ -19,6 +19,13 @@ def test_portal3f_acceptance_tool_is_integrity_bound_and_installed() -> None:
     )
     assert "git -c safe.directory=/srv/gpu-platform/platform" in acceptance_text
     assert (
+        "read -r assoc_user assoc_account assoc_qos assoc_default_qos assoc_extra"
+        in acceptance_text
+    )
+    assert "read -r qos_name qos_max_tres qos_extra" in acceptance_text
+    assert "${QOS}|${QOS}|" not in acceptance_text
+    assert "${QOS}|gres/gpu=1|" not in acceptance_text
+    assert (
         hashlib.sha256(gpu_probe_source.read_bytes()).hexdigest()
         == "120fc85413226ba4c106e5e1a291882900a20ec40f31bebea21643f152fcf4d1"
     )

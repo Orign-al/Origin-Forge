@@ -274,9 +274,16 @@ systemctl --failed --no-legend --plain >"${log_dir}/systemd-failed-before.txt"
 scontrol show node "${NODE_NAME}" >"${log_dir}/node-before.txt"
 sacctmgr -n -P show assoc where User="${PILOT_USER}" Account="${ACCOUNT}" \
     format=User,Account,QOS,DefaultQOS >"${log_dir}/association.txt"
-grep -Fxq "${PILOT_USER}|${ACCOUNT}|${QOS}|${QOS}|" "${log_dir}/association.txt"
+[[ $(wc -l <"${log_dir}/association.txt") -eq 1 ]]
+IFS='|' read -r assoc_user assoc_account assoc_qos assoc_default_qos assoc_extra \
+    <"${log_dir}/association.txt"
+[[ ${assoc_user} == "${PILOT_USER}" && ${assoc_account} == "${ACCOUNT}" \
+    && ${assoc_qos} == "${QOS}" && ${assoc_default_qos} == "${QOS}" \
+    && -z ${assoc_extra} ]]
 sacctmgr -n -P show qos "${QOS}" format=Name,MaxTRESPerUser >"${log_dir}/qos.txt"
-grep -Fq "${QOS}|gres/gpu=1|" "${log_dir}/qos.txt"
+[[ $(wc -l <"${log_dir}/qos.txt") -eq 1 ]]
+IFS='|' read -r qos_name qos_max_tres qos_extra <"${log_dir}/qos.txt"
+[[ ${qos_name} == "${QOS}" && ${qos_max_tres} == 'gres/gpu=1' && -z ${qos_extra} ]]
 [[ $(enroot version) == 4.2.1 ]]
 [[ $(srun --version) == 'slurm 25.11.7' ]]
 srun --help >"${log_dir}/srun-help.txt" 2>&1
