@@ -8,6 +8,7 @@ readonly UNIT_DIR=/etc/systemd/system
 readonly CONFIG_DIR=/etc/h100-portal
 readonly SSH_KEY_STAGING_DIR=/var/lib/h100-portal/ssh-key-staging
 readonly PORTAL3F_ACCEPTANCE_SOURCE="${PLATFORM_DIR}/scripts/h100-origin-pilot-acceptance"
+readonly PORTAL3F_GPU_PROBE_SOURCE="${PLATFORM_DIR}/tests/gpu-device-mapping/gpu-device-context-probe.c"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "install-runtime.sh must run as root" >&2
@@ -18,7 +19,8 @@ for required in \
   "$SOURCE_DIR" \
   "$RUNTIME_DIR/venv" \
   "$CONFIG_DIR/portal.env" \
-  "$PORTAL3F_ACCEPTANCE_SOURCE"; do
+  "$PORTAL3F_ACCEPTANCE_SOURCE" \
+  "$PORTAL3F_GPU_PROBE_SOURCE"; do
   if [[ ! -e $required ]]; then
     echo "required deployment input missing: $required" >&2
     exit 1
@@ -40,7 +42,8 @@ rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
 
 install -d -o root -g root -m 0755 \
   "$RUNTIME_DIR/apps/web/.next/standalone/apps/web/.next/static" \
-  "$RUNTIME_DIR/scripts"
+  "$RUNTIME_DIR/scripts" \
+  "$RUNTIME_DIR/tests/gpu-device-mapping"
 rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
   "$SOURCE_DIR/apps/web/.next/static/" \
   "$RUNTIME_DIR/apps/web/.next/standalone/apps/web/.next/static/"
@@ -59,6 +62,10 @@ install -o root -g root -m 0640 \
 install -o root -g root -m 0755 \
   "$PORTAL3F_ACCEPTANCE_SOURCE" \
   "$RUNTIME_DIR/scripts/h100-origin-pilot-acceptance"
+
+install -o root -g root -m 0644 \
+  "$PORTAL3F_GPU_PROBE_SOURCE" \
+  "$RUNTIME_DIR/tests/gpu-device-mapping/gpu-device-context-probe.c"
 
 for unit in \
   h100-portal-worker.socket \
