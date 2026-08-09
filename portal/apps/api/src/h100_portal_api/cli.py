@@ -46,9 +46,9 @@ from h100_portal_api.routes.operations import (
     execute_operation,
     transition,
     validate_activate_database_bindings,
-    validate_activate_execution_result,
     validate_activate_worker_result,
     validate_operation_payload,
+    validate_persisted_activate_execution_result,
 )
 from h100_portal_api.security import digest_secret, normalize_login, random_token, safe_metadata
 from h100_portal_api.worker_client import WorkerClientError, call_worker
@@ -1042,7 +1042,7 @@ def activate_origin_pilot_final(approval_text: str) -> int:
                     select(PortalSshKey).where(PortalSshKey.id == PORTAL3E_FINAL_KEY_RECORD_ID)
                 ).all()
             )
-        validate_activate_execution_result(final_records, execution)
+        validate_persisted_activate_execution_result(final_records, execution)
         print("compute_identity=ACTIVE")
         print("ssh_key_state=INSTALLED")
         print("host_ssh_server=READY_FOR_CLIENT_VALIDATION")

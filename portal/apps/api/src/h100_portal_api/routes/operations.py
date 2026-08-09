@@ -374,6 +374,33 @@ def validate_activate_execution_result(
     return activate
 
 
+def validate_persisted_activate_execution_result(
+    records: list[PortalSshKey], persisted_result: dict[str, Any]
+) -> dict[str, Any]:
+    """Revalidate the audit-safe result after its password field was redacted.
+
+    The raw Worker response is validated before the Operation can become
+    SUCCEEDED.  ``safe_metadata`` then deliberately replaces the non-secret
+    password lock-state value because its key is named ``password``.  Require
+    that exact redaction marker here and restore only the already-validated
+    lock-state assertion in a copy used for read-back validation.
+    """
+    persisted_activate = persisted_result.get("activate")
+    if (
+        not isinstance(persisted_activate, dict)
+        or persisted_activate.get("password") != "[REDACTED]"
+    ):
+        raise OperationPayloadError(
+            "ACTIVATE_RESULT_INCOMPLETE",
+            "Persisted Worker result is missing the required password redaction marker",
+        )
+    normalized_result = {
+        **persisted_result,
+        "activate": {**persisted_activate, "password": "LOCKED"},
+    }
+    return validate_activate_execution_result(records, normalized_result)
+
+
 def operation_response(operation: PortalOperation) -> OperationResponse:
     return OperationResponse(
         id=operation.id,

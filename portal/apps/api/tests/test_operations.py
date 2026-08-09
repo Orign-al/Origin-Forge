@@ -33,7 +33,9 @@ from h100_portal_api.routes.operations import (
     validate_activate_execution_result,
     validate_activate_worker_result,
     validate_operation_payload,
+    validate_persisted_activate_execution_result,
 )
+from h100_portal_api.security import safe_metadata
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -436,6 +438,29 @@ def test_portal3e_final_binding_and_active_persistence(database: Session) -> Non
     assert container.safe_spec["host_ssh_client_validation"] == "PENDING"
     assert container.safe_spec["container_ssh_client_validation"] == "PENDING"
     assert container.safe_spec["slurm_node_state"] == "DRAIN"
+
+
+def test_portal3e_persisted_result_revalidates_redacted_password_state(
+    database: Session,
+) -> None:
+    _owner, _managed, key, _operation = create_portal3e_database_state(database)
+    raw_result = portal3e_execution_result(key)
+    persisted_result = safe_metadata(raw_result)
+    assert isinstance(persisted_result, dict)
+
+    with pytest.raises(OperationPayloadError, match="ACTIVATE_RESULT_INCOMPLETE"):
+        validate_activate_execution_result([key], persisted_result)
+
+    activate = validate_persisted_activate_execution_result([key], persisted_result)
+    assert activate["password"] == "LOCKED"
+
+
+def test_portal3e_persisted_result_requires_exact_redaction_marker(database: Session) -> None:
+    _owner, _managed, key, _operation = create_portal3e_database_state(database)
+    raw_result = portal3e_execution_result(key)
+
+    with pytest.raises(OperationPayloadError, match="password redaction marker"):
+        validate_persisted_activate_execution_result([key], raw_result)
 
 
 def test_portal3e_final_execution_result_rejects_container_password_authentication() -> None:
