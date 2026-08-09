@@ -1,6 +1,7 @@
 import base64
 import binascii
 import csv
+import errno
 import fcntl
 import grp
 import hashlib
@@ -20,7 +21,7 @@ import urllib.request
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from h100_portal_worker.schemas import (
@@ -5008,103 +5009,191 @@ def _portal4a_slurm_security_preflight(payload: dict[str, Any]) -> None:
         raise LifecycleValidationError("GPU_LIMIT_REJECTED", "Slurm GPU limit is not one")
 
 
-def _portal4a_user_path(relative: str, *, directory: bool, uid: int, gid: int) -> Path:
-    root = PILOT_DATA_ROOT / PILOT_USERNAME
-    try:
-        root_resolved = root.resolve(strict=True)
-        candidate = (root / relative).resolve(strict=True)
-        metadata = candidate.lstat()
-    except OSError as exc:
-        raise LifecycleValidationError(
-            "USER_PATH_NOT_FOUND", "requested user path does not exist"
-        ) from exc
-    if not candidate.is_relative_to(root_resolved):
+def _portal4a_relative_parts(relative: str) -> tuple[str, ...]:
+    path = PurePosixPath(relative)
+    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
         raise LifecycleValidationError(
             "SYMLINK_ESCAPE_REJECTED", "requested user path escapes the owned workspace"
         )
+    return path.parts
+
+
+def _validate_owned_descriptor(
+    descriptor: int, *, directory: bool, uid: int, gid: int
+) -> os.stat_result:
+    metadata = os.fstat(descriptor)
     expected_type = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
-    if (
-        not expected_type
-        or stat.S_ISLNK(metadata.st_mode)
-        or metadata.st_uid != uid
-        or metadata.st_gid != gid
-    ):
+    if not expected_type or metadata.st_uid != uid or metadata.st_gid != gid:
         raise LifecycleValidationError(
             "USER_PATH_OWNERSHIP_REJECTED", "requested user path metadata is invalid"
         )
-    return candidate
+    return metadata
 
 
-def _read_user_script(path: Path, uid: int, gid: int) -> bytes:
-    before = path.lstat()
-    if before.st_size <= 0 or before.st_size > 1024 * 1024:
-        raise LifecycleValidationError("JOB_SCRIPT_REJECTED", "job script size is invalid")
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
+@contextmanager
+def _open_portal4a_user_path(
+    relative: str, *, directory: bool, uid: int, gid: int
+) -> Iterator[tuple[Path, int, os.stat_result]]:
+    parts = _portal4a_relative_parts(relative)
+    root = PILOT_DATA_ROOT / PILOT_USERNAME
+    descriptors: list[int] = []
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        opened = os.fstat(descriptor)
-        if (
-            (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
-            or opened.st_uid != uid
-            or opened.st_gid != gid
-            or not stat.S_ISREG(opened.st_mode)
-        ):
-            raise LifecycleValidationError(
-                "JOB_SCRIPT_CHANGED", "job script changed during validation"
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow)
+        descriptors.append(descriptor)
+        _validate_owned_descriptor(descriptor, directory=True, uid=uid, gid=gid)
+        metadata = os.fstat(descriptor)
+        for index, part in enumerate(parts):
+            is_directory = index < len(parts) - 1 or directory
+            flags = os.O_RDONLY | os.O_CLOEXEC | nofollow
+            if is_directory:
+                flags |= os.O_DIRECTORY
+            descriptor = os.open(part, flags, dir_fd=descriptors[-1])
+            descriptors.append(descriptor)
+            metadata = _validate_owned_descriptor(
+                descriptor, directory=is_directory, uid=uid, gid=gid
             )
-        content = os.read(descriptor, 1024 * 1024 + 1)
+        yield root.joinpath(*parts), descriptors[-1], metadata
+    except LifecycleValidationError:
+        raise
+    except OSError as exc:
+        code = (
+            "SYMLINK_ESCAPE_REJECTED"
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}
+            else "USER_PATH_NOT_FOUND"
+        )
+        raise LifecycleValidationError(code, "requested user path cannot be opened safely") from exc
     finally:
-        os.close(descriptor)
-    if len(content) != before.st_size or b"\x00" in content:
+        for descriptor in reversed(descriptors):
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+def _portal4a_user_path(relative: str, *, directory: bool, uid: int, gid: int) -> Path:
+    with _open_portal4a_user_path(relative, directory=directory, uid=uid, gid=gid) as (
+        path,
+        _descriptor,
+        _metadata,
+    ):
+        return path
+
+
+def _read_regular_descriptor(descriptor: int, metadata: os.stat_result) -> bytes:
+    if metadata.st_size <= 0 or metadata.st_size > 1024 * 1024:
+        raise LifecycleValidationError("JOB_SCRIPT_REJECTED", "job script size is invalid")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    content = bytearray()
+    while len(content) <= 1024 * 1024:
+        chunk = os.read(descriptor, min(64 * 1024, 1024 * 1024 + 1 - len(content)))
+        if not chunk:
+            break
+        content.extend(chunk)
+    if len(content) != metadata.st_size or b"\x00" in content:
         raise LifecycleValidationError("JOB_SCRIPT_REJECTED", "job script content is invalid")
-    return content
+    return bytes(content)
 
 
-def _stage_user_job_script(payload: dict[str, Any], content: bytes) -> Path:
+def _read_user_script(relative: str, uid: int, gid: int) -> bytes:
+    with _open_portal4a_user_path(relative, directory=False, uid=uid, gid=gid) as (
+        _path,
+        descriptor,
+        metadata,
+    ):
+        return _read_regular_descriptor(descriptor, metadata)
+
+
+def _ensure_portal4a_owned_directory(relative: str, uid: int, gid: int) -> Path:
+    parts = _portal4a_relative_parts(relative)
+    root = PILOT_DATA_ROOT / PILOT_USERNAME
+    descriptors: list[int] = []
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow)
+        descriptors.append(descriptor)
+        _validate_owned_descriptor(descriptor, directory=True, uid=uid, gid=gid)
+        for index, part in enumerate(parts):
+            created = False
+            try:
+                next_descriptor = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                next_descriptor = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow,
+                    dir_fd=descriptor,
+                )
+                os.fchown(next_descriptor, uid, gid)
+                created = True
+            descriptors.append(next_descriptor)
+            descriptor = next_descriptor
+            _validate_owned_descriptor(descriptor, directory=True, uid=uid, gid=gid)
+            if created or index > 0:
+                os.fchmod(descriptor, 0o700)
+        return root.joinpath(*parts)
+    except LifecycleValidationError:
+        raise
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "JOB_STAGING_REJECTED", "job staging directory cannot be opened safely"
+        ) from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+def _stage_user_job_script(payload: dict[str, Any], content: bytes) -> tuple[Path, int]:
     uid = int(payload["uid"])
     gid = int(payload["gid"])
-    workspace = _portal4a_user_path("workspace", directory=True, uid=uid, gid=gid)
-    portal_dir = workspace / ".portal"
-    script_dir = portal_dir / "job-scripts"
-    output_dir = portal_dir / "jobs"
-    for directory in (portal_dir, script_dir, output_dir):
-        if directory.exists():
-            metadata = directory.lstat()
-            if (
-                not stat.S_ISDIR(metadata.st_mode)
-                or stat.S_ISLNK(metadata.st_mode)
-                or metadata.st_uid != uid
-                or metadata.st_gid != gid
-            ):
-                raise LifecycleValidationError(
-                    "JOB_STAGING_REJECTED", "job staging directory metadata is invalid"
-                )
-        else:
-            directory.mkdir(mode=0o700)
-            os.chown(directory, uid, gid)
-        os.chmod(directory, 0o700)
-    destination = script_dir / f"{payload['portal_job_id']}.sh"
-    if destination.exists():
-        existing = _read_user_script(destination, uid, gid)
-        if existing != content:
-            raise LifecycleValidationError(
-                "JOB_STAGING_CONFLICT", "staged job script differs from idempotent request"
+    script_relative = "workspace/.portal/job-scripts"
+    _ensure_portal4a_owned_directory(script_relative, uid, gid)
+    _ensure_portal4a_owned_directory("workspace/.portal/jobs", uid, gid)
+    filename = f"{payload['portal_job_id']}.sh"
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    with _open_portal4a_user_path(script_relative, directory=True, uid=uid, gid=gid) as (
+        script_dir,
+        directory_descriptor,
+        _metadata,
+    ):
+        created = False
+        try:
+            descriptor = os.open(
+                filename,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | nofollow,
+                0o700,
+                dir_fd=directory_descriptor,
             )
-        return destination
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(destination, flags, 0o700)
-    try:
-        os.write(descriptor, content)
-        os.fsync(descriptor)
-        os.fchown(descriptor, uid, gid)
-        os.fchmod(descriptor, 0o700)
-    finally:
-        os.close(descriptor)
-    return destination
+            created = True
+        except FileExistsError:
+            descriptor = os.open(
+                filename,
+                os.O_RDONLY | os.O_CLOEXEC | nofollow,
+                dir_fd=directory_descriptor,
+            )
+        try:
+            if created:
+                os.fchown(descriptor, uid, gid)
+                os.fchmod(descriptor, 0o700)
+                os.write(descriptor, content)
+                os.fsync(descriptor)
+            metadata = _validate_owned_descriptor(descriptor, directory=False, uid=uid, gid=gid)
+            if created:
+                if metadata.st_size != len(content):
+                    raise LifecycleValidationError(
+                        "JOB_STAGING_REJECTED", "staged job script is incomplete"
+                    )
+            elif _read_regular_descriptor(descriptor, metadata) != content:
+                raise LifecycleValidationError(
+                    "JOB_STAGING_CONFLICT", "staged job script differs from idempotent request"
+                )
+            return script_dir / filename, descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
 
 
 def _slurm_time(seconds: int) -> str:
@@ -5134,7 +5223,11 @@ def _slurm_job_owner(job_id: int) -> str | None:
 
 
 def _run_as_managed_user(
-    payload: dict[str, Any], command: list[str], timeout: float
+    payload: dict[str, Any],
+    command: list[str],
+    timeout: float,
+    *,
+    pass_fds: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     setpriv = BINARIES["setpriv"]
     if not os.path.exists(setpriv) or any("\x00" in item for item in command):
@@ -5158,6 +5251,7 @@ def _run_as_managed_user(
             check=False,
             shell=False,
             text=True,
+            pass_fds=pass_fds,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {
@@ -5175,22 +5269,21 @@ def _run_as_managed_user(
 
 
 def _execute_self_job_submit(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    staged_descriptor: int | None = None
     try:
         _portal4a_slurm_security_preflight(payload)
         uid = int(payload["uid"])
         gid = int(payload["gid"])
-        source = _portal4a_user_path(
-            str(payload["script_relative_path"]), directory=False, uid=uid, gid=gid
-        )
+        content = _read_user_script(str(payload["script_relative_path"]), uid, gid)
         workdir = _portal4a_user_path(
             str(payload["workdir_relative_path"]), directory=True, uid=uid, gid=gid
         )
-        staged = _stage_user_job_script(payload, _read_user_script(source, uid, gid))
+        _staged, staged_descriptor = _stage_user_job_script(payload, content)
         root = PILOT_DATA_ROOT / PILOT_USERNAME
         stdout = root / str(payload["stdout_relative_path"])
         stderr = root / str(payload["stderr_relative_path"])
-        output_parent = stdout.parent.resolve(strict=True)
-        if output_parent != stderr.parent.resolve(strict=True):
+        output_parent = _ensure_portal4a_owned_directory("workspace/.portal/jobs", uid, gid)
+        if stdout.parent != output_parent or stderr.parent != output_parent:
             raise LifecycleValidationError(
                 "JOB_OUTPUT_REJECTED", "job output directories are inconsistent"
             )
@@ -5213,8 +5306,8 @@ def _execute_self_job_submit(request: WorkerRequest, payload: dict[str, Any]) ->
             argv.append("--gres=gpu:1")
         if payload.get("image_ref"):
             argv.append(f"--container-image={payload['image_ref']}")
-        argv.append(str(staged))
-        submitted = _run_as_managed_user(payload, argv, timeout=30)
+        argv.append(f"/proc/self/fd/{staged_descriptor}")
+        submitted = _run_as_managed_user(payload, argv, timeout=30, pass_fds=(staged_descriptor,))
         if not submitted.get("ok"):
             return {
                 "status": "ERROR",
@@ -5249,6 +5342,10 @@ def _execute_self_job_submit(request: WorkerRequest, payload: dict[str, Any]) ->
         }
     except LifecycleValidationError as exc:
         return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+    finally:
+        if staged_descriptor is not None:
+            with suppress(OSError):
+                os.close(staged_descriptor)
 
 
 def _execute_self_job_cancel(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
@@ -5276,22 +5373,18 @@ def _execute_self_job_cancel(request: WorkerRequest, payload: dict[str, Any]) ->
 
 def _read_job_log(relative: str, uid: int, gid: int) -> str:
     try:
-        path = _portal4a_user_path(relative, directory=False, uid=uid, gid=gid)
+        with _open_portal4a_user_path(relative, directory=False, uid=uid, gid=gid) as (
+            _path,
+            descriptor,
+            metadata,
+        ):
+            start = metadata.st_size - MAX_OUTPUT if metadata.st_size > MAX_OUTPUT else 0
+            os.lseek(descriptor, start, os.SEEK_SET)
+            content = os.read(descriptor, MAX_OUTPUT)
     except LifecycleValidationError as exc:
         if exc.code == "USER_PATH_NOT_FOUND":
             return ""
         raise
-    metadata = path.lstat()
-    start = metadata.st_size - MAX_OUTPUT if metadata.st_size > MAX_OUTPUT else 0
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
-    try:
-        os.lseek(descriptor, start, os.SEEK_SET)
-        content = os.read(descriptor, MAX_OUTPUT)
-    finally:
-        os.close(descriptor)
     return content.decode("utf-8", errors="replace")
 
 
@@ -5457,6 +5550,11 @@ def _execute_portal4a_container_lifecycle(
     request: WorkerRequest, payload: dict[str, Any]
 ) -> dict[str, Any]:
     try:
+        if request.requested_by != payload["username"]:
+            raise LifecycleValidationError(
+                "RESOURCE_OWNERSHIP_REJECTED",
+                "user-level operation actor does not own the target resource",
+            )
         action = request.operation_type.rsplit(".", 1)[-1]
         if action in {"start", "restart"} and payload.get("lease_id") is None:
             raise LifecycleValidationError(
@@ -5846,6 +5944,16 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
         return {
             "status": "ERROR",
             "error": {"code": getattr(exc, "code", "PAYLOAD_REJECTED"), "message": str(exc)},
+        }
+    if request.operation_type.startswith("self.") and request.requested_by != payload.get(
+        "username"
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "RESOURCE_OWNERSHIP_REJECTED",
+                "message": "user-level operation actor does not own the target resource",
+            },
         }
     if request.operation_type in KNOWN_WRITES:
         if not request.dry_run:

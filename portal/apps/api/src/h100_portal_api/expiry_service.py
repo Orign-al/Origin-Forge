@@ -1,8 +1,8 @@
 import sys
 from typing import Any
 
-from sqlalchemy import select, update
-from sqlalchemy.orm import Session
+from sqlalchemy import exists, or_, select, update
+from sqlalchemy.orm import Session, aliased
 
 from h100_portal_api.audit import record_audit
 from h100_portal_api.database import SessionLocal
@@ -22,6 +22,23 @@ from h100_portal_api.models import (
 from h100_portal_api.worker_client import WorkerClientError, call_worker
 
 DUE_STATES = {"ACTIVE", "RENEWAL_WINDOW", "RENEWAL_PENDING", "EXPIRED"}
+
+
+def _due_predicate(now: Any) -> Any:
+    active_successor = aliased(PortalComputeLease)
+    return (
+        PortalComputeLease.state.in_(DUE_STATES),
+        PortalComputeLease.expires_at <= now,
+        PortalComputeLease.recycled_at.is_(None),
+        or_(
+            PortalComputeLease.state != "EXPIRED",
+            ~exists().where(
+                active_successor.previous_lease_id == PortalComputeLease.id,
+                active_successor.state == "ACTIVE",
+                active_successor.expires_at > now,
+            ),
+        ),
+    )
 
 
 def _operation(
@@ -84,6 +101,8 @@ def _activate_successor(
 
 def _recycle_one(db: Session, lease: PortalComputeLease) -> bool:
     now = utcnow()
+    original_state = lease.state
+    original_expired_at = lease.expired_at
     managed = db.scalar(
         select(PortalManagedUser)
         .where(PortalManagedUser.id == lease.owner_managed_user_id)
@@ -136,6 +155,8 @@ def _recycle_one(db: Session, lease: PortalComputeLease) -> bool:
             timeout_seconds=180,
         )
     except WorkerClientError as exc:
+        lease.state = original_state
+        lease.expired_at = original_expired_at
         operation.status = OperationStatus.FAILED
         operation.error_code = exc.code[:64]
         operation.finished_at = utcnow()
@@ -147,6 +168,8 @@ def _recycle_one(db: Session, lease: PortalComputeLease) -> bool:
         or result.get("container_key_state") != "SUSPENDED_BY_RECYCLE"
         or result.get("data_preserved") is not True
     ):
+        lease.state = original_state
+        lease.expired_at = original_expired_at
         operation.status = OperationStatus.FAILED
         error = result.get("error", {})
         operation.error_code = str(error.get("code", "RECYCLE_FAILED"))[:64]
@@ -240,11 +263,7 @@ def process_due_leases(limit: int = 32) -> tuple[int, int]:
     with SessionLocal() as db:
         due_ids = db.scalars(
             select(PortalComputeLease.id)
-            .where(
-                PortalComputeLease.state.in_(DUE_STATES),
-                PortalComputeLease.expires_at <= utcnow(),
-                PortalComputeLease.recycled_at.is_(None),
-            )
+            .where(*_due_predicate(utcnow()))
             .order_by(PortalComputeLease.expires_at)
             .limit(limit)
         ).all()
@@ -252,12 +271,7 @@ def process_due_leases(limit: int = 32) -> tuple[int, int]:
         with SessionLocal() as db:
             lease = db.scalar(
                 select(PortalComputeLease)
-                .where(
-                    PortalComputeLease.id == lease_id,
-                    PortalComputeLease.state.in_(DUE_STATES),
-                    PortalComputeLease.expires_at <= utcnow(),
-                    PortalComputeLease.recycled_at.is_(None),
-                )
+                .where(PortalComputeLease.id == lease_id, *_due_predicate(utcnow()))
                 .with_for_update()
             )
             if lease is None:

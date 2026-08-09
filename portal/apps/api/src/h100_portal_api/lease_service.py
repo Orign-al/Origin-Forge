@@ -21,6 +21,10 @@ REMINDER_WINDOW_SECONDS = 48 * 60 * 60
 ACTIVE_LEASE_STATES = {"ACTIVE", "RENEWAL_WINDOW", "RENEWAL_PENDING"}
 
 
+class RenewalLeaseExpiredError(Exception):
+    """Signals that the expired lease and cancelled request must be committed."""
+
+
 def _error(status_code: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message})
 
@@ -266,7 +270,18 @@ def request_renewal(
         if existing.requested_duration_seconds != duration_seconds:
             raise _error(409, "IDEMPOTENCY_CONFLICT", "幂等键已用于不同续期请求")
         return existing
-    active, terminal = entitlement(db, owner_id, now=trusted_now, lock=True)
+    try:
+        active, terminal = entitlement(db, owner_id, now=trusted_now, lock=True)
+    except HTTPException as exc:
+        raw_detail: Any = getattr(exc, "detail", None)
+        detail = raw_detail if isinstance(raw_detail, dict) else {}
+        if detail.get("code") == "LEASE_INACTIVE":
+            raise _error(
+                409,
+                "LEASE_EXPIRED_RESTORE_REQUIRED",
+                "租约已过期，请申请恢复",
+            ) from exc
+        raise
     remaining = int((ensure_utc(terminal.expires_at) - trusted_now).total_seconds())
     if remaining <= 0:
         raise _error(409, "LEASE_EXPIRED_RESTORE_REQUIRED", "租约已过期，请申请恢复")
@@ -323,7 +338,12 @@ def decide_renewal(
     if ensure_utc(lease.expires_at) <= trusted_now:
         lease.state = "EXPIRED"
         lease.expired_at = trusted_now
-        raise _error(409, "LEASE_EXPIRED_RESTORE_REQUIRED", "租约已过期，请改用恢复流程")
+        request.state = "CANCELLED"
+        request.decided_at = trusted_now
+        request.decided_by = decided_by
+        request.decision_comment = comment
+        db.flush()
+        raise RenewalLeaseExpiredError
     request.decided_at = trusted_now
     request.decided_by = decided_by
     request.decision_comment = comment

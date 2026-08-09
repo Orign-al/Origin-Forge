@@ -13,6 +13,7 @@ from h100_portal_api.database import get_db
 from h100_portal_api.dependencies import permission_dependency
 from h100_portal_api.enums import OperationStatus, RiskLevel
 from h100_portal_api.lease_service import (
+    RenewalLeaseExpiredError,
     create_lease,
     decide_renewal,
     entitlement,
@@ -327,7 +328,18 @@ def _container_action(
     lease_id: uuid.UUID | None = None
     lease_deadline: datetime | None = None
     if action in {"start", "restart"}:
-        active, terminal = entitlement(db, managed.id, lock=True)
+        try:
+            active, terminal = entitlement(db, managed.id, lock=True)
+        except HTTPException as exc:
+            raw_detail: Any = getattr(exc, "detail", None)
+            detail = raw_detail if isinstance(raw_detail, dict) else {}
+            if detail.get("code") == "LEASE_INACTIVE":
+                raise _error(
+                    409,
+                    "CONTAINER_OPERATION_DENIED_LEASE_INACTIVE",
+                    "租约失效时不能启动开发容器",
+                ) from exc
+            raise
         lease_id = active.id
         lease_deadline = terminal.expires_at
         if managed.compute_environment_state != "ACTIVE":
@@ -893,13 +905,31 @@ def admin_decide_renewal(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     require_session_csrf(request, context)
-    renewal, successor = decide_renewal(
-        db,
-        request_id=request_id,
-        decision=body.decision,
-        decided_by=context.user.id,
-        comment=body.comment,
-    )
+    try:
+        renewal, successor = decide_renewal(
+            db,
+            request_id=request_id,
+            decision=body.decision,
+            decided_by=context.user.id,
+            comment=body.comment,
+        )
+    except RenewalLeaseExpiredError:
+        _audit(
+            db,
+            request,
+            context,
+            event_type="LEASE_RENEWAL_CANCELLED",
+            object_type="lease_renewal_request",
+            object_id=str(request_id),
+            result="DENIED",
+            metadata={"reason": "LEASE_EXPIRED_RESTORE_REQUIRED"},
+        )
+        db.commit()
+        raise _error(
+            409,
+            "LEASE_EXPIRED_RESTORE_REQUIRED",
+            "租约已过期，请改用恢复流程",
+        ) from None
     _audit(
         db,
         request,

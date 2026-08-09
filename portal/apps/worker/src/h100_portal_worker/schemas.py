@@ -504,9 +504,10 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
     if set(payload) != fields:
         raise PayloadValidationError("JOB_SPEC_REJECTED", "job specification fields are incomplete")
     result = _portal4a_identity(payload)
+    portal_job_id = _canonical_uuid(payload.get("portal_job_id"), "Portal job ID")
     result.update(
         {
-            "portal_job_id": _canonical_uuid(payload.get("portal_job_id"), "Portal job ID"),
+            "portal_job_id": portal_job_id,
             "lease_id": _canonical_uuid(payload.get("lease_id"), "lease ID"),
         }
     )
@@ -534,6 +535,13 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
     image_ref = payload.get("image_ref")
     if image_ref not in {None, APPROVED_JOB_IMAGE}:
         raise PayloadValidationError("IMAGE_NOT_APPROVED", "container image is not approved")
+    stdout_path = _relative_user_path(payload.get("stdout_relative_path"), "stdout path")
+    stderr_path = _relative_user_path(payload.get("stderr_relative_path"), "stderr path")
+    if (
+        stdout_path != f"workspace/.portal/jobs/{portal_job_id}.out"
+        or stderr_path != f"workspace/.portal/jobs/{portal_job_id}.err"
+    ):
+        raise PayloadValidationError("JOB_OUTPUT_REJECTED", "job output path is not fixed")
     result.update(
         {
             "name": name,
@@ -543,12 +551,8 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
             "workdir_relative_path": _relative_user_path(
                 payload.get("workdir_relative_path"), "workdir"
             ),
-            "stdout_relative_path": _relative_user_path(
-                payload.get("stdout_relative_path"), "stdout path"
-            ),
-            "stderr_relative_path": _relative_user_path(
-                payload.get("stderr_relative_path"), "stderr path"
-            ),
+            "stdout_relative_path": stdout_path,
+            "stderr_relative_path": stderr_path,
             "cpus": cpus,
             "memory_mb": memory_mb,
             "gpu_count": gpu_count,
@@ -584,14 +588,18 @@ def _validate_self_job_target(payload: dict[str, Any], *, logs: bool = False) ->
     if set(payload) != expected:
         raise PayloadValidationError("JOB_TARGET_REJECTED", "job target fields are invalid")
     result = _portal4a_identity(payload)
-    result["portal_job_id"] = _canonical_uuid(payload.get("portal_job_id"), "Portal job ID")
+    portal_job_id = _canonical_uuid(payload.get("portal_job_id"), "Portal job ID")
+    result["portal_job_id"] = portal_job_id
     if logs:
-        result["stdout_relative_path"] = _relative_user_path(
-            payload.get("stdout_relative_path"), "stdout path"
-        )
-        result["stderr_relative_path"] = _relative_user_path(
-            payload.get("stderr_relative_path"), "stderr path"
-        )
+        stdout_path = _relative_user_path(payload.get("stdout_relative_path"), "stdout path")
+        stderr_path = _relative_user_path(payload.get("stderr_relative_path"), "stderr path")
+        if (
+            stdout_path != f"workspace/.portal/jobs/{portal_job_id}.out"
+            or stderr_path != f"workspace/.portal/jobs/{portal_job_id}.err"
+        ):
+            raise PayloadValidationError("JOB_OUTPUT_REJECTED", "job output path is not fixed")
+        result["stdout_relative_path"] = stdout_path
+        result["stderr_relative_path"] = stderr_path
     else:
         job_id = payload.get("slurm_job_id")
         if not isinstance(job_id, int) or not 0 < job_id < 2**63:

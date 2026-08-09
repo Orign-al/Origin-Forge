@@ -5,6 +5,7 @@ import socket
 import struct
 import subprocess
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2133,3 +2134,125 @@ def test_live_image_inventory_requires_digest_and_uses_whitelisted_fields(
     assert result["images"][0]["digest"] == digest
     assert result["images"][0]["immutable"] is True
     assert result["images"][0]["architecture"] == "amd64"
+
+
+def portal4a_job_payload() -> dict[str, object]:
+    portal_job_id = str(uuid.uuid4())
+    return {
+        "portal_job_id": portal_job_id,
+        "managed_user_id": "3b95b4f0-95d9-444a-8f0b-46288195a807",
+        "lease_id": str(uuid.uuid4()),
+        "username": "origin-pilot",
+        "uid": 20001,
+        "gid": 20001,
+        "name": "portal-job",
+        "script_relative_path": "workspace/job.sh",
+        "workdir_relative_path": "workspace",
+        "stdout_relative_path": f"workspace/.portal/jobs/{portal_job_id}.out",
+        "stderr_relative_path": f"workspace/.portal/jobs/{portal_job_id}.err",
+        "cpus": 1,
+        "memory_mb": 1024,
+        "gpu_count": 1,
+        "time_limit_seconds": 600,
+        "lease_deadline_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+        "image_ref": None,
+    }
+
+
+def test_portal4a_worker_schema_fixes_job_outputs_and_gpu_limit() -> None:
+    payload = portal4a_job_payload()
+    validated = validate_payload("self.job.submit", payload)
+    assert validated["stdout_relative_path"] == payload["stdout_relative_path"]
+    with pytest.raises(ValueError, match="output path"):
+        validate_payload(
+            "self.job.submit",
+            {**payload, "stdout_relative_path": "workspace/other.out"},
+        )
+    with pytest.raises(ValueError, match="GPU"):
+        validate_payload("self.job.submit", {**payload, "gpu_count": 2})
+
+
+def test_portal4a_worker_rejects_spoofed_self_actor_and_container_actor() -> None:
+    self_request = request("self.job.submit", portal4a_job_payload())
+    denied = handle(self_request)
+    assert denied["error"]["code"] == "RESOURCE_OWNERSHIP_REJECTED"
+
+    container_payload = {
+        "managed_user_id": "3b95b4f0-95d9-444a-8f0b-46288195a807",
+        "username": "origin-pilot",
+        "uid": 20001,
+        "gid": 20001,
+        "name": "gpu-dev-origin-pilot",
+        "lease_id": str(uuid.uuid4()),
+        "lease_expires_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+        "expected_gpu": "NONE",
+    }
+    denied = handle(request("container.start", container_payload))
+    assert denied["error"]["code"] == "RESOURCE_OWNERSHIP_REJECTED"
+
+
+def test_portal4a_component_open_rejects_symlink_and_pins_staged_inode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    uid = os.getuid()
+    gid = os.getgid()
+    root = tmp_path / "users" / "origin-pilot"
+    workspace = root / "workspace"
+    workspace.mkdir(parents=True)
+    script = workspace / "job.sh"
+    script.write_bytes(b"#!/bin/sh\necho approved\n")
+    (workspace / "escape").symlink_to("/etc")
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", tmp_path / "users")
+
+    with pytest.raises(handlers.LifecycleValidationError) as escaped:
+        handlers._read_user_script("workspace/escape/passwd", uid, gid)
+    assert escaped.value.code == "SYMLINK_ESCAPE_REJECTED"
+
+    portal_job_id = str(uuid.uuid4())
+    staged, descriptor = handlers._stage_user_job_script(
+        {"portal_job_id": portal_job_id, "uid": uid, "gid": gid},
+        script.read_bytes(),
+    )
+    try:
+        replacement = staged.with_suffix(".replacement")
+        replacement.write_bytes(b"#!/bin/sh\necho replaced\n")
+        os.replace(replacement, staged)
+        with open(f"/proc/self/fd/{descriptor}", "rb") as pinned:
+            assert pinned.read() == b"#!/bin/sh\necho approved\n"
+        assert staged.read_bytes() == b"#!/bin/sh\necho replaced\n"
+    finally:
+        os.close(descriptor)
+
+
+def test_portal4a_setpriv_uses_fixed_argv_and_never_shell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def completed(argv, **kwargs):  # type: ignore[no-untyped-def]
+        captured["argv"] = argv
+        captured.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="123\n", stderr="")
+
+    monkeypatch.setitem(handlers.BINARIES, "setpriv", "/usr/bin/setpriv")
+    monkeypatch.setattr(handlers.os.path, "exists", lambda _path: True)
+    monkeypatch.setattr(handlers.subprocess, "run", completed)
+    result = handlers._run_as_managed_user(
+        {"uid": 20001, "gid": 20001},
+        ["/usr/bin/sbatch", "--parsable", "/proc/self/fd/9"],
+        timeout=30,
+        pass_fds=(9,),
+    )
+    assert result["ok"] is True
+    assert captured["argv"] == [
+        "/usr/bin/setpriv",
+        "--reuid=20001",
+        "--regid=20001",
+        "--clear-groups",
+        "--",
+        "/usr/bin/sbatch",
+        "--parsable",
+        "/proc/self/fd/9",
+    ]
+    assert captured["shell"] is False
+    assert captured["pass_fds"] == (9,)

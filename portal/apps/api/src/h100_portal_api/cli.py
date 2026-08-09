@@ -102,6 +102,7 @@ PORTAL3C_APPROVAL_TEXT = "允许使用修订并重新验收通过的两阶段流
 PORTAL3ER_APPROVAL_REFERENCE = "portal3e-r-host-ssh-policy-v1"
 PORTAL3ER_KEY_RECORD_ID = uuid.UUID("7427da72-37b9-4ac2-8ada-2f0c83b7718e")
 PORTAL3ER_KEY_FINGERPRINT = "SHA256:nek6vyEb3GT+UJAcY5y/8PgY4achF2ouNy+8C2JqUVc"
+PORTAL4A_FINAL_CREDENTIAL_SETTING_KEY = "portal4a.final_ordinary_user_credential"
 
 
 def ensure_roles(db: Session) -> None:
@@ -1941,8 +1942,8 @@ def portal3g_start_production_pilot(approval_text: str) -> int:
 
 
 def portal4a_create_origin_pilot_user(base_url: str) -> int:
-    temporary_password = random_token(32)
-    validate_password(temporary_password, "origin-pilot")
+    internal_password = random_token(48)
+    validate_password(internal_password, "origin-pilot")
     with SessionLocal() as db:
         ensure_roles(db)
         existing = db.scalar(
@@ -2000,7 +2001,7 @@ def portal4a_create_origin_pilot_user(base_url: str) -> int:
         db.add(
             PortalPasswordCredential(
                 user_id=user.id,
-                password_hash=hash_password(temporary_password),
+                password_hash=hash_password(internal_password),
                 password_changed_at=utcnow(),
             )
         )
@@ -2072,18 +2073,13 @@ def portal4a_create_origin_pilot_user(base_url: str) -> int:
             },
         )
         db.commit()
-        print("========================================")
-        print("ORDINARY USER TEST LOGIN")
-        print("========================================")
-        print(f"LOGIN URL: {base_url.rstrip('/')}/login")
-        print("USERNAME: origin-pilot")
-        print(f"TEMPORARY PASSWORD: {temporary_password}")
-        print("ROLE: user")
-        print("PASSWORD CHANGE REQUIRED: YES")
+        print("ordinary_user=origin-pilot")
+        print("role=user")
+        print("internal_credential=CREATED_NOT_DISCLOSED")
+        print(f"login_url={base_url.rstrip('/')}/login")
         print(f"LEASE ID: {lease.id}")
         print(f"LEASE START: {lease.starts_at.isoformat()}")
         print(f"LEASE EXPIRES: {lease.expires_at.isoformat()}")
-        print("========================================")
     return 0
 
 
@@ -2108,7 +2104,7 @@ def _portal4a_completed_job(db: Session, managed: PortalManagedUser, gpu_count: 
                 "gid": managed.gid,
                 "slurm_job_id": job.slurm_job_id,
             },
-            requested_by="origin-al",
+            requested_by="origin-pilot",
             idempotency_key=f"portal4a-final-job-status:{job.id}",
             dry_run=False,
         )
@@ -2123,6 +2119,128 @@ def _portal4a_completed_job(db: Session, managed: PortalManagedUser, gpu_count: 
             job.finished_at = job.finished_at or utcnow()
             return job
     raise RuntimeError(f"completed Portal job with gpu_count={gpu_count} is missing")
+
+
+def portal4a_issue_origin_pilot_test_login(base_url: str) -> int:
+    temporary_password = random_token(48)
+    validate_password(temporary_password, "origin-pilot")
+    with SessionLocal() as db:
+        if db.get(PortalSetting, PORTAL4A_FINAL_CREDENTIAL_SETTING_KEY) is not None:
+            print(
+                "PORTAL-4A-R CREDENTIAL ISSUE BLOCKED — final credential was already issued",
+                file=sys.stderr,
+            )
+            return 2
+        owner = db.scalar(select(PortalUser).where(PortalUser.normalized_login == "origin-al"))
+        user = db.scalar(select(PortalUser).where(PortalUser.normalized_login == "origin-pilot"))
+        if owner is None or user is None or {role.name for role in user.roles} != {"user"}:
+            print(
+                "PORTAL-4A-R CREDENTIAL ISSUE BLOCKED — ordinary-user account is not final",
+                file=sys.stderr,
+            )
+            return 2
+        managed = db.scalar(
+            select(PortalManagedUser).where(PortalManagedUser.portal_user_id == user.id)
+        )
+        if (
+            managed is None
+            or managed.host_access_state != "DISABLED_BY_PLATFORM_POLICY"
+            or managed.shell != "/usr/sbin/nologin"
+            or managed.compute_environment_state != "ACTIVE"
+        ):
+            print(
+                "PORTAL-4A-R CREDENTIAL ISSUE BLOCKED — Host policy or compute state is not final",
+                file=sys.stderr,
+            )
+            return 2
+        lease = db.scalar(
+            select(PortalComputeLease)
+            .where(
+                PortalComputeLease.owner_managed_user_id == managed.id,
+                PortalComputeLease.state.in_({"ACTIVE", "RENEWAL_WINDOW", "RENEWAL_PENDING"}),
+                PortalComputeLease.expires_at > utcnow(),
+            )
+            .order_by(PortalComputeLease.expires_at.desc())
+        )
+        container = db.scalar(
+            select(PortalContainer).where(
+                PortalContainer.owner_managed_user_id == managed.id,
+                PortalContainer.observed_state == "RUNNING",
+            )
+        )
+        key = db.scalar(
+            select(PortalSshKey).where(
+                PortalSshKey.owner_managed_user_id == managed.id,
+                PortalSshKey.active.is_(True),
+                PortalSshKey.scope == "CONTAINER",
+                PortalSshKey.host_install_state == "REMOVED_BY_POLICY",
+                PortalSshKey.container_install_state == "INSTALLED",
+            )
+        )
+        credential = db.scalar(
+            select(PortalPasswordCredential).where(PortalPasswordCredential.user_id == user.id)
+        )
+        if lease is None or container is None or key is None or credential is None:
+            print(
+                "PORTAL-4A-R CREDENTIAL ISSUE BLOCKED — final resource baseline is incomplete",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            _portal4a_completed_job(db, managed, 0)
+            _portal4a_completed_job(db, managed, 1)
+        except RuntimeError, WorkerClientError:
+            print(
+                "PORTAL-4A-R CREDENTIAL ISSUE BLOCKED — Portal CPU/GPU entry gate is incomplete",
+                file=sys.stderr,
+            )
+            return 2
+        now = utcnow()
+        credential.password_hash = hash_password(temporary_password)
+        credential.password_changed_at = now
+        user.password_state = PasswordState.RESET_REQUIRED
+        db.execute(
+            update(PortalSession)
+            .where(PortalSession.user_id == user.id, PortalSession.revoked_at.is_(None))
+            .values(revoked_at=now)
+        )
+        db.add(
+            PortalSetting(
+                key=PORTAL4A_FINAL_CREDENTIAL_SETTING_KEY,
+                value={"issued_at": now.isoformat(), "username": "origin-pilot", "displayed": True},
+                sensitive=False,
+            )
+        )
+        record_audit(
+            db,
+            event_type="portal.ordinary_user.final_credential_issued",
+            actor="origin-al",
+            actor_role="platform_owner",
+            source_ip="local-console",
+            user_agent="h100-portal-admin",
+            object_type="portal_user",
+            object_id=str(user.id),
+            metadata={
+                "password_change_required": True,
+                "prior_sessions_revoked": True,
+                "credential_logged": False,
+            },
+        )
+        db.commit()
+        print("========================================")
+        print("ORDINARY USER TEST LOGIN")
+        print("========================================")
+        print(f"LOGIN URL: {base_url.rstrip('/')}/login")
+        print("USERNAME: origin-pilot")
+        print(f"TEMPORARY PASSWORD: {temporary_password}")
+        print("ROLE: user")
+        print("PASSWORD CHANGE REQUIRED: YES")
+        print("HOST SSH: DISABLED")
+        print("DEVELOPMENT CONTAINER: AVAILABLE")
+        print("MAX GPU: 1")
+        print(f"LEASE EXPIRES: {lease.expires_at.isoformat()}")
+        print("========================================")
+    return 0
 
 
 def portal4a_revoke_origin_pilot_host_access(approval_text: str) -> int:
@@ -2287,6 +2405,8 @@ def main() -> int:
     portal3g.add_argument("--approval-text", required=True)
     portal4a_user = subparsers.add_parser("portal4a-create-origin-pilot-user")
     portal4a_user.add_argument("--base-url", default="http://10.10.10.2:18080")
+    portal4a_credential = subparsers.add_parser("portal4a-issue-origin-pilot-test-login")
+    portal4a_credential.add_argument("--base-url", default="http://10.10.10.2:18080")
     portal4a_revoke = subparsers.add_parser("portal4a-revoke-origin-pilot-host-access")
     portal4a_revoke.add_argument("--approval-text", required=True)
     args = parser.parse_args()
@@ -2312,6 +2432,8 @@ def main() -> int:
         return portal3g_start_production_pilot(args.approval_text)
     if args.command == "portal4a-create-origin-pilot-user":
         return portal4a_create_origin_pilot_user(args.base_url)
+    if args.command == "portal4a-issue-origin-pilot-test-login":
+        return portal4a_issue_origin_pilot_test_login(args.base_url)
     if args.command == "portal4a-revoke-origin-pilot-host-access":
         return portal4a_revoke_origin_pilot_host_access(args.approval_text)
     return 2
