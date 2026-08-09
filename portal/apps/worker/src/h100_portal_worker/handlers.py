@@ -148,9 +148,9 @@ PORTAL3E_FINAL_KEY_FINGERPRINT = "SHA256:nek6vyEb3GT+UJAcY5y/8PgY4achF2ouNy+8C2J
 PORTAL3E_FINAL_IDEMPOTENCY_KEY = "portal3e-final-origin-pilot-activate-v1"
 PORTAL3E_FINAL_ROLLBACK_IDEMPOTENCY_KEY = "portal3e-final-origin-pilot-rollback-v1"
 PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY = "portal3f-origin-pilot-client-validation-v1"
-# v1-v4 remain immutable ROLLED_BACK audit records. v5 uses a fixed transient
-# systemd launcher so the hardened Worker never relaxes NoNewPrivileges.
-PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY = "portal3f-origin-pilot-acceptance-v5"
+# v1-v5 remain immutable ROLLED_BACK audit records. v6 prepares the exact
+# per-UID Enroot paths required by the first managed Pyxis workload.
+PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY = "portal3f-origin-pilot-acceptance-v6"
 HOST_ED25519_PUBLIC_KEY = Path("/etc/ssh/ssh_host_ed25519_key.pub")
 CONTAINER_ED25519_PUBLIC_KEY = Path(
     "/srv/gpu-platform/container-data/origin-pilot/ssh-host-keys/ssh_host_ed25519_key.pub"

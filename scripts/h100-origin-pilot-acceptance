@@ -215,6 +215,23 @@ check_gpu_baseline() {
     check_dcgm "${label}"
 }
 
+prepare_enroot_user_paths() {
+    local kind parent target
+    for kind in cache data runtime; do
+        parent="/srv/gpu-platform/enroot/${kind}"
+        [[ -d ${parent} && ! -L ${parent} ]]
+        [[ $(stat -c '%u:%g:%a' "${parent}") == '0:0:711' ]]
+        target="${parent}/${PILOT_UID}"
+        if [[ -e ${target} || -L ${target} ]]; then
+            [[ -d ${target} && ! -L ${target} ]]
+            [[ $(stat -c '%u:%g:%a' "${target}") == "${PILOT_UID}:${PILOT_GID}:700" ]]
+        else
+            install -d -o "${PILOT_UID}" -g "${PILOT_GID}" -m 0700 "${target}"
+        fi
+        stat -c '%u:%g %a %n' "${target}"
+    done
+}
+
 run_out_of_job_denial_round() {
     local round=$1 open_unit cuda_unit open_file cgroup
     open_unit="h100-portal3f-open-${request_id:0:8}-${round}"
@@ -293,6 +310,7 @@ IFS='|' read -r qos_name qos_max_tres qos_extra <"${log_dir}/qos.txt"
 srun --help >"${log_dir}/srun-help.txt" 2>&1
 grep -Fq -- '--container-image' "${log_dir}/srun-help.txt"
 check_gpu_baseline before
+prepare_enroot_user_paths >"${log_dir}/enroot-user-paths.txt"
 
 gcc -O2 -Wall -Wextra -Werror -o "${gpu_probe}" "${GPU_PROBE_SOURCE}" -ldl \
     >"${log_dir}/gpu-probe-build.txt" 2>&1

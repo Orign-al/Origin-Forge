@@ -28,6 +28,8 @@ def test_portal3f_acceptance_tool_is_integrity_bound_and_installed() -> None:
     assert '--unit="${cpu_launcher_unit}"' in acceptance_text
     assert '--unit="${gpu_launcher_unit}"' in acceptance_text
     assert "/usr/sbin/runuser --user" not in acceptance_text
+    assert "prepare_enroot_user_paths" in acceptance_text
+    assert '"${PILOT_UID}:${PILOT_GID}:700"' in acceptance_text
     assert (
         hashlib.sha256(gpu_probe_source.read_bytes()).hexdigest()
         == "120fc85413226ba4c106e5e1a291882900a20ec40f31bebea21643f152fcf4d1"
