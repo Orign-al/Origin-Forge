@@ -13,9 +13,11 @@ def test_portal3f_acceptance_tool_is_integrity_bound_and_installed() -> None:
     manifest = json.loads((PORTAL_ROOT / "deploy/worker-scripts.json").read_text())
 
     assert source.is_file()
+    acceptance_text = source.read_text()
     assert (
         manifest["h100-origin-pilot-acceptance"] == hashlib.sha256(source.read_bytes()).hexdigest()
     )
+    assert "git -c safe.directory=/srv/gpu-platform/platform" in acceptance_text
     assert (
         hashlib.sha256(gpu_probe_source.read_bytes()).hexdigest()
         == "120fc85413226ba4c106e5e1a291882900a20ec40f31bebea21643f152fcf4d1"

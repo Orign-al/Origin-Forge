@@ -240,7 +240,8 @@ run_out_of_job_denial_round() {
 }
 
 date --iso-8601=seconds >"${log_dir}/started-at.txt"
-git -C /srv/gpu-platform/platform rev-parse HEAD >"${log_dir}/git-head.txt"
+git -c safe.directory=/srv/gpu-platform/platform \
+    -C /srv/gpu-platform/platform rev-parse HEAD >"${log_dir}/git-head.txt"
 [[ $(<"${log_dir}/git-head.txt") == 145ded3864f99f5af0c9549fba7004d2784c4dea \
     || $(<"${log_dir}/git-head.txt") =~ ^[0-9a-f]{40}$ ]] || fail 'GIT_HEAD_INVALID'
 
