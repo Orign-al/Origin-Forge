@@ -6,7 +6,7 @@
   "h100-container-status": "a046c8c2089829f96a9fd348820811fb908606fbe147547c84328b61d2f39d7e",
   "h100-container-stop": "d39d1033b0d14c75779ad60ffefdc8731fb429bae694aa0abb1e733a2e7d484c",
   "h100-gpu-bypass-guard": "a4b1e49375369f3ed9e58fbd2da27cc40285f4962a27a83574da61e739acd9de",
-  "h100-origin-pilot-acceptance": "fd074abbd0fc882d9b9cc7666c5d08989e7cc21f40fc210580cb12ec367f1c58",
+  "h100-origin-pilot-acceptance": "7435b53558b6c36d1cf30a8513c0b4aff4ca2cdc65b99f2d716c16a283f65866",
   "h100-quota-show": "2cbf32484357a8db284af1b7f0072a73bf5c3e4eb36b303085c81f4e45b2e483",
   "h100-user-create": "e0c46257f9290e60b198b1c9d1998a6c1a90184da81141684a601c0980c4cdba",
   "h100-user-gpu-isolation": "d1b14bea04aa25e536a8972a959fe5da5c8e1c7e8a79b1acc5031279795f7b8c"

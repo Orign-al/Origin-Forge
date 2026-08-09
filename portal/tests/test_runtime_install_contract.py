@@ -30,6 +30,11 @@ def test_portal3f_acceptance_tool_is_integrity_bound_and_installed() -> None:
     assert "/usr/sbin/runuser --user" not in acceptance_text
     assert "prepare_enroot_user_paths" in acceptance_text
     assert '"${PILOT_UID}:${PILOT_GID}:700"' in acceptance_text
+    assert '"${log_dir}/gpu-compute-cgroup.txt"' in acceptance_text
+    assert "slurmstepd.scope/job_${gpu_job_id}" in acceptance_text
+    assert (
+        "'/system.slice/slurmstepd.scope/job_' \"${log_dir}/gpu-stdout.txt\"" not in acceptance_text
+    )
     assert (
         hashlib.sha256(gpu_probe_source.read_bytes()).hexdigest()
         == "120fc85413226ba4c106e5e1a291882900a20ec40f31bebea21643f152fcf4d1"

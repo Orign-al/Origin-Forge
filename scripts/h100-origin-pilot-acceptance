@@ -64,6 +64,7 @@ active_launcher_pid=
 cpu_job_id=
 gpu_job_id=
 gpu_uuid=
+gpu_process_pid=
 final_node_state=UNKNOWN
 final_reason='portal3f origin-pilot acceptance failed'
 
@@ -386,6 +387,12 @@ for _attempt in $(seq 1 180); do
     sleep 1
 done
 [[ -s ${log_dir}/gpu-compute-running.txt ]] || fail 'GPU_CUDA_CONTEXT_NOT_OBSERVED'
+gpu_process_pid=$(awk -F',' 'NR == 1 {gsub(/[[:space:]]/, "", $1); print $1}' \
+    "${log_dir}/gpu-compute-running.txt")
+[[ ${gpu_process_pid} =~ ^[1-9][0-9]*$ && -r /proc/${gpu_process_pid}/cgroup ]]
+tr '\n' ',' <"/proc/${gpu_process_pid}/cgroup" >"${log_dir}/gpu-compute-cgroup.txt"
+grep -Fq "/system.slice/slurmstepd.scope/job_${gpu_job_id}/" \
+    "${log_dir}/gpu-compute-cgroup.txt"
 run_out_of_job_denial_round 1
 run_out_of_job_denial_round 2
 wait "${active_launcher_pid}"
@@ -393,7 +400,6 @@ active_launcher_pid=
 grep -Fxq 'GPU_DEVICE_CONTEXT_PROBE_RESULT=PASSED' "${log_dir}/gpu-stdout.txt"
 grep -Fxq 'NVML_DEVICE_COUNT=result=0 count=1' "${log_dir}/gpu-stdout.txt"
 grep -Fxq 'CUDA_CONTEXT_RESULT=PASSED' "${log_dir}/gpu-stdout.txt"
-grep -Fq '/system.slice/slurmstepd.scope/job_' "${log_dir}/gpu-stdout.txt"
 [[ $(grep -Ec '^DEVICE_OPEN path=/dev/nvidia[0-3] role=ALLOCATED flags=O_RDWR result=OPENED ' "${log_dir}/gpu-stdout.txt") -eq 1 ]]
 [[ $(grep -Ec '^DEVICE_OPEN path=/dev/nvidia[0-3] role=UNALLOCATED flags=O_RDWR result=DENIED ' "${log_dir}/gpu-stdout.txt") -eq 3 ]]
 gpu_uuid=$(sed -nE 's/^VISIBLE_GPU .* uuid_result=0 uuid=(GPU-[^ ]+) .*/\1/p' \

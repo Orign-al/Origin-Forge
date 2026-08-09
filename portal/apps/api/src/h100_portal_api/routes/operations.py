@@ -99,9 +99,9 @@ PORTAL3F_APPROVAL_TEXT = (
 )
 PORTAL3F_APPROVAL_REFERENCE = "portal3f-origin-pilot-first-acceptance-v1"
 PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY = "portal3f-origin-pilot-client-validation-v1"
-# v1-v5 remain immutable ROLLED_BACK audit records. v6 prepares the exact
-# per-UID Enroot paths required by the first managed Pyxis workload.
-PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY = "portal3f-origin-pilot-acceptance-v6"
+# v1-v6 remain immutable ROLLED_BACK audit records. v7 verifies the GPU task's
+# Slurm cgroup from the host because Pyxis intentionally uses a cgroup namespace.
+PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY = "portal3f-origin-pilot-acceptance-v7"
 PORTAL3F_IMAGE_REF = (
     "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
     "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
