@@ -111,6 +111,29 @@ ACTIVATE EXECUTION: DISABLED — ADMINISTRATOR APPROVAL REQUIRED
 应保持相同 fingerprint。撤销与轮换按独立 record 操作，不覆盖其他有效 Key；撤销最后一
 把 Key 必须先明确警告并重新认证。
 
+## Managed compute host SSH policy preflight
+
+每个受管计算身份在 Activate 的任何写入发生前，都必须通过宿主 OpenSSH effective-config
+检查。Worker 只接受数据库绑定的固定 Unix 用户名，并使用固定的代表性虚拟网络上下文执行
+`/usr/sbin/sshd -T -C`；Portal 或浏览器不能提供用户名、`-C` 参数、Match 表达式或任意
+argv。只 grep `sshd_config` 不是有效验收，因为最终策略可能来自 Include 和 Match。
+
+当前 Pilot 以平台受管的精确 `Match User origin-pilot` policy 实现，不新建 Unix group，
+也不改变全局策略。最低 Gate 与当前平台目标均为：
+
+```text
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+```
+
+任何字段缺失、`sshd -T` 失败、目标未知、参数注入、语法错误或 management identity
+effective config 变化都必须 fail-closed，并发生在 authorized_keys、shell 和容器写入前。
+未来扩展用户时，生命周期工具只允许从已验证 Managed Compute User record 生成精确用户名
+规则；Portal 不提供任意 Match 输入。只有现有、语义明确且无附带权限的 managed-compute
+group 经独立审批后，才可将精确用户规则迁移为 `Match Group`。
+
 Portal-3C 已真实 Stage `origin-pilot`。Stage 完成后仍没有 authorized_keys、普通 shell
 或运行中的用户容器。Portal-3D-R 可以登记用户自己的真实公钥并显示类型、fingerprint、
 注释、Scope 和时间，但不得因此安装 Key 或激活身份。Activate 继续受后续独立 Gate 阻断。

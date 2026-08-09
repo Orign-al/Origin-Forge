@@ -56,6 +56,7 @@ BINARIES = {
     "ss": "/usr/bin/ss",
     "ssh-keygen": "/usr/bin/ssh-keygen",
     "passwd": "/usr/bin/passwd",
+    "sshd": "/usr/sbin/sshd",
     "squeue-fallback": "/usr/bin/squeue",
 }
 SCRIPT_ALLOWLIST = {
@@ -108,6 +109,8 @@ PILOT_SSH_PORT_FIRST = 22023
 PILOT_USERNAME = "origin-pilot"
 MANAGEMENT_USERNAME = "origin-al"
 MANAGEMENT_IP = "10.82.36.1"
+SSH_REPRESENTATIVE_CLIENT_IP = "10.20.18.10"
+SSH_REPRESENTATIVE_HOST = "sagsh100server"
 GPU_DROPIN_NAME = "50-h100-gpu-isolation.conf"
 GPU_DROPIN_CONTENT = "[Slice]\nDevicePolicy=closed\n"
 GPU_REGISTRY = Path("/etc/h100-platform/gpu-isolated-users")
@@ -144,6 +147,25 @@ STAGE_REQUIRED_SCRIPTS = frozenset(
 )
 FORBIDDEN_PILOT_GROUPS = frozenset(
     {"sudo", "docker", "video", "render", "adm", "systemd-journal", "gpu-platform-admin"}
+)
+SSH_POLICY_FIELDS = (
+    "pubkeyauthentication",
+    "passwordauthentication",
+    "kbdinteractiveauthentication",
+    "authenticationmethods",
+    "permitrootlogin",
+    "authorizedkeysfile",
+    "usepam",
+    "allowtcpforwarding",
+    "x11forwarding",
+)
+SSH_MANAGEMENT_NO_REGRESSION_FIELDS = (
+    "pubkeyauthentication",
+    "passwordauthentication",
+    "kbdinteractiveauthentication",
+    "authenticationmethods",
+    "permitrootlogin",
+    "authorizedkeysfile",
 )
 
 
@@ -1294,6 +1316,138 @@ class LifecycleValidationError(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
+
+
+def _parse_sshd_effective_config(output: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in output.splitlines():
+        keyword, separator, value = raw_line.strip().partition(" ")
+        if separator and keyword in SSH_POLICY_FIELDS:
+            if keyword in values:
+                raise LifecycleValidationError(
+                    "HOST_SSH_POLICY_PREFLIGHT_FAILED",
+                    "sshd effective configuration contains duplicate policy fields",
+                )
+            values[keyword] = value.strip()
+    missing = sorted(set(SSH_POLICY_FIELDS) - set(values))
+    if missing:
+        raise LifecycleValidationError(
+            "HOST_SSH_POLICY_PREFLIGHT_FAILED",
+            "sshd effective configuration is incomplete",
+        )
+    return values
+
+
+def _sshd_effective_config(username: str | None) -> dict[str, str]:
+    """Read only a fixed effective SSH context; callers cannot supply `-C` data."""
+    if username is not None and username not in {PILOT_USERNAME, MANAGEMENT_USERNAME, "codexops"}:
+        raise LifecycleValidationError(
+            "HOST_SSH_POLICY_TARGET_REJECTED",
+            "SSH policy checks are limited to fixed managed and management identities",
+        )
+    arguments = ["-T"]
+    if username is not None:
+        arguments.extend(
+            [
+                "-C",
+                f"user={username},host={SSH_REPRESENTATIVE_HOST},"
+                f"addr={SSH_REPRESENTATIVE_CLIENT_IP},laddr={MANAGEMENT_IP},lport=22",
+            ]
+        )
+    result = run_fixed("sshd", arguments, timeout=10)
+    if not result.get("ok"):
+        raise LifecycleValidationError(
+            "HOST_SSH_POLICY_PREFLIGHT_FAILED",
+            "sshd effective configuration could not be evaluated",
+        )
+    return _parse_sshd_effective_config(str(result.get("stdout", "")))
+
+
+def managed_host_ssh_policy(username: str) -> dict[str, Any]:
+    if username != PILOT_USERNAME:
+        raise LifecycleValidationError(
+            "HOST_SSH_POLICY_TARGET_REJECTED",
+            "Activate SSH policy is bound to the managed compute identity",
+        )
+    effective = _sshd_effective_config(username)
+    methods_raw = effective["authenticationmethods"]
+    policy = {
+        "pubkey_authentication": effective["pubkeyauthentication"] == "yes",
+        "password_authentication": effective["passwordauthentication"] == "yes",
+        "keyboard_interactive_authentication": effective["kbdinteractiveauthentication"] == "yes",
+        "authentication_methods": [item for item in re.split(r"[\s,]+", methods_raw) if item],
+        "authentication_methods_raw": methods_raw,
+        "status": "PASSING",
+        "source": "SSHD_EFFECTIVE_CONFIG",
+        "representative_host": SSH_REPRESENTATIVE_HOST,
+        "representative_client_address": SSH_REPRESENTATIVE_CLIENT_IP,
+        "local_address": MANAGEMENT_IP,
+        "local_port": 22,
+    }
+    if not (
+        policy["pubkey_authentication"] is True
+        and policy["password_authentication"] is False
+        and policy["keyboard_interactive_authentication"] is False
+        and methods_raw == "publickey"
+    ):
+        raise LifecycleValidationError(
+            "HOST_SSH_POLICY_PREFLIGHT_FAILED",
+            "managed compute SSH is not public-key-only",
+        )
+    return policy
+
+
+def validate_ssh_policy_no_regression(
+    username: str, before: dict[str, str], after: dict[str, str]
+) -> None:
+    if username not in {MANAGEMENT_USERNAME, "codexops"}:
+        raise LifecycleValidationError(
+            "HOST_SSH_POLICY_TARGET_REJECTED",
+            "no-regression comparison is limited to management identities",
+        )
+    changed = [
+        field
+        for field in SSH_MANAGEMENT_NO_REGRESSION_FIELDS
+        if before.get(field) != after.get(field)
+    ]
+    if changed:
+        raise LifecycleValidationError(
+            "HOST_SSH_POLICY_MANAGEMENT_REGRESSION",
+            f"{username} effective SSH policy changed",
+        )
+
+
+def ssh_policy_status() -> dict[str, Any]:
+    try:
+        global_effective = _sshd_effective_config(None)
+        managed = managed_host_ssh_policy(PILOT_USERNAME)
+        origin_al = _sshd_effective_config(MANAGEMENT_USERNAME)
+        codexops = _sshd_effective_config("codexops")
+    except LifecycleValidationError as exc:
+        return {
+            "status": "PARTIAL",
+            "managed_compute_user_policy": {
+                "status": "BLOCKED",
+                "error_code": exc.code,
+            },
+        }
+    return {
+        "status": "OK",
+        "global_ssh_policy": {
+            "password_authentication": global_effective["passwordauthentication"] == "yes",
+            "pubkey_authentication": global_effective["pubkeyauthentication"] == "yes",
+            "keyboard_interactive_authentication": global_effective["kbdinteractiveauthentication"]
+            == "yes",
+            "authentication_methods": global_effective["authenticationmethods"],
+        },
+        "managed_compute_user_policy": managed,
+        "management_identities": {
+            MANAGEMENT_USERNAME: {
+                field: origin_al[field] for field in SSH_MANAGEMENT_NO_REGRESSION_FIELDS
+            },
+            "codexops": {field: codexops[field] for field in SSH_MANAGEMENT_NO_REGRESSION_FIELDS},
+        },
+    }
 
 
 def _ssh_key_fingerprint(public_key_line: str) -> str:
@@ -3552,6 +3706,7 @@ def _user_activate_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
             "approved SSH key record belongs to another managed identity",
         )
     stage_summary = _stage_postcondition_summary(APPROVED_STAGE_PAYLOAD)
+    host_ssh_policy = managed_host_ssh_policy(stage_summary["username"])
     host_records, container_records = _activation_target_records(key_records)
     host_plan = [
         {
@@ -3589,6 +3744,7 @@ def _user_activate_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
         "shell_current": stage_summary["shell"],
         "password_current": stage_summary["password"],
         "gpu_isolation": "PASS",
+        "host_ssh_policy": host_ssh_policy,
         "guard": stage_summary["guard"],
         "quota": stage_summary["quota"],
         "slurm": stage_summary["slurm"],
@@ -3715,6 +3871,8 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
             return images_list()
         if request.operation_type == "gpu_isolation.status.read":
             return gpu_isolation_status()
+        if request.operation_type == "ssh.policy.read":
+            return ssh_policy_status()
     except Exception as exc:
         return {
             "status": "UNKNOWN",

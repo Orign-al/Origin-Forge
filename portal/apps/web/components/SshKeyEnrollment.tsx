@@ -146,6 +146,12 @@ export function SshKeyEnrollment({
   const effectiveManagedUserId =
     managedUserId ?? keysQuery.data?.enrollment.managed_user_id;
   const plan = localActivatePlan ?? activateDryRun;
+  const hostSshPolicy =
+    plan?.host_ssh_policy &&
+    typeof plan.host_ssh_policy === "object" &&
+    !Array.isArray(plan.host_ssh_policy)
+      ? (plan.host_ssh_policy as Record<string, unknown>)
+      : null;
 
   function resetFlow(nextMode: EnrollmentMode) {
     setMode(nextMode);
@@ -699,6 +705,44 @@ export function SshKeyEnrollment({
             <div className="kv">
               <dt>当前 Shell</dt>
               <dd>{String(plan.shell_current ?? "/usr/sbin/nologin")}</dd>
+            </div>
+            <div className="kv">
+              <dt>宿主 SSH 策略</dt>
+              <dd>{String(hostSshPolicy?.status ?? "UNKNOWN")}</dd>
+            </div>
+            <div className="kv">
+              <dt>Public Key Authentication</dt>
+              <dd>
+                {hostSshPolicy?.pubkey_authentication === true
+                  ? "ENABLED"
+                  : "DISABLED"}
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>Password Authentication</dt>
+              <dd>
+                {hostSshPolicy?.password_authentication === false
+                  ? "DISABLED"
+                  : "ENABLED"}
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>Keyboard Interactive</dt>
+              <dd>
+                {hostSshPolicy?.keyboard_interactive_authentication === false
+                  ? "DISABLED"
+                  : "ENABLED"}
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>Required Authentication</dt>
+              <dd>
+                {Array.isArray(hostSshPolicy?.authentication_methods)
+                  ? hostSshPolicy.authentication_methods
+                      .map((item) => String(item).toUpperCase())
+                      .join(", ")
+                  : "UNKNOWN"}
+              </dd>
             </div>
           </dl>
         </section>

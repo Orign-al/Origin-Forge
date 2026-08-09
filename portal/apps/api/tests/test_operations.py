@@ -16,9 +16,11 @@ from h100_portal_api.operations import can_transition, can_transition_onboarding
 from h100_portal_api.routes import operations as operations_route
 from h100_portal_api.routes.operations import (
     PORTAL3C_STAGE_IDEMPOTENCY_KEY,
+    OperationPayloadError,
     is_portal3c_real_stage,
     persist_portal3c_staged_identity,
     validate_activate_database_bindings,
+    validate_activate_worker_result,
     validate_operation_payload,
 )
 from sqlalchemy import select
@@ -118,6 +120,40 @@ def test_activate_payload_requires_approved_record_ids_and_rejects_paths() -> No
     assert validate_operation_payload("user.activate", valid)["expected_state"] == "STAGED"
     with pytest.raises(ValueError, match="ARBITRARY_PATH_REJECTED"):
         validate_operation_payload("user.activate", {**valid, "public_key_path": "/etc/passwd"})
+
+
+def test_activate_worker_result_requires_structured_host_ssh_policy() -> None:
+    result = {
+        "approved_ssh_keys": [],
+        "host_authorized_keys_install": "PLANNED",
+        "container_authorized_keys_install": "PLANNED",
+        "host_authorized_keys_plan": [],
+        "container_authorized_keys_plan": [],
+        "activate_cli_contract": "TARGET_SCOPED_ROOT_CONTROLLED_BUNDLES",
+        "execution_enabled": False,
+        "host_ssh_policy": {
+            "pubkey_authentication": True,
+            "password_authentication": False,
+            "keyboard_interactive_authentication": False,
+            "authentication_methods": ["publickey"],
+            "status": "PASSING",
+        },
+    }
+    validate_activate_worker_result([], result)
+
+    missing_policy = {key: value for key, value in result.items() if key != "host_ssh_policy"}
+    with pytest.raises(OperationPayloadError, match="ACTIVATE_DRY_RUN_INCOMPLETE"):
+        validate_activate_worker_result([], missing_policy)
+
+    password_enabled = {
+        **result,
+        "host_ssh_policy": {
+            **result["host_ssh_policy"],
+            "password_authentication": True,
+        },
+    }
+    with pytest.raises(OperationPayloadError, match="ACTIVATE_DRY_RUN_INCOMPLETE"):
+        validate_activate_worker_result([], password_enabled)
 
 
 def test_activate_ids_are_bound_to_the_owners_staged_identity(database: Session) -> None:

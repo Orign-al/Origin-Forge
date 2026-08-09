@@ -248,6 +248,22 @@ const overview = {
     onboarding_states: {},
   },
   tasks: { status: "OK", pending_approval: 0, failed: 0, total: 0 },
+  ssh_policy: {
+    status: "OK",
+    global_ssh_policy: {
+      pubkey_authentication: true,
+      password_authentication: true,
+      keyboard_interactive_authentication: false,
+      authentication_methods: "any",
+    },
+    managed_compute_user_policy: {
+      status: "PASSING",
+      pubkey_authentication: true,
+      password_authentication: false,
+      keyboard_interactive_authentication: false,
+      authentication_methods: ["publickey"],
+    },
+  },
 };
 
 async function json(
@@ -718,6 +734,12 @@ test("系统页显示管理员接受的内部 HTTP 状态", async ({ page }) => 
     page.getByText("NOT ENABLED — NOT REQUIRED FOR CURRENT PILOT SCOPE"),
   ).toBeVisible();
   await expect(page.getByText(/HTTPS/)).toHaveCount(0);
+  await expect(page.getByText("Global SSH Policy", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("Managed Compute User Policy", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("PUBLIC KEY ONLY")).toBeVisible();
+  await expect(page.getByText("Global Password Authentication")).toBeVisible();
 });
 
 test("Slurm 页面明确显示 DRAIN 和禁止 RESUME", async ({ page }) => {

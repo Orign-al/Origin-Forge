@@ -22,6 +22,7 @@ KNOWN_READS = {
     "registry.status.read",
     "images.list",
     "gpu_isolation.status.read",
+    "ssh.policy.read",
 }
 KNOWN_WRITES = {
     "user.plan",

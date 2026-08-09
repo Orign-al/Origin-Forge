@@ -33,9 +33,12 @@ from h100_portal_api.routes.operations import (
     APPROVED_ORIGIN_PILOT_STAGE,
     PORTAL3C_STAGE_APPROVAL_REFERENCE,
     PORTAL3C_STAGE_IDEMPOTENCY_KEY,
+    OperationPayloadError,
     enrich_user_plan_with_portal_state,
     execute_operation,
     transition,
+    validate_activate_database_bindings,
+    validate_activate_worker_result,
     validate_operation_payload,
 )
 from h100_portal_api.security import digest_secret, normalize_login, random_token, safe_metadata
@@ -49,6 +52,9 @@ ROLE_DESCRIPTIONS = {
     "user": "普通用户",
 }
 PORTAL3C_APPROVAL_TEXT = "允许使用修订并重新验收通过的两阶段流程 Stage 独立计算用户 origin-pilot"
+PORTAL3ER_APPROVAL_REFERENCE = "portal3e-r-host-ssh-policy-v1"
+PORTAL3ER_KEY_RECORD_ID = uuid.UUID("7427da72-37b9-4ac2-8ada-2f0c83b7718e")
+PORTAL3ER_KEY_FINGERPRINT = "SHA256:nek6vyEb3GT+UJAcY5y/8PgY4achF2ouNy+8C2JqUVc"
 
 
 def ensure_roles(db: Session) -> None:
@@ -650,6 +656,138 @@ def stage_origin_pilot(approval_text: str) -> int:
         return 2
 
 
+def revalidate_origin_pilot_activate() -> int:
+    """Create a fresh, non-executable Activate dry-run after SSH policy remediation."""
+    with SessionLocal() as db:
+        owner = db.scalar(select(PortalUser).where(PortalUser.normalized_login == "origin-al"))
+        if (
+            owner is None
+            or owner.account_state != AccountState.ACTIVE
+            or owner.unix_username != "origin-al"
+            or not any(role.name == "platform_owner" for role in owner.roles)
+        ):
+            print(
+                "PORTAL-3E-R DRY-RUN BLOCKED — Origin-al owner binding is invalid",
+                file=sys.stderr,
+            )
+            return 2
+        managed = db.scalar(
+            select(PortalManagedUser).where(PortalManagedUser.portal_user_id == owner.id)
+        )
+        if (
+            managed is None
+            or managed.unix_username != "origin-pilot"
+            or managed.onboarding_state != OnboardingState.STAGED
+            or managed.shell != "/usr/sbin/nologin"
+        ):
+            print("PORTAL-3E-R DRY-RUN BLOCKED — origin-pilot is not STAGED", file=sys.stderr)
+            return 2
+        payload = {
+            "managed_user_id": str(managed.id),
+            "approved_ssh_key_record_ids": [str(PORTAL3ER_KEY_RECORD_ID)],
+            "expected_state": "STAGED",
+            "approval_reference": PORTAL3ER_APPROVAL_REFERENCE,
+        }
+        try:
+            records = validate_activate_database_bindings(
+                db, owner_id=owner.id, target_id="origin-pilot", payload=payload
+            )
+        except OperationPayloadError as exc:
+            print(f"PORTAL-3E-R DRY-RUN BLOCKED — {exc.code}", file=sys.stderr)
+            return 2
+        if (
+            len(records) != 1
+            or records[0].id != PORTAL3ER_KEY_RECORD_ID
+            or records[0].fingerprint_sha256 != PORTAL3ER_KEY_FINGERPRINT
+            or records[0].key_type != "ssh-ed25519"
+            or records[0].scope != "BOTH"
+        ):
+            print("PORTAL-3E-R DRY-RUN BLOCKED — approved SSH key changed", file=sys.stderr)
+            return 2
+        idempotency_key = f"portal3e-r-activate:{uuid.uuid4()}"
+        try:
+            result = call_worker(
+                "user.activate",
+                payload=payload,
+                requested_by="origin-al",
+                approved_by=None,
+                idempotency_key=idempotency_key,
+                dry_run=True,
+                timeout_seconds=45,
+            )
+            if result.get("status") != "DRY_RUN" or result.get("activate_status") != "READY":
+                error = result.get("error", {})
+                code = (
+                    error.get("code", "ACTIVATE_DRY_RUN_BLOCKED")
+                    if isinstance(error, dict)
+                    else "ACTIVATE_DRY_RUN_BLOCKED"
+                )
+                print(f"PORTAL-3E-R DRY-RUN BLOCKED — {code}", file=sys.stderr)
+                return 2
+            validate_activate_worker_result(records, result)
+        except (WorkerClientError, OperationPayloadError) as exc:
+            print(
+                f"PORTAL-3E-R DRY-RUN BLOCKED — {getattr(exc, 'code', 'WORKER_FAILED')}",
+                file=sys.stderr,
+            )
+            return 2
+        operation = PortalOperation(
+            operation_type="user.activate",
+            target_type="compute_identity",
+            target_id="origin-pilot",
+            requested_by=owner.id,
+            request_summary=(
+                "Portal-3E-R host SSH public-key-only policy revalidated Activate dry-run"
+            ),
+            validated_payload=payload,
+            idempotency_key=idempotency_key,
+            risk_level=RiskLevel.CRITICAL,
+            status=OperationStatus.DRAFT,
+            dry_run_result=cast(dict[str, Any], safe_metadata(result)),
+            result_summary=(
+                "Activate dry-run READY；host SSH public-key-only policy PASSING；"
+                "execution_enabled=false"
+            ),
+            created_at=utcnow(),
+        )
+        db.add(operation)
+        db.flush()
+        db.add(
+            PortalOperationEvent(
+                operation_id=operation.id,
+                from_status=None,
+                to_status=OperationStatus.DRAFT,
+                safe_message="Portal-3E-R fresh Activate dry-run created; execution disabled",
+                created_at=utcnow(),
+            )
+        )
+        record_audit(
+            db,
+            event_type="user.activate.dry_run_revalidated",
+            actor="origin-al",
+            actor_role="platform_owner",
+            source_ip="local-console",
+            user_agent="h100-portal-admin",
+            object_type="operation",
+            object_id=str(operation.id),
+            result="DRY_RUN",
+            metadata={
+                "target": "origin-pilot",
+                "host_ssh_policy": "PUBLIC_KEY_ONLY",
+                "execution_enabled": False,
+                "key_fingerprint": PORTAL3ER_KEY_FINGERPRINT,
+            },
+            operation_id=operation.id,
+        )
+        db.commit()
+        print(f"operation_id={operation.id}")
+        print("operation_status=DRAFT")
+        print("activate_status=READY")
+        print("host_ssh_policy=PUBLIC_KEY_ONLY")
+        print("execution_enabled=false")
+        return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="H100 Portal administrator bootstrap")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -662,6 +800,7 @@ def main() -> int:
     subparsers.add_parser("draft-origin-pilot-stage")
     stage = subparsers.add_parser("stage-origin-pilot")
     stage.add_argument("--approval-text", required=True)
+    subparsers.add_parser("revalidate-origin-pilot-activate")
     args = parser.parse_args()
     if args.command == "prepare-origin-al":
         return prepare_origin_al()
@@ -675,6 +814,8 @@ def main() -> int:
         return draft_origin_pilot_stage()
     if args.command == "stage-origin-pilot":
         return stage_origin_pilot(args.approval_text)
+    if args.command == "revalidate-origin-pilot-activate":
+        return revalidate_origin_pilot_activate()
     return 2
 
 

@@ -194,6 +194,10 @@ Host h100-${String(linux.unix_username)}-dev
               <dt>GPU</dt>
               <dd>仅在 Slurm Job 内可用</dd>
             </div>
+            <div className="kv">
+              <dt>认证方式</dt>
+              <dd>SSH 公钥</dd>
+            </div>
             <div className="kv access-key-row">
               <dt>SSH User Public Key</dt>
               <dd className="mono ssh-fingerprint-value access-key-fingerprint">
@@ -257,6 +261,10 @@ Host h100-${String(linux.unix_username)}-dev
               <dd>
                 <StatusBadge value={containerState} />
               </dd>
+            </div>
+            <div className="kv">
+              <dt>认证方式</dt>
+              <dd>SSH 公钥</dd>
             </div>
             <div className="kv access-key-row">
               <dt>SSH User Public Key</dt>

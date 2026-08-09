@@ -176,6 +176,13 @@ function activatePlan(keys: MockKey[]) {
     shell_current: "/usr/sbin/nologin",
     password_current: "LOCKED",
     gpu_isolation: "PASS",
+    host_ssh_policy: {
+      status: "PASSING",
+      pubkey_authentication: true,
+      password_authentication: false,
+      keyboard_interactive_authentication: false,
+      authentication_methods: ["publickey"],
+    },
     guard: { timer: "ENABLED_ACTIVE", status: "PASSING" },
     quota: { project_id: 30001, hard_limit_gb: 300 },
     slurm: {

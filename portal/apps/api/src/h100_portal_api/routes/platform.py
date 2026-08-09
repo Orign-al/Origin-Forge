@@ -45,6 +45,7 @@ def overview(
         "alerts": adapter("monitoring.alerts.read", context),
         "monitoring": adapter("monitoring.summary.read", context),
         "gpu_health": adapter("gpu.health.read", context),
+        "ssh_policy": adapter("ssh.policy.read", context),
     }
     portal_states: dict[str, int] = {
         str(state): count

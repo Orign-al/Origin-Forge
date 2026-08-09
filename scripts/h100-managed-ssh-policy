@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly SOURCE=/srv/gpu-platform/platform/config/ssh/70-h100-managed-compute-users.conf
+readonly TARGET=/etc/ssh/sshd_config.d/70-h100-managed-compute-users.conf
+readonly EXPECTED_SHA256=0a6b3037bd059f36b43a6a27e9c554af5378f42c283a30a863b359369e7ba6ed
+readonly SSHD=/usr/sbin/sshd
+readonly REPRESENTATIVE_HOST=sagsh100server
+readonly REPRESENTATIVE_CLIENT=10.20.18.10
+readonly LOCAL_ADDRESS=10.82.36.1
+readonly POLICY_FIELDS='^(pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|authenticationmethods|permitrootlogin|authorizedkeysfile) '
+
+temp_dir=
+created_target=0
+
+cleanup() {
+  if [[ -n "${temp_dir}" && "${temp_dir}" == /tmp/h100-managed-ssh-policy.* ]]; then
+    rm -f -- "${temp_dir}"/* 2>/dev/null || true
+    rmdir -- "${temp_dir}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+fail() {
+  printf 'HOST SSH POLICY CHANGE BLOCKED — %s\n' "$1" >&2
+  exit 1
+}
+
+require_root() {
+  [[ "$(id -u)" -eq 0 ]] || fail 'ROOT REQUIRED'
+}
+
+effective() {
+  local username=$1
+  case "${username}" in
+    origin-pilot|origin-al|codexops) ;;
+    *) fail 'UNKNOWN MANAGED USER' ;;
+  esac
+  "${SSHD}" -T -C \
+    "user=${username},host=${REPRESENTATIVE_HOST},addr=${REPRESENTATIVE_CLIENT},laddr=${LOCAL_ADDRESS},lport=22" \
+    | grep -E "${POLICY_FIELDS}" \
+    | LC_ALL=C sort
+}
+
+validate_source() {
+  [[ -f "${SOURCE}" && ! -L "${SOURCE}" ]] || fail 'POLICY SOURCE INVALID'
+  [[ "$(sha256sum "${SOURCE}" | awk '{print $1}')" == "${EXPECTED_SHA256}" ]] \
+    || fail 'POLICY SOURCE HASH MISMATCH'
+}
+
+validate_target_file() {
+  [[ -f "${TARGET}" && ! -L "${TARGET}" ]] || fail 'POLICY FILE INVALID'
+  [[ "$(stat -c '%U:%G:%a:%h:%F' "${TARGET}")" == 'root:root:644:1:regular file' ]] \
+    || fail 'POLICY FILE METADATA INVALID'
+  [[ "$(sha256sum "${TARGET}" | awk '{print $1}')" == "${EXPECTED_SHA256}" ]] \
+    || fail 'POLICY FILE HASH MISMATCH'
+}
+
+validate_pilot_effective() {
+  local observed
+  observed="$(effective origin-pilot)" || return 1
+  grep -Fxq 'pubkeyauthentication yes' <<<"${observed}" \
+    || return 1
+  grep -Fxq 'passwordauthentication no' <<<"${observed}" \
+    || return 1
+  grep -Fxq 'kbdinteractiveauthentication no' <<<"${observed}" \
+    || return 1
+  grep -Fxq 'authenticationmethods publickey' <<<"${observed}" \
+    || return 1
+}
+
+rollback_unreloaded_change() {
+  if ((created_target == 1)); then
+    rm -f -- "${TARGET}"
+    created_target=0
+  fi
+  "${SSHD}" -t || fail 'ROLLBACK CONFIG VALIDATION FAILED'
+}
+
+apply_policy() {
+  validate_source
+  "${SSHD}" -t || fail 'EXISTING SSHD CONFIG INVALID'
+  temp_dir="$(mktemp -d /tmp/h100-managed-ssh-policy.XXXXXX)"
+  effective origin-al >"${temp_dir}/origin-al.before"
+  effective codexops >"${temp_dir}/codexops.before"
+  if [[ -e "${TARGET}" || -L "${TARGET}" ]]; then
+    validate_target_file
+  else
+    local temporary
+    temporary="$(mktemp /etc/ssh/sshd_config.d/.70-h100-managed-compute-users.XXXXXX)"
+    install -o root -g root -m 0644 "${SOURCE}" "${temporary}"
+    [[ "$(sha256sum "${temporary}" | awk '{print $1}')" == "${EXPECTED_SHA256}" ]] \
+      || { rm -f -- "${temporary}"; fail 'ATOMIC POLICY HASH MISMATCH'; }
+    mv -fT -- "${temporary}" "${TARGET}"
+    sync -f "${TARGET}"
+    sync -f /etc/ssh/sshd_config.d
+    created_target=1
+  fi
+  if ! "${SSHD}" -t; then
+    rollback_unreloaded_change
+    fail 'SSHD CONFIG VALIDATION FAILED'
+  fi
+  if ! validate_pilot_effective; then
+    rollback_unreloaded_change
+    fail 'ORIGIN-PILOT EFFECTIVE POLICY FAILED'
+  fi
+  effective origin-al >"${temp_dir}/origin-al.after"
+  effective codexops >"${temp_dir}/codexops.after"
+  if ! cmp -s "${temp_dir}/origin-al.before" "${temp_dir}/origin-al.after"; then
+    rollback_unreloaded_change
+    fail 'ORIGIN-AL SSH REGRESSION'
+  fi
+  if ! cmp -s "${temp_dir}/codexops.before" "${temp_dir}/codexops.after"; then
+    rollback_unreloaded_change
+    fail 'CODEXOPS SSH REGRESSION'
+  fi
+  validate_target_file
+  printf 'MANAGED COMPUTE SSH POLICY INSTALLED — RELOAD NOT PERFORMED\n'
+}
+
+verify_policy() {
+  validate_target_file
+  "${SSHD}" -t || fail 'SSHD CONFIG VALIDATION FAILED'
+  validate_pilot_effective || fail 'ORIGIN-PILOT EFFECTIVE POLICY FAILED'
+  printf 'MANAGED COMPUTE SSH POLICY VERIFIED\n'
+}
+
+remove_policy() {
+  validate_target_file
+  temp_dir="$(mktemp -d /tmp/h100-managed-ssh-policy.XXXXXX)"
+  install -o root -g root -m 0600 "${TARGET}" "${temp_dir}/policy.before"
+  rm -f -- "${TARGET}"
+  if ! "${SSHD}" -t; then
+    install -o root -g root -m 0644 "${temp_dir}/policy.before" "${TARGET}"
+    sync -f "${TARGET}"
+    sync -f /etc/ssh/sshd_config.d
+    "${SSHD}" -t || fail 'ROLLBACK RESTORE CONFIG VALIDATION FAILED'
+    fail 'ROLLBACK CONFIG VALIDATION FAILED — POLICY RESTORED'
+  fi
+  printf 'MANAGED COMPUTE SSH POLICY REMOVED — RELOAD NOT PERFORMED\n'
+}
+
+require_root
+case "${1:-}" in
+  apply) apply_policy ;;
+  verify) verify_policy ;;
+  remove) remove_policy ;;
+  *) printf 'Usage: sudo h100-managed-ssh-policy {apply|verify|remove}\n' >&2; exit 2 ;;
+esac

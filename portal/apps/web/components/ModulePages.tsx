@@ -964,6 +964,9 @@ export function SystemModule() {
   const node =
     rowsAt((query.data as Row | undefined)?.platform, "nodes")[0] ??
     ((query.data as Row | undefined)?.platform as Row | undefined)?.node;
+  const sshPolicy = (query.data as Row | undefined)?.ssh_policy as Row | undefined;
+  const globalSshPolicy = sshPolicy?.global_ssh_policy as Row | undefined;
+  const managedSshPolicy = sshPolicy?.managed_compute_user_policy as Row | undefined;
   return (
     <ModuleFrame
       title="系统"
@@ -1023,6 +1026,64 @@ export function SystemModule() {
           <div className="notice" style={{ marginTop: 8 }}>
             PCI DOE：P1 observation；NFS / 第二节点未部署
           </div>
+        </SectionCard>
+        <SectionCard title="Global SSH Policy">
+          <dl className="kv-grid">
+            <div className="kv">
+              <dt>Public Key Authentication</dt>
+              <dd>
+                {globalSshPolicy?.pubkey_authentication === true
+                  ? "ENABLED"
+                  : "DISABLED"}
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>Global Password Authentication</dt>
+              <dd>
+                {globalSshPolicy?.password_authentication === true
+                  ? "ENABLED"
+                  : "DISABLED"}
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>Authentication Methods</dt>
+              <dd>{scalar(globalSshPolicy?.authentication_methods)}</dd>
+            </div>
+          </dl>
+        </SectionCard>
+        <SectionCard title="Managed Compute User Policy">
+          <dl className="kv-grid">
+            <div className="kv">
+              <dt>状态</dt>
+              <dd>
+                <StatusBadge value={scalar(managedSshPolicy?.status, "UNKNOWN")} />
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>Managed Compute Users</dt>
+              <dd>PUBLIC KEY ONLY</dd>
+            </div>
+            <div className="kv">
+              <dt>Password Authentication</dt>
+              <dd>
+                {managedSshPolicy?.password_authentication === false
+                  ? "DISABLED"
+                  : "ENABLED"}
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>Keyboard Interactive</dt>
+              <dd>
+                {managedSshPolicy?.keyboard_interactive_authentication === false
+                  ? "DISABLED"
+                  : "ENABLED"}
+              </dd>
+            </div>
+            <div className="kv">
+              <dt>Required Authentication</dt>
+              <dd>PUBLICKEY</dd>
+            </div>
+          </dl>
         </SectionCard>
       </div>
       <SectionCard title="数据源状态">

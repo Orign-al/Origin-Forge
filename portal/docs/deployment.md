@@ -116,6 +116,20 @@ SSH public-key staging 必须在启用自助登记前存在：
 `deploy/worker-scripts.json` 必须保存同一精确值。不得使用通配 hash、跳过校验或先启动
 Worker 再补 allowlist；Worker 重启后必须先证明两个脚本的 `integrity_ok=true`。
 
+### Managed compute user SSH policy
+
+受管 policy source 是仓库根目录的
+`config/ssh/70-h100-managed-compute-users.conf`，部署/验证入口是
+`scripts/h100-managed-ssh-policy`。脚本只管理固定 source、固定 target、固定 SHA-256 和固定
+`sshd -T -C` 上下文；`apply` 在完成 `sshd -t`、origin-pilot effective policy 和
+origin-al/codexops no-regression 检查后仍不会自行 reload。管理员复核证据后，才对实际
+OpenSSH unit 执行 reload，保持原管理连接并建立第二条管理连接。
+
+部署前必须备份主配置与所有实际 drop-in，保留 owner/mode/mtime/hash。若语法、effective
+policy、管理账号 diff、reload、服务状态或第二连接任一失败，保持原连接，恢复备份，重新
+执行 `sshd -t` 与 reload。禁止 stop/restart sshd，也禁止把 PasswordAuthentication 的
+变更扩大到全局用户。策略验收本身不安装 authorized_keys、不修改 shell、不启动容器。
+
 ## 验收
 
 ```bash

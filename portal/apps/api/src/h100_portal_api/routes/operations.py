@@ -205,6 +205,7 @@ def validate_activate_worker_result(
         for record in records
         if record.scope in {"CONTAINER", "BOTH"}
     ]
+    host_ssh_policy = worker_result.get("host_ssh_policy")
     if (
         worker_result.get("host_authorized_keys_install") != "PLANNED"
         or worker_result.get("container_authorized_keys_install") != "PLANNED"
@@ -212,6 +213,12 @@ def validate_activate_worker_result(
         or worker_result.get("container_authorized_keys_plan") != expected_container_plan
         or worker_result.get("activate_cli_contract") != "TARGET_SCOPED_ROOT_CONTROLLED_BUNDLES"
         or worker_result.get("execution_enabled") is not False
+        or not isinstance(host_ssh_policy, dict)
+        or host_ssh_policy.get("pubkey_authentication") is not True
+        or host_ssh_policy.get("password_authentication") is not False
+        or host_ssh_policy.get("keyboard_interactive_authentication") is not False
+        or host_ssh_policy.get("authentication_methods") != ["publickey"]
+        or host_ssh_policy.get("status") != "PASSING"
     ):
         raise OperationPayloadError(
             "ACTIVATE_DRY_RUN_INCOMPLETE", "Worker Activate plan is incomplete"

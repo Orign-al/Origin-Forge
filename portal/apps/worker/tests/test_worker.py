@@ -187,6 +187,136 @@ def staged_result() -> dict[str, object]:
     }
 
 
+def effective_ssh_config(**overrides: str) -> dict[str, str]:
+    config = {
+        "pubkeyauthentication": "yes",
+        "passwordauthentication": "no",
+        "kbdinteractiveauthentication": "no",
+        "authenticationmethods": "publickey",
+        "permitrootlogin": "prohibit-password",
+        "authorizedkeysfile": ".ssh/authorized_keys .ssh/authorized_keys2",
+        "usepam": "yes",
+        "allowtcpforwarding": "yes",
+        "x11forwarding": "yes",
+    }
+    config.update(overrides)
+    return config
+
+
+def passing_host_ssh_policy() -> dict[str, object]:
+    return {
+        "pubkey_authentication": True,
+        "password_authentication": False,
+        "keyboard_interactive_authentication": False,
+        "authentication_methods": ["publickey"],
+        "authentication_methods_raw": "publickey",
+        "status": "PASSING",
+        "source": "SSHD_EFFECTIVE_CONFIG",
+    }
+
+
+def test_managed_host_ssh_policy_requires_complete_public_key_only_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        handlers,
+        "_sshd_effective_config",
+        lambda username: effective_ssh_config(),
+    )
+
+    policy = handlers.managed_host_ssh_policy("origin-pilot")
+
+    assert policy["pubkey_authentication"] is True
+    assert policy["password_authentication"] is False
+    assert policy["keyboard_interactive_authentication"] is False
+    assert policy["authentication_methods"] == ["publickey"]
+    assert policy["status"] == "PASSING"
+
+
+@pytest.mark.parametrize(
+    ("override", "value"),
+    [
+        ("passwordauthentication", "yes"),
+        ("pubkeyauthentication", "no"),
+        ("kbdinteractiveauthentication", "yes"),
+        ("authenticationmethods", "any"),
+    ],
+)
+def test_managed_host_ssh_policy_fails_closed_on_unsafe_effective_value(
+    monkeypatch: pytest.MonkeyPatch, override: str, value: str
+) -> None:
+    monkeypatch.setattr(
+        handlers,
+        "_sshd_effective_config",
+        lambda username: effective_ssh_config(**{override: value}),
+    )
+
+    with pytest.raises(
+        handlers.LifecycleValidationError,
+        match="HOST_SSH_POLICY_PREFLIGHT_FAILED",
+    ):
+        handlers.managed_host_ssh_policy("origin-pilot")
+
+
+def test_sshd_effective_config_command_failure_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        handlers,
+        "run_fixed",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "exit_code": 255,
+            "stdout": "",
+            "stderr": "not logged by this test",
+        },
+    )
+
+    with pytest.raises(
+        handlers.LifecycleValidationError,
+        match="HOST_SSH_POLICY_PREFLIGHT_FAILED",
+    ):
+        handlers._sshd_effective_config("origin-pilot")
+
+
+def test_sshd_effective_config_rejects_unknown_user_and_context_injection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        handlers,
+        "run_fixed",
+        lambda *_args, **_kwargs: pytest.fail("rejected identity must not reach sshd"),
+    )
+
+    for username in ("unknown-user", "origin-pilot,addr=203.0.113.9"):
+        with pytest.raises(
+            handlers.LifecycleValidationError,
+            match="HOST_SSH_POLICY_TARGET_REJECTED",
+        ):
+            handlers._sshd_effective_config(username)
+
+
+@pytest.mark.parametrize("username", ["origin-al", "codexops"])
+def test_management_ssh_policy_regression_is_rejected(username: str) -> None:
+    before = effective_ssh_config()
+    handlers.validate_ssh_policy_no_regression(username, before, dict(before))
+    after = {**before, "passwordauthentication": "yes"}
+
+    with pytest.raises(
+        handlers.LifecycleValidationError,
+        match="HOST_SSH_POLICY_MANAGEMENT_REGRESSION",
+    ):
+        handlers.validate_ssh_policy_no_regression(username, before, after)
+
+
+def test_malformed_sshd_effective_output_is_rejected() -> None:
+    with pytest.raises(
+        handlers.LifecycleValidationError,
+        match="HOST_SSH_POLICY_PREFLIGHT_FAILED",
+    ):
+        handlers._parse_sshd_effective_config("passwordauthentication no\n")
+
+
 def test_only_exact_approved_real_stage_executes(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr(
         handlers,
@@ -848,6 +978,11 @@ def test_activate_dry_run_binds_managed_user_scope_and_staged_state(
         lambda: {name: {"integrity_ok": True} for name in handlers.STAGE_REQUIRED_SCRIPTS},
     )
     monkeypatch.setattr(handlers, "_stage_postcondition_summary", lambda _payload: staged_result())
+    monkeypatch.setattr(
+        handlers,
+        "managed_host_ssh_policy",
+        lambda username: passing_host_ssh_policy(),
+    )
     activate = {
         "managed_user_id": payload["managed_user_id"],
         "approved_ssh_key_record_ids": [payload["record_id"]],
@@ -871,6 +1006,7 @@ def test_activate_dry_run_binds_managed_user_scope_and_staged_state(
     assert result["container_authorized_keys_install"] == "PLANNED"
     assert result["host_authorized_keys_current"] == "ABSENT"
     assert result["container_authorized_keys_current"] == "ABSENT"
+    assert result["host_ssh_policy"] == passing_host_ssh_policy()
     assert wrong_owner["error"]["code"] == "PUBLIC_KEY_RECORD_OWNER_MISMATCH"
 
 
@@ -887,6 +1023,11 @@ def test_activate_dry_run_rejects_incomplete_scope(
         lambda: {name: {"integrity_ok": True} for name in handlers.STAGE_REQUIRED_SCRIPTS},
     )
     monkeypatch.setattr(handlers, "_stage_postcondition_summary", lambda _payload: staged_result())
+    monkeypatch.setattr(
+        handlers,
+        "managed_host_ssh_policy",
+        lambda username: passing_host_ssh_policy(),
+    )
     result = handle(
         request(
             "user.activate",
@@ -923,6 +1064,11 @@ def test_activate_dry_run_reports_exact_target_scope_mapping(
         lambda: {name: {"integrity_ok": True} for name in handlers.STAGE_REQUIRED_SCRIPTS},
     )
     monkeypatch.setattr(handlers, "_stage_postcondition_summary", lambda _payload: staged_result())
+    monkeypatch.setattr(
+        handlers,
+        "managed_host_ssh_policy",
+        lambda username: passing_host_ssh_policy(),
+    )
 
     result = handle(
         request(
