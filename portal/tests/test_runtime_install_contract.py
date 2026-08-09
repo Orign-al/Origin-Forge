@@ -25,6 +25,9 @@ def test_portal3f_acceptance_tool_is_integrity_bound_and_installed() -> None:
     assert "read -r qos_name qos_max_tres qos_extra" in acceptance_text
     assert "${QOS}|${QOS}|" not in acceptance_text
     assert "${QOS}|gres/gpu=1|" not in acceptance_text
+    assert '--unit="${cpu_launcher_unit}"' in acceptance_text
+    assert '--unit="${gpu_launcher_unit}"' in acceptance_text
+    assert "/usr/sbin/runuser --user" not in acceptance_text
     assert (
         hashlib.sha256(gpu_probe_source.read_bytes()).hexdigest()
         == "120fc85413226ba4c106e5e1a291882900a20ec40f31bebea21643f152fcf4d1"

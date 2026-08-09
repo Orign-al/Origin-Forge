@@ -56,6 +56,8 @@ readonly scratch_dir="/srv/gpu-platform/scratch/.portal3f-${request_id}"
 readonly gpu_probe="${scratch_dir}/gpu-device-context-probe"
 readonly cpu_job_name="portal3f-cpu-${request_id:0:8}"
 readonly gpu_job_name="portal3f-gpu-${request_id:0:8}"
+readonly cpu_launcher_unit="h100-portal3f-cpu-${request_id:0:8}"
+readonly gpu_launcher_unit="h100-portal3f-gpu-${request_id:0:8}"
 
 success=0
 active_launcher_pid=
@@ -105,6 +107,8 @@ cleanup() {
     ensure_drain
     scancel --user="${PILOT_USER}" --name="${cpu_job_name}" >/dev/null 2>&1 || true
     scancel --user="${PILOT_USER}" --name="${gpu_job_name}" >/dev/null 2>&1 || true
+    systemctl stop "${cpu_launcher_unit}.service" "${gpu_launcher_unit}.service" \
+        >/dev/null 2>&1 || true
     if [[ ${active_launcher_pid} =~ ^[0-9]+$ ]]; then
         kill "${active_launcher_pid}" >/dev/null 2>&1 || true
         wait "${active_launcher_pid}" >/dev/null 2>&1 || true
@@ -305,8 +309,13 @@ done
 [[ -z $(squeue -h) ]]
 sinfo -Nel >"${log_dir}/sinfo-after-resume.txt"
 
-/usr/sbin/runuser --user "${PILOT_USER}" -- \
-    srun --partition="${PARTITION}" --account="${ACCOUNT}" --qos="${QOS}" \
+systemd-run --system --wait --pipe --collect --quiet \
+    --unit="${cpu_launcher_unit}" \
+    --uid="${PILOT_USER}" \
+    --property=Type=exec \
+    --property=NoNewPrivileges=yes \
+    --property=TimeoutStartSec=240 \
+    /usr/bin/srun --partition="${PARTITION}" --account="${ACCOUNT}" --qos="${QOS}" \
     --job-name="${cpu_job_name}" --nodes=1 --ntasks=1 --cpus-per-task=1 \
     --mem=1G --time=00:03:00 \
     "${ACCEPTANCE_SCRIPT}" --cpu-probe \
@@ -328,8 +337,13 @@ grep -Fq '/system.slice/slurmstepd.scope/job_' "${log_dir}/cpu-stdout.txt"
 wait_for_accounting cpu "${cpu_job_id}"
 [[ -z $(squeue -h -j "${cpu_job_id}") ]]
 
-/usr/sbin/runuser --user "${PILOT_USER}" -- \
-    srun --partition="${PARTITION}" --account="${ACCOUNT}" --qos="${QOS}" \
+systemd-run --system --wait --pipe --collect --quiet \
+    --unit="${gpu_launcher_unit}" \
+    --uid="${PILOT_USER}" \
+    --property=Type=exec \
+    --property=NoNewPrivileges=yes \
+    --property=TimeoutStartSec=600 \
+    /usr/bin/srun --partition="${PARTITION}" --account="${ACCOUNT}" --qos="${QOS}" \
     --job-name="${gpu_job_name}" --nodes=1 --ntasks=1 --cpus-per-task=2 \
     --mem=4G --gres=gpu:h100:1 --time=00:08:00 --mpi=none \
     --container-image="${IMAGE_REF}" --no-container-mount-home \

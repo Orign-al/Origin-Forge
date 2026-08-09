@@ -99,9 +99,9 @@ PORTAL3F_APPROVAL_TEXT = (
 )
 PORTAL3F_APPROVAL_REFERENCE = "portal3f-origin-pilot-first-acceptance-v1"
 PORTAL3F_CLIENT_VALIDATION_IDEMPOTENCY_KEY = "portal3f-origin-pilot-client-validation-v1"
-# v1-v3 remain immutable ROLLED_BACK audit records. v4 binds the retry after
-# correcting fixed-field parsing of the installed Slurm association and QOS.
-PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY = "portal3f-origin-pilot-acceptance-v4"
+# v1-v4 remain immutable ROLLED_BACK audit records. v5 uses a fixed transient
+# systemd launcher so the hardened Worker never relaxes NoNewPrivileges.
+PORTAL3F_PILOT_ACCEPTANCE_IDEMPOTENCY_KEY = "portal3f-origin-pilot-acceptance-v5"
 PORTAL3F_IMAGE_REF = (
     "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
     "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
