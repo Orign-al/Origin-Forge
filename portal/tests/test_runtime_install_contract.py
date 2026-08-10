@@ -54,3 +54,5 @@ def test_portal3f_worker_can_write_only_the_guard_metrics_directory() -> None:
 
     assert "ProtectSystem=strict" in unit
     assert "ReadWritePaths=/var/lib/node_exporter/textfile_collector" in unit
+    ambient = [line for line in unit.splitlines() if line.startswith("AmbientCapabilities=")]
+    assert ambient == ["AmbientCapabilities=CAP_SETUID"]

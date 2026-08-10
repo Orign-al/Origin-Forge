@@ -13,6 +13,9 @@ ExecStart=/opt/h100-portal/venv/bin/h100-portal-worker
 Restart=on-failure
 RestartSec=3s
 NoNewPrivileges=yes
+# The fixed submit path needs CAP_SETUID only until setpriv enters the managed UID.
+# setpriv clears all child capability sets before it executes sbatch.
+AmbientCapabilities=CAP_SETUID
 PrivateTmp=yes
 ProtectSystem=strict
 # Stage must create the approved nologin home. ProtectSystem=strict plus the
