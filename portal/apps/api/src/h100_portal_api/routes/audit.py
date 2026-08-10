@@ -12,7 +12,7 @@ from h100_portal_api.auth import (
     user_agent,
 )
 from h100_portal_api.database import get_db
-from h100_portal_api.dependencies import permission_dependency
+from h100_portal_api.dependencies import auth_context, permission_dependency
 from h100_portal_api.models import PortalAuditEvent
 from h100_portal_api.rbac import highest_role
 from h100_portal_api.schemas import PageAccessRequest
@@ -24,7 +24,7 @@ router = APIRouter(prefix="/audit", tags=["audit"])
 def page_access(
     body: PageAccessRequest,
     request: Request,
-    context: AuthContext = Depends(permission_dependency("platform.read")),
+    context: AuthContext = Depends(auth_context),
     db: Session = Depends(get_db),
 ) -> None:
     require_session_csrf(request, context)

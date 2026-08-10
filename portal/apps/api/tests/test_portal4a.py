@@ -254,6 +254,45 @@ def _job(db: Session, identity: SimpleNamespace, name: str) -> PortalJob:
     return job
 
 
+def test_ordinary_user_can_record_own_page_access_without_platform_read(
+    client, database: Session, origin_headers: dict[str, str]
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(database)
+    headers = _login(client, origin_headers, identity.user.normalized_login)
+
+    response = client.post(
+        "/api/v1/audit/page-access",
+        headers=headers,
+        json={"path": "/terminal"},
+    )
+
+    assert response.status_code == 204
+    event = database.scalar(
+        select(PortalAuditEvent).where(
+            PortalAuditEvent.event_type == "page.access",
+            PortalAuditEvent.actor == identity.user.normalized_login,
+        )
+    )
+    assert event is not None
+    assert event.object_id == "/terminal"
+
+
+def test_page_access_still_requires_session_csrf(
+    client, database: Session, origin_headers: dict[str, str]
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(database)
+    _login(client, origin_headers, identity.user.normalized_login)
+
+    response = client.post(
+        "/api/v1/audit/page-access",
+        headers=origin_headers,
+        json={"path": "/terminal"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "CSRF_REJECTED"
+
+
 def test_lease_duration_is_enforced_by_domain_and_database(database: Session) -> None:
     identity = _identity(database)
     with pytest.raises(ValueError, match="345600"):
