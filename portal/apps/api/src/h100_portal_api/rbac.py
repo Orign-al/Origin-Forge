@@ -85,6 +85,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "self.container.start",
         "self.container.stop",
         "self.container.restart",
+        "self.container.terminal",
         "self.ssh_keys.read",
         "self.ssh_keys.write",
         "self.storage.read",

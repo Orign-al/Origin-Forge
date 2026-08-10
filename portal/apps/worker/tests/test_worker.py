@@ -1,9 +1,12 @@
+import base64
 import hashlib
 import json
 import os
+import queue
 import socket
 import struct
 import subprocess
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from h100_portal_worker import handlers, server
+from h100_portal_worker import terminal as worker_terminal
 from h100_portal_worker.handlers import handle, run_fixed
 from h100_portal_worker.protocol import ProtocolError, decode_frame, encode_frame
 from h100_portal_worker.schemas import WorkerRequest, validate_payload
@@ -2159,6 +2163,23 @@ def portal4a_job_payload() -> dict[str, object]:
     }
 
 
+def portal4a_terminal_payload() -> dict[str, object]:
+    return {
+        "managed_user_id": "3b95b4f0-95d9-444a-8f0b-46288195a807",
+        "username": "origin-pilot",
+        "uid": 20001,
+        "gid": 20001,
+        "name": "gpu-dev-origin-pilot",
+        "lease_id": str(uuid.uuid4()),
+        "lease_expires_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+        "expected_gpu": "NONE",
+        "host_access": "DISABLED_BY_PLATFORM_POLICY",
+        "expected_key_fingerprints": [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+        "cols": 120,
+        "rows": 32,
+    }
+
+
 def test_portal4a_worker_schema_fixes_job_outputs_and_gpu_limit() -> None:
     payload = portal4a_job_payload()
     validated = validate_payload("self.job.submit", payload)
@@ -2170,6 +2191,190 @@ def test_portal4a_worker_schema_fixes_job_outputs_and_gpu_limit() -> None:
         )
     with pytest.raises(ValueError, match="GPU"):
         validate_payload("self.job.submit", {**payload, "gpu_count": 2})
+
+
+def test_web_terminal_schema_binds_owned_container_without_command_fields() -> None:
+    payload = portal4a_terminal_payload()
+    validated = validate_payload("self.container.terminal", payload)
+    request_id = "00000000-0000-4000-8000-000000000099"
+    marker = "h100-portal-terminal-00000000-0000-4000-8000-000000000099"
+    assert validated["name"] == "gpu-dev-origin-pilot"
+    assert validated["uid"] == validated["gid"] == 20001
+    assert validated["expected_gpu"] == "NONE"
+    assert validated["host_access"] == "DISABLED_BY_PLATFORM_POLICY"
+    assert worker_terminal._terminal_marker(request_id) == marker
+    assert worker_terminal._terminal_argv(validated, marker) == [
+        "/usr/bin/docker",
+        "exec",
+        "--detach-keys=ctrl-]",
+        "--interactive",
+        "--tty",
+        "--user",
+        "20001:20001",
+        "--workdir",
+        "/workspace",
+        "--env",
+        "HOME=/home/origin-pilot",
+        "--env",
+        "USER=origin-pilot",
+        "--env",
+        "LOGNAME=origin-pilot",
+        "--env",
+        "TERM=xterm-256color",
+        "gpu-dev-origin-pilot",
+        "/bin/bash",
+        "-c",
+        'exec -a "$1" /bin/bash --login',
+        "h100-portal-terminal-wrapper",
+        marker,
+    ]
+    for changed in (
+        {"name": "gpu-dev-other-user"},
+        {"uid": 0},
+        {"expected_gpu": "ALL"},
+        {"host_access": "ENABLED"},
+        {"command": "id"},
+        {"cols": 500},
+    ):
+        with pytest.raises(ValueError):
+            validate_payload("self.container.terminal", {**payload, **changed})
+    with pytest.raises(ValueError, match="reserved detach control"):
+        worker_terminal._decode_input(
+            {
+                "type": "input",
+                "data_b64": base64.b64encode(b"safe\x1dunsafe").decode("ascii"),
+            }
+        )
+
+
+def test_web_terminal_process_discovery_matches_only_fixed_markers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "h100-portal-terminal-00000000-0000-4000-8000-000000000099"
+    top = SimpleNamespace(
+        returncode=0,
+        stdout="\n".join(
+            [
+                "PID PPID USER COMMAND",
+                "100 10 origin-pilot " + marker + " --login",
+                "101 10 origin-pilot user-process --login",
+                "102 10 root /usr/sbin/sshd -D",
+            ]
+        ),
+    )
+    monkeypatch.setattr(worker_terminal.subprocess, "run", lambda *_args, **_kwargs: top)
+    assert worker_terminal._marked_host_processes(marker) == [(100, marker)]
+    assert worker_terminal._marked_host_processes() == [(100, marker)]
+
+
+def test_web_terminal_preflight_requires_nologin_and_absent_host_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = validate_payload("self.container.terminal", portal4a_terminal_payload())
+    host_home = tmp_path / "host-home"
+    host_home.mkdir()
+    monkeypatch.setattr(
+        worker_terminal,
+        "_portal4a_account",
+        lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin", pw_dir=str(host_home)),
+    )
+    monkeypatch.setattr(
+        worker_terminal,
+        "_portal4a_container_security",
+        lambda *_args, **_kwargs: {"state": {"Running": True, "Health": {"Status": "healthy"}}},
+    )
+    monkeypatch.setattr(
+        worker_terminal,
+        "_installed_key_fingerprints",
+        lambda *_args: [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+    )
+    monkeypatch.setattr(worker_terminal, "PILOT_DATA_ROOT", tmp_path / "users")
+    worker_terminal._terminal_preflight(payload)
+
+    host_keys = host_home / ".ssh/authorized_keys"
+    host_keys.parent.mkdir()
+    host_keys.write_text("ssh-ed25519 forbidden-host-key\n", encoding="utf-8")
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        worker_terminal._terminal_preflight(payload)
+    assert rejected.value.code == "HOST_ACCESS_POLICY_REJECTED"
+
+
+def test_web_terminal_retries_partial_pty_input_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pieces: list[bytes] = []
+
+    def partial_write(_descriptor: int, data: bytes) -> int:
+        count = min(2, len(data))
+        pieces.append(data[:count])
+        return count
+
+    monkeypatch.setattr(worker_terminal.os, "write", partial_write)
+    worker_terminal._write_input(17, b"abcdef")
+    assert b"".join(pieces) == b"abcdef"
+
+
+def test_web_terminal_input_reader_can_stop_with_a_full_queue() -> None:
+    worker_socket, client_socket = socket.socketpair()
+    incoming: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
+    incoming.put({"type": "already-full"})
+    stopped = threading.Event()
+    reader = threading.Thread(
+        target=worker_terminal._input_reader,
+        args=(worker_socket, incoming, stopped),
+        daemon=True,
+    )
+    reader.start()
+    client_socket.sendall(encode_frame({"type": "resize", "cols": 120, "rows": 32}))
+    stopped.set()
+    reader.join(timeout=1)
+    client_socket.close()
+    worker_socket.close()
+    assert not reader.is_alive()
+
+
+def test_worker_routes_terminal_to_stream_handler_without_general_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("H100_PORTAL_WORKER_TESTING", "1")
+    payload = portal4a_terminal_payload()
+    envelope = {
+        "protocol_version": 1,
+        "request_id": str(uuid.uuid4()),
+        "operation_type": "self.container.terminal",
+        "payload": payload,
+        "requested_by": "origin-pilot",
+        "approved_by": "origin-pilot",
+        "idempotency_key": (
+            f"self-container-terminal:3b95b4f0-95d9-444a-8f0b-46288195a807:{uuid.uuid4()}"
+        ),
+        "dry_run": False,
+    }
+    called: list[str] = []
+
+    def stream(connection: socket.socket, worker_request: WorkerRequest) -> None:
+        called.append(worker_request.operation_type)
+        connection.sendall(
+            encode_frame(
+                {
+                    "status": "READY",
+                    "type": "ready",
+                    "request_id": worker_request.request_id,
+                }
+            )
+        )
+
+    monkeypatch.setattr(server, "serve_terminal_connection", stream)
+    worker_socket, client_socket = socket.socketpair()
+    encoded = json.dumps(envelope).encode()
+    try:
+        client_socket.sendall(struct.pack("!I", len(encoded)) + encoded)
+        server.process_connection(worker_socket)
+        response = decode_frame(client_socket.recv(64 * 1024))
+    finally:
+        client_socket.close()
+    assert response["status"] == "READY"
+    assert called == ["self.container.terminal"]
 
 
 def test_portal4a_worker_rejects_spoofed_self_actor_and_container_actor() -> None:

@@ -181,9 +181,14 @@ export function OrdinaryDashboard() {
       <div className="section-grid">
         <SectionCard title="开始开发" subtitle="进入自己的长期开发容器">
           <p>在开发容器中编写代码、编译和准备数据。容器不直接分配GPU。</p>
-          <Link className="ui-button ui-button-primary" href="/access">
-            查看容器连接
-          </Link>
+          <div className="button-row">
+            <Link className="ui-button ui-button-primary" href="/terminal">
+              打开网页终端
+            </Link>
+            <Link className="ui-button" href="/access">
+              查看SSH连接
+            </Link>
+          </div>
         </SectionCard>
         <SectionCard title="提交计算任务" subtitle="CPU 或最多1张GPU">
           <p>选择工作区中的脚本，通过Portal提交到Slurm。</p>
@@ -343,8 +348,14 @@ export function OrdinaryContainer() {
           </div>
         </dl>
         <div className="button-row access-actions">
+          <Link
+            className={`ui-button ui-button-primary ${container.state !== "RUNNING" ? "link-disabled" : ""}`}
+            href={container.state === "RUNNING" ? "/terminal" : "#"}
+            aria-disabled={container.state !== "RUNNING"}
+          >
+            网页终端
+          </Link>
           <Button
-            tone="primary"
             disabled={container.state === "RUNNING" || mutation.isPending}
             onClick={() => mutation.mutate("start")}
           >

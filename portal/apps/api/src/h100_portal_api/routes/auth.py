@@ -48,6 +48,7 @@ from h100_portal_api.security import (
     verify_password,
 )
 from h100_portal_api.ssh_keys import ssh_enrollment_status
+from h100_portal_api.terminal_service import terminal_registry
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -157,6 +158,7 @@ def login(
         )
         if old_session:
             revoke_session(db, old_session)
+            terminal_registry.close_for_portal_session(old_session.id)
     new_session, session_raw, csrf_raw = create_session(db, user, request)
     record_audit(
         db,
@@ -286,6 +288,7 @@ def setup_password(
     user.account_state = AccountState.ACTIVE
     user.activated_at = user.activated_at or now
     revoke_user_sessions(db, user.id)
+    terminal_registry.close_for_user(user.id)
     new_session, session_raw, csrf_raw = create_session(db, user, request)
     record_audit(
         db,
@@ -354,6 +357,7 @@ def logout(
 ) -> None:
     require_session_csrf(request, context)
     revoke_session(db, context.session)
+    terminal_registry.close_for_portal_session(context.session.id)
     record_audit(
         db,
         event_type="logout",
@@ -435,6 +439,7 @@ def change_password(
     # fresh session in the same transaction. Keeping the old current session
     # alive would not be session rotation.
     revoke_user_sessions(db, context.user.id)
+    terminal_registry.close_for_user(context.user.id)
     new_session, session_raw, csrf_raw = create_session(db, context.user, request)
     new_session.reauthenticated_at = utcnow()
     record_audit(
@@ -487,6 +492,7 @@ def revoke_other_session(
         clear_session_cookies(response)
     else:
         revoke_session(db, target)
+    terminal_registry.close_for_portal_session(target.id)
     record_audit(
         db,
         event_type="session.revoke",
@@ -508,6 +514,7 @@ def revoke_other_sessions(
 ) -> dict[str, int]:
     require_session_csrf(request, context)
     revoked = revoke_user_sessions(db, context.user.id, except_id=context.session.id)
+    terminal_registry.close_for_user(context.user.id, except_session_id=context.session.id)
     record_audit(
         db,
         event_type="session.revoke_others",

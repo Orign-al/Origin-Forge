@@ -182,6 +182,21 @@ class SelfContainerActionRequest(ApiModel):
     idempotency_key: uuid.UUID
 
 
+class SelfTerminalCreateRequest(ApiModel):
+    idempotency_key: uuid.UUID
+    cols: int = Field(default=120, ge=20, le=300)
+    rows: int = Field(default=32, ge=5, le=120)
+
+
+class SelfTerminalInputRequest(ApiModel):
+    data: str = Field(min_length=1, max_length=8192)
+
+
+class SelfTerminalResizeRequest(ApiModel):
+    cols: int = Field(ge=20, le=300)
+    rows: int = Field(ge=5, le=120)
+
+
 class SelfJobSubmitRequest(ApiModel):
     name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
     script_path: str = Field(min_length=1, max_length=255)

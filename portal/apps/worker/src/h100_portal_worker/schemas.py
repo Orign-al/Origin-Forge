@@ -56,6 +56,7 @@ KNOWN_WRITES = {
     "resource.restore",
     "host_access.revoke_managed_user",
 }
+KNOWN_STREAMS = {"self.container.terminal"}
 SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,127}$")
 SAFE_USERNAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 SAFE_APPROVAL_REFERENCE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
@@ -175,7 +176,7 @@ class WorkerRequest(BaseModel):
     @field_validator("operation_type")
     @classmethod
     def known_operation(cls, value: str) -> str:
-        if value not in KNOWN_READS | KNOWN_WRITES:
+        if value not in KNOWN_READS | KNOWN_WRITES | KNOWN_STREAMS:
             raise ValueError("unknown operation type")
         return value
 
@@ -637,6 +638,57 @@ def _validate_container_lifecycle(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _validate_container_terminal(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "managed_user_id",
+        "username",
+        "uid",
+        "gid",
+        "name",
+        "lease_id",
+        "lease_expires_at",
+        "expected_gpu",
+        "host_access",
+        "expected_key_fingerprints",
+        "cols",
+        "rows",
+    }
+    if set(payload) != fields or set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+        raise PayloadValidationError(
+            "TERMINAL_TARGET_REJECTED", "terminal target fields are invalid"
+        )
+    result = _portal4a_identity(payload)
+    if (
+        payload.get("name") != "gpu-dev-origin-pilot"
+        or payload.get("expected_gpu") != "NONE"
+        or payload.get("host_access") != "DISABLED_BY_PLATFORM_POLICY"
+    ):
+        raise PayloadValidationError(
+            "TERMINAL_TARGET_REJECTED", "terminal target is not the owned development container"
+        )
+    cols = payload.get("cols")
+    rows = payload.get("rows")
+    if not isinstance(cols, int) or not 20 <= cols <= 300:
+        raise PayloadValidationError("TERMINAL_SIZE_REJECTED", "terminal columns are invalid")
+    if not isinstance(rows, int) or not 5 <= rows <= 120:
+        raise PayloadValidationError("TERMINAL_SIZE_REJECTED", "terminal rows are invalid")
+    result.update(
+        {
+            "name": "gpu-dev-origin-pilot",
+            "lease_id": _canonical_uuid(payload.get("lease_id"), "lease ID"),
+            "lease_expires_at": _future_timestamp(payload.get("lease_expires_at"), "lease expiry"),
+            "expected_gpu": "NONE",
+            "host_access": "DISABLED_BY_PLATFORM_POLICY",
+            "expected_key_fingerprints": _validated_key_fingerprints(
+                payload.get("expected_key_fingerprints")
+            ),
+            "cols": cols,
+            "rows": rows,
+        }
+    )
+    return result
+
+
 def _validated_key_fingerprints(value: object) -> list[str]:
     if (
         not isinstance(value, list)
@@ -794,6 +846,8 @@ def validate_payload(
                 "STORAGE_TARGET_REJECTED", "storage target fields are invalid"
             )
         return _portal4a_identity(payload)
+    if operation_type == "self.container.terminal":
+        return _validate_container_terminal(payload)
     if (
         operation_type in {"container.start", "container.stop", "container.restart"}
         and "uid" in payload

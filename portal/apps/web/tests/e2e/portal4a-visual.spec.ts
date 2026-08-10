@@ -489,6 +489,13 @@ for (const viewport of [
     await expect(page.getByText(/Docker Socket|Privileged/u)).toHaveCount(0);
     await capture(page, viewport.label, "10-development-container");
 
+    await page.goto("/terminal");
+    await expect(page.getByRole("heading", { name: "网页终端" })).toBeVisible();
+    await expect(page.getByText("容器 Shell，不是宿主 Shell")).toBeVisible();
+    await expect(page.getByRole("button", { name: "打开终端" })).toBeEnabled();
+    await expect(page.getByText(/宿主访问均不可用/u)).toBeVisible();
+    await capture(page, viewport.label, "10b-web-terminal");
+
     await page.goto("/storage");
     await expect(page.getByText("300.0 GB", { exact: true })).toBeVisible();
     await capture(page, viewport.label, "11-storage");

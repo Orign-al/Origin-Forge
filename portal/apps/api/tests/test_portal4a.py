@@ -1,3 +1,5 @@
+import base64
+import json
 import uuid
 from datetime import timedelta
 from types import SimpleNamespace
@@ -21,6 +23,7 @@ from h100_portal_api.lease_service import (
     request_renewal,
 )
 from h100_portal_api.models import (
+    PortalAuditEvent,
     PortalComputeLease,
     PortalContainer,
     PortalJob,
@@ -38,6 +41,7 @@ from h100_portal_api.models import (
     utcnow,
 )
 from h100_portal_api.security import hash_password
+from h100_portal_api.terminal_service import TerminalServiceError
 from h100_portal_api.worker_client import WorkerClientError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -627,6 +631,171 @@ def test_job_and_container_operations_enforce_active_lease_gpu_and_time(
     )
     assert expired_job.status_code == 409
     assert expired_job.json()["detail"]["code"] == "LEASE_INACTIVE"
+
+
+def test_web_terminal_is_owner_scoped_lease_gated_and_does_not_audit_input(
+    client,
+    database: Session,
+    origin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    first = _identity(database)
+    _identity(
+        database,
+        login="fixture-user-b",
+        username="fixture-user-b",
+        uid=20002,
+        port=22024,
+    )
+    headers = _login(client, origin_headers, "origin-pilot")
+
+    class FakeWorker:
+        def __init__(self) -> None:
+            self.ready = {
+                "request_id": str(uuid.uuid4()),
+                "idle_timeout_seconds": 900,
+                "max_duration_seconds": 3600,
+            }
+            self.state = "RUNNING"
+            self.reason = None
+            self.exit_code = None
+            self.inputs: list[bytes] = []
+            self.sizes: list[tuple[int, int]] = []
+
+        def output(self, cursor: int) -> dict[str, object]:
+            assert cursor == 0
+            return {
+                "data_b64": base64.b64encode(b"container-output").decode(),
+                "cursor": len(b"container-output"),
+                "state": self.state,
+                "reason": self.reason,
+                "exit_code": self.exit_code,
+            }
+
+        def send_input(self, data: bytes) -> None:
+            self.inputs.append(data)
+
+        def resize(self, cols: int, rows: int) -> None:
+            self.sizes.append((cols, rows))
+
+        def request_close(self) -> None:
+            self.state = "CLOSING"
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.record = None
+            self.open_payload = None
+
+        def open(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.open_payload = kwargs["payload"]
+            worker = FakeWorker()
+            self.record = SimpleNamespace(
+                id=uuid.uuid4(),
+                owner_managed_user_id=kwargs["owner_managed_user_id"],
+                portal_session_id=kwargs["portal_session_id"],
+                operation_id=kwargs["operation_id"],
+                container_id=kwargs["container_id"],
+                expires_at=utcnow() + timedelta(hours=1),
+                worker=worker,
+            )
+            return self.record
+
+        def owned(self, terminal_id, *, owner_managed_user_id, portal_session_id):  # type: ignore[no-untyped-def]
+            if (
+                self.record is None
+                or terminal_id != self.record.id
+                or owner_managed_user_id != self.record.owner_managed_user_id
+                or portal_session_id != self.record.portal_session_id
+            ):
+                raise TerminalServiceError("TERMINAL_NOT_FOUND", "网页终端不存在")
+            return self.record
+
+    registry = FakeRegistry()
+    monkeypatch.setattr("h100_portal_api.routes.self_service.terminal_registry", registry)
+    opened = client.post(
+        "/api/v1/self/container/terminal/sessions",
+        headers=headers,
+        json={"idempotency_key": str(uuid.uuid4()), "cols": 100, "rows": 30},
+    )
+    assert opened.status_code == 200
+    terminal_id = opened.json()["terminal"]["id"]
+    assert registry.open_payload == {
+        "managed_user_id": str(first.managed.id),
+        "username": "origin-pilot",
+        "uid": 20001,
+        "gid": 20001,
+        "name": "gpu-dev-origin-pilot",
+        "lease_id": str(first.lease.id),
+        "lease_expires_at": ensure_utc(first.lease.expires_at).isoformat(),
+        "expected_gpu": "NONE",
+        "host_access": "DISABLED_BY_PLATFORM_POLICY",
+        "expected_key_fingerprints": [first.key.fingerprint_sha256],
+        "cols": 100,
+        "rows": 30,
+    }
+    output = client.get(f"/api/v1/self/container/terminal/sessions/{terminal_id}/output?cursor=0")
+    assert output.status_code == 200
+    assert base64.b64decode(output.json()["data_b64"]) == b"container-output"
+    sent = client.post(
+        f"/api/v1/self/container/terminal/sessions/{terminal_id}/input",
+        headers=headers,
+        json={"data": "pwd\r"},
+    )
+    resized = client.post(
+        f"/api/v1/self/container/terminal/sessions/{terminal_id}/resize",
+        headers=headers,
+        json={"cols": 132, "rows": 40},
+    )
+    assert sent.status_code == resized.status_code == 200
+    assert registry.record.worker.inputs == [b"pwd\r"]
+    assert registry.record.worker.sizes == [(132, 40)]
+    serialized_audit = json.dumps(
+        [event.safe_metadata for event in database.scalars(select(PortalAuditEvent)).all()]
+    )
+    assert "pwd" not in serialized_audit
+
+    client.cookies.clear()
+    _login(client, origin_headers, "fixture-user-b")
+    denied = client.get(f"/api/v1/self/container/terminal/sessions/{terminal_id}/output?cursor=0")
+    assert denied.status_code == 404
+    assert denied.json()["detail"]["code"] == "TERMINAL_NOT_FOUND"
+
+    client.cookies.clear()
+    headers = _login(client, origin_headers, "origin-pilot")
+    # A different Portal login session cannot attach to an existing terminal,
+    # even when it belongs to the same managed user.
+    rebound = client.get(f"/api/v1/self/container/terminal/sessions/{terminal_id}/output?cursor=0")
+    assert rebound.status_code == 404
+
+
+def test_web_terminal_refuses_host_access_regression_and_expired_lease(
+    client, database: Session, origin_headers: dict[str, str]
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(database)
+    headers = _login(client, origin_headers, "origin-pilot")
+    identity.managed.host_access_state = "ENABLED"
+    identity.managed.shell = "/bin/bash"
+    database.commit()
+    host_regression = client.post(
+        "/api/v1/self/container/terminal/sessions",
+        headers=headers,
+        json={"idempotency_key": str(uuid.uuid4()), "cols": 120, "rows": 32},
+    )
+    assert host_regression.status_code == 409
+    assert host_regression.json()["detail"]["code"] == "TERMINAL_SECURITY_GATE_FAILED"
+
+    identity.managed.host_access_state = "DISABLED_BY_PLATFORM_POLICY"
+    identity.managed.shell = "/usr/sbin/nologin"
+    identity.lease.state = "EXPIRED"
+    identity.lease.expired_at = utcnow()
+    database.commit()
+    expired = client.post(
+        "/api/v1/self/container/terminal/sessions",
+        headers=headers,
+        json={"idempotency_key": str(uuid.uuid4()), "cols": 120, "rows": 32},
+    )
+    assert expired.status_code == 409
+    assert expired.json()["detail"]["code"] == "LEASE_INACTIVE"
 
 
 def test_restore_request_is_idempotent_and_admin_restore_reactivates_all_resources(

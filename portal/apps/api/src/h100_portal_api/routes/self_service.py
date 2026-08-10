@@ -41,6 +41,14 @@ from h100_portal_api.schemas import (
     RestoreDecisionRequest,
     SelfContainerActionRequest,
     SelfJobSubmitRequest,
+    SelfTerminalCreateRequest,
+    SelfTerminalInputRequest,
+    SelfTerminalResizeRequest,
+)
+from h100_portal_api.terminal_service import (
+    TerminalRecord,
+    TerminalServiceError,
+    terminal_registry,
 )
 from h100_portal_api.worker_client import WorkerClientError, call_worker
 
@@ -443,6 +451,255 @@ def restart_self_container(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     return _container_action("restart", body, request, context, db)
+
+
+def _terminal_error(exc: TerminalServiceError) -> HTTPException:
+    status_code = 404 if exc.code == "TERMINAL_NOT_FOUND" else 409
+    if exc.code in {"TERMINAL_WORKER_UNAVAILABLE", "TERMINAL_WORKER_EOF"}:
+        status_code = 503
+    return _error(status_code, exc.code, str(exc))
+
+
+def _owned_terminal(
+    terminal_id: str,
+    context: AuthContext,
+    db: Session,
+    *,
+    require_active: bool,
+) -> tuple[Any, TerminalRecord]:
+    managed = managed_identity_for_user(db, context.user)
+    try:
+        parsed = uuid.UUID(terminal_id)
+    except ValueError as exc:
+        raise _error(404, "TERMINAL_NOT_FOUND", "网页终端不存在") from exc
+    try:
+        record = terminal_registry.owned(
+            parsed,
+            owner_managed_user_id=managed.id,
+            portal_session_id=context.session.id,
+        )
+    except TerminalServiceError as exc:
+        raise _terminal_error(exc) from exc
+    if require_active:
+        try:
+            entitlement(db, managed.id)
+        except HTTPException as exc:
+            record.worker.request_close()
+            raise _error(
+                409, "TERMINAL_DENIED_LEASE_INACTIVE", "租约失效时不能使用网页终端"
+            ) from exc
+        container = _container_for_owner(db, managed.id)
+        if (
+            managed.compute_environment_state != "ACTIVE"
+            or managed.host_access_state != "DISABLED_BY_PLATFORM_POLICY"
+            or managed.shell != "/usr/sbin/nologin"
+            or container.id != record.container_id
+            or container.observed_state != "RUNNING"
+        ):
+            record.worker.request_close()
+            raise _error(409, "TERMINAL_SECURITY_GATE_FAILED", "网页终端安全状态已改变")
+    return managed, record
+
+
+@router.post("/self/container/terminal/sessions")
+def create_self_terminal(
+    body: SelfTerminalCreateRequest,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("self.container.terminal")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_session_csrf(request, context)
+    managed = managed_identity_for_user(db, context.user, lock=True)
+    active_lease, terminal_lease = entitlement(db, managed.id, lock=True)
+    container = _container_for_owner(db, managed.id, lock=True)
+    if (
+        managed.compute_environment_state != "ACTIVE"
+        or managed.host_access_state != "DISABLED_BY_PLATFORM_POLICY"
+        or managed.shell != "/usr/sbin/nologin"
+        or container.observed_state != "RUNNING"
+    ):
+        raise _error(409, "TERMINAL_SECURITY_GATE_FAILED", "开发容器终端当前不可用")
+    keys = db.scalars(
+        select(PortalSshKey).where(
+            PortalSshKey.owner_managed_user_id == managed.id,
+            PortalSshKey.active.is_(True),
+            PortalSshKey.scope == "CONTAINER",
+            PortalSshKey.container_install_state == "INSTALLED",
+        )
+    ).all()
+    fingerprints = sorted(key.fingerprint_sha256 for key in keys)
+    if not fingerprints:
+        raise _error(409, "CONTAINER_KEY_BINDING_REJECTED", "开发容器公钥授权未安装")
+    key = f"self-container-terminal:{managed.id}:{body.idempotency_key}"
+    existing = db.scalar(
+        select(PortalOperation).where(
+            PortalOperation.requested_by == context.user.id,
+            PortalOperation.idempotency_key == key,
+        )
+    )
+    if existing is not None:
+        raise _error(409, "TERMINAL_IDEMPOTENCY_REPLAY", "此终端启动请求已经处理")
+    payload = {
+        "managed_user_id": str(managed.id),
+        "username": managed.unix_username,
+        "uid": managed.uid,
+        "gid": managed.gid,
+        "name": container.name,
+        "lease_id": str(active_lease.id),
+        "lease_expires_at": ensure_utc(terminal_lease.expires_at).isoformat(),
+        "expected_gpu": "NONE",
+        "host_access": "DISABLED_BY_PLATFORM_POLICY",
+        "expected_key_fingerprints": fingerprints,
+        "cols": body.cols,
+        "rows": body.rows,
+    }
+    operation = _new_operation(
+        db,
+        context,
+        owner_id=managed.id,
+        operation_type="self.container.terminal",
+        target_type="container",
+        target_id=container.name,
+        summary="用户打开自己开发容器的网页终端",
+        payload=payload,
+        idempotency_key=key,
+        risk_level=RiskLevel.MEDIUM,
+    )
+    db.commit()
+    try:
+        record = terminal_registry.open(
+            payload=payload,
+            owner_managed_user_id=managed.id,
+            portal_user_id=context.user.id,
+            portal_session_id=context.session.id,
+            operation_id=operation.id,
+            container_id=container.id,
+            container_name=container.name,
+            actor=context.user.normalized_login,
+            actor_role=highest_role(context.user),
+            source_ip=client_ip(request),
+            user_agent=user_agent(request),
+            idempotency_key=key,
+        )
+    except TerminalServiceError as exc:
+        operation.status = OperationStatus.FAILED
+        operation.finished_at = utcnow()
+        operation.error_code = exc.code[:64]
+        _audit(
+            db,
+            request,
+            context,
+            event_type="SELF_CONTAINER_TERMINAL_OPEN_DENIED",
+            object_type="container",
+            object_id=str(container.id),
+            result="DENIED",
+            metadata={"code": exc.code, "gpu": "NONE", "host_access": "DISABLED"},
+        )
+        db.commit()
+        raise _terminal_error(exc) from exc
+    operation.worker_execution_id = str(record.worker.ready.get("request_id", ""))[:64] or None
+    operation.result_summary = "Container web terminal opened; input is not logged"
+    _audit(
+        db,
+        request,
+        context,
+        event_type="SELF_CONTAINER_TERMINAL_OPENED",
+        object_type="container",
+        object_id=str(container.id),
+        metadata={
+            "terminal_session_id": str(record.id),
+            "container": container.name,
+            "uid": managed.uid,
+            "gid": managed.gid,
+            "gpu": "NONE",
+            "host_access": "DISABLED",
+            "transport": "AUTHENTICATED_HTTP_LONG_POLL",
+            "input_logged": False,
+        },
+    )
+    db.commit()
+    return {
+        "status": "RUNNING",
+        "terminal": {
+            "id": str(record.id),
+            "operation_id": str(operation.id),
+            "container": container.name,
+            "username": managed.unix_username,
+            "gpu": "NONE",
+            "host_access": "DISABLED",
+            "state": record.worker.state,
+            "expires_at": record.expires_at.isoformat(),
+            "idle_timeout_seconds": int(record.worker.ready.get("idle_timeout_seconds", 900)),
+            "max_duration_seconds": int(record.worker.ready.get("max_duration_seconds", 3600)),
+        },
+    }
+
+
+@router.get("/self/container/terminal/sessions/{terminal_id}/output")
+def self_terminal_output(
+    terminal_id: str,
+    cursor: int = 0,
+    context: AuthContext = Depends(permission_dependency("self.container.terminal")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    if cursor < 0 or cursor > 2**63 - 1:
+        raise _error(422, "TERMINAL_OUTPUT_CURSOR_REJECTED", "终端输出游标无效")
+    _managed, record = _owned_terminal(terminal_id, context, db, require_active=True)
+    try:
+        output = record.worker.output(cursor)
+    except TerminalServiceError as exc:
+        raise _terminal_error(exc) from exc
+    return {"status": "OK", "terminal_id": str(record.id), **output}
+
+
+@router.post("/self/container/terminal/sessions/{terminal_id}/input")
+def self_terminal_input(
+    terminal_id: str,
+    body: SelfTerminalInputRequest,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("self.container.terminal")),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    require_session_csrf(request, context)
+    _managed, record = _owned_terminal(terminal_id, context, db, require_active=True)
+    encoded = body.data.encode("utf-8")
+    if len(encoded) > 8 * 1024:
+        raise _error(422, "TERMINAL_INPUT_REJECTED", "终端输入长度无效")
+    try:
+        record.worker.send_input(encoded)
+    except TerminalServiceError as exc:
+        raise _terminal_error(exc) from exc
+    return {"status": "ACCEPTED"}
+
+
+@router.post("/self/container/terminal/sessions/{terminal_id}/resize")
+def self_terminal_resize(
+    terminal_id: str,
+    body: SelfTerminalResizeRequest,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("self.container.terminal")),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    require_session_csrf(request, context)
+    _managed, record = _owned_terminal(terminal_id, context, db, require_active=True)
+    try:
+        record.worker.resize(body.cols, body.rows)
+    except TerminalServiceError as exc:
+        raise _terminal_error(exc) from exc
+    return {"status": "ACCEPTED"}
+
+
+@router.delete("/self/container/terminal/sessions/{terminal_id}")
+def close_self_terminal(
+    terminal_id: str,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("self.container.terminal")),
+    db: Session = Depends(get_db),
+) -> dict[str, str]:
+    require_session_csrf(request, context)
+    _managed, record = _owned_terminal(terminal_id, context, db, require_active=False)
+    record.worker.request_close()
+    return {"status": "CLOSING"}
 
 
 def _job_view(job: PortalJob) -> dict[str, Any]:

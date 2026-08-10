@@ -1041,6 +1041,72 @@ button {
     monospace;
 }
 
+.terminal-security-band {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 16px;
+  border: 1px solid #c4d6ea;
+  border-radius: var(--radius);
+  background: var(--info-soft);
+  padding: 13px 15px;
+}
+.terminal-security-band strong {
+  display: block;
+  margin-bottom: 3px;
+  color: #244f77;
+}
+.web-terminal-frame {
+  position: relative;
+  width: 100%;
+  height: clamp(360px, 58vh, 650px);
+  overflow: hidden;
+  border: 1px solid #101820;
+  border-radius: 5px;
+  background: #17212b;
+  padding: 9px 7px 7px;
+}
+.web-terminal-output {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: auto;
+  color: #e8eef2;
+  white-space: pre;
+  tab-size: 8;
+  font:
+    13px/1.3 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    Consolas,
+    monospace;
+  user-select: text;
+}
+.terminal-input-capture {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  left: 8px;
+  bottom: 8px;
+  border: 0;
+  padding: 0;
+  opacity: 0;
+  resize: none;
+}
+.terminal-error {
+  margin-top: 12px;
+}
+.terminal-footnote {
+  margin-top: 11px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.link-disabled {
+  pointer-events: none;
+  opacity: 0.55;
+}
+
 @media (max-width: 1100px) {
   .grid-compact,
   .job-form-grid {
@@ -1088,6 +1154,13 @@ button {
   .page-heading {
     align-items: flex-start;
     flex-direction: column;
+  }
+  .terminal-security-band {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .web-terminal-frame {
+    height: 430px;
   }
 }
 .drawer-backdrop {

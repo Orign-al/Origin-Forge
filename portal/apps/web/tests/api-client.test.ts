@@ -1,7 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { apiFetch } from "@h100-portal/api-client";
-import { enrollSshKey, startManagedContainer } from "../lib/api";
+import {
+  closeSelfTerminal,
+  enrollSshKey,
+  resizeSelfTerminal,
+  sendSelfTerminalInput,
+  startManagedContainer,
+  startSelfTerminal,
+} from "../lib/api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -138,5 +145,72 @@ describe("API client", () => {
       expected_ssh_key_state: "INSTALLED",
     });
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("uses only self-scoped terminal session endpoints", async () => {
+    document.cookie = "h100_csrf=test-csrf-value; Path=/";
+    const requests: Array<{ url: string; method: string; body: unknown }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({
+          url: String(input),
+          method: String(init?.method ?? "GET"),
+          body: init?.body ? JSON.parse(String(init.body)) : null,
+        });
+        return new Response(
+          JSON.stringify({ status: "ACCEPTED", terminal: {} }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }),
+    );
+
+    await startSelfTerminal({
+      idempotency_key: "00000000-0000-4000-8000-000000000091",
+      cols: 120,
+      rows: 32,
+    });
+    await sendSelfTerminalInput(
+      "00000000-0000-4000-8000-000000000092",
+      "pwd\r",
+    );
+    await resizeSelfTerminal("00000000-0000-4000-8000-000000000092", 132, 40);
+    await closeSelfTerminal("00000000-0000-4000-8000-000000000092");
+
+    expect(requests).toEqual([
+      {
+        url: "/api/v1/self/container/terminal/sessions",
+        method: "POST",
+        body: {
+          idempotency_key: "00000000-0000-4000-8000-000000000091",
+          cols: 120,
+          rows: 32,
+        },
+      },
+      {
+        url: "/api/v1/self/container/terminal/sessions/00000000-0000-4000-8000-000000000092/input",
+        method: "POST",
+        body: { data: "pwd\r" },
+      },
+      {
+        url: "/api/v1/self/container/terminal/sessions/00000000-0000-4000-8000-000000000092/resize",
+        method: "POST",
+        body: { cols: 132, rows: 40 },
+      },
+      {
+        url: "/api/v1/self/container/terminal/sessions/00000000-0000-4000-8000-000000000092",
+        method: "DELETE",
+        body: null,
+      },
+    ]);
+    for (const request of requests) {
+      expect(request.url).not.toMatch(/containers\/[^/]+/u);
+      expect(request.body).not.toEqual(
+        expect.objectContaining({ command: expect.anything() }),
+      );
+    }
   });
 });

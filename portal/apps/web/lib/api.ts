@@ -209,6 +209,19 @@ export type SelfJob = {
   exit_code: string | null;
 };
 
+export type SelfTerminal = {
+  id: string;
+  operation_id: string;
+  container: string;
+  username: string;
+  gpu: "NONE";
+  host_access: "DISABLED";
+  state: string;
+  expires_at: string;
+  idle_timeout_seconds: number;
+  max_duration_seconds: number;
+};
+
 export const getCsrf = () => apiFetch<{ csrf_token: string }>("/auth/csrf");
 export const login = (payload: { username: string; password: string }) =>
   apiFetch<{ user: User; ssh_enrollment: SshEnrollment }>("/auth/login", {
@@ -382,6 +395,56 @@ export const selfContainerAction = (action: "start" | "stop" | "restart") =>
       method: "POST",
       body: JSON.stringify({ idempotency_key: crypto.randomUUID() }),
     },
+  );
+export const startSelfTerminal = (payload: {
+  idempotency_key: string;
+  cols: number;
+  rows: number;
+}) =>
+  apiFetch<{ status: string; terminal: SelfTerminal }>(
+    "/self/container/terminal/sessions",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+export const selfTerminalOutput = (
+  id: string,
+  cursor: number,
+  signal?: AbortSignal,
+) =>
+  apiFetch<{
+    status: string;
+    terminal_id: string;
+    data_b64: string;
+    cursor: number;
+    state: string;
+    reason: string | null;
+    exit_code: number | null;
+  }>(
+    `/self/container/terminal/sessions/${encodeURIComponent(id)}/output?cursor=${cursor}`,
+    { signal },
+  );
+export const sendSelfTerminalInput = (id: string, data: string) =>
+  apiFetch<{ status: string }>(
+    `/self/container/terminal/sessions/${encodeURIComponent(id)}/input`,
+    {
+      method: "POST",
+      body: JSON.stringify({ data }),
+    },
+  );
+export const resizeSelfTerminal = (id: string, cols: number, rows: number) =>
+  apiFetch<{ status: string }>(
+    `/self/container/terminal/sessions/${encodeURIComponent(id)}/resize`,
+    {
+      method: "POST",
+      body: JSON.stringify({ cols, rows }),
+    },
+  );
+export const closeSelfTerminal = (id: string) =>
+  apiFetch<{ status: string }>(
+    `/self/container/terminal/sessions/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
   );
 export const selfJobs = () =>
   apiFetch<{ status: string; jobs: SelfJob[]; count: number }>("/self/jobs");

@@ -20,6 +20,7 @@ const ROLE_LABELS: Record<string, string> = {
 const USER_NAVIGATION = [
   ["我的环境", "/"],
   ["连接", "/access"],
+  ["网页终端", "/terminal"],
   ["作业", "/jobs"],
   ["开发容器", "/containers"],
   ["存储", "/storage"],
