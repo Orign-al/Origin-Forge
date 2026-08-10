@@ -21,6 +21,7 @@ import urllib.request
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -5278,7 +5279,12 @@ def _portal4a_sbatch_argv(
     stderr: Path,
     staged_descriptor: int,
 ) -> list[str]:
-    deadline = str(payload["lease_deadline_at"]).replace("+00:00", "")
+    deadline = (
+        datetime.fromisoformat(str(payload["lease_deadline_at"]).replace("Z", "+00:00"))
+        .astimezone(UTC)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "")
+    )
     argv = [
         BINARIES["sbatch"],
         "--parsable",

@@ -2266,6 +2266,7 @@ def test_portal4a_gpu_job_mounts_only_owned_root_and_disables_host_home(
         "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
         "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
     )
+    payload["lease_deadline_at"] = "2026-08-14T05:24:55.083442+00:00"
     users_root = tmp_path / "users"
     monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", users_root)
     argv = handlers._portal4a_sbatch_argv(
@@ -2277,6 +2278,8 @@ def test_portal4a_gpu_job_mounts_only_owned_root_and_disables_host_home(
     )
     owned_root = users_root / "origin-pilot"
     assert "--gres=gpu:1" in argv
+    assert "--deadline=2026-08-14T05:24:55" in argv
+    assert not any(".083442" in item for item in argv)
     assert f"--container-image={payload['image_ref']}" in argv
     assert "--no-container-mount-home" in argv
     assert f"--container-mounts={owned_root}:{owned_root}" in argv
