@@ -637,6 +637,22 @@ def _validate_container_lifecycle(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _validated_key_fingerprints(value: object) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or not 1 <= len(value) <= 5
+        or any(
+            not isinstance(item, str) or re.fullmatch(r"SHA256:[A-Za-z0-9+/]+", item) is None
+            for item in value
+        )
+        or len(set(value)) != len(value)
+    ):
+        raise PayloadValidationError(
+            "CONTAINER_KEY_BINDING_REJECTED", "approved SSH key fingerprints are invalid"
+        )
+    return sorted(value)
+
+
 def _validate_restore(payload: dict[str, Any]) -> dict[str, Any]:
     fields = {
         "restore_request_id",
@@ -647,6 +663,7 @@ def _validate_restore(payload: dict[str, Any]) -> dict[str, Any]:
         "container_name",
         "expected_gpu",
         "host_access",
+        "expected_key_fingerprints",
     }
     if set(payload) != fields:
         raise PayloadValidationError("RESTORE_PAYLOAD_REJECTED", "restore fields are invalid")
@@ -665,6 +682,9 @@ def _validate_restore(payload: dict[str, Any]) -> dict[str, Any]:
             "container_name": "gpu-dev-origin-pilot",
             "expected_gpu": "NONE",
             "host_access": "DISABLED_BY_PLATFORM_POLICY",
+            "expected_key_fingerprints": _validated_key_fingerprints(
+                payload.get("expected_key_fingerprints")
+            ),
         }
     )
     return result
@@ -681,6 +701,7 @@ def _validate_recycle(payload: dict[str, Any]) -> dict[str, Any]:
         "expires_at",
         "expected_gpu",
         "host_access",
+        "expected_key_fingerprints",
     }
     if set(payload) != fields:
         raise PayloadValidationError("RECYCLE_PAYLOAD_REJECTED", "recycle fields are invalid")
@@ -707,6 +728,9 @@ def _validate_recycle(payload: dict[str, Any]) -> dict[str, Any]:
             "expires_at": parsed.astimezone(UTC).isoformat(),
             "expected_gpu": "NONE",
             "host_access": "DISABLED_BY_PLATFORM_POLICY",
+            "expected_key_fingerprints": _validated_key_fingerprints(
+                payload.get("expected_key_fingerprints")
+            ),
         }
     )
     return result

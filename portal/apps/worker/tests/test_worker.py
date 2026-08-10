@@ -2356,3 +2356,205 @@ def test_portal4a_host_revoke_rolls_back_shell_and_key_on_postcondition_failure(
     assert shell["value"] == "/bin/bash"
     assert host_keys.read_text(encoding="utf-8") == "ssh-ed25519 fixture portal4a\n"
     assert not list(host_keys.parent.glob(".authorized_keys.portal4a-*"))
+
+
+def portal4a_restore_payload() -> dict[str, object]:
+    return {
+        "restore_request_id": str(uuid.uuid4()),
+        "managed_user_id": "3b95b4f0-95d9-444a-8f0b-46288195a807",
+        "username": "origin-pilot",
+        "uid": 20001,
+        "gid": 20001,
+        "container_name": "gpu-dev-origin-pilot",
+        "expected_gpu": "NONE",
+        "host_access": "DISABLED_BY_PLATFORM_POLICY",
+        "expected_key_fingerprints": [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+    }
+
+
+def test_portal4a_restore_is_idempotent_after_worker_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = portal4a_restore_payload()
+    active = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys"
+    active.parent.mkdir(parents=True)
+    active.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", tmp_path / "users")
+    monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
+    monkeypatch.setattr(
+        handlers,
+        "_portal4a_account",
+        lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_installed_key_fingerprints",
+        lambda *_args: [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_portal4a_container_security",
+        lambda *_args, **_kwargs: {"state": {"Running": True}},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: pytest.fail("idempotent replay must not restart the container"),
+    )
+    result = handlers._execute_resource_restore(request("resource.restore"), payload)
+    assert result["status"] == "SUCCEEDED"
+    assert result["idempotent_replay"] is True
+    assert result["container_key_fingerprints"] == [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT]
+
+
+def test_portal4a_restore_rolls_back_container_and_key_after_postcondition_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = portal4a_restore_payload()
+    suspended = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys.portal-recycle"
+    suspended.parent.mkdir(parents=True)
+    suspended.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
+    active = suspended.with_name("authorized_keys")
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", tmp_path / "users")
+    monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
+    monkeypatch.setattr(
+        handlers,
+        "_portal4a_account",
+        lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_installed_key_fingerprints",
+        lambda *_args: [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+    )
+    security_calls = 0
+
+    def security(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal security_calls
+        security_calls += 1
+        if security_calls == 1:
+            return {"state": {"Running": False}}
+        raise handlers.LifecycleValidationError(
+            "CONTAINER_SECURITY_REJECTED", "fixture postcondition failure"
+        )
+
+    monkeypatch.setattr(handlers, "_portal4a_container_security", security)
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {
+            "h100-container-start": {"integrity_ok": True},
+            "h100-container-stop": {"integrity_ok": True},
+        },
+    )
+    scripts: list[str] = []
+
+    def run_script(argv, **_kwargs):  # type: ignore[no-untyped-def]
+        scripts.append(argv[0])
+        return {"ok": True}
+
+    monkeypatch.setattr(handlers, "run_allowlisted_script", run_script)
+    result = handlers._execute_resource_restore(request("resource.restore"), payload)
+    assert result["status"] == "ERROR"
+    assert result["error"]["code"] == "CONTAINER_SECURITY_REJECTED"
+    assert result["error"]["rollback_status"] == "ROLLED_BACK"
+    assert scripts == [
+        handlers.SCRIPT_ALLOWLIST["h100-container-start"],
+        handlers.SCRIPT_ALLOWLIST["h100-container-stop"],
+    ]
+    assert suspended.exists()
+    assert not active.exists()
+
+
+def test_portal4a_restore_stops_partial_start_before_resuspending_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = portal4a_restore_payload()
+    suspended = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys.portal-recycle"
+    suspended.parent.mkdir(parents=True)
+    suspended.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
+    active = suspended.with_name("authorized_keys")
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", tmp_path / "users")
+    monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
+    monkeypatch.setattr(
+        handlers,
+        "_portal4a_account",
+        lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_installed_key_fingerprints",
+        lambda *_args: [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_portal4a_container_security",
+        lambda *_args, **_kwargs: {"state": {"Running": False}},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {
+            "h100-container-start": {"integrity_ok": True},
+            "h100-container-stop": {"integrity_ok": True},
+        },
+    )
+    scripts: list[str] = []
+
+    def run_script(argv, **_kwargs):  # type: ignore[no-untyped-def]
+        scripts.append(argv[0])
+        return {"ok": argv[0] == handlers.SCRIPT_ALLOWLIST["h100-container-stop"]}
+
+    monkeypatch.setattr(handlers, "run_allowlisted_script", run_script)
+    result = handlers._execute_resource_restore(request("resource.restore"), payload)
+    assert result["status"] == "ERROR"
+    assert result["error"]["code"] == "CONTAINER_START_FAILED"
+    assert result["error"]["rollback_status"] == "ROLLED_BACK"
+    assert scripts == [
+        handlers.SCRIPT_ALLOWLIST["h100-container-start"],
+        handlers.SCRIPT_ALLOWLIST["h100-container-stop"],
+    ]
+    assert suspended.exists()
+    assert not active.exists()
+
+
+def test_portal4a_recycle_rejects_unapproved_key_before_runtime_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = {
+        **portal4a_restore_payload(),
+        "lease_id": str(uuid.uuid4()),
+        "expires_at": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+    }
+    payload.pop("restore_request_id")
+    active = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys"
+    active.parent.mkdir(parents=True)
+    active.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", tmp_path / "users")
+    monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
+    monkeypatch.setattr(
+        handlers,
+        "_portal4a_account",
+        lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_installed_key_fingerprints",
+        lambda *_args: ["SHA256:unapproved"],
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_active_user_slurm_jobs",
+        lambda *_args: pytest.fail("key binding must be checked before Slurm changes"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_portal4a_container_security",
+        lambda *_args, **_kwargs: pytest.fail(
+            "key binding must be checked before container changes"
+        ),
+    )
+    result = handlers._execute_resource_recycle(request("resource.recycle"), payload)
+    assert result["status"] == "ERROR"
+    assert result["error"]["code"] == "CONTAINER_KEY_BINDING_REJECTED"
+    assert active.exists()

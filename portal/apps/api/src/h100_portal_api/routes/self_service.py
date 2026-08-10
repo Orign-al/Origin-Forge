@@ -131,6 +131,7 @@ def _new_operation(
     summary: str,
     payload: dict[str, Any],
     idempotency_key: str,
+    risk_level: RiskLevel = RiskLevel.MEDIUM,
 ) -> PortalOperation:
     operation = PortalOperation(
         operation_type=operation_type,
@@ -142,7 +143,7 @@ def _new_operation(
         request_summary=summary,
         validated_payload=payload,
         idempotency_key=idempotency_key,
-        risk_level=RiskLevel.MEDIUM,
+        risk_level=risk_level,
         status=OperationStatus.RUNNING,
         approved_at=utcnow(),
         started_at=utcnow(),
@@ -830,6 +831,19 @@ def create_restore_request(
 ) -> dict[str, Any]:
     require_session_csrf(request, context)
     managed = managed_identity_for_user(db, context.user, lock=True)
+    existing = db.scalar(
+        select(PortalResourceRestoreRequest).where(
+            PortalResourceRestoreRequest.owner_managed_user_id == managed.id,
+            PortalResourceRestoreRequest.idempotency_key == str(body.idempotency_key),
+        )
+    )
+    if existing is not None:
+        if (
+            existing.recycle_item_id != item_id
+            or existing.requested_duration_seconds != body.duration_seconds
+        ):
+            raise _error(409, "IDEMPOTENCY_CONFLICT", "幂等键已用于不同恢复申请")
+        return {"status": existing.state, "restore_request_id": str(existing.id)}
     item = db.scalar(
         select(PortalResourceRecycleItem)
         .where(
@@ -841,14 +855,6 @@ def create_restore_request(
     )
     if item is None:
         raise _error(404, "RECYCLE_ITEM_NOT_FOUND", "回收资源不存在")
-    existing = db.scalar(
-        select(PortalResourceRestoreRequest).where(
-            PortalResourceRestoreRequest.owner_managed_user_id == managed.id,
-            PortalResourceRestoreRequest.idempotency_key == str(body.idempotency_key),
-        )
-    )
-    if existing is not None:
-        return {"status": existing.state, "restore_request_id": str(existing.id)}
     restore = PortalResourceRestoreRequest(
         owner_managed_user_id=managed.id,
         recycle_item_id=item.id,
@@ -970,7 +976,11 @@ def admin_decide_restore(
         .where(PortalResourceRecycleItem.id == restore.recycle_item_id)
         .with_for_update()
     )
-    if item is None or item.owner_managed_user_id != restore.owner_managed_user_id:
+    if (
+        item is None
+        or item.owner_managed_user_id != restore.owner_managed_user_id
+        or item.state != "RESTORE_PENDING"
+    ):
         raise _error(409, "RESTORE_OWNERSHIP_MISMATCH", "恢复资源所有权不一致")
     from h100_portal_api.models import PortalManagedUser
 
@@ -988,9 +998,28 @@ def admin_decide_restore(
         restore.state = "REJECTED"
         item.state = "RECYCLE_BIN"
         managed.compute_environment_state = "RECYCLED"
+        _audit(
+            db,
+            request,
+            context,
+            event_type="RESOURCE_RESTORE_REJECTED",
+            object_type="resource_restore_request",
+            object_id=str(restore.id),
+        )
         db.commit()
         return {"status": "REJECTED", "restore_request_id": str(restore.id)}
     container = _container_for_owner(db, managed.id, lock=True)
+    suspended_keys = db.scalars(
+        select(PortalSshKey).where(
+            PortalSshKey.owner_managed_user_id == managed.id,
+            PortalSshKey.active.is_(True),
+            PortalSshKey.scope == "CONTAINER",
+            PortalSshKey.container_install_state == "SUSPENDED_BY_RECYCLE",
+        )
+    ).all()
+    expected_key_fingerprints = sorted(key.fingerprint_sha256 for key in suspended_keys)
+    if not expected_key_fingerprints:
+        raise _error(409, "CONTAINER_KEY_RESTORE_FAILED", "没有可恢复的容器 SSH 公钥")
     payload = {
         "restore_request_id": str(restore.id),
         "managed_user_id": str(managed.id),
@@ -1000,17 +1029,55 @@ def admin_decide_restore(
         "container_name": container.name,
         "expected_gpu": "NONE",
         "host_access": "DISABLED_BY_PLATFORM_POLICY",
+        "expected_key_fingerprints": expected_key_fingerprints,
     }
+    operation = _new_operation(
+        db,
+        context,
+        owner_id=managed.id,
+        operation_type="resource.restore",
+        target_type="resource_recycle_item",
+        target_id=str(item.id),
+        summary="管理员批准恢复用户的可回收计算环境",
+        payload=payload,
+        idempotency_key=f"resource-restore:{restore.id}",
+        risk_level=RiskLevel.HIGH,
+    )
     restore.state = "RESTORING"
     item.state = "RESTORING"
-    result = _worker(
-        "resource.restore",
-        payload=payload,
-        context=context,
-        idempotency_key=f"resource-restore:{restore.id}",
-        timeout_seconds=180,
-    )
-    if result.get("container_state") != "RUNNING" or result.get("container_gpu") != "NONE":
+    try:
+        result = _worker(
+            "resource.restore",
+            payload=payload,
+            context=context,
+            idempotency_key=f"resource-restore:{restore.id}",
+            timeout_seconds=180,
+        )
+    except HTTPException as exc:
+        operation.status = OperationStatus.FAILED
+        operation.finished_at = utcnow()
+        detail = getattr(exc, "detail", {})
+        operation.error_code = str(
+            detail.get("code", "RESTORE_WORKER_FAILED")
+            if isinstance(detail, dict)
+            else "RESTORE_WORKER_FAILED"
+        )[:64]
+        restore.state = "FAILED"
+        item.state = "FAILED"
+        managed.compute_environment_state = "FAILED"
+        db.commit()
+        raise
+    observed_fingerprints = result.get("container_key_fingerprints")
+    if (
+        result.get("container_state") != "RUNNING"
+        or result.get("container_gpu") != "NONE"
+        or result.get("container_key_state") != "INSTALLED"
+        or not isinstance(observed_fingerprints, list)
+        or sorted(str(item) for item in observed_fingerprints) != expected_key_fingerprints
+    ):
+        operation.status = OperationStatus.FAILED
+        operation.error_code = "RESTORE_POSTCONDITION_FAILED"
+        operation.finished_at = utcnow()
         restore.state = "FAILED"
         item.state = "FAILED"
         managed.compute_environment_state = "FAILED"
@@ -1032,14 +1099,20 @@ def admin_decide_restore(
     item.restored_at = utcnow()
     managed.compute_environment_state = "ACTIVE"
     container.observed_state = "RUNNING"
-    key = db.scalar(
-        select(PortalSshKey).where(
-            PortalSshKey.owner_managed_user_id == managed.id,
-            PortalSshKey.active.is_(True),
+    container.desired_state = "RUNNING"
+    for key in suspended_keys:
+        key.container_install_state = "INSTALLED"
+    storage = db.scalar(
+        select(PortalStorageResource).where(
+            PortalStorageResource.owner_managed_user_id == managed.id
         )
     )
-    if key is not None:
-        key.container_install_state = "INSTALLED"
+    if storage is not None:
+        storage.state = "ACTIVE"
+    operation.status = OperationStatus.SUCCEEDED
+    operation.worker_execution_id = str(result.get("request_id", ""))[:64] or None
+    operation.finished_at = utcnow()
+    operation.result_summary = "Recoverable environment restored with Host access disabled"
     _audit(
         db,
         request,

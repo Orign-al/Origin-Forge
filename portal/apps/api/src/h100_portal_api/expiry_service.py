@@ -130,6 +130,17 @@ def _recycle_one(db: Session, lease: PortalComputeLease) -> bool:
     )
     if container is None:
         raise RuntimeError("managed container for due lease is missing")
+    installed_keys = db.scalars(
+        select(PortalSshKey).where(
+            PortalSshKey.owner_managed_user_id == managed.id,
+            PortalSshKey.active.is_(True),
+            PortalSshKey.scope == "CONTAINER",
+            PortalSshKey.container_install_state == "INSTALLED",
+        )
+    ).all()
+    expected_key_fingerprints = sorted(key.fingerprint_sha256 for key in installed_keys)
+    if not expected_key_fingerprints:
+        raise RuntimeError("managed container has no installed Portal SSH key")
     operation = _operation(db, managed, lease)
     payload = {
         "lease_id": str(lease.id),
@@ -141,6 +152,7 @@ def _recycle_one(db: Session, lease: PortalComputeLease) -> bool:
         "expires_at": ensure_utc(lease.expires_at).isoformat(),
         "expected_gpu": "NONE",
         "host_access": "DISABLED_BY_PLATFORM_POLICY",
+        "expected_key_fingerprints": expected_key_fingerprints,
     }
     lease.state = "EXPIRED"
     lease.expired_at = lease.expired_at or now
@@ -161,11 +173,14 @@ def _recycle_one(db: Session, lease: PortalComputeLease) -> bool:
         operation.error_code = exc.code[:64]
         operation.finished_at = utcnow()
         return False
+    observed_fingerprints = result.get("container_key_fingerprints")
     if (
         result.get("status") != "SUCCEEDED"
         or result.get("container_state") != "STOPPED"
         or result.get("container_gpu") != "NONE"
         or result.get("container_key_state") != "SUSPENDED_BY_RECYCLE"
+        or not isinstance(observed_fingerprints, list)
+        or sorted(str(item) for item in observed_fingerprints) != expected_key_fingerprints
         or result.get("data_preserved") is not True
     ):
         lease.state = original_state
@@ -200,12 +215,7 @@ def _recycle_one(db: Session, lease: PortalComputeLease) -> bool:
     managed.compute_environment_state = "RECYCLED"
     container.observed_state = "STOPPED"
     container.desired_state = "STOPPED"
-    for key in db.scalars(
-        select(PortalSshKey).where(
-            PortalSshKey.owner_managed_user_id == managed.id,
-            PortalSshKey.active.is_(True),
-        )
-    ):
+    for key in installed_keys:
         key.container_install_state = "SUSPENDED_BY_RECYCLE"
     storage = db.scalar(
         select(PortalStorageResource).where(

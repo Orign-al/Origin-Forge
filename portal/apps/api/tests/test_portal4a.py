@@ -29,7 +29,9 @@ from h100_portal_api.models import (
     PortalOperation,
     PortalPasswordCredential,
     PortalResourceRecycleItem,
+    PortalResourceRestoreRequest,
     PortalRole,
+    PortalSshKey,
     PortalStorageResource,
     PortalUser,
     ensure_utc,
@@ -40,6 +42,7 @@ from h100_portal_api.worker_client import WorkerClientError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm.exc import StaleDataError
 
 PASSWORD = "Portal ordinary user test passphrase 2026"
 
@@ -96,6 +99,49 @@ def _identity(
     )
     db.add(managed)
     db.flush()
+    enrollment = PortalOperation(
+        operation_type="ssh_key.enroll.fixture",
+        target_type="ssh_public_key",
+        target_id=username,
+        requested_by=user.id,
+        owner_managed_user_id=managed.id,
+        approved_by=user.id,
+        request_summary="fixture SSH key enrollment",
+        validated_payload={},
+        idempotency_key=f"fixture-key:{username}",
+        risk_level=RiskLevel.MEDIUM,
+        status=OperationStatus.SUCCEEDED,
+    )
+    db.add(enrollment)
+    db.flush()
+    fingerprint = (
+        "SHA256:nek6vyEb3GT+UJAcY5y/8PgY4achF2ouNy+8C2JqUVc"
+        if uid == 20001
+        else f"SHA256:fixture{uid}"
+    )
+    key = PortalSshKey(
+        managed_user_id=managed.id,
+        owner_managed_user_id=managed.id,
+        key_type="ssh-ed25519",
+        fingerprint_sha256=fingerprint,
+        public_key="ssh-ed25519 fixture",
+        comment=f"{username} fixture",
+        scope="CONTAINER",
+        state="INSTALLED",
+        host_install_state="REMOVED_BY_POLICY",
+        container_install_state="INSTALLED",
+        generation_method="IMPORTED",
+        created_by=user.id,
+        enrollment_operation_id=enrollment.id,
+        staging_file_name=f"fixture-{uid}.pub",
+        content_sha256=f"{uid:064x}"[-64:],
+        approved_by=user.id,
+        approved_at=utcnow(),
+        validated_at=utcnow(),
+        installed_at=utcnow(),
+        active=True,
+    )
+    db.add(key)
     container = PortalContainer(
         managed_user_id=managed.id,
         owner_managed_user_id=managed.id,
@@ -125,7 +171,7 @@ def _identity(
     )
     db.add(lease)
     db.commit()
-    return SimpleNamespace(user=user, managed=managed, container=container, lease=lease)
+    return SimpleNamespace(user=user, managed=managed, container=container, lease=lease, key=key)
 
 
 def _admin(db: Session) -> PortalUser:
@@ -385,6 +431,72 @@ def test_expiry_skips_superseded_lease_and_retries_worker_failure(
     assert calls == 2
 
 
+def test_expiry_recycles_owned_resources_and_binds_the_approved_key(
+    database: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity(database, remaining_hours=0)
+    pending = _job(database, identity, "pending-at-expiry")
+    pending.slurm_job_id = 401
+    database.commit()
+    factory = sessionmaker(bind=database.get_bind(), autoflush=False, expire_on_commit=False)
+    monkeypatch.setattr(expiry_service, "SessionLocal", factory)
+
+    def recycle(operation_type: str, **kwargs):  # type: ignore[no-untyped-def]
+        assert operation_type == "resource.recycle"
+        assert kwargs["payload"]["expected_key_fingerprints"] == [identity.key.fingerprint_sha256]
+        return {
+            "status": "SUCCEEDED",
+            "request_id": str(uuid.uuid4()),
+            "container_state": "STOPPED",
+            "container_gpu": "NONE",
+            "container_key_state": "SUSPENDED_BY_RECYCLE",
+            "container_key_fingerprints": [identity.key.fingerprint_sha256],
+            "cancelled_pending_job_ids": [401],
+            "cancelled_running_job_ids": [],
+            "data_preserved": True,
+        }
+
+    monkeypatch.setattr(expiry_service, "call_worker", recycle)
+    assert expiry_service.process_due_leases() == (1, 1)
+    database.expire_all()
+    lease = database.get(PortalComputeLease, identity.lease.id)
+    container = database.get(PortalContainer, identity.container.id)
+    key = database.get(PortalSshKey, identity.key.id)
+    storage = database.scalar(
+        select(PortalStorageResource).where(
+            PortalStorageResource.owner_managed_user_id == identity.managed.id
+        )
+    )
+    recycle_item = database.scalar(
+        select(PortalResourceRecycleItem).where(
+            PortalResourceRecycleItem.lease_id == identity.lease.id
+        )
+    )
+    assert lease.state == "RECYCLE_BIN"
+    assert identity.managed.compute_environment_state == "RECYCLED"
+    assert container.desired_state == container.observed_state == "STOPPED"
+    assert key.container_install_state == "SUSPENDED_BY_RECYCLE"
+    assert storage.state == "PRESERVED"
+    assert pending.state == "CANCELLED"
+    assert recycle_item.data_preserved is True
+    assert recycle_item.auto_permanent_delete is False
+
+
+def test_compute_lease_version_rejects_expiry_renewal_lost_update(database: Session) -> None:
+    identity = _identity(database, remaining_hours=12)
+    database.commit()
+    factory = sessionmaker(bind=database.get_bind(), autoflush=False, expire_on_commit=False)
+    with factory() as renewal_session, factory() as expiry_session:
+        renewal_lease = renewal_session.get(PortalComputeLease, identity.lease.id)
+        expiry_lease = expiry_session.get(PortalComputeLease, identity.lease.id)
+        renewal_lease.state = "RENEWAL_PENDING"
+        renewal_session.commit()
+        expiry_lease.state = "EXPIRED"
+        expiry_lease.expired_at = utcnow()
+        with pytest.raises(StaleDataError):
+            expiry_session.commit()
+
+
 def test_ordinary_user_self_routes_are_owner_scoped_and_admin_routes_are_denied(
     client, database: Session, origin_headers: dict[str, str]
 ) -> None:  # type: ignore[no-untyped-def]
@@ -440,6 +552,7 @@ def test_ordinary_user_self_routes_are_owner_scoped_and_admin_routes_are_denied(
     assert container["id"] == str(first.container.id)
     assert second.container.name not in str(container)
     assert client.get(f"/api/v1/containers/{second.container.name}").status_code == 403
+    assert client.get(f"/api/v1/users/{second.user.id}/ssh-keys").status_code == 403
     assert client.get("/api/v1/users").status_code == 403
     assert client.get("/api/v1/admin/lease-renewals").status_code == 403
     assert (
@@ -514,6 +627,118 @@ def test_job_and_container_operations_enforce_active_lease_gpu_and_time(
     )
     assert expired_job.status_code == 409
     assert expired_job.json()["detail"]["code"] == "LEASE_INACTIVE"
+
+
+def test_restore_request_is_idempotent_and_admin_restore_reactivates_all_resources(
+    client,
+    database: Session,
+    origin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(database, remaining_hours=0)
+    admin = _admin(database)
+    identity.lease.state = "RECYCLE_BIN"
+    identity.lease.expired_at = utcnow()
+    identity.lease.recycled_at = utcnow()
+    identity.managed.compute_environment_state = "RECYCLED"
+    identity.container.desired_state = "STOPPED"
+    identity.container.observed_state = "STOPPED"
+    identity.key.container_install_state = "SUSPENDED_BY_RECYCLE"
+    storage = database.scalar(
+        select(PortalStorageResource).where(
+            PortalStorageResource.owner_managed_user_id == identity.managed.id
+        )
+    )
+    storage.state = "PRESERVED"
+    item = PortalResourceRecycleItem(
+        owner_managed_user_id=identity.managed.id,
+        lease_id=identity.lease.id,
+        container_id=identity.container.id,
+        state="RECYCLE_BIN",
+        resource_name=identity.container.name,
+        image_digest=identity.container.image_digest,
+        retained_spec=identity.container.safe_spec,
+        connection_state="DISABLED",
+        data_preserved=True,
+        auto_permanent_delete=False,
+        expires_at=identity.lease.expires_at,
+        recycled_at=utcnow(),
+    )
+    database.add(item)
+    database.commit()
+
+    calls: list[dict[str, object]] = []
+
+    def restore_worker(operation_type: str, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append({"operation_type": operation_type, **kwargs})
+        assert operation_type == "resource.restore"
+        assert kwargs["payload"]["expected_key_fingerprints"] == [identity.key.fingerprint_sha256]
+        return {
+            "status": "SUCCEEDED",
+            "request_id": str(uuid.uuid4()),
+            "container_state": "RUNNING",
+            "container_gpu": "NONE",
+            "container_key_state": "INSTALLED",
+            "container_key_fingerprints": [identity.key.fingerprint_sha256],
+        }
+
+    monkeypatch.setattr("h100_portal_api.routes.self_service.call_worker", restore_worker)
+    user_headers = _login(client, origin_headers, "origin-pilot")
+    idempotency_key = str(uuid.uuid4())
+    body = {"duration_seconds": MAX_LEASE_DURATION_SECONDS, "idempotency_key": idempotency_key}
+    first = client.post(
+        f"/api/v1/self/recycle-bin/{item.id}/restore-requests",
+        headers=user_headers,
+        json=body,
+    )
+    repeated = client.post(
+        f"/api/v1/self/recycle-bin/{item.id}/restore-requests",
+        headers=user_headers,
+        json=body,
+    )
+    conflict = client.post(
+        f"/api/v1/self/recycle-bin/{item.id}/restore-requests",
+        headers=user_headers,
+        json={**body, "duration_seconds": 3600},
+    )
+    assert first.status_code == repeated.status_code == 200
+    assert first.json()["restore_request_id"] == repeated.json()["restore_request_id"]
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+    client.cookies.clear()
+    admin_headers = _login(client, origin_headers, admin.normalized_login)
+    decision = client.post(
+        f"/api/v1/admin/restore-requests/{first.json()['restore_request_id']}/decision",
+        headers=admin_headers,
+        json={"decision": "APPROVE", "comment": "fixture restore approval"},
+    )
+    assert decision.status_code == 200
+    assert decision.json()["status"] == "RESTORED"
+    database.expire_all()
+    restored = database.get(
+        PortalResourceRestoreRequest, uuid.UUID(first.json()["restore_request_id"])
+    )
+    successor = database.get(PortalComputeLease, restored.restored_lease_id)
+    operation = database.scalar(
+        select(PortalOperation).where(
+            PortalOperation.operation_type == "resource.restore",
+            PortalOperation.owner_managed_user_id == identity.managed.id,
+        )
+    )
+    assert len(calls) == 1
+    assert restored.state == "RESTORED"
+    assert successor.state == "ACTIVE"
+    assert successor.duration_seconds == MAX_LEASE_DURATION_SECONDS
+    assert identity.managed.compute_environment_state == "ACTIVE"
+    assert identity.managed.host_access_state == "DISABLED_BY_PLATFORM_POLICY"
+    assert identity.managed.shell == "/usr/sbin/nologin"
+    assert identity.container.desired_state == identity.container.observed_state == "RUNNING"
+    assert identity.key.container_install_state == "INSTALLED"
+    assert storage.state == "ACTIVE"
+    assert item.state == "RESTORED"
+    assert operation.status == OperationStatus.SUCCEEDED
+    assert operation.owner_managed_user_id == identity.managed.id
 
 
 def test_api_rejects_97_hour_renewal_and_restore_requests(

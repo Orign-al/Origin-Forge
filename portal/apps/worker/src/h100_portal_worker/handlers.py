@@ -5635,6 +5635,9 @@ def _execute_portal4a_container_lifecycle(
 
 
 def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    active = PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys"
+    suspended = active.with_name("authorized_keys.portal-recycle")
+    started_by_restore = False
     try:
         account = _portal4a_account(payload)
         if account.pw_shell != "/usr/sbin/nologin":
@@ -5646,16 +5649,22 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
             raise LifecycleValidationError(
                 "HOST_ACCESS_POLICY_REJECTED", "restore must not reinstall host authorized_keys"
             )
-        active = PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys"
-        suspended = active.with_name("authorized_keys.portal-recycle")
-        if active.exists():
-            _installed_key_fingerprints(active, int(payload["uid"]), int(payload["gid"]))
-        elif suspended.exists():
-            _installed_key_fingerprints(suspended, int(payload["uid"]), int(payload["gid"]))
-            os.replace(suspended, active)
-        else:
+        if active.exists() and suspended.exists():
+            raise LifecycleValidationError(
+                "CONTAINER_KEY_RESTORE_FAILED", "active and suspended SSH authorization conflict"
+            )
+        key_path = active if active.exists() else suspended
+        if not key_path.exists():
             raise LifecycleValidationError(
                 "CONTAINER_KEY_RESTORE_FAILED", "suspended container public key is unavailable"
+            )
+        fingerprints = _installed_key_fingerprints(
+            key_path, int(payload["uid"]), int(payload["gid"])
+        )
+        if sorted(fingerprints) != payload["expected_key_fingerprints"]:
+            raise LifecycleValidationError(
+                "CONTAINER_KEY_BINDING_REJECTED",
+                "container SSH authorization differs from the approved Portal key records",
             )
         lifecycle_payload = {
             **payload,
@@ -5663,17 +5672,40 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
             "lease_id": payload["restore_request_id"],
             "lease_expires_at": "restored-by-approved-request",
         }
-        _portal4a_container_security(lifecycle_payload, require_running=False)
+        container = _portal4a_container_security(lifecycle_payload, require_running=None)
+        running = bool(container.get("state", {}).get("Running"))
+        if running:
+            if not active.exists():
+                raise LifecycleValidationError(
+                    "CONTAINER_KEY_RESTORE_FAILED",
+                    "running restored container does not have active SSH authorization",
+                )
+            return {
+                "status": "SUCCEEDED",
+                "handler": "resource.restore",
+                "request_id": request.request_id,
+                "container_state": "RUNNING",
+                "container_gpu": "NONE",
+                "host_access": "DISABLED",
+                "container_key_state": "INSTALLED",
+                "container_key_fingerprints": fingerprints,
+                "idempotent_replay": True,
+            }
+        if suspended.exists():
+            os.replace(suspended, active)
         integrity = script_integrity()
         if not integrity.get("h100-container-start", {}).get("integrity_ok", False):
             raise LifecycleValidationError(
                 "SCRIPT_INTEGRITY_FAILED", "container start script integrity failed"
             )
+        # Treat the start invocation as potentially state-changing even when the
+        # wrapper reports failure: a partially completed start must be stopped
+        # during rollback before SSH authorization is suspended again.
+        started_by_restore = True
         started = run_allowlisted_script(
             [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])], timeout=150
         )
         if not started.get("ok"):
-            os.replace(active, suspended)
             raise LifecycleValidationError(
                 "CONTAINER_START_FAILED", "restored container failed to start"
             )
@@ -5686,9 +5718,49 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
             "container_gpu": "NONE",
             "host_access": "DISABLED",
             "container_key_state": "INSTALLED",
+            "container_key_fingerprints": fingerprints,
+            "idempotent_replay": False,
         }
-    except LifecycleValidationError as exc:
-        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+    except (LifecycleValidationError, OSError) as raw_exc:
+        exc = (
+            raw_exc
+            if isinstance(raw_exc, LifecycleValidationError)
+            else LifecycleValidationError(
+                "CONTAINER_KEY_RESTORE_FAILED", "container SSH authorization could not be restored"
+            )
+        )
+        rollback_errors: list[str] = []
+        if started_by_restore:
+            integrity = script_integrity()
+            if not integrity.get("h100-container-stop", {}).get("integrity_ok", False):
+                rollback_errors.append("container stop script integrity failed")
+            else:
+                stopped = run_allowlisted_script(
+                    [SCRIPT_ALLOWLIST["h100-container-stop"], str(payload["username"])],
+                    timeout=90,
+                )
+                if not stopped.get("ok"):
+                    rollback_errors.append("restored container could not be stopped")
+        if active.exists():
+            try:
+                if suspended.exists():
+                    raise OSError("suspended authorization target already exists")
+                os.replace(active, suspended)
+            except OSError:
+                rollback_errors.append("container SSH authorization could not be suspended")
+        if rollback_errors:
+            return {
+                "status": "ERROR",
+                "error": {
+                    "code": "RESTORE_ROLLBACK_FAILED",
+                    "message": "restore failed and its safety rollback is incomplete",
+                    "cause": exc.code,
+                },
+            }
+        return {
+            "status": "ERROR",
+            "error": {"code": exc.code, "message": str(exc), "rollback_status": "ROLLED_BACK"},
+        }
 
 
 def _active_user_slurm_jobs(username: str) -> list[tuple[int, str]]:
@@ -5717,6 +5789,25 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
         if host_keys.exists():
             raise LifecycleValidationError(
                 "HOST_ACCESS_POLICY_REJECTED", "lease recycle found active host authorized_keys"
+            )
+        active = PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys"
+        suspended = active.with_name("authorized_keys.portal-recycle")
+        if active.exists() and suspended.exists():
+            raise LifecycleValidationError(
+                "CONTAINER_KEY_SUSPEND_CONFLICT", "suspended key target already exists"
+            )
+        key_path = active if active.exists() else suspended
+        if not key_path.exists():
+            raise LifecycleValidationError(
+                "CONTAINER_KEY_SUSPEND_FAILED", "container authorized_keys is unavailable"
+            )
+        fingerprints = _installed_key_fingerprints(
+            key_path, int(payload["uid"]), int(payload["gid"])
+        )
+        if sorted(fingerprints) != payload["expected_key_fingerprints"]:
+            raise LifecycleValidationError(
+                "CONTAINER_KEY_BINDING_REJECTED",
+                "container SSH authorization differs from the approved Portal key records",
             )
         jobs = _active_user_slurm_jobs(str(payload["username"]))
         pending_ids = [job_id for job_id, state in jobs if state.startswith("PEND")]
@@ -5760,25 +5851,8 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
             if not stopped.get("ok"):
                 raise LifecycleValidationError("CONTAINER_STOP_FAILED", "container stop failed")
         _portal4a_container_security(lifecycle_payload, require_running=False)
-        active = PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys"
-        suspended = active.with_name("authorized_keys.portal-recycle")
         if active.exists():
-            fingerprints = _installed_key_fingerprints(
-                active, int(payload["uid"]), int(payload["gid"])
-            )
-            if suspended.exists():
-                raise LifecycleValidationError(
-                    "CONTAINER_KEY_SUSPEND_CONFLICT", "suspended key target already exists"
-                )
             os.replace(active, suspended)
-        elif suspended.exists():
-            fingerprints = _installed_key_fingerprints(
-                suspended, int(payload["uid"]), int(payload["gid"])
-            )
-        else:
-            raise LifecycleValidationError(
-                "CONTAINER_KEY_SUSPEND_FAILED", "container authorized_keys is unavailable"
-            )
         if (
             active.exists()
             or not suspended.exists()
