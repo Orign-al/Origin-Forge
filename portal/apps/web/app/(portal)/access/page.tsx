@@ -29,7 +29,11 @@ export default function AccessPage() {
   const current = useQuery({ queryKey: ["me"], queryFn: me, retry: false });
   if (current.isPending) return <LoadingBlock />;
   if (current.isError) return <ErrorBlock />;
-  return current.data.role === "user" ? <OrdinaryConnection /> : <AdminAccessPage />;
+  return current.data.role === "user" ? (
+    <OrdinaryConnection />
+  ) : (
+    <AdminAccessPage />
+  );
 }
 
 function AdminAccessPage() {

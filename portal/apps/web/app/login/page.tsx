@@ -43,8 +43,8 @@ export default function LoginPage() {
         result.user.password_state === "RESET_REQUIRED"
           ? "/change-password"
           : result.ssh_enrollment?.required && result.ssh_enrollment.setup_path
-          ? result.ssh_enrollment.setup_path
-          : "/",
+            ? result.ssh_enrollment.setup_path
+            : "/",
       );
     } catch {
       setError("用户名或密码不正确，或账号暂时被锁定。");
@@ -64,7 +64,7 @@ export default function LoginPage() {
             <Input
               id="username"
               autoComplete="username"
-              placeholder="Origin-al"
+              placeholder="请输入登录名"
               {...register("username")}
             />
             {errors.username ? (

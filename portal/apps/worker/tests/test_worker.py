@@ -2256,3 +2256,97 @@ def test_portal4a_setpriv_uses_fixed_argv_and_never_shell(
     ]
     assert captured["shell"] is False
     assert captured["pass_fds"] == (9,)
+
+
+def test_portal4a_gpu_job_mounts_only_owned_root_and_disables_host_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = portal4a_job_payload()
+    payload["image_ref"] = (
+        "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
+        "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
+    )
+    users_root = tmp_path / "users"
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", users_root)
+    argv = handlers._portal4a_sbatch_argv(
+        payload,
+        workdir=users_root / "origin-pilot/workspace",
+        stdout=users_root / "origin-pilot/workspace/.portal/jobs/job.out",
+        stderr=users_root / "origin-pilot/workspace/.portal/jobs/job.err",
+        staged_descriptor=9,
+    )
+    owned_root = users_root / "origin-pilot"
+    assert "--gres=gpu:1" in argv
+    assert f"--container-image={payload['image_ref']}" in argv
+    assert "--no-container-mount-home" in argv
+    assert f"--container-mounts={owned_root}:{owned_root}" in argv
+    assert argv[-1] == "/proc/self/fd/9"
+    assert not any("/home/origin-pilot" in item for item in argv)
+
+
+def test_portal4a_host_revoke_rolls_back_shell_and_key_on_postcondition_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    username = "origin-pilot"
+    fingerprint = "SHA256:nek6vyEb3GT+UJAcY5y/8PgY4achF2ouNy+8C2JqUVc"
+    managed_home = tmp_path / "home"
+    host_keys = managed_home / username / ".ssh/authorized_keys"
+    host_keys.parent.mkdir(parents=True)
+    host_keys.write_text("ssh-ed25519 fixture portal4a\n", encoding="utf-8")
+    container_keys = tmp_path / "users" / username / "home/.ssh/authorized_keys"
+    container_keys.parent.mkdir(parents=True)
+    container_keys.write_text("ssh-ed25519 fixture portal4a\n", encoding="utf-8")
+    monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", managed_home)
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", tmp_path / "users")
+    monkeypatch.setattr(handlers, "PLATFORM_BACKUP_ROOT", tmp_path / "backups")
+    monkeypatch.setattr(handlers, "_copy_root_only", lambda _source, _destination: "a" * 64)
+    shell = {"value": "/bin/bash"}
+    monkeypatch.setattr(
+        handlers,
+        "_portal4a_account",
+        lambda _payload: SimpleNamespace(pw_shell=shell["value"]),
+    )
+    monkeypatch.setattr(
+        handlers.pwd,
+        "getpwnam",
+        lambda _username: SimpleNamespace(pw_shell=shell["value"]),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_installed_key_fingerprints",
+        lambda _path, _uid, _gid: [fingerprint],
+    )
+    monkeypatch.setattr(handlers, "_sshd_effective_config", lambda _username: {"policy": "ok"})
+
+    def fixed(binary, args, **_kwargs):  # type: ignore[no-untyped-def]
+        assert binary == "usermod"
+        shell["value"] = args[1]
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(handlers, "run_fixed", fixed)
+    monkeypatch.setattr(
+        handlers,
+        "validate_ssh_policy_no_regression",
+        lambda *_args: (_ for _ in ()).throw(
+            handlers.LifecycleValidationError("SSH_POLICY_REGRESSION", "fixture regression")
+        ),
+    )
+    payload = {
+        "managed_user_id": "3b95b4f0-95d9-444a-8f0b-46288195a807",
+        "username": username,
+        "uid": 20001,
+        "gid": 20001,
+        "key_record_id": "7427da72-37b9-4ac2-8ada-2f0c83b7718e",
+        "key_fingerprint": fingerprint,
+        "container_name": "gpu-dev-origin-pilot",
+        "expected_scope": "BOTH",
+    }
+    result = handlers._execute_host_access_revoke(
+        request("host_access.revoke_managed_user"), payload
+    )
+    assert result["status"] == "ERROR"
+    assert result["error"]["code"] == "SSH_POLICY_REGRESSION"
+    assert result["error"]["rollback_status"] == "ROLLED_BACK"
+    assert shell["value"] == "/bin/bash"
+    assert host_keys.read_text(encoding="utf-8") == "ssh-ed25519 fixture portal4a\n"
+    assert not list(host_keys.parent.glob(".authorized_keys.portal4a-*"))

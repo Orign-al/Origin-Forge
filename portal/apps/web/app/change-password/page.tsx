@@ -16,7 +16,8 @@ export default function RequiredPasswordChangePage() {
   useEffect(() => {
     me()
       .then((result) => {
-        if (result.user.password_state !== "RESET_REQUIRED") router.replace("/");
+        if (result.user.password_state !== "RESET_REQUIRED")
+          router.replace("/");
       })
       .catch(() => router.replace("/login"));
   }, [router]);
@@ -36,7 +37,9 @@ export default function RequiredPasswordChangePage() {
       });
       router.replace("/");
     } catch {
-      setError("密码修改失败。请确认临时密码正确，并使用至少14个字符的新密码。");
+      setError(
+        "密码修改失败。请确认临时密码正确，并使用至少14个字符的新密码。",
+      );
     } finally {
       setBusy(false);
     }
@@ -79,14 +82,20 @@ export default function RequiredPasswordChangePage() {
               onChange={(event) => setConfirmation(event.target.value)}
             />
           </div>
-          {error ? <div className="error-box" role="alert">{error}</div> : null}
+          {error ? (
+            <div className="error-box" role="alert">
+              {error}
+            </div>
+          ) : null}
           <div className="form-actions">
             <Button tone="primary" type="submit" disabled={busy}>
               保存并进入我的环境
             </Button>
           </div>
         </form>
-        <div className="auth-foot">此操作只修改Portal密码，不设置或解锁Linux密码。</div>
+        <div className="auth-foot">
+          此操作只修改Portal密码，不设置或解锁Linux密码。
+        </div>
       </Card>
     </div>
   );

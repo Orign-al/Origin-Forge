@@ -129,6 +129,8 @@ GUARD_METRIC_OWNER_GID = 0
 GUARD_METRIC_MAX_AGE_SECONDS = 15 * 60
 PILOT_STATE_ROOT = Path("/etc/h100-platform/users")
 PILOT_DATA_ROOT = Path("/srv/gpu-platform/users")
+MANAGED_HOME_ROOT = Path("/home")
+PLATFORM_BACKUP_ROOT = Path("/srv/gpu-platform/platform/backups")
 PILOT_COMPOSE_ROOT = Path("/srv/gpu-platform/platform/config/dev-containers")
 PILOT_SCAN_ROOTS = (
     Path("/home"),
@@ -5268,6 +5270,44 @@ def _run_as_managed_user(
     }
 
 
+def _portal4a_sbatch_argv(
+    payload: dict[str, Any],
+    *,
+    workdir: Path,
+    stdout: Path,
+    stderr: Path,
+    staged_descriptor: int,
+) -> list[str]:
+    deadline = str(payload["lease_deadline_at"]).replace("+00:00", "")
+    argv = [
+        BINARIES["sbatch"],
+        "--parsable",
+        "--account=company",
+        "--qos=general",
+        f"--job-name={payload['name']}",
+        f"--cpus-per-task={payload['cpus']}",
+        f"--mem={payload['memory_mb']}M",
+        f"--time={_slurm_time(int(payload['time_limit_seconds']))}",
+        f"--deadline={deadline}",
+        f"--chdir={workdir}",
+        f"--output={stdout}",
+        f"--error={stderr}",
+    ]
+    if int(payload["gpu_count"]) == 1:
+        argv.append("--gres=gpu:1")
+    if payload.get("image_ref"):
+        owned_root = PILOT_DATA_ROOT / PILOT_USERNAME
+        argv.extend(
+            [
+                f"--container-image={payload['image_ref']}",
+                "--no-container-mount-home",
+                f"--container-mounts={owned_root}:{owned_root}",
+            ]
+        )
+    argv.append(f"/proc/self/fd/{staged_descriptor}")
+    return argv
+
+
 def _execute_self_job_submit(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
     staged_descriptor: int | None = None
     try:
@@ -5287,26 +5327,13 @@ def _execute_self_job_submit(request: WorkerRequest, payload: dict[str, Any]) ->
             raise LifecycleValidationError(
                 "JOB_OUTPUT_REJECTED", "job output directories are inconsistent"
             )
-        deadline = str(payload["lease_deadline_at"]).replace("+00:00", "")
-        argv = [
-            BINARIES["sbatch"],
-            "--parsable",
-            "--account=company",
-            "--qos=general",
-            f"--job-name={payload['name']}",
-            f"--cpus-per-task={payload['cpus']}",
-            f"--mem={payload['memory_mb']}M",
-            f"--time={_slurm_time(int(payload['time_limit_seconds']))}",
-            f"--deadline={deadline}",
-            f"--chdir={workdir}",
-            f"--output={stdout}",
-            f"--error={stderr}",
-        ]
-        if int(payload["gpu_count"]) == 1:
-            argv.append("--gres=gpu:1")
-        if payload.get("image_ref"):
-            argv.append(f"--container-image={payload['image_ref']}")
-        argv.append(f"/proc/self/fd/{staged_descriptor}")
+        argv = _portal4a_sbatch_argv(
+            payload,
+            workdir=workdir,
+            stdout=stdout,
+            stderr=stderr,
+            staged_descriptor=staged_descriptor,
+        )
         submitted = _run_as_managed_user(payload, argv, timeout=30, pass_fds=(staged_descriptor,))
         if not submitted.get("ok"):
             return {
@@ -5605,7 +5632,7 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
             raise LifecycleValidationError(
                 "HOST_ACCESS_POLICY_REJECTED", "restore requires host login to remain disabled"
             )
-        host_keys = Path(f"/home/{payload['username']}/.ssh/authorized_keys")
+        host_keys = MANAGED_HOME_ROOT / str(payload["username"]) / ".ssh/authorized_keys"
         if host_keys.exists():
             raise LifecycleValidationError(
                 "HOST_ACCESS_POLICY_REJECTED", "restore must not reinstall host authorized_keys"
@@ -5677,7 +5704,7 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
             raise LifecycleValidationError(
                 "HOST_ACCESS_POLICY_REJECTED", "lease recycle requires host shell to be disabled"
             )
-        host_keys = Path(f"/home/{payload['username']}/.ssh/authorized_keys")
+        host_keys = MANAGED_HOME_ROOT / str(payload["username"]) / ".ssh/authorized_keys"
         if host_keys.exists():
             raise LifecycleValidationError(
                 "HOST_ACCESS_POLICY_REJECTED", "lease recycle found active host authorized_keys"
@@ -5786,9 +5813,31 @@ def _copy_root_only(source: Path, destination: Path) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _rollback_host_access_revoke(
+    *, username: str, host_keys: Path, removed: Path, original_shell: str
+) -> None:
+    current = pwd.getpwnam(username)
+    if current.pw_shell != original_shell:
+        restored_shell = run_fixed("usermod", ["-s", original_shell, username], timeout=20)
+        if not restored_shell.get("ok"):
+            raise OSError("managed host shell rollback failed")
+    if removed.exists():
+        if host_keys.exists():
+            raise OSError("host authorized_keys rollback target is occupied")
+        os.replace(removed, host_keys)
+    refreshed = pwd.getpwnam(username)
+    if refreshed.pw_shell != original_shell or not host_keys.exists():
+        raise OSError("host access rollback postcondition failed")
+
+
 def _execute_host_access_revoke(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    host_keys = MANAGED_HOME_ROOT / str(payload["username"]) / ".ssh/authorized_keys"
+    removed = host_keys.with_name(f".authorized_keys.portal4a-{request.request_id}")
+    original_shell: str | None = None
+    migration_started = False
     try:
         account = _portal4a_account(payload)
+        original_shell = account.pw_shell
         if account.pw_shell not in {"/bin/bash", "/usr/sbin/nologin"}:
             raise LifecycleValidationError(
                 "HOST_ACCESS_STATE_REJECTED", "managed host shell is outside migration states"
@@ -5797,7 +5846,6 @@ def _execute_host_access_revoke(request: WorkerRequest, payload: dict[str, Any])
             MANAGEMENT_USERNAME: _sshd_effective_config(MANAGEMENT_USERNAME),
             "codexops": _sshd_effective_config("codexops"),
         }
-        host_keys = Path(f"/home/{payload['username']}/.ssh/authorized_keys")
         container_keys = PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys"
         container_fingerprints = _installed_key_fingerprints(
             container_keys, int(payload["uid"]), int(payload["gid"])
@@ -5819,11 +5867,13 @@ def _execute_host_access_revoke(request: WorkerRequest, payload: dict[str, Any])
                 )
             stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
             backup_path = (
-                Path("/srv/gpu-platform/platform/backups")
+                PLATFORM_BACKUP_ROOT
                 / f"portal4a-host-access-{stamp}-{request.request_id[:8]}"
                 / "authorized_keys"
             )
             backup_sha256 = _copy_root_only(host_keys, backup_path)
+            os.replace(host_keys, removed)
+            migration_started = True
             changed = run_fixed(
                 "usermod", ["-s", "/usr/sbin/nologin", str(payload["username"])], timeout=20
             )
@@ -5831,9 +5881,6 @@ def _execute_host_access_revoke(request: WorkerRequest, payload: dict[str, Any])
                 raise LifecycleValidationError(
                     "HOST_SHELL_REVOKE_FAILED", "managed host shell could not be disabled"
                 )
-            removed = host_keys.with_name(f".authorized_keys.portal4a-{request.request_id}")
-            os.replace(host_keys, removed)
-            removed.unlink()
         refreshed = pwd.getpwnam(str(payload["username"]))
         if refreshed.pw_shell != "/usr/sbin/nologin" or host_keys.exists():
             raise LifecycleValidationError(
@@ -5847,6 +5894,9 @@ def _execute_host_access_revoke(request: WorkerRequest, payload: dict[str, Any])
             )
         for username, before in management_before.items():
             validate_ssh_policy_no_regression(username, before, _sshd_effective_config(username))
+        _portal4a_account(payload)
+        if migration_started:
+            removed.unlink()
         return {
             "status": "SUCCEEDED",
             "handler": "host_access.revoke_managed_user",
@@ -5866,11 +5916,28 @@ def _execute_host_access_revoke(request: WorkerRequest, payload: dict[str, Any])
             "codexops_policy": "UNCHANGED",
         }
     except (LifecycleValidationError, OSError) as exc:
+        rollback_status = "NOT_REQUIRED"
+        rollback_error: OSError | None = None
+        if migration_started and original_shell is not None:
+            try:
+                _rollback_host_access_revoke(
+                    username=str(payload["username"]),
+                    host_keys=host_keys,
+                    removed=removed,
+                    original_shell=original_shell,
+                )
+                rollback_status = "ROLLED_BACK"
+            except OSError as rollback_exc:
+                rollback_status = "ROLLBACK_FAILED"
+                rollback_error = rollback_exc
         return {
             "status": "ERROR",
             "error": {
-                "code": getattr(exc, "code", "HOST_ACCESS_REVOKE_FAILED"),
-                "message": str(exc),
+                "code": "HOST_ACCESS_ROLLBACK_FAILED"
+                if rollback_error is not None
+                else getattr(exc, "code", "HOST_ACCESS_REVOKE_FAILED"),
+                "message": str(rollback_error or exc),
+                "rollback_status": rollback_status,
             },
         }
 

@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "test:visual": "playwright test tests/e2e/portal2-visual.spec.ts tests/e2e/portal3d-visual.spec.ts"
+    "test:visual": "playwright test tests/e2e/portal2-visual.spec.ts tests/e2e/portal3d-visual.spec.ts tests/e2e/portal4a-visual.spec.ts"
   },
   "dependencies": {
     "@h100-portal/api-client": "workspace:*",

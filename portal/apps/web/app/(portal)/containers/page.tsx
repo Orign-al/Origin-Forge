@@ -11,5 +11,9 @@ export default function ContainersPage() {
   const current = useQuery({ queryKey: ["me"], queryFn: me });
   if (current.isPending) return <LoadingBlock />;
   if (current.isError) return <ErrorBlock />;
-  return current.data.role === "user" ? <OrdinaryContainer /> : <ContainersModule />;
+  return current.data.role === "user" ? (
+    <OrdinaryContainer />
+  ) : (
+    <ContainersModule />
+  );
 }

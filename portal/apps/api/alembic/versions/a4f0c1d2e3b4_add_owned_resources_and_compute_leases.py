@@ -310,7 +310,6 @@ def upgrade() -> None:
             ["owner_managed_user_id"], ["portal_managed_users.id"], ondelete="CASCADE"
         ),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("owner_managed_user_id"),
         sa.UniqueConstraint("root_path"),
     )
     op.create_index(
@@ -361,10 +360,14 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["operation_id"], ["portal_operations.id"]),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("operation_id"),
-        sa.UniqueConstraint("slurm_job_id"),
     )
     for column in ("owner_managed_user_id", "lease_id", "slurm_job_id", "state"):
-        op.create_index(f"ix_portal_jobs_{column}", "portal_jobs", [column], unique=False)
+        op.create_index(
+            f"ix_portal_jobs_{column}",
+            "portal_jobs",
+            [column],
+            unique=column == "slurm_job_id",
+        )
 
     op.create_table(
         "portal_resource_recycle_items",

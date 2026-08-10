@@ -25,7 +25,11 @@ export default function DashboardPage() {
   const current = useQuery({ queryKey: ["me"], queryFn: me });
   if (current.isPending) return <LoadingBlock />;
   if (current.isError) return <ErrorBlock />;
-  return current.data.role === "user" ? <OrdinaryDashboard /> : <AdminDashboardPage />;
+  return current.data.role === "user" ? (
+    <OrdinaryDashboard />
+  ) : (
+    <AdminDashboardPage />
+  );
 }
 
 function AdminDashboardPage() {

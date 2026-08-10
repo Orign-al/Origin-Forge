@@ -60,7 +60,7 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
     ) {
       void recordPageAccess(pathname).catch(() => undefined);
     }
-  }, [current.isSuccess, pathname]);
+  }, [current.data?.user.password_state, current.isSuccess, pathname]);
   if (current.isPending)
     return (
       <div className="auth-page">
@@ -96,11 +96,15 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
         <div className="brand">
           <div className="brand-title">H100 管理平台</div>
           <div className="brand-subtitle">
-            {role === "user" ? "个人计算环境 · Portal-4A-R" : "单机控制面 · Portal-4A-R"}
+            {role === "user"
+              ? "个人计算环境 · Portal-4A-R"
+              : "单机控制面 · Portal-4A-R"}
           </div>
         </div>
         <nav className="nav-group" aria-label="主导航">
-          <div className="nav-label">{role === "user" ? "我的资源" : "平台"}</div>
+          <div className="nav-label">
+            {role === "user" ? "我的资源" : "平台"}
+          </div>
           {activeNavigation.map(([label, href]) => (
             <Link
               key={href}
@@ -115,12 +119,14 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
           {role === "user" ? (
             <>
               Host SSH 已禁用
-              <br />GPU 上限 1 · 租约受控
+              <br />
+              GPU 上限 1 · 租约受控
             </>
           ) : (
             <>
               Production Pilot ACTIVE
-              <br />单节点 · 单受管用户
+              <br />
+              单节点 · 单受管用户
             </>
           )}
         </div>
@@ -154,9 +160,14 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
             ) : null}
           </div>
           <div className="topbar-right">
-            {role !== "user" ? <span className="muted">节点：sagsh100server</span> : null}
             {role !== "user" ? (
-              <span className="alert-count" aria-label={`当前告警 ${alertCount} 个`}>
+              <span className="muted">节点：sagsh100server</span>
+            ) : null}
+            {role !== "user" ? (
+              <span
+                className="alert-count"
+                aria-label={`当前告警 ${alertCount} 个`}
+              >
                 告警 {alertCount}
               </span>
             ) : null}
@@ -169,7 +180,8 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
           </div>
         </header>
         <main className="content">
-          {role !== "user" && current.data.ssh_enrollment?.required &&
+          {role !== "user" &&
+          current.data.ssh_enrollment?.required &&
           current.data.ssh_enrollment.setup_path ? (
             <div className="onboarding-banner" role="status">
               <div>

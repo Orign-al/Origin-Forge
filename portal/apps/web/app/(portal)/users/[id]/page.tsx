@@ -274,7 +274,8 @@ export default function UserDetailPage() {
                       Operation {compute.operation_id}
                     </span>
                     <span>
-                      Client Validation {clientValidationPassed ? "PASS" : "PENDING"}
+                      Client Validation{" "}
+                      {clientValidationPassed ? "PASS" : "PENDING"}
                     </span>
                   </div>
                   {kv([

@@ -142,13 +142,9 @@ function stagedUser(state: Portal3dState) {
       approved_host: "10.82.36.1",
       host_ssh_port: 22,
       host_ssh_server:
-        computeState === "ACTIVE"
-          ? "READY_FOR_CLIENT_VALIDATION"
-          : "NOT_READY",
+        computeState === "ACTIVE" ? "READY_FOR_CLIENT_VALIDATION" : "NOT_READY",
       container_ssh_server:
-        computeState === "ACTIVE"
-          ? "READY_FOR_CLIENT_VALIDATION"
-          : "NOT_READY",
+        computeState === "ACTIVE" ? "READY_FOR_CLIENT_VALIDATION" : "NOT_READY",
       host_server_fingerprint:
         computeState === "ACTIVE" ? "SHA256:test-host-server" : null,
       container_server_fingerprint:
@@ -709,12 +705,16 @@ test("ACTIVE 且 Key 已安装后才显示 SSH 与 VS Code 配置", async ({ pag
     page.getByText("USER AUTHENTICATION KEY FINGERPRINT").first(),
   ).toBeVisible();
   await expect(page.getByText("HOST SSH SERVER FINGERPRINT")).toBeVisible();
-  await expect(page.getByText("CONTAINER SSH SERVER FINGERPRINT")).toBeVisible();
+  await expect(
+    page.getByText("CONTAINER SSH SERVER FINGERPRINT"),
+  ).toBeVisible();
   await expect(page.getByText("SHA256:test-host-server")).toBeVisible();
   await expect(page.getByText("SHA256:test-container-server")).toBeVisible();
   await expect(page.getByText("PENDING", { exact: true })).toHaveCount(2);
   await expect(page.getByText("OUTSIDE SLURM DENIED")).toBeVisible();
-  await expect(page.getByText("sbatch / srun / squeue / sacct / 文件管理")).toBeVisible();
+  await expect(
+    page.getByText("sbatch / srun / squeue / sacct / 文件管理"),
+  ).toBeVisible();
   await expect(
     page.getByText("VS Code Remote SSH / Shell / 开发 / 编译 / 数据准备"),
   ).toBeVisible();
@@ -722,7 +722,9 @@ test("ACTIVE 且 Key 已安装后才显示 SSH 与 VS Code 配置", async ({ pag
   await expect(page.getByText(/当前调度节点保持 DRAIN/u)).toBeVisible();
 });
 
-test("Portal-3F 显示两项真实客户端 PASS 与首个 Pilot 验收结果", async ({ page }) => {
+test("Portal-3F 显示两项真实客户端 PASS 与首个 Pilot 验收结果", async ({
+  page,
+}) => {
   const publicKey = temporaryPublicKey("Portal-3F installed key");
   const state: Portal3dState = {
     authenticated: true,

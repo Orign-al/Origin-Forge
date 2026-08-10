@@ -340,19 +340,26 @@ export const changePassword = (payload: {
     body: JSON.stringify(payload),
   });
 export const selfEnvironment = () =>
-  apiFetch<{ status: string; environment: SelfEnvironment }>("/self/environment");
+  apiFetch<{ status: string; environment: SelfEnvironment }>(
+    "/self/environment",
+  );
 export const selfLease = () =>
   apiFetch<{ status: string; lease: ComputeLease }>("/self/lease");
 export const requestLeaseRenewal = (payload: {
   duration_seconds: number;
   idempotency_key: string;
 }) =>
-  apiFetch<{ status: string; renewal_request_id: string }>("/self/lease/renewals", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
+  apiFetch<{ status: string; renewal_request_id: string }>(
+    "/self/lease/renewals",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
 export const selfContainer = () =>
-  apiFetch<{ status: string; container: SelfEnvironment["container"] }>("/self/container");
+  apiFetch<{ status: string; container: SelfEnvironment["container"] }>(
+    "/self/container",
+  );
 export const selfContainerConnection = () =>
   apiFetch<{
     status: string;

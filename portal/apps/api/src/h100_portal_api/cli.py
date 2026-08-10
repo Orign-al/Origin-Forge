@@ -1,10 +1,12 @@
 import argparse
 import pwd
 import sys
+import time
 import uuid
 from datetime import timedelta
 from typing import Any, cast
 
+import httpx
 from sqlalchemy import select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -103,6 +105,14 @@ PORTAL3ER_APPROVAL_REFERENCE = "portal3e-r-host-ssh-policy-v1"
 PORTAL3ER_KEY_RECORD_ID = uuid.UUID("7427da72-37b9-4ac2-8ada-2f0c83b7718e")
 PORTAL3ER_KEY_FINGERPRINT = "SHA256:nek6vyEb3GT+UJAcY5y/8PgY4achF2ouNy+8C2JqUVc"
 PORTAL4A_FINAL_CREDENTIAL_SETTING_KEY = "portal4a.final_ordinary_user_credential"
+PORTAL4A_LOCAL_API_BASE = "http://127.0.0.1:18081/api/v1"
+PORTAL4A_BROWSER_ORIGIN = "http://127.0.0.1:18080"
+PORTAL4A_CPU_GATE_SCRIPT = "workspace/portal4a-cpu-gate.sh"
+PORTAL4A_GPU_GATE_SCRIPT = "workspace/portal4a-gpu-gate.sh"
+PORTAL4A_APPROVED_IMAGE = (
+    "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
+    "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
+)
 
 
 def ensure_roles(db: Session) -> None:
@@ -2083,6 +2093,305 @@ def portal4a_create_origin_pilot_user(base_url: str) -> int:
     return 0
 
 
+def _portal4a_response(
+    response: httpx.Response, expected_status: int, action: str
+) -> dict[str, Any]:
+    if response.status_code != expected_status:
+        raise RuntimeError(f"{action} returned HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"{action} returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{action} returned an invalid response object")
+    return cast(dict[str, Any], payload)
+
+
+def _portal4a_csrf_headers(client: httpx.Client) -> dict[str, str]:
+    token = client.cookies.get(get_settings().csrf_cookie_name)
+    if not token:
+        raise RuntimeError("Portal session CSRF cookie is missing")
+    return {
+        "Origin": PORTAL4A_BROWSER_ORIGIN,
+        "X-CSRF-Token": token,
+        "User-Agent": "h100-portal4a-controlled-job-gate",
+    }
+
+
+def _portal4a_authenticate_for_job_gate(
+    client: httpx.Client, temporary_password: str, changed_password: str
+) -> None:
+    csrf = _portal4a_response(client.get("/auth/csrf"), 200, "pre-auth CSRF").get("csrf_token")
+    if not isinstance(csrf, str):
+        raise RuntimeError("pre-auth CSRF response is incomplete")
+    login = _portal4a_response(
+        client.post(
+            "/auth/login",
+            headers={
+                "Origin": PORTAL4A_BROWSER_ORIGIN,
+                "X-CSRF-Token": csrf,
+                "User-Agent": "h100-portal4a-controlled-job-gate",
+            },
+            json={"username": "origin-pilot", "password": temporary_password},
+        ),
+        200,
+        "ordinary-user login",
+    )
+    user = login.get("user")
+    if not isinstance(user, dict) or user.get("normalized_login") != "origin-pilot":
+        raise RuntimeError("ordinary-user login identity is incorrect")
+    _portal4a_response(
+        client.post(
+            "/auth/password",
+            headers=_portal4a_csrf_headers(client),
+            json={
+                "current_password": temporary_password,
+                "new_password": changed_password,
+                "confirmation": changed_password,
+            },
+        ),
+        200,
+        "required password change",
+    )
+    current = _portal4a_response(client.get("/auth/me"), 200, "ordinary-user identity read")
+    current_user = current.get("user")
+    if (
+        not isinstance(current_user, dict)
+        or current_user.get("normalized_login") != "origin-pilot"
+        or current_user.get("password_state") != "SET"
+        or [item.get("name") for item in current_user.get("roles", [])] != ["user"]
+    ):
+        raise RuntimeError("ordinary-user session did not complete the password-change gate")
+
+
+def _portal4a_submit_gate_job(
+    client: httpx.Client,
+    *,
+    name: str,
+    script_path: str,
+    gpu_count: int,
+    image_ref: str | None,
+) -> dict[str, Any]:
+    payload = _portal4a_response(
+        client.post(
+            "/self/jobs",
+            headers=_portal4a_csrf_headers(client),
+            json={
+                "name": name,
+                "script_path": script_path,
+                "workdir": "workspace",
+                "cpus": 1,
+                "memory_mb": 2048 if gpu_count else 1024,
+                "gpu_count": gpu_count,
+                "time_limit_seconds": 600,
+                "image_ref": image_ref,
+                "idempotency_key": str(uuid.uuid4()),
+            },
+        ),
+        200,
+        f"{name} submission",
+    )
+    job = payload.get("job")
+    if not isinstance(job, dict) or not isinstance(job.get("id"), str):
+        raise RuntimeError(f"{name} submission response is incomplete")
+    return cast(dict[str, Any], job)
+
+
+def _portal4a_wait_for_gate_job(
+    client: httpx.Client,
+    job: dict[str, Any],
+    *,
+    expected_marker: str,
+    timeout_seconds: int = 900,
+) -> dict[str, Any]:
+    job_id = str(job["id"])
+    label = str(job.get("name", "Portal job"))
+    deadline = time.monotonic() + timeout_seconds
+    last_state: str | None = None
+    terminal_states = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY"}
+    while time.monotonic() < deadline:
+        current_payload = _portal4a_response(
+            client.get(f"/self/jobs/{job_id}"), 200, f"{label} status"
+        )
+        current = current_payload.get("job")
+        if not isinstance(current, dict):
+            raise RuntimeError(f"{label} status response is incomplete")
+        state = str(current.get("state", "UNKNOWN")).split("+", 1)[0]
+        if state != last_state:
+            print(f"{label}_state={state}")
+            last_state = state
+        if state in terminal_states:
+            if state != "COMPLETED" or current.get("exit_code") not in {None, "0:0"}:
+                raise RuntimeError(f"{label} finished with state={state}")
+            logs = _portal4a_response(client.get(f"/self/jobs/{job_id}/logs"), 200, f"{label} logs")
+            stdout = logs.get("stdout")
+            if not isinstance(stdout, str) or expected_marker not in stdout:
+                raise RuntimeError(f"{label} acceptance marker is missing")
+            return cast(dict[str, Any], current)
+        time.sleep(2)
+    raise RuntimeError(f"{label} did not complete within the controlled timeout")
+
+
+def portal4a_run_origin_pilot_job_gate() -> int:
+    login_password = random_token(48)
+    changed_password = random_token(48)
+    parked_password = random_token(48)
+    credential_armed = False
+    cpu_job: dict[str, Any] | None = None
+    gpu_job: dict[str, Any] | None = None
+    try:
+        with SessionLocal() as db:
+            user = db.scalar(
+                select(PortalUser).where(PortalUser.normalized_login == "origin-pilot")
+            )
+            managed = (
+                db.scalar(
+                    select(PortalManagedUser).where(PortalManagedUser.portal_user_id == user.id)
+                )
+                if user is not None
+                else None
+            )
+            credential = (
+                db.scalar(
+                    select(PortalPasswordCredential).where(
+                        PortalPasswordCredential.user_id == user.id
+                    )
+                )
+                if user is not None
+                else None
+            )
+            lease = (
+                db.scalar(
+                    select(PortalComputeLease).where(
+                        PortalComputeLease.owner_managed_user_id == managed.id,
+                        PortalComputeLease.state.in_(
+                            {"ACTIVE", "RENEWAL_WINDOW", "RENEWAL_PENDING"}
+                        ),
+                        PortalComputeLease.expires_at > utcnow(),
+                    )
+                )
+                if managed is not None
+                else None
+            )
+            container = (
+                db.scalar(
+                    select(PortalContainer).where(
+                        PortalContainer.owner_managed_user_id == managed.id,
+                        PortalContainer.observed_state == "RUNNING",
+                    )
+                )
+                if managed is not None
+                else None
+            )
+            if (
+                user is None
+                or {role.name for role in user.roles} != {"user"}
+                or managed is None
+                or credential is None
+                or lease is None
+                or container is None
+                or managed.host_access_state != "ENABLED"
+                or managed.shell != "/bin/bash"
+                or managed.compute_environment_state != "ACTIVE"
+                or db.get(PortalSetting, PORTAL4A_FINAL_CREDENTIAL_SETTING_KEY) is not None
+            ):
+                raise RuntimeError("ordinary-user Portal job gate baseline is incomplete")
+            credential.password_hash = hash_password(login_password)
+            credential.password_changed_at = utcnow()
+            user.password_state = PasswordState.RESET_REQUIRED
+            user.failed_login_count = 0
+            user.locked_until = None
+            db.execute(
+                update(PortalSession)
+                .where(PortalSession.user_id == user.id, PortalSession.revoked_at.is_(None))
+                .values(revoked_at=utcnow())
+            )
+            db.commit()
+            credential_armed = True
+
+        with httpx.Client(
+            base_url=PORTAL4A_LOCAL_API_BASE,
+            timeout=httpx.Timeout(75.0, connect=5.0),
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            _portal4a_authenticate_for_job_gate(client, login_password, changed_password)
+            cpu_job = _portal4a_wait_for_gate_job(
+                client,
+                _portal4a_submit_gate_job(
+                    client,
+                    name="portal4a-cpu-gate",
+                    script_path=PORTAL4A_CPU_GATE_SCRIPT,
+                    gpu_count=0,
+                    image_ref=None,
+                ),
+                expected_marker="PORTAL4A_CPU_GATE_PASS uid=20001 user=origin-pilot",
+            )
+            gpu_job = _portal4a_wait_for_gate_job(
+                client,
+                _portal4a_submit_gate_job(
+                    client,
+                    name="portal4a-gpu-gate",
+                    script_path=PORTAL4A_GPU_GATE_SCRIPT,
+                    gpu_count=1,
+                    image_ref=PORTAL4A_APPROVED_IMAGE,
+                ),
+                expected_marker="PORTAL4A_GPU_GATE_PASS uid=20001 user=origin-pilot gpu_count=1",
+            )
+    except (RuntimeError, httpx.HTTPError, SQLAlchemyError) as exc:
+        print(f"PORTAL-4A-R PORTAL JOB GATE BLOCKED — {exc}", file=sys.stderr)
+        return_code = 2
+    else:
+        return_code = 0
+    finally:
+        if credential_armed:
+            with SessionLocal() as db:
+                user = db.scalar(
+                    select(PortalUser).where(PortalUser.normalized_login == "origin-pilot")
+                )
+                credential = (
+                    db.scalar(
+                        select(PortalPasswordCredential).where(
+                            PortalPasswordCredential.user_id == user.id
+                        )
+                    )
+                    if user is not None
+                    else None
+                )
+                if user is not None and credential is not None:
+                    now = utcnow()
+                    credential.password_hash = hash_password(parked_password)
+                    credential.password_changed_at = now
+                    user.password_state = PasswordState.RESET_REQUIRED
+                    db.execute(
+                        update(PortalSession)
+                        .where(PortalSession.user_id == user.id, PortalSession.revoked_at.is_(None))
+                        .values(revoked_at=now)
+                    )
+                    record_audit(
+                        db,
+                        event_type="portal4a.job_gate.credential_discarded",
+                        actor="origin-al",
+                        actor_role="platform_owner",
+                        source_ip="local-console",
+                        user_agent="h100-portal-admin",
+                        object_type="portal_user",
+                        object_id=str(user.id),
+                        result="SUCCESS" if return_code == 0 else "FAILED",
+                        metadata={"credential_logged": False, "sessions_revoked": True},
+                    )
+                    db.commit()
+    if return_code == 0 and cpu_job is not None and gpu_job is not None:
+        print("portal_job_submission=PASSED")
+        print(f"cpu_portal_job_id={cpu_job['id']}")
+        print(f"cpu_slurm_job_id={cpu_job['slurm_job_id']}")
+        print(f"gpu_portal_job_id={gpu_job['id']}")
+        print(f"gpu_slurm_job_id={gpu_job['slurm_job_id']}")
+        print("slurm_job_owner=origin-pilot")
+        print("internal_gate_credential=DISCARDED")
+    return return_code
+
+
 def _portal4a_completed_job(db: Session, managed: PortalManagedUser, gpu_count: int) -> PortalJob:
     jobs = db.scalars(
         select(PortalJob)
@@ -2405,6 +2714,7 @@ def main() -> int:
     portal3g.add_argument("--approval-text", required=True)
     portal4a_user = subparsers.add_parser("portal4a-create-origin-pilot-user")
     portal4a_user.add_argument("--base-url", default="http://10.10.10.2:18080")
+    subparsers.add_parser("portal4a-run-origin-pilot-job-gate")
     portal4a_credential = subparsers.add_parser("portal4a-issue-origin-pilot-test-login")
     portal4a_credential.add_argument("--base-url", default="http://10.10.10.2:18080")
     portal4a_revoke = subparsers.add_parser("portal4a-revoke-origin-pilot-host-access")
@@ -2432,6 +2742,8 @@ def main() -> int:
         return portal3g_start_production_pilot(args.approval_text)
     if args.command == "portal4a-create-origin-pilot-user":
         return portal4a_create_origin_pilot_user(args.base_url)
+    if args.command == "portal4a-run-origin-pilot-job-gate":
+        return portal4a_run_origin_pilot_job_gate()
     if args.command == "portal4a-issue-origin-pilot-test-login":
         return portal4a_issue_origin_pilot_test_login(args.base_url)
     if args.command == "portal4a-revoke-origin-pilot-host-access":

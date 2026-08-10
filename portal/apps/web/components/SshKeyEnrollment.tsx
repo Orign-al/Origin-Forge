@@ -371,14 +371,22 @@ export function SshKeyEnrollment({
         ) : null}
       </div>
 
-      <ol className="setup-stepper" aria-label="计算环境启用步骤">
-        <li className={validKeys.length ? "step-complete" : "step-current"}>
-          1. SSH 密钥
-        </li>
-        <li>2. 确认资源</li>
-        <li>3. 等待激活</li>
-        <li>4. 连接环境</li>
-      </ol>
+      {containerOnly ? (
+        <div className="security-strip">
+          <span>用途：仅开发容器</span>
+          <span>宿主 SSH：未启用</span>
+          <span>认证：SSH Public Key</span>
+        </div>
+      ) : (
+        <ol className="setup-stepper" aria-label="计算环境启用步骤">
+          <li className={validKeys.length ? "step-complete" : "step-current"}>
+            1. SSH 密钥
+          </li>
+          <li>2. 确认资源</li>
+          <li>3. 等待激活</li>
+          <li>4. 连接环境</li>
+        </ol>
+      )}
 
       {computeState === "STAGED" ? (
         <div className="notice staged-key-boundary">
@@ -413,9 +421,15 @@ export function SshKeyEnrollment({
             </div>
           ) : (
             <div>
-              <strong>{validKeys.length} 把公钥已验证</strong>
+              <strong>
+                {containerOnly && computeState === "ACTIVE"
+                  ? `${validKeys.length} 把公钥可用于开发容器`
+                  : `${validKeys.length} 把公钥已验证`}
+              </strong>
               <div className="muted">
-                尚未安装；计算身份仍需 Activate 审批。
+                {containerOnly && computeState === "ACTIVE"
+                  ? "新增密钥仍只授权自己的开发容器，不会启用宿主访问。"
+                  : "尚未安装；计算身份仍需 Activate 审批。"}
               </div>
             </div>
           )}
