@@ -245,8 +245,13 @@ export function downloadTextFile(
 
 export async function copyText(value: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(value);
-    return;
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Browsers may expose Clipboard API on internal HTTP but deny writes.
+      // Fall through to the user-gesture-scoped compatibility path.
+    }
   }
   const input = document.createElement("textarea");
   input.value = value;

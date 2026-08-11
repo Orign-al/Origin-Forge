@@ -25,6 +25,8 @@ from h100_portal_api.enums import (
     AccountState,
     OnboardingState,
     OperationStatus,
+    PasswordActionPurpose,
+    PasswordActionTokenState,
     PasswordState,
     RiskLevel,
 )
@@ -66,6 +68,7 @@ class PortalUser(Base):
     login_name: Mapped[str] = mapped_column(String(64), nullable=False)
     normalized_login: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(500), nullable=True)
     unix_username: Mapped[str | None] = mapped_column(String(32), nullable=True)
     account_state: Mapped[AccountState] = mapped_column(
         Enum(AccountState, native_enum=False, length=32), default=AccountState.INVITED
@@ -98,16 +101,45 @@ class PortalPasswordCredential(Base):
 
 class PortalPasswordSetupToken(Base):
     __tablename__ = "portal_password_setup_tokens"
+    __table_args__ = (
+        CheckConstraint(
+            "purpose IN ('INITIAL_PASSWORD_SETUP', 'PASSWORD_RESET')",
+            name="ck_password_action_purpose",
+        ),
+        CheckConstraint(
+            "state IN ('ACTIVE', 'USED', 'REVOKED', 'EXPIRED')",
+            name="ck_password_action_state",
+        ),
+        Index("ix_password_action_user_purpose_state", "user_id", "purpose", "state"),
+        Index("ix_password_action_state_expires", "state", "expires_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("portal_users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    purpose: Mapped[PasswordActionPurpose] = mapped_column(
+        Enum(PasswordActionPurpose, native_enum=False, length=32),
+        default=PasswordActionPurpose.INITIAL_PASSWORD_SETUP,
+        nullable=False,
+    )
+    state: Mapped[PasswordActionTokenState] = mapped_column(
+        Enum(PasswordActionTokenState, native_enum=False, length=16),
+        default=PasswordActionTokenState.ACTIVE,
+        nullable=False,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("portal_users.id"), nullable=True, index=True
+    )
+    request_ip_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    challenge_hash: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
+    challenge_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    exchanged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class PortalSession(Base):

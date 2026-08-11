@@ -16,11 +16,23 @@ Portal 密码只认证网页账号，不读取或修改 Linux shadow。`Origin-a
 
 修改网页密码会撤销其他会话并旋转当前会话，不影响 Linux/SSH 密码。
 
-## 一次性设置 token
+## 一次性密码动作 token
 
-设置 token 由 48 字节 CSPRNG 生成并进行 URL-safe 编码。数据库只保存 SHA-256 digest；
-明文仅由管理员 bootstrap CLI 在当前终端显示一次。token 默认 30 分钟过期、单次使用；
-使用后写入 `used_at`，新 token 会撤销旧的未使用 token。
+初始设置与密码重置使用独立 purpose：`INITIAL_PASSWORD_SETUP` 和 `PASSWORD_RESET`。
+token 由 48 字节 CSPRNG 生成并进行 URL-safe 编码，数据库只保存 SHA-256 digest。初始设置
+链接有效 24 小时，重置链接有效 30 分钟，均只能使用一次；重新生成同 purpose 链接会立即
+撤销旧的未使用链接。管理员只能在生成响应中读取一次原始链接，用户密码由用户本人设置。
+
+链接使用 `/setup-password#token=...` fragment，token 不会随初始页面请求发送给 Web 服务。
+页面读取后立即从地址栏删除 fragment，再通过 CSRF 保护的 POST 换取 10 分钟 HttpOnly
+challenge；最终密码提交不再携带原始 token。Setup 页面只加载同源资源，并由全局响应头
+强制 `Referrer-Policy: no-referrer`。数据库、Operation、Audit、列表 API 和详情 API 均不
+返回或保存原始 token、完整一次性 URL 或 challenge 明文。
+
+初始设置成功将 `INVITED` 账号转换为 `ACTIVE`，但保持 Compute Identity 为
+`NOT_PROVISIONED`。密码重置只更新 Portal Argon2id credential，撤销该账号所有旧 Portal
+会话并要求重新登录；Linux、SSH、Container、Jobs、Quota、Lease、Slurm 与 GPU policy
+均不改变。
 
 禁止把 URL 或 token 写入 journal、普通日志、报告、Git、环境变量、shell history 文件、
 工单或聊天。不要通过 `systemd-run`、`tee` 或带命令回显的调试 shell 运行 bootstrap。
@@ -37,7 +49,7 @@ Portal 密码只认证网页账号，不读取或修改 Linux shadow。`Origin-a
 - 高风险操作要求 10 分钟内重新认证。
 
 浏览器关闭不是唯一安全边界。数据库恢复、密钥疑似泄露或管理员账号事件后，应撤销所有
-活动 session 和未使用设置 token。
+活动 session 和未使用密码动作 token。
 
 ## CSRF 和来源校验
 

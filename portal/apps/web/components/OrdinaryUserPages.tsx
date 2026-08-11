@@ -22,6 +22,7 @@ import {
   submitSelfJob,
   type ComputeLease,
   type SelfJob,
+  type User,
 } from "../lib/api";
 import { copyText } from "../lib/ssh-key";
 import { randomUuid } from "../lib/random-uuid";
@@ -63,6 +64,66 @@ function bytes(value: number | null | undefined) {
     unit += 1;
   }
   return `${next.toFixed(unit > 2 ? 1 : 0)} ${units[unit]}`;
+}
+
+export function OrdinaryUnprovisionedDashboard({ user }: { user: User }) {
+  return (
+    <>
+      <PageHeading
+        title="我的环境"
+        description="Portal 账号已激活，计算资源尚未申请"
+        action={<StatusBadge value="NOT PROVISIONED" />}
+      />
+      <div className="grid-compact ordinary-stats">
+        <Card className="stat-panel">
+          <div className="stat-label">账号</div>
+          <div className="stat-value compact-stat">
+            <StatusBadge value={user.account_state} />
+          </div>
+          <div className="stat-detail">Portal 登录身份已建立</div>
+        </Card>
+        <Card className="stat-panel">
+          <div className="stat-label">计算环境</div>
+          <div className="stat-value compact-stat">
+            <StatusBadge value="NOT PROVISIONED" />
+          </div>
+          <div className="stat-detail">尚未创建 Linux、Container 或 Lease</div>
+        </Card>
+      </div>
+      <div className="section-grid">
+        <SectionCard
+          title="申请计算资源"
+          subtitle="后续 Compute Provisioning 流程"
+        >
+          <p>
+            资源申请与管理员审批将在下一阶段开放；创建 Portal
+            账号不会自动创建服务器资源。
+          </p>
+          <Button tone="primary" disabled>
+            申请计算资源
+          </Button>
+        </SectionCard>
+        <SectionCard title="设置SSH密钥" subtitle="用于未来自己的开发容器">
+          <p>计算身份获批后，可登记 SSH 公钥；平台不会要求上传私钥。</p>
+          <Link className="ui-button" href="/ssh-keys">
+            设置SSH密钥
+          </Link>
+        </SectionCard>
+      </div>
+      <div className="section-grid">
+        <SectionCard title="账号与安全">
+          <Link className="table-link" href="/account/security">
+            修改 Portal 密码与管理会话
+          </Link>
+        </SectionCard>
+        <SectionCard title="帮助">
+          <Link className="table-link" href="/help">
+            查看开户与资源申请说明
+          </Link>
+        </SectionCard>
+      </div>
+    </>
+  );
 }
 
 function LeaseAction({ lease }: { lease: ComputeLease }) {
@@ -730,6 +791,20 @@ export function OrdinarySshKeys() {
   const current = useQuery({ queryKey: ["me"], queryFn: me });
   if (current.isPending) return <LoadingBlock />;
   if (current.isError) return <ErrorBlock />;
+  if (current.data.user.resource_onboarding_state === "NOT_ENROLLED") {
+    return (
+      <>
+        <PageHeading title="SSH密钥" description="用于未来自己的开发容器" />
+        <SectionCard title="尚未建立计算身份">
+          <p>
+            SSH
+            公钥登记将在计算资源申请获批后开放。平台只接收公钥，绝不会要求上传私钥。
+          </p>
+          <Button disabled>设置SSH密钥</Button>
+        </SectionCard>
+      </>
+    );
+  }
   return (
     <>
       <PageHeading title="SSH密钥" description="仅用于自己的开发容器" />
@@ -747,6 +822,27 @@ export function OrdinarySshKeys() {
 }
 
 export function OrdinaryHelp() {
+  const current = useQuery({ queryKey: ["me"], queryFn: me });
+  if (current.isPending) return <LoadingBlock />;
+  if (current.isError) return <ErrorBlock />;
+  if (current.data.user.resource_onboarding_state === "NOT_ENROLLED") {
+    return (
+      <>
+        <PageHeading title="帮助" description="Portal 新用户开户流程" />
+        <div className="section-grid">
+          <SectionCard title="当前状态">
+            <p>
+              Portal 账号已激活，但尚未创建 Linux 用户、开发容器、配额、Slurm 或
+              Lease。
+            </p>
+          </SectionCard>
+          <SectionCard title="下一步">
+            <p>下一阶段通过资源申请与管理员审批进入 Compute Provisioning。</p>
+          </SectionCard>
+        </div>
+      </>
+    );
+  }
   return (
     <>
       <PageHeading title="帮助" description="普通用户计算流程" />

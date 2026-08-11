@@ -5,14 +5,23 @@ import { useParams, useSearchParams } from "next/navigation";
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { Button, Card, EmptyState, StatusBadge } from "@h100-portal/ui";
+import { Button, Card, EmptyState, Input, StatusBadge } from "@h100-portal/ui";
 import {
   ErrorBlock,
   LoadingBlock,
   PageHeading,
   SectionCard,
 } from "../../../../components/PortalShell";
-import { createOperation, userDetail } from "../../../../lib/api";
+import {
+  ApiError,
+  createOperation,
+  createPasswordResetLink,
+  createPasswordSetupLink,
+  type GeneratedPasswordActionLink,
+  type User,
+  userDetail,
+} from "../../../../lib/api";
+import { copyText } from "../../../../lib/ssh-key";
 import {
   ObjectTable,
   type SimpleColumnDef,
@@ -69,6 +78,183 @@ function Value({ children }: { children: unknown }) {
   if (children === null || children === undefined || children === "")
     return <span className="muted">—</span>;
   return <>{String(children)}</>;
+}
+
+function localTime(value?: string | null) {
+  if (!value) return "—";
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
+}
+
+function PasswordIdentityActions({ user }: { user: User }) {
+  const queryClient = useQueryClient();
+  const [generated, setGenerated] =
+    useState<GeneratedPasswordActionLink | null>(null);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const latestSetup = user.password_actions?.find(
+    (item) => item.purpose === "INITIAL_PASSWORD_SETUP",
+  );
+  const latestReset = user.password_actions?.find(
+    (item) => item.purpose === "PASSWORD_RESET",
+  );
+
+  async function generate(kind: "setup" | "reset") {
+    setBusy(true);
+    setMessage(null);
+    try {
+      const result =
+        kind === "setup"
+          ? await createPasswordSetupLink(user.id)
+          : await createPasswordResetLink(user.id);
+      setGenerated(result);
+      setConfirmReset(false);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["user", user.id] }),
+        queryClient.invalidateQueries({ queryKey: ["users"] }),
+        queryClient.invalidateQueries({ queryKey: ["operations"] }),
+      ]);
+    } catch (reason) {
+      setMessage(
+        reason instanceof ApiError ? reason.message : "一次性链接生成失败。",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Card className="password-action-panel">
+      <div className="detail-section-heading">
+        <div>
+          <h2>Portal 登录密码</h2>
+          <p className="muted">
+            密码由用户本人设置；管理员不会看到或设置明文密码。
+          </p>
+        </div>
+        <StatusBadge
+          value={
+            user.password_state === "SETUP_REQUIRED"
+              ? "NOT SET"
+              : user.password_state
+          }
+        />
+      </div>
+      <dl className="kv-grid">
+        <div className="kv">
+          <dt>Portal账号</dt>
+          <dd>{user.account_state}</dd>
+        </div>
+        <div className="kv">
+          <dt>计算身份</dt>
+          <dd>
+            {user.resource_onboarding_state === "NOT_ENROLLED"
+              ? "NOT PROVISIONED"
+              : user.resource_onboarding_state}
+          </dd>
+        </div>
+        <div className="kv">
+          <dt>最近 Setup Link</dt>
+          <dd>
+            {latestSetup
+              ? `${latestSetup.state} · ${localTime(latestSetup.expires_at)}`
+              : "—"}
+          </dd>
+        </div>
+        <div className="kv">
+          <dt>最近 Reset Link</dt>
+          <dd>
+            {latestReset
+              ? `${latestReset.state} · ${localTime(latestReset.expires_at)}`
+              : "—"}
+          </dd>
+        </div>
+      </dl>
+      {generated ? (
+        <div className="one-time-link-box" role="status">
+          <strong>
+            {generated.purpose === "INITIAL_PASSWORD_SETUP"
+              ? "一次性设置密码链接"
+              : "一次性密码重置链接"}
+          </strong>
+          <p>此原始链接只在当前页面显示一次。关闭后无法再次读取。</p>
+          <div className="copy-link-row">
+            <Input
+              readOnly
+              value={generated.setup_url}
+              aria-label="一次性密码链接"
+            />
+            <Button
+              type="button"
+              onClick={() => {
+                void copyText(generated.setup_url)
+                  .then(() => setMessage("链接已复制。"))
+                  .catch(() => setMessage("复制失败，请手工选择并复制链接。"));
+              }}
+            >
+              复制链接
+            </Button>
+          </div>
+          <div className="muted compact-help">
+            有效至：{localTime(generated.expires_at)}
+          </div>
+          <div className="notice compact-notice">
+            该链接等同临时登录凭据，请通过可信渠道交给用户。
+          </div>
+          <Button type="button" onClick={() => setGenerated(null)}>
+            关闭一次性显示
+          </Button>
+        </div>
+      ) : user.account_state === "INVITED" &&
+        user.password_state === "SETUP_REQUIRED" ? (
+        <div className="button-row">
+          <Button
+            tone="primary"
+            disabled={busy}
+            onClick={() => void generate("setup")}
+          >
+            {latestSetup?.state === "ACTIVE"
+              ? "重新生成设置密码链接"
+              : "生成设置密码链接"}
+          </Button>
+          <span className="muted">
+            有效期 24 小时；重新生成会立即撤销旧链接。
+          </span>
+        </div>
+      ) : user.account_state === "ACTIVE" ? (
+        confirmReset ? (
+          <div className="reset-confirmation">
+            <div className="notice">
+              将生成一次性密码重置链接。用户现有计算资源不会受到影响。
+            </div>
+            <div className="button-row">
+              <Button
+                tone="primary"
+                disabled={busy}
+                onClick={() => void generate("reset")}
+              >
+                确认生成重置链接
+              </Button>
+              <Button onClick={() => setConfirmReset(false)}>取消</Button>
+            </div>
+          </div>
+        ) : (
+          <Button onClick={() => setConfirmReset(true)}>重置登录密码</Button>
+        )
+      ) : (
+        <div className="notice">当前账号状态不允许生成密码链接。</div>
+      )}
+      {message ? (
+        <div className="notice compact-notice" role="status">
+          {message}
+        </div>
+      ) : null}
+    </Card>
+  );
 }
 
 export default function UserDetailPage() {
@@ -180,6 +366,7 @@ export default function UserDetailPage() {
           {message}
         </div>
       ) : null}
+      <PasswordIdentityActions user={user} />
       <div className="tabs" role="tablist" aria-label="用户详情分区">
         {TABS.map((tab) => (
           <button

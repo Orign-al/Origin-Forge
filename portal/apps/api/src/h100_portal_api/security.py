@@ -106,6 +106,12 @@ def safe_metadata(data: object, sensitive_keys: Iterable[str] | None = None) -> 
         "new_password",
         "confirmation",
         "token",
+        "token_hash",
+        "challenge",
+        "challenge_hash",
+        "setup_url",
+        "reset_url",
+        "action_url",
         "secret",
         "session",
         "cookie",
@@ -137,6 +143,10 @@ def safe_metadata(data: object, sensitive_keys: Iterable[str] | None = None) -> 
     if isinstance(data, tuple):
         return [safe_metadata(value, forbidden) for value in data[:100]]
     if isinstance(data, str) and "BEGIN " in data and "PRIVATE KEY" in data:
+        return "[REDACTED]"
+    if isinstance(data, str) and (
+        "/setup-password#token=" in data or "/setup-password?token=" in data
+    ):
         return "[REDACTED]"
     if isinstance(data, (str, int, float, bool)) or data is None:
         return data

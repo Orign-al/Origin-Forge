@@ -5,11 +5,11 @@ from datetime import timedelta
 from typing import NamedTuple
 
 from fastapi import HTTPException, Request, Response, status
-from sqlalchemy import delete, select, update
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from h100_portal_api.config import get_settings
-from h100_portal_api.enums import PasswordState
+from h100_portal_api.enums import PasswordActionTokenState, PasswordState
 from h100_portal_api.models import (
     PortalManagedUser,
     PortalPasswordSetupToken,
@@ -272,8 +272,14 @@ def revoke_session(db: Session, session: PortalSession) -> None:
 
 def remove_expired_setup_tokens(db: Session) -> None:
     db.execute(
-        delete(PortalPasswordSetupToken).where(
+        update(PortalPasswordSetupToken)
+        .where(
             PortalPasswordSetupToken.expires_at < utcnow(),
-            PortalPasswordSetupToken.used_at.is_not(None),
+            PortalPasswordSetupToken.state == PasswordActionTokenState.ACTIVE,
+        )
+        .values(
+            state=PasswordActionTokenState.EXPIRED,
+            challenge_hash=None,
+            challenge_expires_at=None,
         )
     )

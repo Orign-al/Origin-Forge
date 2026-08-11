@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
@@ -103,9 +102,7 @@ export default function LoginPage() {
           密码分离。当前入口仅绑定已批准的虚拟网络地址；Pilot
           阶段由管理员接受内部 HTTP，未启用 TLS。
           <br />
-          <Link href="/setup-password" className="muted">
-            已有一次性设置链接？
-          </Link>
+          如已收到一次性设置或重置链接，请直接打开管理员交付的完整链接。
         </div>
       </Card>
     </div>

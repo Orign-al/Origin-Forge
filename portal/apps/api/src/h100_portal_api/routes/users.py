@@ -1,17 +1,152 @@
+import pwd
+import uuid
+from datetime import timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from h100_portal_api.auth import AuthContext, serialize_user
+from h100_portal_api.audit import record_audit
+from h100_portal_api.auth import (
+    AuthContext,
+    client_ip,
+    require_session_csrf,
+    serialize_user,
+    user_agent,
+)
+from h100_portal_api.config import get_settings
 from h100_portal_api.database import get_db
 from h100_portal_api.dependencies import auth_context, permission_dependency
-from h100_portal_api.enums import OnboardingState, OperationStatus
-from h100_portal_api.models import PortalContainer, PortalManagedUser, PortalOperation, PortalUser
-from h100_portal_api.rbac import has_permission, highest_role
+from h100_portal_api.enums import (
+    AccountState,
+    OnboardingState,
+    OperationStatus,
+    PasswordActionPurpose,
+    PasswordActionTokenState,
+    PasswordState,
+    RiskLevel,
+)
+from h100_portal_api.models import (
+    PortalContainer,
+    PortalManagedUser,
+    PortalOperation,
+    PortalOperationEvent,
+    PortalPasswordCredential,
+    PortalPasswordSetupToken,
+    PortalRole,
+    PortalUser,
+    ensure_utc,
+    utcnow,
+)
+from h100_portal_api.rbac import assignable_roles, has_permission, highest_role
+from h100_portal_api.schemas import PortalUserCreateRequest
+from h100_portal_api.security import digest_secret, normalize_login, random_token
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+
+def _user_id(value: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404, detail={"code": "USER_NOT_FOUND", "message": "用户不存在"}
+        ) from exc
+
+
+def _password_action_state(token: PortalPasswordSetupToken) -> str:
+    state = token.state.value if hasattr(token.state, "value") else str(token.state)
+    if state == PasswordActionTokenState.ACTIVE and ensure_utc(token.expires_at) <= utcnow():
+        return PasswordActionTokenState.EXPIRED
+    return state
+
+
+def _trusted_request_origin(request: Request) -> str:
+    origin = request.headers.get("origin", "").rstrip("/")
+    allowed_origins = {item.rstrip("/") for item in get_settings().allowed_origins}
+    if origin in allowed_origins:
+        return origin
+    referer = request.headers.get("referer", "")
+    for allowed in allowed_origins:
+        if referer == allowed or referer.startswith(f"{allowed}/"):
+            return allowed
+    raise HTTPException(
+        status_code=400,
+        detail={"code": "PORTAL_ORIGIN_UNAVAILABLE", "message": "无法生成可信 Portal 链接"},
+    )
+
+
+def password_action_view(token: PortalPasswordSetupToken) -> dict[str, Any]:
+    return {
+        "id": str(token.id),
+        "purpose": token.purpose.value if hasattr(token.purpose, "value") else str(token.purpose),
+        "state": _password_action_state(token),
+        "created_at": token.created_at,
+        "expires_at": token.expires_at,
+        "used_at": token.used_at,
+        "revoked_at": token.revoked_at,
+        "created_by": str(token.created_by) if token.created_by else None,
+    }
+
+
+def password_action_views(db: Session, user_id: uuid.UUID) -> list[dict[str, Any]]:
+    rows = db.scalars(
+        select(PortalPasswordSetupToken)
+        .where(PortalPasswordSetupToken.user_id == user_id)
+        .order_by(PortalPasswordSetupToken.created_at.desc())
+        .limit(20)
+    ).all()
+    return [password_action_view(row) for row in rows]
+
+
+def _identity_operation(
+    db: Session,
+    *,
+    actor: PortalUser,
+    operation_type: str,
+    target: PortalUser,
+    summary: str,
+    payload: dict[str, Any],
+) -> PortalOperation:
+    now = utcnow()
+    operation = PortalOperation(
+        operation_type=operation_type,
+        target_type="portal_user",
+        target_id=str(target.id),
+        requested_by=actor.id,
+        approved_by=actor.id,
+        request_summary=summary,
+        validated_payload=payload,
+        idempotency_key=f"{operation_type}:{uuid.uuid4()}",
+        risk_level=RiskLevel.MEDIUM,
+        status=OperationStatus.SUCCEEDED,
+        created_at=now,
+        approved_at=now,
+        started_at=now,
+        finished_at=now,
+        result_summary="Portal identity action completed; compute resources unchanged",
+    )
+    db.add(operation)
+    db.flush()
+    db.add(
+        PortalOperationEvent(
+            operation_id=operation.id,
+            from_status=None,
+            to_status=OperationStatus.SUCCEEDED,
+            safe_message="Fixed Portal identity operation completed",
+            created_at=now,
+        )
+    )
+    return operation
+
+
+def _admin_user_payload(user: PortalUser, db: Session) -> dict[str, Any]:
+    item = serialize_user(user).model_dump(mode="json")
+    item["note"] = user.note
+    item["password_actions"] = password_action_views(db, user.id)
+    return item
 
 
 def resource_view(
@@ -207,7 +342,7 @@ def users(
     }
     result = []
     for user in portal_users:
-        item = serialize_user(user).model_dump(mode="json")
+        item = _admin_user_payload(user, db)
         resource = managed.get(user.id)
         item["linux_identity"] = resource_view(
             user, resource, containers.get(resource.id) if resource is not None else None
@@ -217,20 +352,121 @@ def users(
     return {"status": "OK", "users": result, "count": len(result)}
 
 
+@router.post("", status_code=status.HTTP_201_CREATED)
+def create_user(
+    body: PortalUserCreateRequest,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("users.write")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_session_csrf(request, context)
+    try:
+        normalized = normalize_login(body.login_name)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "LOGIN_NAME_INVALID",
+                "message": "登录名必须以小写字母开头，仅包含小写字母、数字或连字符",
+            },
+        ) from exc
+    if body.role not in set(assignable_roles(context.user)):
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "ROLE_NOT_ASSIGNABLE", "message": "当前账号无权分配该角色"},
+        )
+    if db.scalar(select(PortalUser.id).where(PortalUser.normalized_login == normalized)):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "PORTAL_LOGIN_CONFLICT", "message": "该 Portal 登录名已存在"},
+        )
+    if db.scalar(select(PortalManagedUser.id).where(PortalManagedUser.unix_username == normalized)):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "COMPUTE_IDENTITY_CONFLICT", "message": "该名称已被计算身份使用"},
+        )
+    try:
+        pwd.getpwnam(normalized)
+    except KeyError:
+        pass
+    else:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "LINUX_USERNAME_CONFLICT", "message": "该名称已被 Linux 账号使用"},
+        )
+    role = db.scalar(select(PortalRole).where(PortalRole.name == body.role))
+    if role is None:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "ROLE_INVALID", "message": "角色不存在"},
+        )
+    user = PortalUser(
+        login_name=normalized,
+        normalized_login=normalized,
+        display_name=body.display_name,
+        note=body.note,
+        unix_username=None,
+        account_state=AccountState.INVITED,
+        password_state=PasswordState.SETUP_REQUIRED,
+        resource_onboarding_state=OnboardingState.NOT_ENROLLED,
+        roles=[role],
+    )
+    db.add(user)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "PORTAL_LOGIN_CONFLICT", "message": "该 Portal 登录名已存在"},
+        ) from exc
+    operation = _identity_operation(
+        db,
+        actor=context.user,
+        operation_type="portal_user.create",
+        target=user,
+        summary=f"Create invited Portal account {normalized}",
+        payload={
+            "account_id": str(user.id),
+            "normalized_login": normalized,
+            "role": body.role,
+            "account_state": AccountState.INVITED,
+            "compute_identity": "NOT_PROVISIONED",
+        },
+    )
+    record_audit(
+        db,
+        event_type="PORTAL_USER_CREATED",
+        actor=context.user.normalized_login,
+        actor_role=highest_role(context.user),
+        source_ip=client_ip(request),
+        user_agent=user_agent(request),
+        object_type="portal_user",
+        object_id=str(user.id),
+        operation_id=operation.id,
+        metadata={
+            "normalized_login": normalized,
+            "role": body.role,
+            "account_state": AccountState.INVITED,
+            "compute_identity": "NOT_PROVISIONED",
+        },
+    )
+    db.commit()
+    return {
+        "status": "CREATED",
+        "user": _admin_user_payload(user, db),
+        "operation_id": str(operation.id),
+        "compute_resources_created": False,
+    }
+
+
 @router.get("/{user_id}")
 def user_detail(
     user_id: str,
     context: AuthContext = Depends(auth_context),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    import uuid
-
-    try:
-        target = uuid.UUID(user_id)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=404, detail={"code": "USER_NOT_FOUND", "message": "用户不存在"}
-        ) from exc
+    target = _user_id(user_id)
     user = db.get(PortalUser, target)
     if user is None:
         raise HTTPException(
@@ -251,7 +487,199 @@ def user_detail(
         if resource is not None
         else None
     )
-    item = serialize_user(user).model_dump(mode="json")
+    item = _admin_user_payload(user, db)
     item["linux_identity"] = resource_view(user, resource, container)
     item["compute_onboarding"] = compute_plan_view(user, db)
     return {"status": "OK", "user": item}
+
+
+@router.get("/{user_id}/password-action-tokens")
+def password_action_tokens(
+    user_id: str,
+    context: AuthContext = Depends(permission_dependency("users.read")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    target = db.get(PortalUser, _user_id(user_id))
+    if target is None:
+        raise HTTPException(
+            status_code=404, detail={"code": "USER_NOT_FOUND", "message": "用户不存在"}
+        )
+    rows = password_action_views(db, target.id)
+    return {"status": "OK", "tokens": rows, "count": len(rows)}
+
+
+def _create_password_action_link(
+    *,
+    purpose: PasswordActionPurpose,
+    user_id: str,
+    request: Request,
+    context: AuthContext,
+    db: Session,
+) -> dict[str, Any]:
+    require_session_csrf(request, context)
+    origin = _trusted_request_origin(request)
+    target = db.scalar(
+        select(PortalUser).where(PortalUser.id == _user_id(user_id)).with_for_update()
+    )
+    if target is None:
+        raise HTTPException(
+            status_code=404, detail={"code": "USER_NOT_FOUND", "message": "用户不存在"}
+        )
+    credential = db.scalar(
+        select(PortalPasswordCredential).where(PortalPasswordCredential.user_id == target.id)
+    )
+    if purpose == PasswordActionPurpose.INITIAL_PASSWORD_SETUP:
+        if (
+            target.account_state != AccountState.INVITED
+            or target.password_state != PasswordState.SETUP_REQUIRED
+            or credential is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "INITIAL_SETUP_NOT_ALLOWED",
+                    "message": "只有尚未设置密码的邀请账号可以生成设置链接",
+                },
+            )
+        lifetime = timedelta(hours=get_settings().initial_password_setup_token_hours)
+        operation_type = "portal_user.password_setup_link.create"
+        created_event = "PASSWORD_SETUP_LINK_CREATED"
+        revoked_event = "PASSWORD_SETUP_LINK_REVOKED"
+    else:
+        if (
+            target.account_state != AccountState.ACTIVE
+            or target.password_state not in {PasswordState.SET, PasswordState.RESET_REQUIRED}
+            or credential is None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "PASSWORD_RESET_NOT_ALLOWED",
+                    "message": "当前账号状态不能生成密码重置链接",
+                },
+            )
+        lifetime = timedelta(minutes=get_settings().password_reset_token_minutes)
+        operation_type = "portal_user.password_reset_link.create"
+        created_event = "PASSWORD_RESET_LINK_CREATED"
+        revoked_event = "PASSWORD_RESET_LINK_REVOKED"
+    now = utcnow()
+    active_rows = db.scalars(
+        select(PortalPasswordSetupToken)
+        .where(
+            PortalPasswordSetupToken.user_id == target.id,
+            PortalPasswordSetupToken.purpose == purpose,
+            PortalPasswordSetupToken.state == PasswordActionTokenState.ACTIVE,
+            PortalPasswordSetupToken.used_at.is_(None),
+        )
+        .with_for_update()
+    ).all()
+    if active_rows:
+        active_ids = [row.id for row in active_rows]
+        db.execute(
+            update(PortalPasswordSetupToken)
+            .where(PortalPasswordSetupToken.id.in_(active_ids))
+            .values(
+                state=PasswordActionTokenState.REVOKED,
+                revoked_at=now,
+                challenge_hash=None,
+                challenge_expires_at=None,
+            )
+        )
+        record_audit(
+            db,
+            event_type=revoked_event,
+            actor=context.user.normalized_login,
+            actor_role=highest_role(context.user),
+            source_ip=client_ip(request),
+            user_agent=user_agent(request),
+            object_type="portal_user",
+            object_id=str(target.id),
+            metadata={"purpose": purpose, "revoked_count": len(active_rows)},
+        )
+    raw_token = random_token(48)
+    expires_at = now + lifetime
+    token = PortalPasswordSetupToken(
+        user_id=target.id,
+        token_hash=digest_secret(raw_token),
+        purpose=purpose,
+        state=PasswordActionTokenState.ACTIVE,
+        created_at=now,
+        expires_at=expires_at,
+        created_by=context.user.id,
+        request_ip_digest=digest_secret(f"{get_settings().secret_key}:{client_ip(request)}"),
+    )
+    db.add(token)
+    db.flush()
+    operation = _identity_operation(
+        db,
+        actor=context.user,
+        operation_type=operation_type,
+        target=target,
+        summary=f"Create one-time {purpose.value} link for {target.normalized_login}",
+        payload={
+            "account_id": str(target.id),
+            "purpose": purpose,
+            "expires_at": expires_at.isoformat(),
+            "one_time": True,
+            "revoked_previous_count": len(active_rows),
+        },
+    )
+    record_audit(
+        db,
+        event_type=created_event,
+        actor=context.user.normalized_login,
+        actor_role=highest_role(context.user),
+        source_ip=client_ip(request),
+        user_agent=user_agent(request),
+        object_type="password_action_token",
+        object_id=str(token.id),
+        operation_id=operation.id,
+        metadata={
+            "account_id": str(target.id),
+            "purpose": purpose,
+            "expires_at": expires_at.isoformat(),
+            "one_time": True,
+        },
+    )
+    db.commit()
+    action_url = f"{origin}/setup-password#token={raw_token}"
+    return {
+        "status": "GENERATED",
+        "purpose": purpose,
+        "setup_url": action_url,
+        "expires_at": expires_at,
+        "token": password_action_view(token),
+        "operation_id": str(operation.id),
+    }
+
+
+@router.post("/{user_id}/password-setup-links", status_code=status.HTTP_201_CREATED)
+def create_password_setup_link(
+    user_id: str,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("users.write")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return _create_password_action_link(
+        purpose=PasswordActionPurpose.INITIAL_PASSWORD_SETUP,
+        user_id=user_id,
+        request=request,
+        context=context,
+        db=db,
+    )
+
+
+@router.post("/{user_id}/password-reset-links", status_code=status.HTTP_201_CREATED)
+def create_password_reset_link(
+    user_id: str,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("users.write")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return _create_password_action_link(
+        purpose=PasswordActionPurpose.PASSWORD_RESET,
+        user_id=user_id,
+        request=request,
+        context=context,
+        db=db,
+    )

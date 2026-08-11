@@ -3,7 +3,10 @@
 import { useQuery } from "@tanstack/react-query";
 import { ACCESS_MODE_LABEL } from "@h100-portal/config";
 import { Card, StatusBadge } from "@h100-portal/ui";
-import { OrdinaryDashboard } from "../../components/OrdinaryUserPages";
+import {
+  OrdinaryDashboard,
+  OrdinaryUnprovisionedDashboard,
+} from "../../components/OrdinaryUserPages";
 
 import {
   PageHeading,
@@ -26,7 +29,11 @@ export default function DashboardPage() {
   if (current.isPending) return <LoadingBlock />;
   if (current.isError) return <ErrorBlock />;
   return current.data.role === "user" ? (
-    <OrdinaryDashboard />
+    current.data.user.resource_onboarding_state === "NOT_ENROLLED" ? (
+      <OrdinaryUnprovisionedDashboard user={current.data.user} />
+    ) : (
+      <OrdinaryDashboard />
+    )
   ) : (
     <AdminDashboardPage />
   );

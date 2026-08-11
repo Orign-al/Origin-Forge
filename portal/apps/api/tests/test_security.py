@@ -103,3 +103,6 @@ def test_recursive_redaction() -> None:
         "private_key_path": "[REDACTED]",
         "fingerprint": "SHA256:safe",
     }
+    assert safe_metadata({"message": "open http://portal/setup-password#token=raw-secret"}) == {
+        "message": "[REDACTED]"
+    }

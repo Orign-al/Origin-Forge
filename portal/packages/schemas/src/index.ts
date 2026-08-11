@@ -7,7 +7,6 @@ export const loginSchema = z.object({
 
 export const setupPasswordSchema = z
   .object({
-    token: z.string().min(32).max(256),
     password: z.string().min(14).max(128),
     confirmation: z.string().min(14).max(128),
   })
@@ -16,5 +15,12 @@ export const setupPasswordSchema = z
     path: ["confirmation"],
   });
 
+export const passwordActionExchangeSchema = z.object({
+  token: z.string().min(32).max(256),
+});
+
 export type LoginInput = z.infer<typeof loginSchema>;
 export type SetupPasswordInput = z.infer<typeof setupPasswordSchema>;
+export type PasswordActionExchangeInput = z.infer<
+  typeof passwordActionExchangeSchema
+>;

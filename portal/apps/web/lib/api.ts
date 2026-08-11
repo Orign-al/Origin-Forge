@@ -9,6 +9,7 @@ export type User = {
   login_name: string;
   normalized_login: string;
   display_name: string;
+  note?: string | null;
   unix_username: string | null;
   account_state: string;
   password_state: string;
@@ -19,6 +20,7 @@ export type User = {
   failed_login_count?: number;
   locked_until?: string | null;
   roles: Array<{ name: string; description: string }>;
+  password_actions?: PasswordActionMetadata[];
   linux_identity?: Record<string, unknown>;
   compute_onboarding?: {
     status: string;
@@ -39,6 +41,26 @@ export type User = {
       error_code?: string | null;
     } | null;
   };
+};
+
+export type PasswordActionMetadata = {
+  id: string;
+  purpose: "INITIAL_PASSWORD_SETUP" | "PASSWORD_RESET";
+  state: "ACTIVE" | "USED" | "REVOKED" | "EXPIRED";
+  created_at: string;
+  expires_at: string;
+  used_at: string | null;
+  revoked_at: string | null;
+  created_by: string | null;
+};
+
+export type GeneratedPasswordActionLink = {
+  status: "GENERATED";
+  purpose: "INITIAL_PASSWORD_SETUP" | "PASSWORD_RESET";
+  setup_url: string;
+  expires_at: string;
+  token: PasswordActionMetadata;
+  operation_id: string;
 };
 
 export type SshEnrollment = {
@@ -230,18 +252,31 @@ export const login = (payload: { username: string; password: string }) =>
     method: "POST",
     body: JSON.stringify(payload),
   });
+export const exchangePasswordAction = (token: string) =>
+  apiFetch<{
+    status: "READY";
+    purpose: "INITIAL_PASSWORD_SETUP" | "PASSWORD_RESET";
+    username: string;
+    display_name: string;
+    expires_at: string;
+    one_time: true;
+  }>("/auth/password-action/exchange", {
+    method: "POST",
+    body: JSON.stringify({ token }),
+  });
 export const setupPassword = (payload: {
-  token: string;
   password: string;
   confirmation: string;
 }) =>
-  apiFetch<{ user: User; ssh_enrollment: SshEnrollment }>(
-    "/auth/setup-password",
-    {
-      method: "POST",
-      body: JSON.stringify(payload),
-    },
-  );
+  apiFetch<{
+    user: User;
+    ssh_enrollment: SshEnrollment;
+    purpose: "INITIAL_PASSWORD_SETUP" | "PASSWORD_RESET";
+    requires_login: boolean;
+  }>("/auth/setup-password", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 export const me = () =>
   apiFetch<{ user: User; role: string; ssh_enrollment: SshEnrollment }>(
     "/auth/me",
@@ -250,8 +285,34 @@ export const logout = () => apiFetch<void>("/auth/logout", { method: "POST" });
 export const overview = () => apiFetch<Overview>("/platform/overview");
 export const users = () =>
   apiFetch<{ status: string; users: User[]; count: number }>("/users");
+export const createPortalUser = (payload: {
+  login_name: string;
+  display_name: string;
+  role: string;
+  note: string | null;
+}) =>
+  apiFetch<{
+    status: "CREATED";
+    user: User;
+    operation_id: string;
+    compute_resources_created: false;
+  }>("/users", { method: "POST", body: JSON.stringify(payload) });
 export const userDetail = (id: string) =>
   apiFetch<{ status: string; user: User }>(`/users/${encodeURIComponent(id)}`);
+export const passwordActionTokens = (id: string) =>
+  apiFetch<{ status: string; tokens: PasswordActionMetadata[]; count: number }>(
+    `/users/${encodeURIComponent(id)}/password-action-tokens`,
+  );
+export const createPasswordSetupLink = (id: string) =>
+  apiFetch<GeneratedPasswordActionLink>(
+    `/users/${encodeURIComponent(id)}/password-setup-links`,
+    { method: "POST" },
+  );
+export const createPasswordResetLink = (id: string) =>
+  apiFetch<GeneratedPasswordActionLink>(
+    `/users/${encodeURIComponent(id)}/password-reset-links`,
+    { method: "POST" },
+  );
 export const sshKeys = (userId: string) =>
   apiFetch<SshKeyList>(`/users/${encodeURIComponent(userId)}/ssh-keys`);
 export const enrollSshKey = (

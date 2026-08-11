@@ -25,7 +25,12 @@ from h100_portal_api.auth import (
 from h100_portal_api.config import get_settings
 from h100_portal_api.database import get_db
 from h100_portal_api.dependencies import auth_context
-from h100_portal_api.enums import AccountState, PasswordState
+from h100_portal_api.enums import (
+    AccountState,
+    PasswordActionPurpose,
+    PasswordActionTokenState,
+    PasswordState,
+)
 from h100_portal_api.models import (
     PortalPasswordCredential,
     PortalPasswordSetupToken,
@@ -37,6 +42,7 @@ from h100_portal_api.models import (
 from h100_portal_api.schemas import (
     ChangePasswordRequest,
     LoginRequest,
+    PasswordActionExchangeRequest,
     ReauthenticateRequest,
     SetupPasswordRequest,
 )
@@ -44,6 +50,7 @@ from h100_portal_api.security import (
     digest_secret,
     hash_password,
     normalize_login,
+    random_token,
     validate_password,
     verify_password,
 )
@@ -209,22 +216,145 @@ def _record_session_created(
     )
 
 
-@router.get("/setup-status")
-def setup_status(token: str, db: Session = Depends(get_db)) -> dict[str, bool]:
-    if len(token) > 256:
-        return {"valid": False}
-    candidate = db.scalar(
-        select(PortalPasswordSetupToken).where(
-            PortalPasswordSetupToken.token_hash == digest_secret(token)
+def _set_password_action_cookie(response: Response, raw_challenge: str) -> None:
+    settings = get_settings()
+    response.set_cookie(
+        settings.password_action_cookie_name,
+        raw_challenge,
+        httponly=True,
+        secure=settings.cookie_secure,
+        samesite="strict",
+        path="/api/v1/auth",
+        max_age=settings.password_action_challenge_minutes * 60,
+    )
+
+
+def _clear_password_action_cookie(response: Response) -> None:
+    response.delete_cookie(get_settings().password_action_cookie_name, path="/api/v1/auth")
+
+
+def _password_action_error(candidate: PortalPasswordSetupToken | None) -> tuple[str, str]:
+    if candidate is not None:
+        if candidate.used_at is not None or candidate.state == PasswordActionTokenState.USED:
+            return "PASSWORD_ACTION_USED", "此链接已经使用"
+        if ensure_utc(candidate.expires_at) <= utcnow() or (
+            candidate.state == PasswordActionTokenState.EXPIRED
+        ):
+            return "PASSWORD_ACTION_EXPIRED", "此链接已经过期"
+        if candidate.revoked_at is not None or candidate.state == PasswordActionTokenState.REVOKED:
+            return "PASSWORD_ACTION_REVOKED", "此链接已被新的链接替代"
+    return "PASSWORD_ACTION_INVALID", "此链接无效"
+
+
+def _password_action_account_is_valid(
+    candidate: PortalPasswordSetupToken, user: PortalUser
+) -> bool:
+    if candidate.purpose == PasswordActionPurpose.INITIAL_PASSWORD_SETUP:
+        return (
+            user.account_state == AccountState.INVITED
+            and user.password_state == PasswordState.SETUP_REQUIRED
         )
+    return user.account_state == AccountState.ACTIVE and user.password_state in {
+        PasswordState.SET,
+        PasswordState.RESET_REQUIRED,
+    }
+
+
+@router.post("/password-action/exchange")
+def exchange_password_action(
+    body: PasswordActionExchangeRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    require_preauth_csrf(request)
+    token_digest = digest_secret(body.token)
+    if not rate_limiter.allowed(f"password-action-ip:{client_ip(request)}", 30, 300):
+        raise HTTPException(
+            status_code=429, detail={"code": "RATE_LIMITED", "message": "请求过于频繁，请稍后重试"}
+        )
+    candidate_ref = db.scalar(
+        select(PortalPasswordSetupToken).where(PortalPasswordSetupToken.token_hash == token_digest)
     )
-    valid = bool(
-        candidate
-        and candidate.used_at is None
-        and candidate.revoked_at is None
-        and ensure_utc(candidate.expires_at) > utcnow()
+    user = (
+        db.scalar(
+            select(PortalUser).where(PortalUser.id == candidate_ref.user_id).with_for_update()
+        )
+        if candidate_ref is not None
+        else None
     )
-    return {"valid": valid}
+    candidate = (
+        db.scalar(
+            select(PortalPasswordSetupToken)
+            .where(PortalPasswordSetupToken.id == candidate_ref.id)
+            .with_for_update()
+        )
+        if candidate_ref is not None
+        else None
+    )
+    if (
+        candidate is None
+        or candidate.state != PasswordActionTokenState.ACTIVE
+        or candidate.used_at is not None
+        or candidate.revoked_at is not None
+        or ensure_utc(candidate.expires_at) <= utcnow()
+    ):
+        if (
+            candidate is not None
+            and candidate.state == PasswordActionTokenState.ACTIVE
+            and ensure_utc(candidate.expires_at) <= utcnow()
+        ):
+            candidate.state = PasswordActionTokenState.EXPIRED
+            candidate.challenge_hash = None
+            candidate.challenge_expires_at = None
+            db.commit()
+        code, message = _password_action_error(candidate)
+        raise HTTPException(status_code=400, detail={"code": code, "message": message})
+    if user is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "PASSWORD_ACTION_INVALID", "message": "此链接无效"},
+        )
+    purpose = candidate.purpose
+    if not _password_action_account_is_valid(candidate, user):
+        candidate.state = PasswordActionTokenState.REVOKED
+        candidate.revoked_at = utcnow()
+        candidate.challenge_hash = None
+        candidate.challenge_expires_at = None
+        db.commit()
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "PASSWORD_ACTION_INVALID", "message": "此链接无效"},
+        )
+    now = utcnow()
+    challenge = random_token(48)
+    candidate.challenge_hash = digest_secret(challenge)
+    candidate.challenge_expires_at = min(
+        ensure_utc(candidate.expires_at),
+        now + timedelta(minutes=get_settings().password_action_challenge_minutes),
+    )
+    candidate.exchanged_at = now
+    record_audit(
+        db,
+        event_type="PASSWORD_ACTION_LINK_EXCHANGED",
+        actor=user.normalized_login,
+        actor_role="anonymous",
+        source_ip=client_ip(request),
+        user_agent=user_agent(request),
+        object_type="password_action_token",
+        object_id=str(candidate.id),
+        metadata={"purpose": purpose},
+    )
+    db.commit()
+    _set_password_action_cookie(response, challenge)
+    return {
+        "status": "READY",
+        "purpose": purpose,
+        "username": user.login_name,
+        "display_name": user.display_name,
+        "expires_at": candidate.expires_at,
+        "one_time": True,
+    }
 
 
 @router.post("/setup-password")
@@ -235,26 +365,59 @@ def setup_password(
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     require_preauth_csrf(request)
-    candidate = db.scalar(
+    raw_challenge = request.cookies.get(get_settings().password_action_cookie_name, "")
+    candidate_ref = db.scalar(
         select(PortalPasswordSetupToken).where(
-            PortalPasswordSetupToken.token_hash == digest_secret(body.token)
+            PortalPasswordSetupToken.challenge_hash == digest_secret(raw_challenge)
         )
+    )
+    user = (
+        db.scalar(
+            select(PortalUser).where(PortalUser.id == candidate_ref.user_id).with_for_update()
+        )
+        if candidate_ref is not None
+        else None
+    )
+    candidate = (
+        db.scalar(
+            select(PortalPasswordSetupToken)
+            .where(PortalPasswordSetupToken.id == candidate_ref.id)
+            .with_for_update()
+        )
+        if candidate_ref is not None
+        else None
     )
     if (
         candidate is None
+        or not raw_challenge
+        or candidate.state != PasswordActionTokenState.ACTIVE
         or candidate.used_at is not None
         or candidate.revoked_at is not None
         or ensure_utc(candidate.expires_at) <= utcnow()
+        or candidate.challenge_expires_at is None
+        or ensure_utc(candidate.challenge_expires_at) <= utcnow()
     ):
+        _clear_password_action_cookie(response)
+        code, message = _password_action_error(candidate)
         raise HTTPException(
             status_code=400,
-            detail={"code": "SETUP_TOKEN_INVALID", "message": "设置链接无效或已过期"},
+            detail={"code": code, "message": message},
         )
-    user = db.get(PortalUser, candidate.user_id)
     if user is None:
         raise HTTPException(
             status_code=400,
-            detail={"code": "SETUP_TOKEN_INVALID", "message": "设置链接无效或已过期"},
+            detail={"code": "PASSWORD_ACTION_INVALID", "message": "此链接无效"},
+        )
+    if not _password_action_account_is_valid(candidate, user):
+        candidate.state = PasswordActionTokenState.REVOKED
+        candidate.revoked_at = utcnow()
+        candidate.challenge_hash = None
+        candidate.challenge_expires_at = None
+        db.commit()
+        _clear_password_action_cookie(response)
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "PASSWORD_ACTION_INVALID", "message": "此链接无效"},
         )
     try:
         validate_password(body.password, user.normalized_login)
@@ -275,50 +438,102 @@ def setup_password(
         credential.password_hash = hash_password(body.password)
         credential.password_changed_at = now
     candidate.used_at = now
+    candidate.state = PasswordActionTokenState.USED
+    candidate.challenge_hash = None
+    candidate.challenge_expires_at = None
+    other_active = db.scalars(
+        select(PortalPasswordSetupToken).where(
+            PortalPasswordSetupToken.user_id == user.id,
+            PortalPasswordSetupToken.id != candidate.id,
+            PortalPasswordSetupToken.state == PasswordActionTokenState.ACTIVE,
+            PortalPasswordSetupToken.used_at.is_(None),
+        )
+    ).all()
     db.execute(
         update(PortalPasswordSetupToken)
         .where(
             PortalPasswordSetupToken.user_id == user.id,
             PortalPasswordSetupToken.id != candidate.id,
+            PortalPasswordSetupToken.state == PasswordActionTokenState.ACTIVE,
             PortalPasswordSetupToken.used_at.is_(None),
         )
-        .values(revoked_at=now)
+        .values(
+            state=PasswordActionTokenState.REVOKED,
+            revoked_at=now,
+            challenge_hash=None,
+            challenge_expires_at=None,
+        )
     )
     user.password_state = PasswordState.SET
-    user.account_state = AccountState.ACTIVE
-    user.activated_at = user.activated_at or now
-    revoke_user_sessions(db, user.id)
+    initial_setup = candidate.purpose == PasswordActionPurpose.INITIAL_PASSWORD_SETUP
+    if initial_setup:
+        user.account_state = AccountState.ACTIVE
+        user.activated_at = user.activated_at or now
+    revoked_sessions = revoke_user_sessions(db, user.id)
     terminal_registry.close_for_user(user.id)
-    new_session, session_raw, csrf_raw = create_session(db, user, request)
+    new_session = None
+    session_raw = None
+    csrf_raw = None
+    if initial_setup:
+        new_session, session_raw, csrf_raw = create_session(db, user, request)
+    revoked_by_purpose = {
+        purpose.value: sum(1 for row in other_active if row.purpose == purpose)
+        for purpose in PasswordActionPurpose
+    }
+    for purpose, count in revoked_by_purpose.items():
+        if count:
+            record_audit(
+                db,
+                event_type=(
+                    "PASSWORD_SETUP_LINK_REVOKED"
+                    if purpose == PasswordActionPurpose.INITIAL_PASSWORD_SETUP
+                    else "PASSWORD_RESET_LINK_REVOKED"
+                ),
+                actor=user.normalized_login,
+                actor_role=highest_role_safe(user),
+                source_ip=client_ip(request),
+                user_agent=user_agent(request),
+                object_type="portal_user",
+                object_id=str(user.id),
+                metadata={"purpose": purpose, "revoked_count": count},
+            )
     record_audit(
         db,
-        event_type="token.consume",
+        event_type="PASSWORD_SETUP_COMPLETED" if initial_setup else "PASSWORD_RESET_COMPLETED",
         actor=user.normalized_login,
         actor_role=highest_role_safe(user),
         source_ip=client_ip(request),
         user_agent=user_agent(request),
-        object_type="password_setup_token",
+        object_type="password_action_token",
         object_id=str(candidate.id),
-        metadata={"single_use": True},
+        metadata={"purpose": candidate.purpose, "single_use": True},
     )
-    record_audit(
-        db,
-        event_type="password.setup",
-        actor=user.normalized_login,
-        actor_role=highest_role_safe(user),
-        source_ip=client_ip(request),
-        user_agent=user_agent(request),
-        object_type="portal_user",
-        object_id=str(user.id),
-        metadata={"one_time_token": True},
-    )
-    _record_session_created(db, request, user, new_session, reason="password_setup")
+    if initial_setup and new_session is not None:
+        _record_session_created(db, request, user, new_session, reason="password_setup")
+    else:
+        record_audit(
+            db,
+            event_type="SESSION_REVOKED_AFTER_PASSWORD_RESET",
+            actor=user.normalized_login,
+            actor_role=highest_role_safe(user),
+            source_ip=client_ip(request),
+            user_agent=user_agent(request),
+            object_type="portal_user",
+            object_id=str(user.id),
+            metadata={"revoked_count": revoked_sessions, "requires_login": True},
+        )
     db.commit()
-    set_session_cookies(response, session_raw, csrf_raw)
+    _clear_password_action_cookie(response)
+    if initial_setup and session_raw is not None and csrf_raw is not None:
+        set_session_cookies(response, session_raw, csrf_raw)
+    else:
+        clear_session_cookies(response)
     return {
         "user": serialize_user(user).model_dump(mode="json"),
         "csrf_token": csrf_raw,
         "ssh_enrollment": ssh_enrollment_status(db, user),
+        "purpose": candidate.purpose,
+        "requires_login": not initial_setup,
     }
 
 

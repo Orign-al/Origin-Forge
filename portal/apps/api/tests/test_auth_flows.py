@@ -1,6 +1,13 @@
 from datetime import timedelta
 
-from h100_portal_api.enums import AccountState, OnboardingState, OperationStatus, PasswordState
+from h100_portal_api.enums import (
+    AccountState,
+    OnboardingState,
+    OperationStatus,
+    PasswordActionPurpose,
+    PasswordActionTokenState,
+    PasswordState,
+)
 from h100_portal_api.models import (
     PortalAuditEvent,
     PortalPasswordCredential,
@@ -38,6 +45,8 @@ def invite_origin(database, expired: bool = False):  # type: ignore[no-untyped-d
         PortalPasswordSetupToken(
             user_id=user.id,
             token_hash=digest_secret(token),
+            purpose=PasswordActionPurpose.INITIAL_PASSWORD_SETUP,
+            state=PasswordActionTokenState.ACTIVE,
             expires_at=utcnow() + timedelta(minutes=-1 if expired else 30),
         )
     )
@@ -74,11 +83,16 @@ def test_first_password_setup_activates_account_and_token_is_single_use(
     client, database, origin_headers
 ) -> None:  # type: ignore[no-untyped-def]
     user, token = invite_origin(database)
+    exchange = client.post(
+        "/api/v1/auth/password-action/exchange",
+        headers=csrf_headers(client, origin_headers),
+        json={"token": token},
+    )
+    assert exchange.status_code == 200
     response = client.post(
         "/api/v1/auth/setup-password",
-        headers=csrf_headers(client, origin_headers),
+        headers={**origin_headers, "X-CSRF-Token": client.cookies["h100_csrf"]},
         json={
-            "token": token,
             "password": "这是 Origin-al 的网页长口令 2026",
             "confirmation": "这是 Origin-al 的网页长口令 2026",
         },
@@ -91,33 +105,26 @@ def test_first_password_setup_activates_account_and_token_is_single_use(
     assert refreshed.resource_onboarding_state == OnboardingState.NOT_ENROLLED
     assert client.cookies.get("h100_session")
     audit_types = database.scalars(select(PortalAuditEvent.event_type)).all()
-    assert "token.consume" in audit_types
+    assert "PASSWORD_SETUP_COMPLETED" in audit_types
     assert "session.create" in audit_types
     replay = client.post(
-        "/api/v1/auth/setup-password",
+        "/api/v1/auth/password-action/exchange",
         headers=csrf_headers(client, origin_headers),
-        json={
-            "token": token,
-            "password": "另一条足够长的网页口令 2026",
-            "confirmation": "另一条足够长的网页口令 2026",
-        },
+        json={"token": token},
     )
     assert replay.status_code == 400
-    assert replay.json()["detail"]["code"] == "SETUP_TOKEN_INVALID"
+    assert replay.json()["detail"]["code"] == "PASSWORD_ACTION_USED"
 
 
 def test_expired_setup_token_is_rejected(client, database, origin_headers) -> None:  # type: ignore[no-untyped-def]
     _user, token = invite_origin(database, expired=True)
     response = client.post(
-        "/api/v1/auth/setup-password",
+        "/api/v1/auth/password-action/exchange",
         headers=csrf_headers(client, origin_headers),
-        json={
-            "token": token,
-            "password": "A sufficiently long portal password",
-            "confirmation": "A sufficiently long portal password",
-        },
+        json={"token": token},
     )
     assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "PASSWORD_ACTION_EXPIRED"
 
 
 def test_login_is_case_insensitive_and_rotates_existing_session(

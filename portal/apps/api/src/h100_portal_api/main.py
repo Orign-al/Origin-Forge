@@ -3,6 +3,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -65,6 +66,24 @@ async def safe_exception_handler(_request: Request, _exc: Exception) -> JSONResp
     return JSONResponse(
         status_code=500, content={"detail": {"code": "INTERNAL_ERROR", "message": "服务器内部错误"}}
     )
+
+
+@app.exception_handler(RequestValidationError)
+async def safe_validation_exception_handler(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    # FastAPI's default validation response includes the rejected raw input.
+    # Passwords, action tokens, SSH keys and other credentials must never be
+    # reflected into proxy diagnostics or browser error capture.
+    errors = [
+        {
+            "loc": [str(item) for item in error.get("loc", ())],
+            "msg": str(error.get("msg", "Invalid request"))[:256],
+            "type": str(error.get("type", "value_error"))[:128],
+        }
+        for error in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 
 @app.get("/health/live", tags=["health"])

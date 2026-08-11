@@ -1,12 +1,17 @@
 "use client";
 
-import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useEffect, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 
 import { Button, Card, Input } from "@h100-portal/ui";
-import { getCsrf, setupPassword } from "../../lib/api";
+import {
+  ApiError,
+  exchangePasswordAction,
+  getCsrf,
+  setupPassword,
+} from "../../lib/api";
 
 const schema = z
   .object({
@@ -22,22 +27,69 @@ const schema = z
   });
 type FormValues = z.infer<typeof schema>;
 
-function SetupPasswordForm() {
+type PasswordAction = {
+  purpose: "INITIAL_PASSWORD_SETUP" | "PASSWORD_RESET";
+  username: string;
+  display_name: string;
+  expires_at: string;
+};
+
+type LinkState = "LOADING" | "READY" | "EXPIRED" | "USED" | "INVALID";
+
+function localTime(value: string) {
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
+}
+
+export default function SetupPasswordPage() {
   const router = useRouter();
-  const params = useSearchParams();
-  const token = params.get("token") ?? "";
+  const [action, setAction] = useState<PasswordAction | null>(null);
+  const [linkState, setLinkState] = useState<LinkState>("LOADING");
   const [error, setError] = useState<string | null>(null);
-  const [ready, setReady] = useState(false);
+  const [resetComplete, setResetComplete] = useState(false);
+  const exchangeStarted = useRef(false);
   const {
     register,
     handleSubmit,
     formState: { errors, isSubmitting },
   } = useForm<FormValues>();
+
   useEffect(() => {
-    getCsrf()
-      .then(() => setReady(true))
-      .catch(() => setError("无法建立安全会话。"));
+    if (exchangeStarted.current) return;
+    exchangeStarted.current = true;
+    const fragment = new URLSearchParams(window.location.hash.slice(1));
+    const token = fragment.get("token") ?? "";
+    window.history.replaceState(null, "", window.location.pathname);
+    if (!token) {
+      // Keep all effect-driven state transitions asynchronous. This also
+      // avoids treating the server render's token-less URL as a client state.
+      void Promise.resolve().then(() => setLinkState("INVALID"));
+      return;
+    }
+    void getCsrf()
+      .then(() => exchangePasswordAction(token))
+      .then((result) => {
+        setAction(result);
+        setLinkState("READY");
+      })
+      .catch((reason: unknown) => {
+        if (reason instanceof ApiError) {
+          if (reason.code === "PASSWORD_ACTION_EXPIRED") {
+            setLinkState("EXPIRED");
+            return;
+          }
+          if (reason.code === "PASSWORD_ACTION_USED") {
+            setLinkState("USED");
+            return;
+          }
+        }
+        setLinkState("INVALID");
+      });
   }, []);
+
   async function submit(values: FormValues) {
     setError(null);
     const parsed = schema.safeParse(values);
@@ -46,93 +98,117 @@ function SetupPasswordForm() {
       return;
     }
     try {
-      const result = await setupPassword({ token, ...parsed.data });
-      router.replace(
-        result.ssh_enrollment?.required && result.ssh_enrollment.setup_path
-          ? result.ssh_enrollment.setup_path
-          : "/",
+      const result = await setupPassword(parsed.data);
+      if (result.requires_login) {
+        setResetComplete(true);
+        return;
+      }
+      router.replace("/");
+    } catch (reason) {
+      setError(
+        reason instanceof ApiError
+          ? reason.message
+          : "密码设置失败，请重新获取一次性链接。",
       );
-    } catch {
-      setError("设置链接无效、已过期或密码不符合安全要求。");
     }
   }
+
+  const isReset = action?.purpose === "PASSWORD_RESET";
   return (
     <div className="auth-page">
       <Card className="auth-panel">
-        <div className="auth-brand">
-          <span className="local-mode">一次性邀请</span>
-          <h1>设置网页密码</h1>
-          <p>只设置 Portal 密码，不修改 Linux 或 SSH 密码。</p>
-        </div>
-        {!token ? (
-          <div className="error-box">
-            缺少一次性设置 token。请使用管理员终端显示的完整链接。
+        {linkState === "LOADING" ? (
+          <div className="ui-empty">正在验证一次性链接…</div>
+        ) : linkState !== "READY" ? (
+          <div className="auth-brand">
+            <span className="local-mode">一次性密码链接</span>
+            <h1>
+              {linkState === "EXPIRED"
+                ? "链接已过期"
+                : linkState === "USED"
+                  ? "链接已使用"
+                  : "链接无效"}
+            </h1>
+            <p>请联系管理员生成新的密码设置或重置链接。</p>
           </div>
+        ) : resetComplete ? (
+          <>
+            <div className="auth-brand">
+              <span className="local-mode">密码重置完成</span>
+              <h1>使用新密码登录</h1>
+              <p>该账号的旧 Portal 会话已全部撤销，计算资源没有变化。</p>
+            </div>
+            <Button tone="primary" onClick={() => router.replace("/login")}>
+              返回登录
+            </Button>
+          </>
         ) : (
-          <form onSubmit={handleSubmit(submit)} noValidate>
-            <div className="form-field">
-              <label htmlFor="password">新网页密码</label>
-              <Input
-                id="password"
-                type="password"
-                autoComplete="new-password"
-                {...register("password")}
-              />
-              <div className="muted" style={{ marginTop: 5, fontSize: 12 }}>
-                14–128 个字符，可使用中文和 Unicode；不会 trim 前后空格。
+          <>
+            <div className="auth-brand">
+              <span className="local-mode">
+                {isReset ? "密码重置" : "账号邀请"}
+              </span>
+              <h1>{isReset ? "重置你的登录密码" : "设置你的登录密码"}</h1>
+              <p>此链接只能使用一次。</p>
+            </div>
+            <dl className="kv-grid compact-action-identity">
+              <div className="kv">
+                <dt>Username</dt>
+                <dd>{action?.username}</dd>
               </div>
-              {errors.password ? (
-                <div className="form-error">{errors.password.message}</div>
-              ) : null}
-            </div>
-            <div className="form-field">
-              <label htmlFor="confirmation">再次输入密码</label>
-              <Input
-                id="confirmation"
-                type="password"
-                autoComplete="new-password"
-                {...register("confirmation")}
-              />
-              {errors.confirmation ? (
-                <div className="form-error">{errors.confirmation.message}</div>
-              ) : null}
-            </div>
-            {error ? (
-              <div className="error-box" role="alert">
-                {error}
+              <div className="kv">
+                <dt>有效至</dt>
+                <dd>{action ? localTime(action.expires_at) : "—"}</dd>
               </div>
-            ) : null}
-            <div className="form-actions">
-              <Button
-                tone="primary"
-                type="submit"
-                disabled={!ready || isSubmitting}
-              >
-                {isSubmitting ? "保存中…" : "设置密码并进入平台"}
-              </Button>
+            </dl>
+            <form onSubmit={handleSubmit(submit)} noValidate>
+              <div className="form-field">
+                <label htmlFor="password">新密码</label>
+                <Input
+                  id="password"
+                  type="password"
+                  autoComplete="new-password"
+                  {...register("password")}
+                />
+                <div className="muted compact-help">
+                  14–128 个字符，可使用中文和 Unicode。
+                </div>
+                {errors.password ? (
+                  <div className="form-error">{errors.password.message}</div>
+                ) : null}
+              </div>
+              <div className="form-field">
+                <label htmlFor="confirmation">确认新密码</label>
+                <Input
+                  id="confirmation"
+                  type="password"
+                  autoComplete="new-password"
+                  {...register("confirmation")}
+                />
+                {errors.confirmation ? (
+                  <div className="form-error">
+                    {errors.confirmation.message}
+                  </div>
+                ) : null}
+              </div>
+              {error ? (
+                <div className="error-box" role="alert">
+                  {error}
+                </div>
+              ) : null}
+              <div className="form-actions">
+                <Button tone="primary" type="submit" disabled={isSubmitting}>
+                  {isSubmitting ? "保存中…" : "设置密码并继续"}
+                </Button>
+              </div>
+            </form>
+            <div className="auth-foot">
+              该操作只修改 Portal 身份密码，不修改 Linux、SSH、Container、Lease
+              或其他计算资源。
             </div>
-          </form>
+          </>
         )}
-        <div className="auth-foot">
-          链接单次有效，默认 30 分钟过期。不要把 token 转发或写入日志。
-        </div>
       </Card>
     </div>
-  );
-}
-
-export default function SetupPasswordPage() {
-  return (
-    <Suspense
-      fallback={
-        <div className="auth-page">
-          <Card className="auth-panel">
-            <div className="ui-empty">正在验证一次性设置入口…</div>
-          </Card>
-        </div>
-      }
-    >
-      <SetupPasswordForm />
-    </Suspense>
   );
 }

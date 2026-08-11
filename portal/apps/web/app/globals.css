@@ -523,6 +523,55 @@ button {
   width: auto;
   min-width: 210px;
 }
+.identity-create-panel,
+.password-action-panel {
+  padding: 16px;
+  margin-bottom: 14px;
+}
+.identity-form-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0 14px;
+}
+.identity-note-field {
+  grid-column: 1 / -1;
+}
+.identity-note {
+  width: 100%;
+  min-height: 76px;
+  resize: vertical;
+  font: inherit;
+}
+.one-time-link-box {
+  margin-top: 14px;
+  border: 1px solid #b8d2c0;
+  border-radius: 5px;
+  padding: 14px;
+  background: #f7fbf8;
+}
+.one-time-link-box > p {
+  margin: 5px 0 12px;
+  color: var(--muted);
+}
+.copy-link-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.copy-link-row .ui-input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.compact-notice {
+  margin: 10px 0;
+}
+.compact-action-identity {
+  margin-bottom: 4px;
+}
+.reset-confirmation {
+  margin-top: 12px;
+}
 .auth-page {
   min-height: 100vh;
   display: grid;
@@ -1144,6 +1193,7 @@ button {
     padding: 16px 12px 28px;
   }
   .grid-compact,
+  .identity-form-grid,
   .job-form-grid,
   .section-grid,
   .kv-grid,
@@ -1218,6 +1268,10 @@ button {
     padding: 16px 12px 26px;
   }
   .section-grid {
+    grid-template-columns: 1fr;
+  }
+  .identity-form-grid,
+  .copy-link-row {
     grid-template-columns: 1fr;
   }
   .page-heading {

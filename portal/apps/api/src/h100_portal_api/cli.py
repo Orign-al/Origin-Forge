@@ -18,6 +18,8 @@ from h100_portal_api.enums import (
     AccountState,
     OnboardingState,
     OperationStatus,
+    PasswordActionPurpose,
+    PasswordActionTokenState,
     PasswordState,
     RiskLevel,
 )
@@ -215,15 +217,23 @@ def bootstrap_origin_al(reset: bool, base_url: str) -> int:
                     PortalPasswordSetupToken.user_id == user.id,
                     PortalPasswordSetupToken.used_at.is_(None),
                 )
-                .values(revoked_at=utcnow())
+                .values(
+                    revoked_at=utcnow(),
+                    state=PasswordActionTokenState.REVOKED,
+                    challenge_hash=None,
+                    challenge_expires_at=None,
+                )
             )
         token = random_token(48)
         db.add(
             PortalPasswordSetupToken(
                 user_id=user.id,
                 token_hash=digest_secret(token),
+                purpose=PasswordActionPurpose.INITIAL_PASSWORD_SETUP,
+                state=PasswordActionTokenState.ACTIVE,
                 created_at=utcnow(),
-                expires_at=utcnow() + timedelta(minutes=get_settings().setup_token_minutes),
+                expires_at=utcnow()
+                + timedelta(hours=get_settings().initial_password_setup_token_hours),
             )
         )
         if created:
@@ -246,10 +256,10 @@ def bootstrap_origin_al(reset: bool, base_url: str) -> int:
     print("Origin-al 网页密码设置入口")
     print()
     print("通过已批准的私有隧道网络打开：")
-    print(f"{base_url.rstrip('/')}/setup-password?token={token}")
+    print(f"{base_url.rstrip('/')}/setup-password#token={token}")
     print()
     print("SSH Tunnel 仍可作为回退访问方式。")
-    print("链接 30 分钟有效，仅可使用一次。")
+    print("链接 24 小时有效，仅可使用一次。")
     print("--------------------------------------------------")
     return 0
 

@@ -30,6 +30,13 @@ const USER_NAVIGATION = [
   ["帮助", "/help"],
 ] as const;
 
+const UNPROVISIONED_USER_NAVIGATION = [
+  ["我的环境", "/"],
+  ["SSH密钥", "/ssh-keys"],
+  ["账号与安全", "/account/security"],
+  ["帮助", "/help"],
+] as const;
+
 export function PortalShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
@@ -77,7 +84,12 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
   }
   const user = current.data.user;
   const role = current.data.role;
-  const activeNavigation = role === "user" ? USER_NAVIGATION : navigation;
+  const activeNavigation =
+    role === "user"
+      ? user.resource_onboarding_state === "NOT_ENROLLED"
+        ? UNPROVISIONED_USER_NAVIGATION
+        : USER_NAVIGATION
+      : navigation;
   const alertData = alertQuery.data as { count?: unknown } | undefined;
   const alertCount =
     typeof alertData?.count === "number" ? alertData.count : "—";
@@ -119,9 +131,13 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
         <div className="sidebar-foot">
           {role === "user" ? (
             <>
-              Host SSH 已禁用
+              {user.resource_onboarding_state === "NOT_ENROLLED"
+                ? "计算资源未配置"
+                : "Host SSH 已禁用"}
               <br />
-              GPU 上限 1 · 租约受控
+              {user.resource_onboarding_state === "NOT_ENROLLED"
+                ? "Portal Identity Only"
+                : "GPU 上限 1 · 租约受控"}
             </>
           ) : (
             <>

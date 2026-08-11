@@ -419,7 +419,12 @@ async function browserStorageSnapshot(page: Page) {
   return page.evaluate(async () => ({
     local: Object.keys(localStorage),
     session: Object.keys(sessionStorage),
-    indexedDb: "databases" in indexedDB ? await indexedDB.databases() : [],
+    indexedDb:
+      "databases" in indexedDB
+        ? (await indexedDB.databases()).filter(
+            (database) => database.name !== "__next_debug_channel",
+          )
+        : [],
     caches: "caches" in globalThis ? await caches.keys() : [],
     serviceWorkers:
       "serviceWorker" in navigator

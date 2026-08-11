@@ -16,6 +16,18 @@ class PasswordState(StrEnum):
     DISABLED = "DISABLED"
 
 
+class PasswordActionPurpose(StrEnum):
+    INITIAL_PASSWORD_SETUP = "INITIAL_PASSWORD_SETUP"  # noqa: S105
+    PASSWORD_RESET = "PASSWORD_RESET"  # noqa: S105
+
+
+class PasswordActionTokenState(StrEnum):
+    ACTIVE = "ACTIVE"
+    USED = "USED"
+    REVOKED = "REVOKED"
+    EXPIRED = "EXPIRED"
+
+
 class OnboardingState(StrEnum):
     NOT_ENROLLED = "NOT_ENROLLED"
     DRAFT = "DRAFT"

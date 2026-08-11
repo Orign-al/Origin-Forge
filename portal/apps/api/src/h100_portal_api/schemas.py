@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from h100_portal_api.enums import (
     AccountState,
@@ -22,8 +22,11 @@ class LoginRequest(ApiModel):
     password: str = Field(min_length=1, max_length=128)
 
 
-class SetupPasswordRequest(ApiModel):
+class PasswordActionExchangeRequest(ApiModel):
     token: str = Field(min_length=32, max_length=256)
+
+
+class SetupPasswordRequest(ApiModel):
     password: str = Field(min_length=14, max_length=128)
     confirmation: str = Field(min_length=14, max_length=128)
 
@@ -32,6 +35,29 @@ class SetupPasswordRequest(ApiModel):
         if self.password != self.confirmation:
             raise ValueError("password confirmation does not match")
         return self
+
+
+class PortalUserCreateRequest(ApiModel):
+    login_name: str = Field(min_length=1, max_length=64)
+    display_name: str = Field(min_length=1, max_length=128)
+    role: str = Field(default="user", pattern=r"^[a-z][a-z_]{2,31}$")
+    note: str | None = Field(default=None, max_length=500)
+
+    @field_validator("display_name")
+    @classmethod
+    def display_name_is_not_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("display name must not be blank")
+        return normalized
+
+    @field_validator("note")
+    @classmethod
+    def normalize_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
 
 
 class ChangePasswordRequest(ApiModel):

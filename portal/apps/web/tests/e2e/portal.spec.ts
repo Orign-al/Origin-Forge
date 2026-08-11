@@ -2,15 +2,20 @@ import { expect, test, type Page, type Route } from "@playwright/test";
 
 type MockState = {
   authenticated?: boolean;
-  role?: "platform_owner" | "operator";
+  role?: "platform_owner" | "operator" | "user";
   loginSucceeds?: boolean;
   setupUsesRemaining?: number;
+  passwordActionReady?: boolean;
+  setupUsed?: boolean;
   denyOperations?: boolean;
   enforceCsrf?: boolean;
   draftCreated?: boolean;
   planConflict?: boolean;
   staged?: boolean;
   productionPilot?: boolean;
+  createdInvitedUser?: boolean;
+  setupLinkGenerated?: boolean;
+  resetLinkGenerated?: boolean;
 };
 
 const MOCK_SETUP_TOKEN = "test-only-portal-setup-token-with-forty-eight-bytes";
@@ -42,6 +47,34 @@ const owner = {
     draft_state: "DRAFT NOT CREATED",
     plan: null,
   },
+};
+
+const invitedUser = {
+  id: "00000000-0000-4000-8000-000000000052",
+  login_name: "origin-pilot2",
+  normalized_login: "origin-pilot2",
+  display_name: "Origin Pilot 2",
+  note: "Portal identity only",
+  unix_username: null,
+  account_state: "INVITED",
+  password_state: "SETUP_REQUIRED",
+  resource_onboarding_state: "NOT_ENROLLED",
+  created_at: "2026-08-11T10:00:00Z",
+  activated_at: null,
+  last_login_at: null,
+  roles: [{ name: "user", description: "普通用户" }],
+  linux_identity: {
+    unix_username: null,
+    onboarding_state: "NOT_ENROLLED",
+    gpu_isolation_state: "NOT_APPLIED",
+  },
+  compute_onboarding: {
+    status: "NOT_APPLICABLE",
+    compute_username: null,
+    draft_state: "NOT_APPLICABLE",
+    plan: null,
+  },
+  password_actions: [],
 };
 
 const originPilotPlan = {
@@ -360,23 +393,81 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
       });
       return;
     }
-    if (path === "/auth/setup-password") {
-      if ((state.setupUsesRemaining ?? 0) < 1) {
+    if (path === "/auth/password-action/exchange") {
+      if (state.setupUsed) {
         await json(
           route,
           {
             detail: {
-              code: "SETUP_TOKEN_INVALID",
-              message: "设置链接无效或已过期",
+              code: "PASSWORD_ACTION_USED",
+              message: "此链接已经使用",
             },
           },
           400,
         );
         return;
       }
+      if ((state.setupUsesRemaining ?? 0) < 1) {
+        await json(
+          route,
+          {
+            detail: {
+              code: "PASSWORD_ACTION_EXPIRED",
+              message: "此链接已经过期",
+            },
+          },
+          400,
+        );
+        return;
+      }
+      state.passwordActionReady = true;
+      await json(route, {
+        status: "READY",
+        purpose: "INITIAL_PASSWORD_SETUP",
+        username: "origin-pilot2",
+        display_name: "Origin Pilot 2",
+        expires_at: "2026-08-12T12:00:00Z",
+        one_time: true,
+      });
+      return;
+    }
+    if (path === "/auth/setup-password") {
+      if (!state.passwordActionReady) {
+        await json(
+          route,
+          {
+            detail: {
+              code: "PASSWORD_ACTION_INVALID",
+              message: "此链接无效",
+            },
+          },
+          400,
+        );
+        return;
+      }
+      state.passwordActionReady = false;
       state.setupUsesRemaining = (state.setupUsesRemaining ?? 1) - 1;
+      state.setupUsed = true;
       state.authenticated = true;
-      await json(route, { user: owner, csrf_token: "session-csrf" }, 200);
+      await json(
+        route,
+        {
+          user: owner,
+          csrf_token: "session-csrf",
+          purpose: "INITIAL_PASSWORD_SETUP",
+          requires_login: false,
+          ssh_enrollment: {
+            required: false,
+            managed_user_id: null,
+            compute_identity: null,
+            compute_state: "NOT_ENROLLED",
+            validated_key_count: 0,
+            ssh_key_state: "NOT_APPLICABLE",
+            setup_path: null,
+          },
+        },
+        200,
+      );
       return;
     }
     if (path === "/auth/logout") {
@@ -542,10 +633,100 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
       return;
     }
     if (path === "/users") {
+      if (request.method() === "POST") {
+        state.createdInvitedUser = true;
+        await json(
+          route,
+          {
+            status: "CREATED",
+            user: invitedUser,
+            operation_id: "00000000-0000-4000-8000-000000000053",
+            compute_resources_created: false,
+          },
+          201,
+        );
+        return;
+      }
       await json(route, {
         status: "OK",
-        users: [state.staged ? stagedOwner : owner],
-        count: 1,
+        users: [
+          state.staged ? stagedOwner : owner,
+          ...(state.createdInvitedUser ? [invitedUser] : []),
+        ],
+        count: state.createdInvitedUser ? 2 : 1,
+      });
+      return;
+    }
+    if (path === `/users/${invitedUser.id}/password-setup-links`) {
+      state.setupLinkGenerated = true;
+      await json(
+        route,
+        {
+          status: "GENERATED",
+          purpose: "INITIAL_PASSWORD_SETUP",
+          setup_url: `http://127.0.0.1:18080/setup-password#token=${MOCK_SETUP_TOKEN}`,
+          expires_at: "2026-08-12T10:00:00Z",
+          token: {
+            id: "00000000-0000-4000-8000-000000000054",
+            purpose: "INITIAL_PASSWORD_SETUP",
+            state: "ACTIVE",
+            created_at: "2026-08-11T10:00:00Z",
+            expires_at: "2026-08-12T10:00:00Z",
+            used_at: null,
+            revoked_at: null,
+            created_by: owner.id,
+          },
+          operation_id: "00000000-0000-4000-8000-000000000055",
+        },
+        201,
+      );
+      return;
+    }
+    if (path === `/users/${owner.id}/password-reset-links`) {
+      state.resetLinkGenerated = true;
+      await json(
+        route,
+        {
+          status: "GENERATED",
+          purpose: "PASSWORD_RESET",
+          setup_url: `http://127.0.0.1:18080/setup-password#token=${MOCK_SETUP_TOKEN}`,
+          expires_at: "2026-08-11T10:30:00Z",
+          token: {
+            id: "00000000-0000-4000-8000-000000000056",
+            purpose: "PASSWORD_RESET",
+            state: "ACTIVE",
+            created_at: "2026-08-11T10:00:00Z",
+            expires_at: "2026-08-11T10:30:00Z",
+            used_at: null,
+            revoked_at: null,
+            created_by: owner.id,
+          },
+          operation_id: "00000000-0000-4000-8000-000000000057",
+        },
+        201,
+      );
+      return;
+    }
+    if (path === `/users/${invitedUser.id}`) {
+      await json(route, {
+        status: "OK",
+        user: {
+          ...invitedUser,
+          password_actions: state.setupLinkGenerated
+            ? [
+                {
+                  id: "00000000-0000-4000-8000-000000000054",
+                  purpose: "INITIAL_PASSWORD_SETUP",
+                  state: "ACTIVE",
+                  created_at: "2026-08-11T10:00:00Z",
+                  expires_at: "2026-08-12T10:00:00Z",
+                  used_at: null,
+                  revoked_at: null,
+                  created_by: owner.id,
+                },
+              ]
+            : [],
+        },
       });
       return;
     }
@@ -690,15 +871,32 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
 }
 
 async function fillPasswordSetup(page: Page): Promise<void> {
-  await page.getByLabel("新网页密码").fill(MOCK_PASSWORD);
-  await page.getByLabel("再次输入密码").fill(MOCK_PASSWORD);
-  await page.getByRole("button", { name: "设置密码并进入平台" }).click();
+  await page.getByLabel("新密码", { exact: true }).fill(MOCK_PASSWORD);
+  await page.getByLabel("确认新密码").fill(MOCK_PASSWORD);
+  await page.getByRole("button", { name: "设置密码并继续" }).click();
 }
 
 test("未登录访问控制台时跳转登录页", async ({ page }) => {
   await installMockApi(page, {});
   await page.goto("/");
   await expect(page).toHaveURL(/\/login$/);
+});
+
+test("未配置计算资源的普通用户只看到身份层首页", async ({ page }) => {
+  await installMockApi(page, { authenticated: true, role: "user" });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "我的环境" })).toBeVisible();
+  await expect(
+    page.getByText("NOT PROVISIONED", { exact: true }).first(),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "申请计算资源" }),
+  ).toBeDisabled();
+  await expect(page.getByRole("link", { name: "设置SSH密钥" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "作业" })).toHaveCount(0);
+  await expect(
+    page.getByText(/尚未创建 Linux、Container 或 Lease/),
+  ).toBeVisible();
 });
 
 test("无效登录显示统一错误文案", async ({ page }) => {
@@ -714,7 +912,8 @@ test("无效登录显示统一错误文案", async ({ page }) => {
 
 test("首次密码设置后进入总览", async ({ page }) => {
   await installMockApi(page, { setupUsesRemaining: 1 });
-  await page.goto(`/setup-password?token=${MOCK_SETUP_TOKEN}`);
+  await page.goto(`/setup-password#token=${MOCK_SETUP_TOKEN}`);
+  await expect(page).toHaveURL(/\/setup-password$/);
   await fillPasswordSetup(page);
   await expect(page).toHaveURL(/\/$/);
   await expect(page.getByRole("heading", { name: "总览" })).toBeVisible();
@@ -725,24 +924,18 @@ test("首次密码设置后进入总览", async ({ page }) => {
 
 test("过期 token 被拒绝", async ({ page }) => {
   await installMockApi(page, { setupUsesRemaining: 0 });
-  await page.goto(`/setup-password?token=${MOCK_SETUP_TOKEN}`);
-  await fillPasswordSetup(page);
-  await expect(page.locator(".error-box[role='alert']")).toContainText(
-    "设置链接无效",
-  );
+  await page.goto(`/setup-password#token=${MOCK_SETUP_TOKEN}`);
+  await expect(page.getByRole("heading", { name: "链接已过期" })).toBeVisible();
 });
 
 test("token 使用一次后不能重用", async ({ page }) => {
   const state: MockState = { setupUsesRemaining: 1 };
   await installMockApi(page, state);
-  await page.goto(`/setup-password?token=${MOCK_SETUP_TOKEN}`);
+  await page.goto(`/setup-password#token=${MOCK_SETUP_TOKEN}`);
   await fillPasswordSetup(page);
   await expect(page).toHaveURL(/\/$/);
-  await page.goto(`/setup-password?token=${MOCK_SETUP_TOKEN}`);
-  await fillPasswordSetup(page);
-  await expect(page.locator(".error-box[role='alert']")).toContainText(
-    "设置链接无效",
-  );
+  await page.goto(`/setup-password#token=${MOCK_SETUP_TOKEN}`);
+  await expect(page.getByRole("heading", { name: "链接已使用" })).toBeVisible();
 });
 
 test("Origin-al 可使用大小写显示名登录", async ({ page }) => {
@@ -850,9 +1043,54 @@ test("所有者能查看用户页且计算身份未注册", async ({ page }) => 
     page.getByText("Origin-al", { exact: true }).first(),
   ).toBeVisible();
   await expect(
-    page.getByText("NOT_ENROLLED", { exact: true }).first(),
+    page.getByText("NOT PROVISIONED", { exact: true }).first(),
   ).toBeVisible();
-  await expect(page.getByText(/不会自动进入 Pilot/)).toBeVisible();
+  await expect(page.getByText(/不会创建 Linux 用户/)).toBeVisible();
+});
+
+test("管理员创建 INVITED Portal 用户并一次性显示 Setup Link", async ({
+  page,
+}) => {
+  const state: MockState = { authenticated: true };
+  await installMockApi(page, state);
+  await page.goto("/users");
+  await page.getByRole("button", { name: "新建用户" }).click();
+  await page.getByLabel("Username / Login Name").fill("origin-pilot2");
+  await page.getByLabel("Display Name").fill("Origin Pilot 2");
+  await page.getByLabel("备注（可选）").fill("Portal identity only");
+  await page.getByRole("button", { name: "创建邀请账号" }).click();
+  await expect(page).toHaveURL(new RegExp(`/users/${invitedUser.id}$`, "u"));
+  await expect(
+    page.getByText("NOT SET", { exact: true }).first(),
+  ).toBeVisible();
+  await expect(
+    page.getByText("NOT PROVISIONED", { exact: true }).first(),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "生成设置密码链接" }).click();
+  await expect(page.getByLabel("一次性密码链接")).toHaveValue(
+    new RegExp("/setup-password#token=", "u"),
+  );
+  await expect(page.getByText(/只在当前页面显示一次/)).toBeVisible();
+  await page.getByRole("button", { name: "复制链接" }).click();
+  await expect(page.getByText("链接已复制。")).toBeVisible();
+  await page.getByRole("button", { name: "关闭一次性显示" }).click();
+  await expect(page.getByLabel("一次性密码链接")).toHaveCount(0);
+  await page.getByRole("button", { name: "重新生成设置密码链接" }).click();
+  await expect(page.getByLabel("一次性密码链接")).toHaveValue(
+    new RegExp("/setup-password#token=", "u"),
+  );
+});
+
+test("ACTIVE 用户密码重置先确认且明确不影响计算资源", async ({ page }) => {
+  await installMockApi(page, { authenticated: true });
+  await page.goto(`/users/${owner.id}`);
+  await page.getByRole("button", { name: "重置登录密码" }).click();
+  await expect(page.getByText(/用户现有计算资源不会受到影响/)).toBeVisible();
+  await page.getByRole("button", { name: "确认生成重置链接" }).click();
+  await expect(page.getByLabel("一次性密码链接")).toHaveValue(
+    new RegExp("/setup-password#token=", "u"),
+  );
+  await expect(page.getByText(/有效至/).last()).toBeVisible();
 });
 
 test("用户详情按标签区分网页、Linux 与 GPU 身份", async ({ page }) => {

@@ -22,7 +22,10 @@ class Settings(BaseSettings):
     session_idle_minutes: int = Field(default=30, ge=5, le=240)
     session_absolute_hours: int = Field(default=12, ge=1, le=48)
     reauthentication_minutes: int = Field(default=10, ge=1, le=30)
-    setup_token_minutes: int = Field(default=30, ge=5, le=120)
+    initial_password_setup_token_hours: int = Field(default=24, ge=1, le=48)
+    password_reset_token_minutes: int = Field(default=30, ge=5, le=120)
+    password_action_challenge_minutes: int = Field(default=10, ge=5, le=30)
+    password_action_cookie_name: str = "h100_password_action"  # noqa: S105
     login_failures_before_lock: int = Field(default=5, ge=3, le=20)
     login_lock_minutes: int = Field(default=15, ge=1, le=120)
     api_host: str = "127.0.0.1"
