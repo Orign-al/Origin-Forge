@@ -24,6 +24,7 @@ import {
   type SelfJob,
 } from "../lib/api";
 import { copyText } from "../lib/ssh-key";
+import { randomUuid } from "../lib/random-uuid";
 import { SshKeyEnrollment } from "./SshKeyEnrollment";
 import {
   ErrorBlock,
@@ -70,7 +71,7 @@ function LeaseAction({ lease }: { lease: ComputeLease }) {
     mutationFn: () =>
       requestLeaseRenewal({
         duration_seconds: 345600,
-        idempotency_key: crypto.randomUUID(),
+        idempotency_key: randomUuid(),
       }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["self-environment"] });
@@ -469,7 +470,7 @@ export function OrdinaryJobs() {
         gpu_count: gpu,
         time_limit_seconds: minutes * 60,
         image_ref: containerized ? APPROVED_IMAGE : null,
-        idempotency_key: crypto.randomUUID(),
+        idempotency_key: randomUuid(),
       }),
     onSuccess: async () =>
       queryClient.invalidateQueries({ queryKey: ["self-jobs"] }),

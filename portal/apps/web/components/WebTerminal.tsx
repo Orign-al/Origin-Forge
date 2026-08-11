@@ -20,6 +20,7 @@ import {
   type SelfTerminal,
 } from "../lib/api";
 import { TerminalScreen } from "../lib/terminal-screen";
+import { randomUuid } from "../lib/random-uuid";
 import { PageHeading, SectionCard } from "./PortalShell";
 
 type TerminalState =
@@ -252,7 +253,7 @@ export function WebTerminal() {
     try {
       const dimensions = dimensionsRef.current;
       const response = await startSelfTerminal({
-        idempotency_key: crypto.randomUUID(),
+        idempotency_key: randomUuid(),
         cols: dimensions.cols,
         rows: dimensions.rows,
       });

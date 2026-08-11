@@ -20,6 +20,7 @@ import {
   userDetail,
 } from "../../../lib/api";
 import { copyText } from "../../../lib/ssh-key";
+import { randomUuid } from "../../../lib/random-uuid";
 
 type ConnectionView = "host" | "container" | "vscode" | null;
 
@@ -58,7 +59,7 @@ function AdminAccessPage() {
   const startContainer = useMutation({
     mutationFn: (name: string) =>
       startManagedContainer(name, {
-        idempotency_key: crypto.randomUUID(),
+        idempotency_key: randomUuid(),
         expected_compute_state: "ACTIVE",
         expected_container_state: "STOPPED",
         expected_ssh_key_state: "INSTALLED",

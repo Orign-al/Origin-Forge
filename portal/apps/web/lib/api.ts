@@ -1,5 +1,7 @@
 import { ApiError, apiFetch } from "@h100-portal/api-client";
 
+import { randomUuid } from "./random-uuid";
+
 export { ApiError };
 
 export type User = {
@@ -393,7 +395,7 @@ export const selfContainerAction = (action: "start" | "stop" | "restart") =>
     `/self/container/${action}`,
     {
       method: "POST",
-      body: JSON.stringify({ idempotency_key: crypto.randomUUID() }),
+      body: JSON.stringify({ idempotency_key: randomUuid() }),
     },
   );
 export const startSelfTerminal = (payload: {
@@ -472,7 +474,7 @@ export const cancelSelfJob = (id: string) =>
     `/self/jobs/${encodeURIComponent(id)}/cancel`,
     {
       method: "POST",
-      body: JSON.stringify({ idempotency_key: crypto.randomUUID() }),
+      body: JSON.stringify({ idempotency_key: randomUuid() }),
     },
   );
 export const selfStorage = () =>
@@ -509,7 +511,7 @@ export const requestRestore = (itemId: string, durationSeconds = 345600) =>
       method: "POST",
       body: JSON.stringify({
         duration_seconds: durationSeconds,
-        idempotency_key: crypto.randomUUID(),
+        idempotency_key: randomUuid(),
       }),
     },
   );
