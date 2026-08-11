@@ -29,6 +29,8 @@ KNOWN_READS = {
     "self.storage.read",
 }
 KNOWN_WRITES = {
+    "compute.provision.plan",
+    "compute.provision.dry_run",
     "user.plan",
     "user.stage",
     "user.activate",
@@ -153,6 +155,15 @@ APPROVED_PRODUCTION_PILOT_PAYLOAD: dict[str, Any] = {
     "approval_reference": PORTAL3G_APPROVAL_REFERENCE,
 }
 APPROVED_JOB_IMAGE = PORTAL3F_IMAGE_REF
+STANDARD_COMPUTE_STORAGE_BYTES = 300 * 1024**3
+STANDARD_COMPUTE_PROFILE = "STANDARD_8CPU_32GB"
+STANDARD_COMPUTE_LEASE_SECONDS = 96 * 60 * 60
+PILOT_UID_MIN = 20_000
+PILOT_UID_MAX = 60_000
+PROJECT_ID_MIN = 30_000
+PROJECT_ID_MAX = 39_999
+PILOT_SSH_PORT_MIN = 22_023
+PILOT_SSH_PORT_MAX = 22_999
 
 
 class PayloadValidationError(ValueError):
@@ -188,6 +199,182 @@ def _canonical_uuid(value: object, field: str) -> str:
         return str(uuid.UUID(value))
     except ValueError as exc:
         raise PayloadValidationError("PAYLOAD_REJECTED", f"invalid {field}") from exc
+
+
+def _compute_request_identity(payload: dict[str, Any]) -> dict[str, str]:
+    username = payload.get("username")
+    if not isinstance(username, str) or not SAFE_USERNAME.fullmatch(username):
+        raise PayloadValidationError("COMPUTE_PLAN_PAYLOAD_REJECTED", "invalid username")
+    if username in {"root", "origin-al", "codexops"}:
+        raise PayloadValidationError("COMPUTE_PLAN_PAYLOAD_REJECTED", "protected username")
+    return {
+        "request_id": _canonical_uuid(payload.get("request_id"), "compute request ID"),
+        "portal_account_id": _canonical_uuid(payload.get("portal_account_id"), "Portal account ID"),
+        "username": username,
+    }
+
+
+def _reserved_number_list(
+    payload: dict[str, Any], field: str, *, minimum: int, maximum: int
+) -> list[int]:
+    raw = payload.get(field)
+    if not isinstance(raw, list) or len(raw) > 4096:
+        raise PayloadValidationError("COMPUTE_PLAN_PAYLOAD_REJECTED", f"invalid {field}")
+    if any(not isinstance(item, int) or not minimum <= item <= maximum for item in raw):
+        raise PayloadValidationError("COMPUTE_PLAN_PAYLOAD_REJECTED", f"invalid {field}")
+    if len(raw) != len(set(raw)):
+        raise PayloadValidationError("COMPUTE_PLAN_PAYLOAD_REJECTED", f"duplicate {field}")
+    return sorted(raw)
+
+
+def _validate_compute_provision_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "request_id",
+        "portal_account_id",
+        "username",
+        "requested_gpu_max",
+        "requested_storage_bytes",
+        "requested_container_profile",
+        "requested_lease_seconds",
+        "reserved_uids",
+        "reserved_gids",
+        "reserved_project_ids",
+        "reserved_ssh_ports",
+        "reserved_container_names",
+    }
+    if set(payload) != fields or set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+        raise PayloadValidationError(
+            "COMPUTE_PLAN_PAYLOAD_REJECTED", "compute provision plan fields are invalid"
+        )
+    result: dict[str, Any] = _compute_request_identity(payload)
+    gpu_max = payload.get("requested_gpu_max")
+    if gpu_max not in {0, 1} or isinstance(gpu_max, bool):
+        raise PayloadValidationError("GPU_MAX_REJECTED", "GPU max must be zero or one")
+    if (
+        payload.get("requested_storage_bytes") != STANDARD_COMPUTE_STORAGE_BYTES
+        or payload.get("requested_container_profile") != STANDARD_COMPUTE_PROFILE
+        or payload.get("requested_lease_seconds") != STANDARD_COMPUTE_LEASE_SECONDS
+    ):
+        raise PayloadValidationError(
+            "STANDARD_COMPUTE_PROFILE_REQUIRED", "compute request differs from standard profile"
+        )
+    result.update(
+        {
+            "requested_gpu_max": gpu_max,
+            "requested_storage_bytes": STANDARD_COMPUTE_STORAGE_BYTES,
+            "requested_container_profile": STANDARD_COMPUTE_PROFILE,
+            "requested_lease_seconds": STANDARD_COMPUTE_LEASE_SECONDS,
+            "reserved_uids": _reserved_number_list(
+                payload, "reserved_uids", minimum=PILOT_UID_MIN, maximum=PILOT_UID_MAX
+            ),
+            "reserved_gids": _reserved_number_list(
+                payload, "reserved_gids", minimum=PILOT_UID_MIN, maximum=PILOT_UID_MAX
+            ),
+            "reserved_project_ids": _reserved_number_list(
+                payload,
+                "reserved_project_ids",
+                minimum=PROJECT_ID_MIN,
+                maximum=PROJECT_ID_MAX,
+            ),
+            "reserved_ssh_ports": _reserved_number_list(
+                payload,
+                "reserved_ssh_ports",
+                minimum=PILOT_SSH_PORT_MIN,
+                maximum=PILOT_SSH_PORT_MAX,
+            ),
+        }
+    )
+    container_names = payload.get("reserved_container_names")
+    if (
+        not isinstance(container_names, list)
+        or len(container_names) > 4096
+        or any(
+            not isinstance(item, str)
+            or not SAFE_IDENTIFIER.fullmatch(item)
+            or not item.startswith("gpu-dev-")
+            for item in container_names
+        )
+        or len(container_names) != len(set(container_names))
+    ):
+        raise PayloadValidationError(
+            "COMPUTE_PLAN_PAYLOAD_REJECTED", "invalid reserved container names"
+        )
+    result["reserved_container_names"] = sorted(container_names)
+    return result
+
+
+def _validate_compute_provision_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "request_id",
+        "plan_id",
+        "portal_account_id",
+        "username",
+        "uid",
+        "gid",
+        "project_id",
+        "ssh_port",
+        "container_name",
+        "storage_bytes",
+        "container_profile",
+        "container_cpus",
+        "container_memory_gb",
+        "container_pids_limit",
+        "container_gpu",
+        "slurm_account",
+        "slurm_qos",
+        "gpu_max",
+        "lease_seconds",
+        "lease_state",
+        "host_ssh",
+        "shell",
+        "password_state",
+        "execution_enabled",
+    }
+    if set(payload) != fields or set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+        raise PayloadValidationError(
+            "COMPUTE_DRY_RUN_PAYLOAD_REJECTED", "compute dry-run fields are invalid"
+        )
+    result: dict[str, Any] = _compute_request_identity(payload)
+    result["plan_id"] = _canonical_uuid(payload.get("plan_id"), "provision plan ID")
+    username = result["username"]
+    expected = {
+        "storage_bytes": STANDARD_COMPUTE_STORAGE_BYTES,
+        "container_profile": STANDARD_COMPUTE_PROFILE,
+        "container_cpus": 8,
+        "container_memory_gb": 32,
+        "container_pids_limit": 4096,
+        "container_gpu": 0,
+        "slurm_account": "company",
+        "slurm_qos": "general",
+        "lease_seconds": STANDARD_COMPUTE_LEASE_SECONDS,
+        "lease_state": "NOT_STARTED",
+        "host_ssh": "DISABLED",
+        "shell": "/usr/sbin/nologin",
+        "password_state": "LOCKED",
+        "execution_enabled": False,
+        "container_name": f"gpu-dev-{username}",
+    }
+    if any(payload.get(field) != value for field, value in expected.items()):
+        raise PayloadValidationError(
+            "COMPUTE_DRY_RUN_PLAN_MISMATCH", "reserved plan differs from fixed policy"
+        )
+    gpu_max = payload.get("gpu_max")
+    if gpu_max not in {0, 1} or isinstance(gpu_max, bool):
+        raise PayloadValidationError("GPU_MAX_REJECTED", "GPU max must be zero or one")
+    numbers = {
+        "uid": (PILOT_UID_MIN, PILOT_UID_MAX),
+        "gid": (PILOT_UID_MIN, PILOT_UID_MAX),
+        "project_id": (PROJECT_ID_MIN, PROJECT_ID_MAX),
+        "ssh_port": (PILOT_SSH_PORT_MIN, PILOT_SSH_PORT_MAX),
+    }
+    for field, (minimum, maximum) in numbers.items():
+        value = payload.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+            raise PayloadValidationError("COMPUTE_DRY_RUN_PAYLOAD_REJECTED", f"invalid {field}")
+        result[field] = value
+    result.update(expected)
+    result["gpu_max"] = gpu_max
+    return result
 
 
 def _validate_user_stage(payload: dict[str, Any], allow_legacy_stage: bool) -> dict[str, Any]:
@@ -827,6 +1014,10 @@ def _validate_host_revoke(payload: dict[str, Any]) -> dict[str, Any]:
 def validate_payload(
     operation_type: str, payload: dict[str, Any], *, allow_legacy_stage: bool = False
 ) -> dict[str, Any]:
+    if operation_type == "compute.provision.plan":
+        return _validate_compute_provision_plan(payload)
+    if operation_type == "compute.provision.dry_run":
+        return _validate_compute_provision_dry_run(payload)
     if operation_type == "containers.inspect":
         name = payload.get("name")
         if not isinstance(name, str) or not SAFE_IDENTIFIER.fullmatch(name):

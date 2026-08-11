@@ -29,6 +29,7 @@ from h100_portal_api.enums import (
     RiskLevel,
 )
 from h100_portal_api.models import (
+    PortalComputeResourceRequest,
     PortalContainer,
     PortalManagedUser,
     PortalOperation,
@@ -146,6 +147,21 @@ def _admin_user_payload(user: PortalUser, db: Session) -> dict[str, Any]:
     item = serialize_user(user).model_dump(mode="json")
     item["note"] = user.note
     item["password_actions"] = password_action_views(db, user.id)
+    compute_request = db.scalar(
+        select(PortalComputeResourceRequest)
+        .where(PortalComputeResourceRequest.portal_account_id == user.id)
+        .order_by(PortalComputeResourceRequest.created_at.desc())
+    )
+    item["compute_request"] = (
+        {
+            "id": str(compute_request.id),
+            "status": compute_request.status,
+            "gpu_max": compute_request.requested_gpu_max,
+            "submitted_at": compute_request.submitted_at,
+        }
+        if compute_request is not None
+        else None
+    )
     return item
 
 

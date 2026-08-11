@@ -7,6 +7,7 @@ import { type FormEvent, useState } from "react";
 import { Button, Card, EmptyState, Input, StatusBadge } from "@h100-portal/ui";
 import {
   ApiError,
+  cancelSelfComputeRequest,
   cancelSelfJob,
   me,
   requestLeaseRenewal,
@@ -14,6 +15,7 @@ import {
   selfContainer,
   selfContainerAction,
   selfContainerConnection,
+  selfComputeRequest,
   selfEnvironment,
   selfJobLogs,
   selfJobs,
@@ -67,11 +69,37 @@ function bytes(value: number | null | undefined) {
 }
 
 export function OrdinaryUnprovisionedDashboard({ user }: { user: User }) {
+  const queryClient = useQueryClient();
+  const query = useQuery({
+    queryKey: ["self-compute-request"],
+    queryFn: selfComputeRequest,
+    refetchInterval: 30_000,
+  });
+  const cancel = useMutation({
+    mutationFn: (id: string) => cancelSelfComputeRequest(id),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: ["self-compute-request"],
+      });
+    },
+  });
+  const computeRequest = query.data?.request ?? null;
+  const pending = ["REQUESTED", "UNDER_REVIEW"].includes(
+    computeRequest?.status ?? "",
+  );
+  const approved = ["APPROVED", "PROVISION_PLAN_READY"].includes(
+    computeRequest?.status ?? "",
+  );
+  const environmentLabel = pending
+    ? "审批中"
+    : approved
+      ? "已批准，等待创建"
+      : "尚未申请";
   return (
     <>
       <PageHeading
         title="我的环境"
-        description="Portal 账号已激活，计算资源尚未申请"
+        description={`Portal 账号已激活，计算环境${environmentLabel}`}
         action={<StatusBadge value="NOT PROVISIONED" />}
       />
       <div className="grid-compact ordinary-stats">
@@ -85,23 +113,95 @@ export function OrdinaryUnprovisionedDashboard({ user }: { user: User }) {
         <Card className="stat-panel">
           <div className="stat-label">计算环境</div>
           <div className="stat-value compact-stat">
-            <StatusBadge value="NOT PROVISIONED" />
+            <StatusBadge
+              value={
+                pending
+                  ? "PENDING APPROVAL"
+                  : approved
+                    ? "APPROVED"
+                    : "NOT PROVISIONED"
+              }
+            />
           </div>
-          <div className="stat-detail">尚未创建 Linux、Container 或 Lease</div>
+          <div className="stat-detail">
+            {approved
+              ? "资源尚未执行 Provision，Lease 尚未开始"
+              : pending
+                ? "等待管理员审批，尚未创建任何资源"
+                : "尚未创建 Linux、Container 或 Lease"}
+          </div>
         </Card>
       </div>
+      {query.isError ? (
+        <ErrorBlock message="计算资源申请状态暂时不可用；未将其显示为未申请。" />
+      ) : null}
       <div className="section-grid">
         <SectionCard
           title="申请计算资源"
-          subtitle="后续 Compute Provisioning 流程"
+          subtitle="用户申请 → 管理员审批 → 资源规划"
         >
-          <p>
-            资源申请与管理员审批将在下一阶段开放；创建 Portal
-            账号不会自动创建服务器资源。
-          </p>
-          <Button tone="primary" disabled>
-            申请计算资源
-          </Button>
+          {pending && computeRequest ? (
+            <>
+              <p>
+                状态：等待管理员审批 · GPU {computeRequest.requested_gpu_max} ·
+                Storage 300GB · Lease 4天
+              </p>
+              <div className="button-row">
+                <Link
+                  className="ui-button ui-button-primary"
+                  href="/compute-request"
+                >
+                  查看申请
+                </Link>
+                {computeRequest.status === "REQUESTED" ? (
+                  <Button
+                    disabled={cancel.isPending}
+                    onClick={() => cancel.mutate(computeRequest.id)}
+                  >
+                    撤回申请
+                  </Button>
+                ) : null}
+              </div>
+            </>
+          ) : approved && computeRequest ? (
+            <>
+              <p>
+                申请已批准，正在等待创建。当前仍没有 Container、Quota、Slurm
+                Association 或 Lease。
+              </p>
+              <Link
+                className="ui-button ui-button-primary"
+                href="/compute-request"
+              >
+                查看批准状态
+              </Link>
+            </>
+          ) : (
+            <>
+              {computeRequest?.status === "REJECTED" ? (
+                <div className="notice">
+                  上次申请未通过：{computeRequest.review_note ?? "未提供原因"}
+                </div>
+              ) : null}
+              <p>
+                申请标准开发环境；提交申请不会自动创建服务器资源，也不会开始
+                Lease。
+              </p>
+              <Link
+                className="ui-button ui-button-primary"
+                href="/compute-request"
+              >
+                申请计算资源
+              </Link>
+            </>
+          )}
+          {cancel.isError ? (
+            <div className="form-error">
+              {cancel.error instanceof ApiError
+                ? cancel.error.message
+                : "申请未能撤回"}
+            </div>
+          ) : null}
         </SectionCard>
         <SectionCard title="设置SSH密钥" subtitle="用于未来自己的开发容器">
           <p>计算身份获批后，可登记 SSH 公钥；平台不会要求上传私钥。</p>

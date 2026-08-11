@@ -497,6 +497,14 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
       await json(route, { changed: true });
       return;
     }
+    if (path === "/self/compute-request") {
+      await json(route, {
+        status: "OK",
+        compute_identity: "NOT_PROVISIONED",
+        request: null,
+      });
+      return;
+    }
     if (path === "/audit/page-access") {
       await route.fulfill({ status: 204, body: "" });
       return;
@@ -889,9 +897,7 @@ test("未配置计算资源的普通用户只看到身份层首页", async ({ pa
   await expect(
     page.getByText("NOT PROVISIONED", { exact: true }).first(),
   ).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "申请计算资源" }),
-  ).toBeDisabled();
+  await expect(page.getByRole("link", { name: "申请计算资源" })).toBeVisible();
   await expect(page.getByRole("link", { name: "设置SSH密钥" })).toBeVisible();
   await expect(page.getByRole("link", { name: "作业" })).toHaveCount(0);
   await expect(

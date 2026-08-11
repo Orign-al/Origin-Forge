@@ -60,6 +60,64 @@ class PortalUserCreateRequest(ApiModel):
         return normalized or None
 
 
+class ComputeResourceRequestCreate(ApiModel):
+    """Closed ordinary-user contract for the standard first compute profile."""
+
+    requested_gpu_max: Literal[0, 1] = 0
+    requested_storage_bytes: Literal[322122547200] = 322122547200
+    requested_container_profile: Literal["STANDARD_8CPU_32GB"] = "STANDARD_8CPU_32GB"
+    requested_lease_seconds: Literal[345600] = 345600
+    purpose: str = Field(min_length=1, max_length=1000)
+    user_note: str | None = Field(default=None, max_length=1000)
+    idempotency_key: uuid.UUID
+
+    @field_validator("purpose")
+    @classmethod
+    def purpose_is_plain_nonblank_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("purpose must not be blank")
+        return normalized
+
+    @field_validator("user_note")
+    @classmethod
+    def normalize_user_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class ComputeResourceRequestCancel(ApiModel):
+    idempotency_key: uuid.UUID
+
+
+class ComputeResourceReviewRequest(ApiModel):
+    decision: Literal["APPROVE", "REJECT"]
+    review_note: str | None = Field(default=None, max_length=1000)
+    idempotency_key: uuid.UUID
+
+    @field_validator("review_note")
+    @classmethod
+    def normalize_review_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @model_validator(mode="after")
+    def rejection_requires_a_note(self) -> ComputeResourceReviewRequest:
+        if self.decision == "REJECT" and not self.review_note:
+            raise ValueError("review note is required when rejecting a request")
+        return self
+
+
+class ComputeProvisionActionRequest(ApiModel):
+    """Plan and dry-run actions accept no allocator or host parameters."""
+
+    idempotency_key: uuid.UUID
+
+
 class ChangePasswordRequest(ApiModel):
     current_password: str = Field(min_length=1, max_length=128)
     new_password: str = Field(min_length=14, max_length=128)

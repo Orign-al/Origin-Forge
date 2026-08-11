@@ -161,6 +161,16 @@ ACTIVE/DRAIN/空队列/Guard/GPU/DCGM/systemd/container preflight 后只执行�
 reason 为 `production pilot safety gate failed`，且不会自动重试 RESUME。API 仅在 Worker
 postflight 通过后写入非敏感 `production_pilot` setting 和审计记录。
 
+Portal-5A-1A 新增 `compute.provision.plan` 与 `compute.provision.dry_run` 两个固定 dry-run
+operation。Plan payload 只包含 Portal request/account/username、固定标准规格和数据库已占用
+reservation 集合；Worker 联合 `/etc/passwd`、group、legacy ownership、XFS projects、Docker、
+`ss`、Slurm account/QOS/association、标准镜像、GPU isolation 脚本及 Guard timer 生成候选，
+不运行 Guard 主程序。精确 dry-run payload 只接受已 reservation 的 UID/GID/Project ID/Port/
+Container Name 和固定 8 CPU、32GB、4096 PIDs、Container GPU NONE、Host SSH disabled、
+`/usr/sbin/nologin`、password locked、Lease NOT_STARTED。两种 operation 在 `dry_run=false`
+时均落入 `WRITE_EXECUTION_DISABLED`，没有 useradd、Docker、quota、sacctmgr、systemd 或 Lease
+写 handler。
+
 ## 固定命令适配器
 
 命令只从代码内绝对路径 allowlist 选择，`shell=False`，固定 `PATH`/locale/cwd，stdin

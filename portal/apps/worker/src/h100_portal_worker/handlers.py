@@ -31,6 +31,9 @@ from h100_portal_worker.schemas import (
     APPROVED_PRODUCTION_PILOT_PAYLOAD,
     APPROVED_STAGE_PAYLOAD,
     KNOWN_WRITES,
+    STANDARD_COMPUTE_LEASE_SECONDS,
+    STANDARD_COMPUTE_PROFILE,
+    STANDARD_COMPUTE_STORAGE_BYTES,
     WorkerRequest,
     validate_payload,
 )
@@ -2206,8 +2209,12 @@ def _ownership_conflict(identity_number: int) -> tuple[str, str | None]:
     return ("CONFLICT", first[0][:255]) if first else ("PASS", None)
 
 
-def _candidate_uid_gid() -> tuple[int | None, list[dict[str, str]], dict[str, str]]:
+def _candidate_uid_gid(
+    excluded: set[int] | None = None,
+) -> tuple[int | None, list[dict[str, str]], dict[str, str]]:
     used_uids, used_gids = _used_identity_numbers()
+    used_uids.update(excluded or set())
+    used_gids.update(excluded or set())
     rejected: list[dict[str, str]] = []
     checks = {
         "uid_range": f"{PILOT_UID_MIN}-{PILOT_UID_MAX}",
@@ -2255,8 +2262,9 @@ def _used_project_ids() -> set[int]:
     return used
 
 
-def _candidate_project_id() -> tuple[int | None, dict[str, str]]:
+def _candidate_project_id(excluded: set[int] | None = None) -> tuple[int | None, dict[str, str]]:
     used = _used_project_ids()
+    used.update(excluded or set())
     for value in range(PROJECT_ID_FIRST, PROJECT_ID_MAX + 1):
         if value not in used:
             return value, {
@@ -2298,8 +2306,9 @@ def _used_ssh_ports() -> tuple[set[int], bool]:
     return ports, True
 
 
-def _candidate_ssh_port() -> tuple[int | None, dict[str, str]]:
+def _candidate_ssh_port(excluded: set[int] | None = None) -> tuple[int | None, dict[str, str]]:
     used, readable = _used_ssh_ports()
+    used.update(excluded or set())
     if not readable:
         return None, {
             "range": f"{PILOT_SSH_PORT_MIN}-{PILOT_SSH_PORT_MAX}",
@@ -2403,6 +2412,434 @@ def _slurm_plan_checks(username: str) -> list[dict[str, str]]:
         }
     )
     return checks
+
+
+def _check(name: str, passed: bool, success: str, failure: str) -> dict[str, str]:
+    return {
+        "check": name,
+        "status": "PASS" if passed else "FAIL",
+        "detail": success if passed else failure,
+    }
+
+
+def _target_container_absent(name: str) -> tuple[bool, str]:
+    inspected = run_fixed("docker", ["container", "inspect", name], timeout=15)
+    if inspected.get("ok"):
+        return False, "目标开发容器已存在"
+    error = str(inspected.get("stderr", ""))
+    absent = "No such container" in error or "No such object" in error
+    return (True, "目标开发容器不存在") if absent else (False, "Docker 状态无法安全确认")
+
+
+def _compute_slurm_checks(username: str) -> list[dict[str, str]]:
+    """Read-only Production checks; an IDLE node must not be drained for planning."""
+    checks: list[dict[str, str]] = []
+    nodes = slurm_node()
+    node_rows = nodes.get("nodes", []) if nodes.get("status") == "OK" else []
+    node_available = bool(node_rows) and all(
+        not any(marker in str(item.get("state", "")).upper() for marker in ("DOWN", "DRAIN"))
+        for item in node_rows
+        if isinstance(item, dict)
+    )
+    checks.append(
+        _check(
+            "slurm_scheduler_available",
+            node_available,
+            "Slurm 节点可调度；dry-run 不修改节点状态",
+            "Slurm 节点不可用或处于 DOWN/DRAIN",
+        )
+    )
+    accounts = slurm_accounts()
+    account_ok = accounts.get("status") in {"OK", "PARTIAL"} and any(
+        str(item.get("account")) == "company" for item in accounts.get("accounts", [])
+    )
+    checks.append(
+        _check(
+            "slurm_account_company",
+            account_ok,
+            "company account 已存在",
+            "company account 不可用",
+        )
+    )
+    qos_rows = [item for item in accounts.get("qos", []) if item.get("name") == "general"]
+    qos_ok = bool(qos_rows) and "gres/gpu=1" in str(qos_rows[0].get("max_tres_per_user", ""))
+    checks.append(
+        _check(
+            "slurm_qos_general_max_gpu",
+            qos_ok,
+            "general QOS 强制每用户最多 1 张 GPU",
+            "general QOS 无法证明 MaxTRESPerUser=gres/gpu=1",
+        )
+    )
+    assoc = _assoc_exists(username)
+    checks.append(
+        _check(
+            "slurm_association_absent",
+            assoc is False,
+            "目标用户尚无 Slurm association",
+            "目标 association 已存在或状态无法确认",
+        )
+    )
+    return checks
+
+
+def _xfs_project_quota_capable() -> bool:
+    state = run_fixed("xfs_quota", ["-x", "-c", "state", str(PILOT_DATA_ROOT.parent)], timeout=20)
+    output = str(state.get("stdout", ""))
+    project_state = output.partition("Project quota state")[2]
+    return bool(
+        state.get("ok")
+        and project_state
+        and "Accounting: ON" in project_state
+        and "Enforcement: ON" in project_state
+    )
+
+
+def _standard_dev_image_available() -> bool:
+    """Bind the future standard profile to the already accepted Pilot image."""
+    source = run_fixed("docker", ["container", "inspect", "gpu-dev-origin-pilot"], timeout=15)
+    if not source.get("ok"):
+        return False
+    try:
+        parsed = json.loads(str(source.get("stdout", "")))
+        item = parsed[0] if isinstance(parsed, list) and parsed else {}
+        image_id = item.get("Image") if isinstance(item, dict) else None
+    except json.JSONDecodeError, IndexError:
+        return False
+    if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        return False
+    return bool(run_fixed("docker", ["image", "inspect", image_id], timeout=20).get("ok"))
+
+
+def _compute_platform_checks(username: str) -> list[dict[str, str]]:
+    checks: list[dict[str, str]] = []
+    data_parent_ok = PILOT_DATA_ROOT.exists() and PILOT_DATA_ROOT.is_dir()
+    checks.append(
+        _check(
+            "storage_parent_available",
+            data_parent_ok,
+            "/srv/gpu-platform/users 存在；未创建用户目录",
+            "标准用户存储父目录不可用",
+        )
+    )
+    checks.append(
+        _check(
+            "xfs_project_quota_capability",
+            _xfs_project_quota_capable(),
+            "XFS project quota accounting/enforcement 已启用",
+            "XFS project quota capability 无法证明",
+        )
+    )
+    checks.extend(_compute_slurm_checks(username))
+    global_dropins = [
+        Path("/etc/systemd/system/user.slice.d/50-h100-gpu-isolation.conf"),
+        Path("/etc/systemd/system/user-.slice.d/50-h100-gpu-isolation.conf"),
+    ]
+    checks.append(
+        _check(
+            "gpu_isolation_no_global_dropin",
+            not any(path.exists() for path in global_dropins),
+            "GPU 隔离保持精确 per-UID 策略，无全局 user slice 放行",
+            "发现禁止的全局 GPU policy drop-in",
+        )
+    )
+    integrity = script_integrity()
+    lifecycle_ok = all(
+        integrity.get(name, {}).get("integrity_ok", False) for name in STAGE_REQUIRED_SCRIPTS
+    )
+    checks.append(
+        _check(
+            "gpu_isolation_lifecycle_integrity",
+            lifecycle_ok,
+            "固定用户/Container/GPU 隔离生命周期脚本完整性通过",
+            "固定生命周期脚本完整性失败",
+        )
+    )
+    timer_enabled = run_fixed(
+        "systemctl", ["is-enabled", "h100-gpu-bypass-guard.timer"], timeout=10
+    )
+    timer_active = run_fixed("systemctl", ["is-active", "h100-gpu-bypass-guard.timer"], timeout=10)
+    guard_ready = (
+        str(timer_enabled.get("stdout", "")).strip() == "enabled"
+        and str(timer_active.get("stdout", "")).strip() == "active"
+    )
+    checks.append(
+        _check(
+            "gpu_bypass_guard_readiness",
+            guard_ready,
+            "Guard timer enabled/active；未直接执行 Guard 主程序",
+            "Guard timer readiness 无法证明",
+        )
+    )
+    checks.append(
+        _check(
+            "standard_container_image_available",
+            _standard_dev_image_available(),
+            "已验收 Pilot 开发容器镜像在本机可用",
+            "标准开发容器镜像不可用",
+        )
+    )
+    return checks
+
+
+def _compute_target_checks(username: str, container_name: str) -> list[dict[str, str]]:
+    user_absent = group_absent = False
+    try:
+        pwd.getpwnam(username)
+    except KeyError:
+        user_absent = True
+    try:
+        grp.getgrnam(username)
+    except KeyError:
+        group_absent = True
+    container_absent, container_detail = _target_container_absent(container_name)
+    stale_paths = (
+        MANAGED_HOME_ROOT / username,
+        PILOT_DATA_ROOT / username,
+        PILOT_STATE_ROOT / f"{username}.state",
+        PILOT_COMPOSE_ROOT / username,
+    )
+    stale_absent = not any(path.exists() for path in stale_paths)
+    exact_dropins = list(Path("/etc/systemd/system").glob("user-*.slice.d"))
+    # The target UID is not known in the allocator pass, so only target-name
+    # artifacts are checked here; exact UID policy is checked in final dry-run.
+    return [
+        _check(
+            "linux_username_available",
+            user_absent and group_absent,
+            "目标 Linux 用户和同名组不存在",
+            "目标 Linux 用户或组已存在",
+        ),
+        _check(
+            "container_name_available",
+            container_absent,
+            container_detail,
+            container_detail,
+        ),
+        _check(
+            "target_platform_paths_absent",
+            stale_absent,
+            "目标 home/data/state/compose 尚未创建",
+            "发现目标用户的宿主资源遗留",
+        ),
+        _check(
+            "host_access_policy",
+            True,
+            "计划固定为 nologin、password LOCKED、Host SSH DISABLED",
+            "Host access policy mismatch",
+        ),
+        _check(
+            "target_name_does_not_select_systemd_policy",
+            all(username not in path.name for path in exact_dropins),
+            "未发现按用户名伪装的 systemd GPU policy",
+            "发现目标用户名相关的异常 systemd policy",
+        ),
+    ]
+
+
+def _compute_conflicts(checks: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [
+        {"code": item["check"].upper(), "message": item["detail"]}
+        for item in checks
+        if item.get("status") != "PASS"
+    ]
+
+
+def _compute_provision_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    """Allocate candidates using host truth plus Portal DB reservation exclusions."""
+    username = str(payload["username"])
+    container_name = f"gpu-dev-{username}"
+    checks = _compute_target_checks(username, container_name)
+    checks.extend(_compute_platform_checks(username))
+    if container_name in set(payload["reserved_container_names"]):
+        checks.append(
+            _check(
+                "container_name_reservation_available",
+                False,
+                "容器名 reservation 可用",
+                "容器名已被另一个 Provision Plan reservation 占用",
+            )
+        )
+    else:
+        checks.append(
+            _check(
+                "container_name_reservation_available",
+                True,
+                "容器名未被其他 Provision Plan reservation 占用",
+                "容器名 reservation 冲突",
+            )
+        )
+    excluded_identity = set(payload["reserved_uids"]) | set(payload["reserved_gids"])
+    uid, rejections, uid_checks = _candidate_uid_gid(excluded_identity)
+    project_id, project_checks = _candidate_project_id(set(payload["reserved_project_ids"]))
+    ssh_port, port_checks = _candidate_ssh_port(set(payload["reserved_ssh_ports"]))
+    checks.extend(
+        [
+            _check(
+                "uid_gid_candidate",
+                uid is not None,
+                "UID/GID 候选同时避开宿主与 Portal reservations",
+                "没有可用 UID/GID 候选",
+            ),
+            _check(
+                "project_id_candidate",
+                project_id is not None,
+                "Project ID 候选同时避开 XFS 映射与 Portal reservations",
+                "没有可用 Project ID 候选",
+            ),
+            _check(
+                "ssh_port_candidate",
+                ssh_port is not None,
+                "SSH Port 候选同时避开监听、Docker 与 Portal reservations",
+                "没有可用 SSH Port 候选",
+            ),
+        ]
+    )
+    conflicts = _compute_conflicts(checks)
+    ready = not conflicts and uid is not None and project_id is not None and ssh_port is not None
+    return {
+        "status": "DRY_RUN",
+        "handler": "compute.provision.plan",
+        "plan_status": "READY" if ready else "CONFLICT",
+        "execution_enabled": False,
+        "request_id": payload["request_id"],
+        "portal_account_id": payload["portal_account_id"],
+        "username": username,
+        "proposed_uid": uid,
+        "proposed_gid": uid,
+        "proposed_project_id": project_id,
+        "proposed_ssh_port": ssh_port,
+        "proposed_container_name": container_name,
+        "proposed_storage_bytes": STANDARD_COMPUTE_STORAGE_BYTES,
+        "proposed_container_profile": STANDARD_COMPUTE_PROFILE,
+        "proposed_container": {
+            "cpus": 8,
+            "memory_gb": 32,
+            "pids_limit": 4096,
+            "gpu": "NONE",
+        },
+        "proposed_slurm": {
+            "account": "company",
+            "qos": "general",
+            "max_gpu": payload["requested_gpu_max"],
+        },
+        "proposed_host_access": {
+            "ssh": "DISABLED",
+            "shell": "/usr/sbin/nologin",
+            "password": "LOCKED",
+        },
+        "proposed_lease": {
+            "duration_seconds": STANDARD_COMPUTE_LEASE_SECONDS,
+            "state": "NOT_STARTED",
+            "starts_at": None,
+            "expires_at": None,
+        },
+        "validation_results": checks,
+        "candidate_rejections": rejections,
+        "allocator_sources": {
+            "uid_gid": uid_checks,
+            "project_id": project_checks,
+            "ssh_port": port_checks,
+            "portal_reservations_checked": True,
+        },
+        "conflicts": conflicts,
+        "infrastructure_side_effects": "NONE",
+    }
+
+
+def _compute_exact_resource_checks(payload: dict[str, Any]) -> list[dict[str, str]]:
+    uid = int(payload["uid"])
+    gid = int(payload["gid"])
+    used_uids, used_gids = _used_identity_numbers()
+    ownership_status, _path = _ownership_conflict(uid)
+    project_available = int(payload["project_id"]) not in _used_project_ids()
+    used_ports, ports_readable = _used_ssh_ports()
+    port_available = ports_readable and int(payload["ssh_port"]) not in used_ports
+    dropin = Path(f"/etc/systemd/system/user-{uid}.slice.d/{GPU_DROPIN_NAME}")
+    return [
+        _check(
+            "reserved_uid_gid_still_available",
+            uid not in used_uids and gid not in used_gids,
+            "Reserved UID/GID 仍未出现在宿主身份库或平台 state",
+            "Reserved UID/GID 已被占用",
+        ),
+        _check(
+            "reserved_uid_gid_ownership_absent",
+            ownership_status == "PASS",
+            "Reserved UID/GID 未发现 legacy ownership",
+            "Reserved UID/GID ownership 不安全",
+        ),
+        _check(
+            "reserved_project_id_still_available",
+            project_available,
+            "Reserved Project ID 仍未写入 XFS mappings",
+            "Reserved Project ID 已被占用",
+        ),
+        _check(
+            "reserved_ssh_port_still_available",
+            port_available,
+            "Reserved SSH Port 仍未监听且未被容器使用",
+            "Reserved SSH Port 已占用或监听状态不可读",
+        ),
+        _check(
+            "per_uid_gpu_policy_absent",
+            not dropin.exists(),
+            "目标 per-UID GPU policy 尚未创建",
+            "目标 per-UID GPU policy 已存在",
+        ),
+    ]
+
+
+def _compute_provision_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
+    username = str(payload["username"])
+    checks = _compute_target_checks(username, str(payload["container_name"]))
+    checks.extend(_compute_exact_resource_checks(payload))
+    checks.extend(_compute_platform_checks(username))
+    checks.extend(
+        [
+            _check(
+                "lease_not_started",
+                payload["lease_state"] == "NOT_STARTED",
+                "Lease starts_at/expires_at 保持 NULL，未开始计时",
+                "Lease 被提前启动",
+            ),
+            _check(
+                "provision_execution_gate",
+                payload["execution_enabled"] is False,
+                "execution_enabled=false；真实 Provision 不可达",
+                "真实 Provision gate 意外开启",
+            ),
+            _check(
+                "container_gpu_none",
+                payload["container_gpu"] == 0,
+                "标准开发容器 GPU=NONE",
+                "开发容器不得配置 GPU",
+            ),
+        ]
+    )
+    conflicts = _compute_conflicts(checks)
+    return {
+        "status": "DRY_RUN",
+        "handler": "compute.provision.dry_run",
+        "dry_run_status": "READY_FOR_PROVISION" if not conflicts else "CONFLICT",
+        "execution_enabled": False,
+        "request_id": payload["request_id"],
+        "plan_id": payload["plan_id"],
+        "portal_account_id": payload["portal_account_id"],
+        "username": username,
+        "validation_results": checks,
+        "conflicts": conflicts,
+        "resource_writes": {
+            "linux_user": False,
+            "container": False,
+            "xfs_quota": False,
+            "slurm_association": False,
+            "gpu_policy": False,
+            "lease": False,
+        },
+        "infrastructure_side_effects": "NONE",
+        "next_gate": "ADMINISTRATOR_PROVISION_APPROVAL_REQUIRED",
+    }
 
 
 def _user_plan(requested_username: str) -> dict[str, Any]:
@@ -6026,6 +6463,10 @@ def _execute_host_access_revoke(request: WorkerRequest, payload: dict[str, Any])
 
 
 def dry_run_plan(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    if request.operation_type == "compute.provision.plan":
+        return _compute_provision_plan(payload)
+    if request.operation_type == "compute.provision.dry_run":
+        return _compute_provision_dry_run(payload)
     if request.operation_type == "user.ssh_client_validation.record":
         return _portal3f_client_validation_plan(payload)
     if request.operation_type == "user.pilot.acceptance":

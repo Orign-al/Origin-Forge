@@ -716,10 +716,24 @@ export default function UserDetailPage() {
               )}
             </div>
           ) : (
-            <EmptyState
-              title="没有可用的计算身份计划"
-              detail="当前账号不属于 Portal-3A 目标"
-            />
+            <div className="compute-plan">
+              <EmptyState
+                title={
+                  user.compute_request
+                    ? `计算资源申请：${user.compute_request.status}`
+                    : "计算身份尚未配置"
+                }
+                detail="Portal 账号与 Compute Identity 分离；批准申请不会自动创建服务器资源。"
+              />
+              {user.compute_request ? (
+                <Link
+                  className="ui-button ui-button-primary"
+                  href={`/compute-requests/${user.compute_request.id}`}
+                >
+                  打开计算资源申请
+                </Link>
+              ) : null}
+            </div>
           )
         ) : null}
         {activeTab === "Linux 身份"

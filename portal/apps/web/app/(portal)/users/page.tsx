@@ -130,7 +130,7 @@ export default function UsersPage() {
           : user.password_state,
       compute:
         user.resource_onboarding_state === "NOT_ENROLLED"
-          ? "NOT PROVISIONED"
+          ? (user.compute_request?.status ?? "NOT PROVISIONED")
           : user.resource_onboarding_state,
       lease:
         user.resource_onboarding_state === "NOT_ENROLLED" ? "—" : "查看详情",

@@ -21,6 +21,12 @@ export type User = {
   locked_until?: string | null;
   roles: Array<{ name: string; description: string }>;
   password_actions?: PasswordActionMetadata[];
+  compute_request?: {
+    id: string;
+    status: string;
+    gpu_max: 0 | 1;
+    submitted_at: string | null;
+  } | null;
   linux_identity?: Record<string, unknown>;
   compute_onboarding?: {
     status: string;
@@ -246,6 +252,69 @@ export type SelfTerminal = {
   max_duration_seconds: number;
 };
 
+export type ProvisionPlan = {
+  id: string;
+  state: string;
+  username?: string;
+  uid?: number;
+  gid?: number;
+  project_id?: number;
+  container_name?: string;
+  container_ssh_port?: number;
+  storage_bytes: number;
+  container_profile: "STANDARD_8CPU_32GB";
+  container_cpus: 8;
+  container_memory_gb: 32;
+  container_pids_limit: 4096;
+  container_gpu: 0;
+  slurm_account?: "company";
+  slurm_qos?: "general";
+  gpu_max: 0 | 1;
+  lease_seconds: 345600;
+  lease_state: "NOT_STARTED";
+  host_ssh: "DISABLED";
+  shell?: "/usr/sbin/nologin";
+  password_state?: "LOCKED";
+  execution_enabled: false;
+  reservation_expires_at: string;
+  dry_run_at: string | null;
+  allocator_result?: Record<string, unknown>;
+  dry_run_result?: Record<string, unknown> | null;
+};
+
+export type ComputeResourceRequest = {
+  id: string;
+  portal_account_id: string;
+  requested_by?: string;
+  managed_user_id?: string | null;
+  username: string;
+  status: string;
+  requested_gpu_max: 0 | 1;
+  requested_storage_bytes: 322122547200;
+  requested_container_profile: "STANDARD_8CPU_32GB";
+  requested_lease_seconds: 345600;
+  purpose: string;
+  user_note: string | null;
+  submitted_at: string | null;
+  review_note: string | null;
+  reviewed_at: string | null;
+  reviewed_by?: string | null;
+  approved_at: string | null;
+  rejected_at: string | null;
+  cancelled_at: string | null;
+  created_at: string;
+  updated_at: string;
+  plan: ProvisionPlan | null;
+  portal_user?: {
+    login_name: string;
+    display_name: string;
+    role: string;
+    account_state: string;
+    password_state: string;
+    compute_state: string;
+  };
+};
+
 export const getCsrf = () => apiFetch<{ csrf_token: string }>("/auth/csrf");
 export const login = (payload: { username: string; password: string }) =>
   apiFetch<{ user: User; ssh_enrollment: SshEnrollment }>("/auth/login", {
@@ -415,6 +484,71 @@ export const changePassword = (payload: {
     method: "POST",
     body: JSON.stringify(payload),
   });
+export const selfComputeRequest = () =>
+  apiFetch<{
+    status: string;
+    compute_identity: "NOT_PROVISIONED";
+    request: ComputeResourceRequest | null;
+  }>("/self/compute-request");
+export const createSelfComputeRequest = (payload: {
+  requested_gpu_max: 0 | 1;
+  requested_storage_bytes: 322122547200;
+  requested_container_profile: "STANDARD_8CPU_32GB";
+  requested_lease_seconds: 345600;
+  purpose: string;
+  user_note: string | null;
+  idempotency_key: string;
+}) =>
+  apiFetch<{ status: "REQUESTED"; request: ComputeResourceRequest }>(
+    "/self/compute-request",
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+export const cancelSelfComputeRequest = (id: string) =>
+  apiFetch<{ status: "CANCELLED"; request: ComputeResourceRequest }>(
+    `/self/compute-request/${encodeURIComponent(id)}/cancel`,
+    {
+      method: "POST",
+      body: JSON.stringify({ idempotency_key: randomUuid() }),
+    },
+  );
+export const adminComputeRequests = () =>
+  apiFetch<{
+    status: string;
+    requests: ComputeResourceRequest[];
+    count: number;
+  }>("/admin/compute-resource-requests");
+export const adminComputeRequest = (id: string) =>
+  apiFetch<{ status: string; request: ComputeResourceRequest }>(
+    `/admin/compute-resource-requests/${encodeURIComponent(id)}`,
+  );
+export const reviewComputeRequest = (
+  id: string,
+  payload: {
+    decision: "APPROVE" | "REJECT";
+    review_note: string | null;
+    idempotency_key: string;
+  },
+) =>
+  apiFetch<{ status: string; request: ComputeResourceRequest }>(
+    `/admin/compute-resource-requests/${encodeURIComponent(id)}/review`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+export const createProvisionPlan = (id: string) =>
+  apiFetch<{ status: string; plan: ProvisionPlan }>(
+    `/admin/compute-resource-requests/${encodeURIComponent(id)}/plan`,
+    {
+      method: "POST",
+      body: JSON.stringify({ idempotency_key: randomUuid() }),
+    },
+  );
+export const dryRunProvisionPlan = (id: string) =>
+  apiFetch<{ status: "READY_FOR_PROVISION"; plan: ProvisionPlan }>(
+    `/admin/compute-resource-requests/${encodeURIComponent(id)}/dry-run`,
+    {
+      method: "POST",
+      body: JSON.stringify({ idempotency_key: randomUuid() }),
+    },
+  );
 export const selfEnvironment = () =>
   apiFetch<{ status: string; environment: SelfEnvironment }>(
     "/self/environment",

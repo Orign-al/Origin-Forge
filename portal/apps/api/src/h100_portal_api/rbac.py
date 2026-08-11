@@ -26,6 +26,9 @@ PERMISSIONS: dict[str, set[str]] = {
         "settings.read",
         "settings.write",
         "owner.manage",
+        "compute_requests.read",
+        "compute_requests.review",
+        "compute_requests.plan",
     },
     "platform_admin": {
         "platform.read",
@@ -45,6 +48,9 @@ PERMISSIONS: dict[str, set[str]] = {
         "operations.read",
         "operations.write",
         "audit.read",
+        "compute_requests.read",
+        "compute_requests.review",
+        "compute_requests.plan",
     },
     "operator": {
         "platform.read",
@@ -90,6 +96,9 @@ PERMISSIONS: dict[str, set[str]] = {
         "self.ssh_keys.write",
         "self.storage.read",
         "self.connection.read",
+        "self.compute_requests.read",
+        "self.compute_requests.create",
+        "self.compute_requests.cancel",
     },
 }
 

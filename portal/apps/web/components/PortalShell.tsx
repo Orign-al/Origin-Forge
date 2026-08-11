@@ -32,6 +32,7 @@ const USER_NAVIGATION = [
 
 const UNPROVISIONED_USER_NAVIGATION = [
   ["我的环境", "/"],
+  ["资源申请", "/compute-request"],
   ["SSH密钥", "/ssh-keys"],
   ["账号与安全", "/account/security"],
   ["帮助", "/help"],
@@ -110,8 +111,8 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
           <div className="brand-title">H100 管理平台</div>
           <div className="brand-subtitle">
             {role === "user"
-              ? "个人计算环境 · Portal-4A-R"
-              : "单机控制面 · Portal-4A-R"}
+              ? "个人计算环境 · Portal-5A-1A"
+              : "单机控制面 · Portal-5A-1A"}
           </div>
         </div>
         <nav className="nav-group" aria-label="主导航">

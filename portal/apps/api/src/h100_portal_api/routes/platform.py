@@ -9,6 +9,7 @@ from h100_portal_api.database import get_db
 from h100_portal_api.dependencies import permission_dependency
 from h100_portal_api.models import (
     PortalAuditEvent,
+    PortalComputeResourceRequest,
     PortalManagedUser,
     PortalOperation,
     PortalSetting,
@@ -87,6 +88,14 @@ def overview(
             select(PortalOperation.status, func.count()).group_by(PortalOperation.status)
         ).tuples()
     }
+    compute_requests_pending = (
+        db.scalar(
+            select(func.count())
+            .select_from(PortalComputeResourceRequest)
+            .where(PortalComputeResourceRequest.status.in_(("REQUESTED", "UNDER_REVIEW")))
+        )
+        or 0
+    )
     identity = {
         "status": "OK",
         "portal_users": sum(portal_states.values()),
@@ -96,7 +105,7 @@ def overview(
     }
     tasks = {
         "status": "OK",
-        "pending_approval": operation_states.get("PENDING_APPROVAL", 0),
+        "pending_approval": operation_states.get("PENDING_APPROVAL", 0) + compute_requests_pending,
         "failed": operation_states.get("FAILED", 0),
         "total": sum(operation_states.values()),
     }

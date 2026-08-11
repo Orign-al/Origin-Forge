@@ -317,6 +317,232 @@ class PortalManagedUser(Base):
     )
 
 
+class PortalComputeResourceRequest(Base):
+    """A human-submitted request for a future managed compute identity.
+
+    The owner is the Portal account because a managed Unix identity deliberately
+    does not exist yet.  ``active_slot`` is a nullable singleton used to enforce
+    one in-flight first-provisioning request per Portal account on every
+    supported database.
+    """
+
+    __tablename__ = "portal_compute_resource_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('DRAFT', 'REQUESTED', 'UNDER_REVIEW', 'APPROVED', "
+            "'REJECTED', 'CANCELLED', 'PROVISION_PLAN_READY', 'PROVISIONING', "
+            "'STAGED', 'KEY_ENROLLMENT_PENDING', 'ACTIVE', 'FAILED')",
+            name="ck_compute_resource_request_state",
+        ),
+        CheckConstraint(
+            "requested_gpu_max BETWEEN 0 AND 1",
+            name="ck_compute_resource_request_gpu_max",
+        ),
+        CheckConstraint(
+            "requested_storage_bytes = 322122547200",
+            name="ck_compute_resource_request_standard_storage",
+        ),
+        CheckConstraint(
+            "requested_container_profile = 'STANDARD_8CPU_32GB'",
+            name="ck_compute_resource_request_standard_container",
+        ),
+        CheckConstraint(
+            "requested_lease_seconds = 345600",
+            name="ck_compute_resource_request_initial_lease",
+        ),
+        CheckConstraint(
+            "portal_account_id = requested_by",
+            name="ck_compute_resource_request_actor_is_owner",
+        ),
+        CheckConstraint(
+            "(status IN ('DRAFT', 'REQUESTED', 'UNDER_REVIEW', 'APPROVED', "
+            "'PROVISION_PLAN_READY') AND active_slot = 1) OR "
+            "(status NOT IN ('DRAFT', 'REQUESTED', 'UNDER_REVIEW', 'APPROVED', "
+            "'PROVISION_PLAN_READY') AND active_slot IS NULL)",
+            name="ck_compute_resource_request_active_slot",
+        ),
+        UniqueConstraint(
+            "portal_account_id",
+            "active_slot",
+            name="uq_compute_resource_request_active_account",
+        ),
+        Index("ix_compute_resource_request_account_state", "portal_account_id", "status"),
+        Index("ix_compute_resource_request_state_submitted", "status", "submitted_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    portal_account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("portal_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    requested_by: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("portal_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    managed_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("portal_managed_users.id"), nullable=True, index=True
+    )
+    username: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    active_slot: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    requested_gpu_max: Mapped[int] = mapped_column(Integer, nullable=False)
+    requested_storage_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    requested_container_profile: Mapped[str] = mapped_column(String(64), nullable=False)
+    requested_lease_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    purpose: Mapped[str] = mapped_column(String(1000), nullable=False)
+    user_note: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("portal_users.id"))
+    review_note: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    provision_plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            "portal_provision_plans.id",
+            name="fk_compute_resource_request_provision_plan",
+            use_alter=True,
+        ),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    __mapper_args__: dict[str, Any] = {"version_id_col": version}  # noqa: RUF012
+
+
+class PortalProvisionPlan(Base):
+    """Reserved, non-executable resource coordinates for one approved request."""
+
+    __tablename__ = "portal_provision_plans"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('RESERVED', 'READY_FOR_PROVISION', 'CONSUMED', 'RELEASED', "
+            "'EXPIRED', 'FAILED')",
+            name="ck_portal_provision_plan_state",
+        ),
+        CheckConstraint("gpu_max BETWEEN 0 AND 1", name="ck_portal_provision_plan_gpu_max"),
+        CheckConstraint("storage_bytes = 322122547200", name="ck_provision_plan_storage"),
+        CheckConstraint("container_profile = 'STANDARD_8CPU_32GB'", name="ck_plan_profile"),
+        CheckConstraint("container_cpus = 8", name="ck_provision_plan_cpus"),
+        CheckConstraint("container_memory_gb = 32", name="ck_provision_plan_memory"),
+        CheckConstraint("container_pids_limit = 4096", name="ck_provision_plan_pids"),
+        CheckConstraint("container_gpu = 0", name="ck_provision_plan_container_gpu"),
+        CheckConstraint("lease_seconds = 345600", name="ck_provision_plan_lease"),
+        CheckConstraint("lease_state = 'NOT_STARTED'", name="ck_provision_plan_lease_state"),
+        CheckConstraint("host_ssh_enabled = false", name="ck_provision_plan_host_ssh"),
+        CheckConstraint("shell = '/usr/sbin/nologin'", name="ck_provision_plan_shell"),
+        CheckConstraint("password_state = 'LOCKED'", name="ck_provision_plan_password"),
+        CheckConstraint("execution_enabled = false", name="ck_provision_plan_execution_gate"),
+        Index("ix_portal_provision_plan_account_state", "portal_account_id", "state"),
+        Index("ix_portal_provision_plan_reservation_expiry", "state", "reservation_expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("portal_compute_resource_requests.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    portal_account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("portal_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    state: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    username: Mapped[str] = mapped_column(String(32), nullable=False)
+    uid: Mapped[int] = mapped_column(Integer, nullable=False)
+    gid: Mapped[int] = mapped_column(Integer, nullable=False)
+    project_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    container_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    container_ssh_port: Mapped[int] = mapped_column(Integer, nullable=False)
+    storage_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    container_profile: Mapped[str] = mapped_column(String(64), nullable=False)
+    container_cpus: Mapped[int] = mapped_column(Integer, nullable=False)
+    container_memory_gb: Mapped[int] = mapped_column(Integer, nullable=False)
+    container_pids_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    container_gpu: Mapped[int] = mapped_column(Integer, nullable=False)
+    slurm_account: Mapped[str] = mapped_column(String(64), nullable=False)
+    slurm_qos: Mapped[str] = mapped_column(String(64), nullable=False)
+    gpu_max: Mapped[int] = mapped_column(Integer, nullable=False)
+    lease_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    lease_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    host_ssh_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    shell: Mapped[str] = mapped_column(String(128), nullable=False)
+    password_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    execution_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reservation_expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    allocator_result: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    dry_run_result: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    dry_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("portal_users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    __mapper_args__: dict[str, Any] = {"version_id_col": version}  # noqa: RUF012
+
+
+class PortalResourceReservation(Base):
+    """A DB-backed allocator reservation; it never represents host creation."""
+
+    __tablename__ = "portal_resource_reservations"
+    __table_args__ = (
+        CheckConstraint(
+            "resource_type IN ('UID', 'GID', 'PROJECT_ID', 'SSH_PORT', 'CONTAINER_NAME')",
+            name="ck_portal_resource_reservation_type",
+        ),
+        CheckConstraint(
+            "state IN ('RESERVED', 'CONSUMED', 'RELEASED', 'EXPIRED')",
+            name="ck_portal_resource_reservation_state",
+        ),
+        UniqueConstraint("active_key", name="uq_portal_resource_reservation_active_key"),
+        UniqueConstraint(
+            "plan_id", "resource_type", name="uq_portal_resource_reservation_plan_type"
+        ),
+        Index("ix_resource_reservation_state_expiry", "state", "expires_at"),
+        Index("ix_resource_reservation_owner_state", "portal_account_id", "state"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    plan_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("portal_provision_plans.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("portal_compute_resource_requests.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    portal_account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("portal_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    resource_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    resource_value: Mapped[str] = mapped_column(String(128), nullable=False)
+    active_key: Mapped[str | None] = mapped_column(String(192), nullable=True)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    reserved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PortalAllocatorLock(Base):
+    """Singleton row used to serialize allocation across concurrent approvals."""
+
+    __tablename__ = "portal_allocator_locks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class PortalSshKey(Base):
     __tablename__ = "portal_ssh_keys"
     __table_args__ = (

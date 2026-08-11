@@ -71,6 +71,27 @@ Slurm DRAIN/RESUME、用户 Activate/Suspend、删除、quota/QOS、运行容器
 前端隐藏按钮不构成授权。`platform_owner` 可审批；其他角色按权限矩阵受限，auditor
 只读，user 只能访问自己的资源。
 
+## Portal-5A-1A 计算资源申请
+
+首次计算资源申请以 Portal Account 为 owner，因为此时 Managed Compute Identity 尚不存在。
+普通用户只通过 `/self/compute-request` 创建、读取和撤回自己的 `REQUESTED` 申请；API、
+唯一约束和 `active_slot` 同时保证每个账号只有一条进行中的首次开户申请。申请 schema 固定为
+GPU 0/1、300GiB、`STANDARD_8CPU_32GB` 和 96 小时首次 Lease，并拒绝 UID、Project ID、
+SSH Port、Docker 参数或其他基础设施字段。提交继续强制 session、Origin、CSRF 与按 IP/账号
+rate limit。
+
+只有 `platform_owner` 和 `platform_admin` 可以审批、生成 Plan 或执行 dry-run；operator、
+普通用户及申请人本人均不能管理该申请。批准只将申请置为 `APPROVED`，不创建 Linux 用户、
+Container、Quota、Slurm Association、GPU policy 或 Lease。allocator 在数据库行锁内结合
+宿主身份库、XFS Project ID、Docker、监听端口、Slurm、Portal managed resources 与现有
+reservation 选择候选值，并建立 24 小时 Portal DB reservation。过期 reservation 释放其
+active key，Plan 标记为 `EXPIRED`，申请返回 `APPROVED` 等待重新规划。
+
+`compute.provision.dry_run` 重新绑定申请、Plan、owner 和五项精确 reservation，并调用 Root
+Worker 做只读宿主 preflight。通过后 Plan 为 `READY_FOR_PROVISION`，但固定
+`execution_enabled=false`，Lease 的 starts/expires 保持为空。本阶段的真实 Provision API
+始终返回 `PROVISION_EXECUTION_DISABLED_NEXT_GATE`；只有后续管理员阶段才能增加执行路径。
+
 ## Portal-3C 执行边界
 
 唯一 DRAFT 依次进入 `PENDING_APPROVAL → APPROVED → QUEUED → RUNNING`。API 只有在
