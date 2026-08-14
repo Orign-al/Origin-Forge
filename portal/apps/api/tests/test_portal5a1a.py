@@ -137,6 +137,43 @@ def review(client, headers, request_id: str, decision: str, note: str | None = N
     )
 
 
+def stage_contract_fixture() -> dict[str, object]:
+    return {
+        "status": "PASS",
+        "contract_sha256": "d" * 64,
+        "handler": {
+            "identity": "h100-provision-stage",
+            "deployed_path": "/usr/local/sbin/h100-provision-stage",
+            "sha256": "a" * 64,
+            "integrity_status": "PASS",
+        },
+        "argv_contract": {
+            "version": "compute-provision-stage-argv-v1",
+            "sha256": "b" * 64,
+            "shape_status": "PASS",
+            "shell_argument_count": 14,
+            "expected_shell_argument_count": 14,
+            "multi_digit_position_status": "PASS",
+            "argument_13": {
+                "index": 13,
+                "semantic_role": "EXPLICIT_STAGE_CONFIRMATION_FLAG",
+                "binding_status": "VALID",
+            },
+            "argument_14": {
+                "index": 14,
+                "semantic_role": "CONFIRMED_TARGET_USERNAME",
+                "binding_status": "VALID",
+            },
+        },
+        "confirmation_gate": {
+            "identity": "EXPLICIT_STAGE_CONFIRMATION_GATE",
+            "validator_version": "compute-provision-stage-confirmation-validator-v1",
+            "validator_sha256": "c" * 64,
+            "status": "PASS",
+        },
+    }
+
+
 def worker_plan(uid: int = 20002, project_id: int = 30002, port: int = 22024):
     def call(operation_type, **kwargs):  # type: ignore[no-untyped-def]
         assert kwargs["dry_run"] is True
@@ -188,6 +225,7 @@ def worker_plan(uid: int = 20002, project_id: int = 30002, port: int = 22024):
                 "gpu_policy": False,
                 "lease": False,
             },
+            "stage_contract": stage_contract_fixture(),
             "infrastructure_side_effects": "NONE",
         }
 
@@ -203,6 +241,7 @@ def worker_stage():
         assert kwargs["dry_run"] is False
         payload = kwargs["payload"]
         assert payload["execution_enabled"] is True
+        assert payload["dry_run_stage_contract"] == stage_contract_fixture()
         assert kwargs["idempotency_key"] == f"compute-stage:{payload['stage_operation_id']}"
         assert set(payload["reservation_ids"]) == {
             "UID",
@@ -590,6 +629,13 @@ def test_admin_approval_reservation_and_dry_run_remain_zero_side_effect_before_s
     assert dry_run.status_code == 200
     assert dry_run.json()["status"] == "READY_FOR_PROVISION"
     assert dry_run.json()["plan"]["state"] == "READY_FOR_PROVISION"
+    dry_run_operation = database.scalar(
+        select(PortalOperation).where(PortalOperation.operation_type == "compute.provision.dry_run")
+    )
+    assert dry_run_operation is not None
+    assert dry_run_operation.dry_run_result is not None
+    assert dry_run_operation.dry_run_result["stage_contract"]["status"] == "PASS"
+    assert dry_run_operation.validated_payload["stage_contract_sha256"] == "d" * 64
     denied = client.post(
         f"/api/v1/admin/compute-resource-requests/{request_id}/provision",
         headers=admin_headers,
@@ -611,6 +657,56 @@ def test_admin_approval_reservation_and_dry_run_remain_zero_side_effect_before_s
     assert "COMPUTE_RESOURCE_REQUEST_APPROVED" in event_types
     assert "PROVISION_PLAN_CREATED" in event_types
     assert "PROVISION_DRY_RUN_COMPLETED" in event_types
+
+
+def test_dry_run_missing_stage_contract_evidence_never_becomes_ready(
+    client, database, origin_headers, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    user = account(database, login="contract-incomplete-user")
+    admin = account(database, login="contract-incomplete-admin", role="platform_owner")
+    request_id = submit(client, login(client, origin_headers, user.normalized_login)).json()[
+        "request"
+    ]["id"]
+    admin_headers = login(client, origin_headers, admin.normalized_login)
+    assert review(client, admin_headers, request_id, "APPROVE", "approved once").status_code == 200
+    complete_worker = worker_plan()
+
+    def incomplete_worker(operation_type, **kwargs):  # type: ignore[no-untyped-def]
+        result = complete_worker(operation_type, **kwargs)
+        if operation_type == "compute.provision.dry_run":
+            result.pop("stage_contract")
+        return result
+
+    monkeypatch.setattr("h100_portal_api.routes.compute_requests.call_worker", incomplete_worker)
+    assert (
+        client.post(
+            f"/api/v1/admin/compute-resource-requests/{request_id}/plan",
+            headers=admin_headers,
+            json={"idempotency_key": str(uuid.uuid4())},
+        ).status_code
+        == 200
+    )
+    rejected = client.post(
+        f"/api/v1/admin/compute-resource-requests/{request_id}/dry-run",
+        headers=admin_headers,
+        json={"idempotency_key": str(uuid.uuid4())},
+    )
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == "PROVISION_DRY_RUN_CONTRACT_INCOMPLETE"
+    database.expire_all()
+    item = database.get(PortalComputeResourceRequest, uuid.UUID(request_id))
+    assert item is not None and item.status == "PROVISION_PLAN_READY"
+    plan = database.get(PortalProvisionPlan, item.provision_plan_id)
+    assert plan is not None and plan.state == "RESERVED"
+    assert (
+        database.scalar(
+            select(func.count())
+            .select_from(PortalOperation)
+            .where(PortalOperation.operation_type == "compute.provision.dry_run")
+        )
+        == 0
+    )
+    assert all(assert_zero_compute_side_effects(database, user.id).values())
 
 
 def test_reserved_stage_requires_reauth_consumes_plan_without_reapproval_or_lease(

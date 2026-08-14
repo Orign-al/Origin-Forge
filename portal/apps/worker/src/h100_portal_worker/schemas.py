@@ -81,6 +81,11 @@ FORBIDDEN_SECRET_OR_COMMAND_FIELDS = {
     "argv",
     "path",
 }
+COMPUTE_STAGE_HANDLER_IDENTITY = "h100-provision-stage"
+COMPUTE_STAGE_HANDLER_PATH = "/usr/local/sbin/h100-provision-stage"
+COMPUTE_STAGE_ARGV_CONTRACT_VERSION = "compute-provision-stage-argv-v1"
+COMPUTE_STAGE_CONFIRMATION_VALIDATOR_VERSION = "compute-provision-stage-confirmation-validator-v1"
+COMPUTE_STAGE_CONTRACT_HASH = re.compile(r"^[0-9a-f]{64}$")
 APPROVED_SSH_KEY_TYPES = {
     "ssh-ed25519",
     "ecdsa-sha2-nistp256",
@@ -423,6 +428,102 @@ def _validate_compute_provision_retry_verify(payload: dict[str, Any]) -> dict[st
     return result
 
 
+def _validate_compute_stage_contract(value: Any) -> dict[str, Any]:
+    """Accept only the non-secret, successful contract evidence emitted by dry-run."""
+    if not isinstance(value, dict) or set(value) != {
+        "status",
+        "contract_sha256",
+        "handler",
+        "argv_contract",
+        "confirmation_gate",
+    }:
+        raise PayloadValidationError(
+            "DRY_RUN_STAGE_CONTRACT_INCOMPLETE",
+            "successful structured dry-run Stage contract evidence is required",
+        )
+    handler = value.get("handler")
+    argv_contract = value.get("argv_contract")
+    confirmation_gate = value.get("confirmation_gate")
+    if (
+        value.get("status") != "PASS"
+        or not isinstance(value.get("contract_sha256"), str)
+        or not COMPUTE_STAGE_CONTRACT_HASH.fullmatch(value["contract_sha256"])
+        or not isinstance(handler, dict)
+        or set(handler) != {"identity", "deployed_path", "sha256", "integrity_status"}
+        or handler.get("identity") != COMPUTE_STAGE_HANDLER_IDENTITY
+        or handler.get("deployed_path") != COMPUTE_STAGE_HANDLER_PATH
+        or not isinstance(handler.get("sha256"), str)
+        or not COMPUTE_STAGE_CONTRACT_HASH.fullmatch(handler["sha256"])
+        or handler.get("integrity_status") != "PASS"
+        or not isinstance(argv_contract, dict)
+        or set(argv_contract)
+        != {
+            "version",
+            "sha256",
+            "shape_status",
+            "shell_argument_count",
+            "expected_shell_argument_count",
+            "multi_digit_position_status",
+            "argument_13",
+            "argument_14",
+        }
+        or argv_contract.get("version") != COMPUTE_STAGE_ARGV_CONTRACT_VERSION
+        or not isinstance(argv_contract.get("sha256"), str)
+        or not COMPUTE_STAGE_CONTRACT_HASH.fullmatch(argv_contract["sha256"])
+        or argv_contract.get("shape_status") != "PASS"
+        or argv_contract.get("shell_argument_count") != 14
+        or argv_contract.get("expected_shell_argument_count") != 14
+        or argv_contract.get("multi_digit_position_status") != "PASS"
+        or not isinstance(confirmation_gate, dict)
+        or set(confirmation_gate) != {"identity", "validator_version", "validator_sha256", "status"}
+        or confirmation_gate.get("identity") != "EXPLICIT_STAGE_CONFIRMATION_GATE"
+        or confirmation_gate.get("validator_version")
+        != COMPUTE_STAGE_CONFIRMATION_VALIDATOR_VERSION
+        or not isinstance(confirmation_gate.get("validator_sha256"), str)
+        or not COMPUTE_STAGE_CONTRACT_HASH.fullmatch(confirmation_gate["validator_sha256"])
+        or confirmation_gate.get("status") != "PASS"
+    ):
+        raise PayloadValidationError(
+            "DRY_RUN_STAGE_CONTRACT_INCOMPLETE",
+            "dry-run Stage contract identity or validation evidence is incomplete",
+        )
+    arguments = (
+        (
+            argv_contract.get("argument_13"),
+            13,
+            "EXPLICIT_STAGE_CONFIRMATION_FLAG",
+        ),
+        (
+            argv_contract.get("argument_14"),
+            14,
+            "CONFIRMED_TARGET_USERNAME",
+        ),
+    )
+    for argument, index, role in arguments:
+        if (
+            not isinstance(argument, dict)
+            or set(argument) != {"index", "semantic_role", "binding_status"}
+            or argument.get("index") != index
+            or argument.get("semantic_role") != role
+            or argument.get("binding_status") != "VALID"
+        ):
+            raise PayloadValidationError(
+                "DRY_RUN_STAGE_CONTRACT_INCOMPLETE",
+                f"dry-run argument {index} binding evidence is incomplete",
+            )
+    return {
+        "status": "PASS",
+        "contract_sha256": value["contract_sha256"],
+        "handler": dict(handler),
+        "argv_contract": {
+            **argv_contract,
+            "argument_13": dict(argv_contract["argument_13"]),
+            "argument_14": dict(argv_contract["argument_14"]),
+        },
+        "confirmation_gate": dict(confirmation_gate),
+    }
+
+
 def _validate_compute_provision_stage(payload: dict[str, Any]) -> dict[str, Any]:
     """Validate the closed Stage contract produced from a reserved plan.
 
@@ -436,6 +537,7 @@ def _validate_compute_provision_stage(payload: dict[str, Any]) -> dict[str, Any]
         "portal_account_id",
         "stage_operation_id",
         "dry_run_operation_id",
+        "dry_run_stage_contract",
         "reservation_ids",
         "username",
         "uid",
@@ -459,6 +561,11 @@ def _validate_compute_provision_stage(payload: dict[str, Any]) -> dict[str, Any]
         "password_state",
         "execution_enabled",
     }
+    if "dry_run_stage_contract" not in payload:
+        raise PayloadValidationError(
+            "DRY_RUN_STAGE_CONTRACT_INCOMPLETE",
+            "Stage requires structured contract evidence from its dry-run",
+        )
     if set(payload) != fields or set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
         raise PayloadValidationError(
             "COMPUTE_STAGE_PAYLOAD_REJECTED", "compute Stage fields are invalid"
@@ -466,7 +573,13 @@ def _validate_compute_provision_stage(payload: dict[str, Any]) -> dict[str, Any]
     dry_run_payload = {
         key: value
         for key, value in payload.items()
-        if key not in {"stage_operation_id", "dry_run_operation_id", "reservation_ids"}
+        if key
+        not in {
+            "stage_operation_id",
+            "dry_run_operation_id",
+            "dry_run_stage_contract",
+            "reservation_ids",
+        }
     }
     dry_run_payload["execution_enabled"] = False
     result = _validate_compute_provision_dry_run(dry_run_payload)
@@ -492,6 +605,9 @@ def _validate_compute_provision_stage(payload: dict[str, Any]) -> dict[str, Any]
             ),
             "dry_run_operation_id": _canonical_uuid(
                 payload.get("dry_run_operation_id"), "dry-run operation ID"
+            ),
+            "dry_run_stage_contract": _validate_compute_stage_contract(
+                payload.get("dry_run_stage_contract")
             ),
             "reservation_ids": {
                 resource_type: _canonical_uuid(value, f"{resource_type} reservation ID")

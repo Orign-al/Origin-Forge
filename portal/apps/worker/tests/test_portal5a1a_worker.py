@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 import subprocess
 import uuid
@@ -58,6 +59,16 @@ def dry_run_payload() -> dict[str, object]:
     }
 
 
+def stage_integrity(handler_sha256: str = "a" * 64) -> dict[str, dict[str, object]]:
+    return {
+        name: {
+            "integrity_ok": True,
+            "sha256": handler_sha256 if name == "h100-provision-stage" else "b" * 64,
+        }
+        for name in handlers.COMPUTE_STAGE_REQUIRED_SCRIPTS
+    }
+
+
 def stage_payload() -> dict[str, object]:
     payload = {**dry_run_payload(), "execution_enabled": True}
     payload.update(
@@ -75,6 +86,9 @@ def stage_payload() -> dict[str, object]:
                 )
             },
         }
+    )
+    payload["dry_run_stage_contract"] = handlers._compute_stage_contract(
+        payload, integrity=stage_integrity()
     )
     return payload
 
@@ -184,7 +198,7 @@ def test_compute_retry_verify_is_closed_and_read_only(monkeypatch: pytest.Monkey
     monkeypatch.setattr(
         handlers,
         "script_integrity",
-        lambda: {name: {"integrity_ok": True} for name in handlers.COMPUTE_STAGE_REQUIRED_SCRIPTS},
+        stage_integrity,
     )
     monkeypatch.setattr(handlers, "_compute_stage_retained_resources", lambda _payload: [])
     verified = handlers.handle(request("compute.provision.retry_verify", payload, dry_run=True))
@@ -304,12 +318,27 @@ def test_exact_dry_run_reports_zero_side_effects_and_real_execution_is_disabled(
     monkeypatch.setattr(
         handlers, "_compute_platform_checks", lambda _username: [passed("platform")]
     )
+    monkeypatch.setattr(handlers, "script_integrity", stage_integrity)
     result = handlers.handle(request("compute.provision.dry_run", payload, dry_run=True))
     assert result["status"] == "DRY_RUN"
     assert result["dry_run_status"] == "READY_FOR_PROVISION"
     assert result["execution_enabled"] is False
     assert result["infrastructure_side_effects"] == "NONE"
     assert not any(result["resource_writes"].values())
+    contract = result["stage_contract"]
+    assert contract["status"] == "PASS"
+    assert contract["handler"]["sha256"] == "a" * 64
+    assert contract["argv_contract"]["argument_13"] == {
+        "index": 13,
+        "semantic_role": "EXPLICIT_STAGE_CONFIRMATION_FLAG",
+        "binding_status": "VALID",
+    }
+    assert contract["argv_contract"]["argument_14"] == {
+        "index": 14,
+        "semantic_role": "CONFIRMED_TARGET_USERNAME",
+        "binding_status": "VALID",
+    }
+    assert contract["confirmation_gate"]["status"] == "PASS"
 
     monkeypatch.setattr(
         handlers,
@@ -321,6 +350,42 @@ def test_exact_dry_run_reports_zero_side_effects_and_real_execution_is_disabled(
     assert denied["error"]["code"] == "WRITE_EXECUTION_DISABLED"
 
 
+@pytest.mark.parametrize("index", [13, 14])
+def test_dry_run_argument_binding_mismatch_is_contract_incomplete_and_read_only(
+    monkeypatch: pytest.MonkeyPatch, index: int
+) -> None:
+    payload = dry_run_payload()
+    monkeypatch.setattr(
+        handlers,
+        "_compute_target_checks",
+        lambda _username, _container: [passed("target")],
+    )
+    monkeypatch.setattr(
+        handlers, "_compute_exact_resource_checks", lambda _payload: [passed("reservation")]
+    )
+    monkeypatch.setattr(
+        handlers, "_compute_platform_checks", lambda _username: [passed("platform")]
+    )
+    monkeypatch.setattr(handlers, "script_integrity", stage_integrity)
+    original_builder = handlers._compute_stage_argv
+
+    def mismatched_builder(stage: dict[str, object]) -> list[str]:
+        argv = original_builder(stage)
+        argv[index] = "synthetic-binding-mismatch"
+        return argv
+
+    monkeypatch.setattr(handlers, "_compute_stage_argv", mismatched_builder)
+    result = handlers.handle(request("compute.provision.dry_run", payload, dry_run=True))
+    assert result["dry_run_status"] == "CONTRACT_INCOMPLETE"
+    assert result["stage_contract"]["status"] == "FAIL"
+    assert (
+        result["stage_contract"]["argv_contract"][f"argument_{index}"]["binding_status"]
+        == "INVALID"
+    )
+    assert result["infrastructure_side_effects"] == "NONE"
+    assert not any(result["resource_writes"].values())
+
+
 def test_compute_stage_runs_only_hash_pinned_fixed_handler(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -328,7 +393,7 @@ def test_compute_stage_runs_only_hash_pinned_fixed_handler(
     monkeypatch.setattr(
         handlers,
         "script_integrity",
-        lambda: {name: {"integrity_ok": True} for name in handlers.COMPUTE_STAGE_REQUIRED_SCRIPTS},
+        stage_integrity,
     )
     monkeypatch.setattr(
         handlers,
@@ -358,6 +423,114 @@ def test_compute_stage_runs_only_hash_pinned_fixed_handler(
     assert dry_run_denied["error"]["code"] == "COMPUTE_STAGE_DRY_RUN_REJECTED"
 
 
+def test_compute_stage_missing_contract_evidence_fails_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = stage_payload()
+    payload.pop("dry_run_stage_contract")
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: pytest.fail("missing evidence must forbid Stage"),
+    )
+    result = handlers.handle(request("compute.provision.stage", payload, dry_run=False))
+    assert result["status"] == "ERROR"
+    assert result["error"]["code"] == "DRY_RUN_STAGE_CONTRACT_INCOMPLETE"
+    assert result["side_effect_classification"] == "NO_SIDE_EFFECT"
+
+
+@pytest.mark.parametrize(
+    ("index", "mismatch"),
+    [
+        (13, "ARGUMENT_13_BINDING"),
+        (14, "ARGUMENT_14_BINDING"),
+    ],
+)
+def test_compute_stage_argument_binding_mismatch_requires_new_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+    index: int,
+    mismatch: str,
+) -> None:
+    payload = stage_payload()
+    original_builder = handlers._compute_stage_argv
+
+    def mismatched_builder(stage: dict[str, object]) -> list[str]:
+        argv = original_builder(stage)
+        argv[index] = "synthetic-binding-mismatch"
+        return argv
+
+    monkeypatch.setattr(handlers, "script_integrity", stage_integrity)
+    monkeypatch.setattr(handlers, "_compute_stage_argv", mismatched_builder)
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: pytest.fail("contract mismatch must forbid Stage"),
+    )
+    result = handlers.handle(request("compute.provision.stage", payload, dry_run=False))
+    assert result["error"]["code"] == "DRY_RUN_STAGE_CONTRACT_MISMATCH"
+    assert mismatch in result["contract_verification"]["mismatches"]
+    assert result["side_effect_classification"] == "NO_SIDE_EFFECT"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "mismatch"),
+    [
+        ("handler", "HANDLER_SHA256"),
+        ("dependency", "CONTRACT_SHA256"),
+        ("argv", "ARGV_CONTRACT_SHA256"),
+        ("validator", "CONFIRMATION_VALIDATOR_SHA256"),
+    ],
+)
+def test_compute_stage_contract_identity_change_requires_new_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    mismatch: str,
+) -> None:
+    payload = stage_payload()
+    expected = payload["dry_run_stage_contract"]
+    assert isinstance(expected, dict)
+    if mutation == "handler":
+        monkeypatch.setattr(handlers, "script_integrity", lambda: stage_integrity("c" * 64))
+    elif mutation == "dependency":
+        changed_integrity = stage_integrity()
+        changed_integrity["h100-platform-common"]["sha256"] = "c" * 64
+        monkeypatch.setattr(handlers, "script_integrity", lambda: changed_integrity)
+    else:
+        monkeypatch.setattr(handlers, "script_integrity", stage_integrity)
+        if mutation == "argv":
+            expected["argv_contract"]["sha256"] = "c" * 64
+        else:
+            expected["confirmation_gate"]["validator_sha256"] = "c" * 64
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: pytest.fail("changed contract must forbid Stage"),
+    )
+    result = handlers.handle(request("compute.provision.stage", payload, dry_run=False))
+    assert result["error"]["code"] == "DRY_RUN_STAGE_CONTRACT_MISMATCH"
+    assert mismatch in result["contract_verification"]["mismatches"]
+    assert result["side_effect_classification"] == "NO_SIDE_EFFECT"
+
+
+def test_stage_contract_evidence_excludes_sensitive_argv_values() -> None:
+    marker = "SYNTHETIC_SECRET_MARKER_MUST_NOT_LEAK"
+    payload = {**stage_payload(), "dry_run_operation_id": marker}
+    evidence = handlers._compute_stage_contract(payload, integrity=stage_integrity())
+    encoded = json.dumps(evidence, sort_keys=True)
+    assert marker not in encoded
+    assert "fixture-user" not in encoded
+    assert "argv" not in evidence
+
+
+def test_compute_provision_transport_remains_local_unix_socket_and_shell_false() -> None:
+    server_source = (PORTAL_ROOT / "apps/worker/src/h100_portal_worker/server.py").read_text()
+    runner_source = inspect.getsource(handlers.run_allowlisted_script)
+    assert 'SOCKET_PATH = "/run/h100-portal/worker.sock"' in server_source
+    assert "socket.AF_UNIX" in server_source
+    assert "shell=False" in runner_source
+    assert "ssh" not in inspect.getsource(handlers._execute_compute_provision_stage).casefold()
+
+
 @pytest.mark.parametrize(
     ("declared", "expected_rollback"),
     [
@@ -374,7 +547,7 @@ def test_compute_stage_failure_classification_is_structured_and_zero_residue_bou
     monkeypatch.setattr(
         handlers,
         "script_integrity",
-        lambda: {name: {"integrity_ok": True} for name in handlers.COMPUTE_STAGE_REQUIRED_SCRIPTS},
+        stage_integrity,
     )
     monkeypatch.setattr(
         handlers,

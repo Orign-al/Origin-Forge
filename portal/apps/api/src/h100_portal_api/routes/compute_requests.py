@@ -1,3 +1,4 @@
+import re
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -80,6 +81,73 @@ IMMUTABLE_STAGE_FAILURE_EVIDENCE: dict[str, dict[str, str]] = {
 
 def _error(status_code: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message})
+
+
+def _ready_stage_contract(result: Any) -> dict[str, Any] | None:
+    """Return only complete, non-secret Stage contract evidence from a successful dry-run."""
+    if not isinstance(result, dict):
+        return None
+    contract = result.get("stage_contract")
+    if not isinstance(contract, dict) or contract.get("status") != "PASS":
+        return None
+    contract_sha256 = contract.get("contract_sha256")
+    handler = contract.get("handler")
+    argv_contract = contract.get("argv_contract")
+    confirmation_gate = contract.get("confirmation_gate")
+    argument_13 = argv_contract.get("argument_13") if isinstance(argv_contract, dict) else None
+    argument_14 = argv_contract.get("argument_14") if isinstance(argv_contract, dict) else None
+    if (
+        set(contract)
+        != {"status", "contract_sha256", "handler", "argv_contract", "confirmation_gate"}
+        or not isinstance(contract_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", contract_sha256) is None
+        or not isinstance(handler, dict)
+        or set(handler) != {"identity", "deployed_path", "sha256", "integrity_status"}
+        or handler.get("identity") != "h100-provision-stage"
+        or handler.get("deployed_path") != "/usr/local/sbin/h100-provision-stage"
+        or handler.get("integrity_status") != "PASS"
+        or not isinstance(handler.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", handler["sha256"]) is None
+        or not isinstance(argv_contract, dict)
+        or set(argv_contract)
+        != {
+            "version",
+            "sha256",
+            "shape_status",
+            "shell_argument_count",
+            "expected_shell_argument_count",
+            "multi_digit_position_status",
+            "argument_13",
+            "argument_14",
+        }
+        or argv_contract.get("version") != "compute-provision-stage-argv-v1"
+        or not isinstance(argv_contract.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", argv_contract["sha256"]) is None
+        or argv_contract.get("shape_status") != "PASS"
+        or argv_contract.get("shell_argument_count") != 14
+        or argv_contract.get("expected_shell_argument_count") != 14
+        or argv_contract.get("multi_digit_position_status") != "PASS"
+        or not isinstance(argument_13, dict)
+        or set(argument_13) != {"index", "semantic_role", "binding_status"}
+        or argument_13.get("index") != 13
+        or argument_13.get("semantic_role") != "EXPLICIT_STAGE_CONFIRMATION_FLAG"
+        or argument_13.get("binding_status") != "VALID"
+        or not isinstance(argument_14, dict)
+        or set(argument_14) != {"index", "semantic_role", "binding_status"}
+        or argument_14.get("index") != 14
+        or argument_14.get("semantic_role") != "CONFIRMED_TARGET_USERNAME"
+        or argument_14.get("binding_status") != "VALID"
+        or not isinstance(confirmation_gate, dict)
+        or set(confirmation_gate) != {"identity", "validator_version", "validator_sha256", "status"}
+        or confirmation_gate.get("identity") != "EXPLICIT_STAGE_CONFIRMATION_GATE"
+        or confirmation_gate.get("validator_version")
+        != "compute-provision-stage-confirmation-validator-v1"
+        or not isinstance(confirmation_gate.get("validator_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", confirmation_gate["validator_sha256"]) is None
+        or confirmation_gate.get("status") != "PASS"
+    ):
+        return None
+    return contract
 
 
 def _request_id(value: str) -> uuid.UUID:
@@ -1526,6 +1594,16 @@ def dry_run_provision_plan(
         plan.updated_at = utcnow()
         db.commit()
         raise _error(409, "PROVISION_DRY_RUN_CONFLICT", "Provision dry-run 未通过")
+    stage_contract = _ready_stage_contract(worker)
+    if stage_contract is None:
+        plan.dry_run_result = worker
+        plan.updated_at = utcnow()
+        db.commit()
+        raise _error(
+            409,
+            "PROVISION_DRY_RUN_CONTRACT_INCOMPLETE",
+            "Provision dry-run 缺少完整 Stage confirmation contract 证据",
+        )
     now = utcnow()
     plan.state = "READY_FOR_PROVISION"
     plan.dry_run_result = worker
@@ -1543,9 +1621,11 @@ def dry_run_provision_plan(
             "plan_id": str(plan.id),
             "portal_account_id": str(item.portal_account_id),
             "execution_enabled": False,
+            "stage_contract_sha256": stage_contract["contract_sha256"],
         },
         result_summary="READY_FOR_PROVISION; infrastructure side effects remained zero",
     )
+    operation.dry_run_result = worker
     _audit(
         db,
         request,
@@ -1559,6 +1639,8 @@ def dry_run_provision_plan(
             "execution_enabled": False,
             "infrastructure_side_effects": "NONE",
             "lease_state": "NOT_STARTED",
+            "stage_contract_status": "PASS",
+            "stage_contract_sha256": stage_contract["contract_sha256"],
         },
         operation_id=operation.id,
     )
@@ -1628,6 +1710,13 @@ def provision_reserved_compute_environment(
         or plan.dry_run_result.get("dry_run_status") != "READY_FOR_PROVISION"
     ):
         raise _error(409, "PROVISION_DRY_RUN_REQUIRED", "真实 Stage 需要成功的精确 Dry-run")
+    stage_contract = _ready_stage_contract(plan.dry_run_result)
+    if stage_contract is None:
+        raise _error(
+            409,
+            "PROVISION_DRY_RUN_CONTRACT_INCOMPLETE",
+            "真实 Stage 需要完整且有效的 Dry-run Stage contract",
+        )
     if plan.request_id != item.id or plan.portal_account_id != item.portal_account_id:
         raise _error(409, "PROVISION_PLAN_BINDING_FAILED", "资源计划与申请归属不一致")
     account = db.get(PortalUser, item.portal_account_id)
@@ -1654,6 +1743,10 @@ def provision_reserved_compute_environment(
             for operation in dry_run_operations
             if isinstance(operation.validated_payload, dict)
             and operation.validated_payload.get("plan_id") == str(plan.id)
+            and operation.validated_payload.get("stage_contract_sha256")
+            == stage_contract["contract_sha256"]
+            and (_ready_stage_contract(operation.dry_run_result) or {}).get("contract_sha256")
+            == stage_contract["contract_sha256"]
         ),
         None,
     )
@@ -1665,6 +1758,7 @@ def provision_reserved_compute_environment(
         **_dry_run_payload(item, plan),
         "stage_operation_id": str(operation_id),
         "dry_run_operation_id": str(dry_run_operation.id),
+        "dry_run_stage_contract": stage_contract,
         "reservation_ids": reservation_ids,
         "execution_enabled": True,
     }

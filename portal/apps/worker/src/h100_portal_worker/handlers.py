@@ -30,6 +30,10 @@ from h100_portal_worker.schemas import (
     APPROVED_PILOT_ACCEPTANCE_PAYLOAD,
     APPROVED_PRODUCTION_PILOT_PAYLOAD,
     APPROVED_STAGE_PAYLOAD,
+    COMPUTE_STAGE_ARGV_CONTRACT_VERSION,
+    COMPUTE_STAGE_CONFIRMATION_VALIDATOR_VERSION,
+    COMPUTE_STAGE_HANDLER_IDENTITY,
+    COMPUTE_STAGE_HANDLER_PATH,
     KNOWN_WRITES,
     STANDARD_COMPUTE_LEASE_SECONDS,
     STANDARD_COMPUTE_PROFILE,
@@ -191,6 +195,23 @@ COMPUTE_STAGE_REQUIRED_SCRIPTS = frozenset(
         "h100-user-gpu-isolation",
         "h100-gpu-bypass-guard",
     }
+)
+COMPUTE_STAGE_ARGV_BINDINGS = (
+    ("STAGE_HANDLER_EXECUTABLE", "literal", COMPUTE_STAGE_HANDLER_PATH),
+    ("EXECUTION_MODE", "literal", "--execute"),
+    ("TARGET_USERNAME", "payload", "username"),
+    ("TARGET_UID", "payload", "uid"),
+    ("TARGET_GID", "payload", "gid"),
+    ("XFS_PROJECT_ID", "payload", "project_id"),
+    ("CONTAINER_SSH_PORT", "payload", "ssh_port"),
+    ("SLURM_ACCOUNT", "payload", "slurm_account"),
+    ("SLURM_QOS", "payload", "slurm_qos"),
+    ("MAX_GPU_LIMIT", "payload", "gpu_max"),
+    ("COMPUTE_REQUEST_ID", "payload", "request_id"),
+    ("PROVISION_PLAN_ID", "payload", "plan_id"),
+    ("DRY_RUN_OPERATION_ID", "payload", "dry_run_operation_id"),
+    ("EXPLICIT_STAGE_CONFIRMATION_FLAG", "literal", "--confirm-stage"),
+    ("CONFIRMED_TARGET_USERNAME", "payload", "username"),
 )
 ACTIVATE_REQUIRED_SCRIPTS = frozenset(
     {
@@ -1355,6 +1376,7 @@ def script_integrity() -> dict[str, Any]:
             writable = bool(file_stat.st_mode & 0o022)
             result[name] = {
                 "path": path_string,
+                "sha256": digest,
                 "owner_uid": file_stat.st_uid,
                 "mode": oct(file_stat.st_mode & 0o777),
                 "regular_file": regular_file,
@@ -2824,11 +2846,157 @@ def _compute_exact_resource_checks(payload: dict[str, Any]) -> list[dict[str, st
     ]
 
 
+def _compute_stage_argv(payload: dict[str, Any]) -> list[str]:
+    """Build the only host argv accepted by multi-user compute Stage."""
+    argv: list[str] = []
+    for _role, source, value in COMPUTE_STAGE_ARGV_BINDINGS:
+        argv.append(value if source == "literal" else str(payload[value]))
+    return argv
+
+
+def _stage_contract_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _compute_stage_contract(
+    payload: dict[str, Any], *, integrity: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Validate and identify the deployed Stage artifact without exposing argv values."""
+    observed_integrity = script_integrity() if integrity is None else integrity
+    handler = observed_integrity.get(COMPUTE_STAGE_HANDLER_IDENTITY, {})
+    handler_sha256 = handler.get("sha256")
+    execution_artifacts: dict[str, str] = {}
+    execution_artifacts_valid = True
+    for name in sorted(COMPUTE_STAGE_REQUIRED_SCRIPTS):
+        artifact = observed_integrity.get(name, {})
+        artifact_sha256 = artifact.get("sha256")
+        artifact_valid = bool(
+            artifact.get("integrity_ok") is True
+            and isinstance(artifact_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", artifact_sha256)
+        )
+        execution_artifacts[name] = artifact_sha256 if artifact_valid else "UNAVAILABLE"
+        execution_artifacts_valid = execution_artifacts_valid and artifact_valid
+    handler_valid = bool(
+        SCRIPT_ALLOWLIST.get(COMPUTE_STAGE_HANDLER_IDENTITY) == COMPUTE_STAGE_HANDLER_PATH
+        and handler.get("integrity_ok") is True
+        and isinstance(handler_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", handler_sha256)
+    )
+
+    contract_payload = dict(payload)
+    contract_payload.setdefault("dry_run_operation_id", "00000000-0000-0000-0000-000000000000")
+    argv = _compute_stage_argv(contract_payload)
+    expected_argv = [
+        value if source == "literal" else str(contract_payload[value])
+        for _role, source, value in COMPUTE_STAGE_ARGV_BINDINGS
+    ]
+    shape_valid = len(argv) == len(COMPUTE_STAGE_ARGV_BINDINGS)
+    bindings_valid = shape_valid and argv == expected_argv
+    argument_13_valid = shape_valid and argv[13] == "--confirm-stage"
+    username = str(payload["username"])
+    argument_14_valid = (
+        shape_valid and argv[2] == username and argv[14] == username and argv[2] == argv[14]
+    )
+    confirmation_valid = argument_13_valid and argument_14_valid
+
+    binding_identity = [
+        {
+            "argv_index": index,
+            "shell_position": index if index else None,
+            "semantic_role": role,
+            "binding_source": source,
+            "binding_name": value,
+        }
+        for index, (role, source, value) in enumerate(COMPUTE_STAGE_ARGV_BINDINGS)
+    ]
+    argv_contract_sha256 = _stage_contract_sha256(
+        {
+            "version": COMPUTE_STAGE_ARGV_CONTRACT_VERSION,
+            "bindings": binding_identity,
+        }
+    )
+    validator_sha256 = _stage_contract_sha256(
+        {
+            "version": COMPUTE_STAGE_CONFIRMATION_VALIDATOR_VERSION,
+            "rules": [
+                "ARGV_LENGTH_EQUALS_CONTRACT",
+                "ARGV_VALUES_EQUAL_DECLARED_BINDINGS",
+                "SHELL_ARGUMENT_13_EQUALS_CONFIRMATION_FLAG",
+                "SHELL_ARGUMENT_14_EQUALS_TARGET_USERNAME",
+                "SHELL_ARGUMENT_2_EQUALS_ARGUMENT_14",
+            ],
+        }
+    )
+    contract_sha256 = _stage_contract_sha256(
+        {
+            "handler_identity": COMPUTE_STAGE_HANDLER_IDENTITY,
+            "handler_path": COMPUTE_STAGE_HANDLER_PATH,
+            "handler_sha256": handler_sha256 if handler_valid else "UNAVAILABLE",
+            "execution_artifacts": execution_artifacts,
+            "argv_contract_version": COMPUTE_STAGE_ARGV_CONTRACT_VERSION,
+            "argv_contract_sha256": argv_contract_sha256,
+            "confirmation_validator_version": COMPUTE_STAGE_CONFIRMATION_VALIDATOR_VERSION,
+            "confirmation_validator_sha256": validator_sha256,
+        }
+    )
+    passed = (
+        handler_valid
+        and execution_artifacts_valid
+        and shape_valid
+        and bindings_valid
+        and confirmation_valid
+    )
+    return {
+        "status": "PASS" if passed else "FAIL",
+        "contract_sha256": contract_sha256,
+        "handler": {
+            "identity": COMPUTE_STAGE_HANDLER_IDENTITY,
+            "deployed_path": COMPUTE_STAGE_HANDLER_PATH,
+            "sha256": handler_sha256,
+            "integrity_status": "PASS" if handler_valid else "FAIL",
+        },
+        "argv_contract": {
+            "version": COMPUTE_STAGE_ARGV_CONTRACT_VERSION,
+            "sha256": argv_contract_sha256,
+            "shape_status": "PASS" if shape_valid and bindings_valid else "FAIL",
+            "shell_argument_count": max(len(argv) - 1, 0),
+            "expected_shell_argument_count": len(COMPUTE_STAGE_ARGV_BINDINGS) - 1,
+            "multi_digit_position_status": (
+                "PASS" if shape_valid and bindings_valid and confirmation_valid else "FAIL"
+            ),
+            "argument_13": {
+                "index": 13,
+                "semantic_role": "EXPLICIT_STAGE_CONFIRMATION_FLAG",
+                "binding_status": "VALID" if argument_13_valid else "INVALID",
+            },
+            "argument_14": {
+                "index": 14,
+                "semantic_role": "CONFIRMED_TARGET_USERNAME",
+                "binding_status": "VALID" if argument_14_valid else "INVALID",
+            },
+        },
+        "confirmation_gate": {
+            "identity": "EXPLICIT_STAGE_CONFIRMATION_GATE",
+            "validator_version": COMPUTE_STAGE_CONFIRMATION_VALIDATOR_VERSION,
+            "validator_sha256": validator_sha256,
+            "status": "PASS" if confirmation_valid else "FAIL",
+        },
+    }
+
+
 def _compute_provision_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
     username = str(payload["username"])
     checks = _compute_target_checks(username, str(payload["container_name"]))
     checks.extend(_compute_exact_resource_checks(payload))
     checks.extend(_compute_platform_checks(username))
+    stage_contract = _compute_stage_contract(payload)
     checks.extend(
         [
             _check(
@@ -2849,13 +3017,31 @@ def _compute_provision_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
                 "标准开发容器 GPU=NONE",
                 "开发容器不得配置 GPU",
             ),
+            _check(
+                "stage_handler_contract",
+                stage_contract["status"] == "PASS",
+                "Deployed Stage handler、argv contract 与 validator 已绑定",
+                "Deployed Stage handler contract 无法验证",
+            ),
+            _check(
+                "explicit_stage_confirmation_gate",
+                stage_contract["confirmation_gate"]["status"] == "PASS",
+                "Stage argument 13/14 显式确认绑定有效",
+                "Stage argument 13/14 显式确认绑定无效",
+            ),
         ]
     )
     conflicts = _compute_conflicts(checks)
     return {
         "status": "DRY_RUN",
         "handler": "compute.provision.dry_run",
-        "dry_run_status": "READY_FOR_PROVISION" if not conflicts else "CONFLICT",
+        "dry_run_status": (
+            "CONTRACT_INCOMPLETE"
+            if stage_contract["status"] != "PASS"
+            else "READY_FOR_PROVISION"
+            if not conflicts
+            else "CONFLICT"
+        ),
         "execution_enabled": False,
         "request_id": payload["request_id"],
         "plan_id": payload["plan_id"],
@@ -2863,6 +3049,7 @@ def _compute_provision_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
         "username": username,
         "validation_results": checks,
         "conflicts": conflicts,
+        "stage_contract": stage_contract,
         "resource_writes": {
             "linux_user": False,
             "container": False,
@@ -2874,27 +3061,6 @@ def _compute_provision_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
         "infrastructure_side_effects": "NONE",
         "next_gate": "ADMINISTRATOR_PROVISION_APPROVAL_REQUIRED",
     }
-
-
-def _compute_stage_argv(payload: dict[str, Any]) -> list[str]:
-    """Build the only host argv accepted by multi-user compute Stage."""
-    return [
-        SCRIPT_ALLOWLIST["h100-provision-stage"],
-        "--execute",
-        str(payload["username"]),
-        str(payload["uid"]),
-        str(payload["gid"]),
-        str(payload["project_id"]),
-        str(payload["ssh_port"]),
-        str(payload["slurm_account"]),
-        str(payload["slurm_qos"]),
-        str(payload["gpu_max"]),
-        str(payload["request_id"]),
-        str(payload["plan_id"]),
-        str(payload["dry_run_operation_id"]),
-        "--confirm-stage",
-        str(payload["username"]),
-    ]
 
 
 def _compute_stage_state(payload: dict[str, Any]) -> dict[str, str]:
@@ -3330,6 +3496,55 @@ def _compute_stage_failure_evidence(
     }
 
 
+def _compute_stage_contract_mismatches(
+    expected: dict[str, Any], current: dict[str, Any]
+) -> list[str]:
+    checks = {
+        "CONTRACT_STATUS": (expected.get("status"), current.get("status")),
+        "CONTRACT_SHA256": (
+            expected.get("contract_sha256"),
+            current.get("contract_sha256"),
+        ),
+        "HANDLER_IDENTITY": (
+            expected.get("handler", {}).get("identity"),
+            current.get("handler", {}).get("identity"),
+        ),
+        "HANDLER_SHA256": (
+            expected.get("handler", {}).get("sha256"),
+            current.get("handler", {}).get("sha256"),
+        ),
+        "ARGV_CONTRACT_VERSION": (
+            expected.get("argv_contract", {}).get("version"),
+            current.get("argv_contract", {}).get("version"),
+        ),
+        "ARGV_CONTRACT_SHA256": (
+            expected.get("argv_contract", {}).get("sha256"),
+            current.get("argv_contract", {}).get("sha256"),
+        ),
+        "ARGUMENT_13_BINDING": (
+            expected.get("argv_contract", {}).get("argument_13", {}).get("binding_status"),
+            current.get("argv_contract", {}).get("argument_13", {}).get("binding_status"),
+        ),
+        "ARGUMENT_14_BINDING": (
+            expected.get("argv_contract", {}).get("argument_14", {}).get("binding_status"),
+            current.get("argv_contract", {}).get("argument_14", {}).get("binding_status"),
+        ),
+        "CONFIRMATION_VALIDATOR_VERSION": (
+            expected.get("confirmation_gate", {}).get("validator_version"),
+            current.get("confirmation_gate", {}).get("validator_version"),
+        ),
+        "CONFIRMATION_VALIDATOR_SHA256": (
+            expected.get("confirmation_gate", {}).get("validator_sha256"),
+            current.get("confirmation_gate", {}).get("validator_sha256"),
+        ),
+        "CONFIRMATION_GATE_STATUS": (
+            expected.get("confirmation_gate", {}).get("status"),
+            current.get("confirmation_gate", {}).get("status"),
+        ),
+    }
+    return sorted(label for label, values in checks.items() if values[0] != values[1])
+
+
 def _execute_compute_provision_stage(
     request: WorkerRequest, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -3382,6 +3597,29 @@ def _execute_compute_provision_stage(
             "failed_handler": "compute.provision.stage",
             "retained_resources": [],
         }
+    expected_contract = payload["dry_run_stage_contract"]
+    current_contract = _compute_stage_contract(payload, integrity=integrity)
+    contract_mismatches = _compute_stage_contract_mismatches(expected_contract, current_contract)
+    if current_contract.get("status") != "PASS" or contract_mismatches:
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "DRY_RUN_STAGE_CONTRACT_MISMATCH",
+                "message": "Stage execution contract changed; a new dry-run is required",
+            },
+            "contract_verification": {
+                "status": "FAIL",
+                "mismatches": contract_mismatches or ["CURRENT_CONTRACT_INVALID"],
+                "expected_contract_sha256": expected_contract.get("contract_sha256"),
+                "current_contract_sha256": current_contract.get("contract_sha256"),
+            },
+            "side_effect_classification": "NO_SIDE_EFFECT",
+            "rollback_status": "NOT_REQUIRED",
+            "last_successful_step": "SCRIPT_INTEGRITY",
+            "first_failed_step": "DRY_RUN_STAGE_CONTRACT_BINDING",
+            "failed_handler": "compute.provision.stage",
+            "retained_resources": [],
+        }
     state_path = PILOT_STATE_ROOT / f"{payload['username']}.state"
     if state_path.exists() or state_path.is_symlink():
         try:
@@ -3408,7 +3646,12 @@ def _execute_compute_provision_stage(
         {
             key: value
             for key, value in payload.items()
-            if key not in {"dry_run_operation_id", "reservation_ids"}
+            if key
+            not in {
+                "stage_operation_id",
+                "dry_run_stage_contract",
+                "reservation_ids",
+            }
         }
         | {"execution_enabled": False}
     )
@@ -7165,10 +7408,22 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
             ),
         )
     except ValueError as exc:
-        return {
+        rejected = {
             "status": "ERROR",
             "error": {"code": getattr(exc, "code", "PAYLOAD_REJECTED"), "message": str(exc)},
         }
+        if request.operation_type == "compute.provision.stage":
+            rejected.update(
+                {
+                    "side_effect_classification": "NO_SIDE_EFFECT",
+                    "rollback_status": "NOT_REQUIRED",
+                    "last_successful_step": "NONE",
+                    "first_failed_step": "WORKER_PAYLOAD_CONTRACT",
+                    "failed_handler": "compute.provision.stage",
+                    "retained_resources": [],
+                }
+            )
+        return rejected
     if request.operation_type.startswith("self.") and request.requested_by != payload.get(
         "username"
     ):
