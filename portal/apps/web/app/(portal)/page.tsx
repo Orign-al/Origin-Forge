@@ -5,6 +5,7 @@ import { ACCESS_MODE_LABEL } from "@h100-portal/config";
 import { Card, StatusBadge } from "@h100-portal/ui";
 import {
   OrdinaryDashboard,
+  OrdinaryStagedDashboard,
   OrdinaryUnprovisionedDashboard,
 } from "../../components/OrdinaryUserPages";
 
@@ -31,6 +32,8 @@ export default function DashboardPage() {
   return current.data.role === "user" ? (
     current.data.user.resource_onboarding_state === "NOT_ENROLLED" ? (
       <OrdinaryUnprovisionedDashboard user={current.data.user} />
+    ) : current.data.user.resource_onboarding_state === "STAGED" ? (
+      <OrdinaryStagedDashboard user={current.data.user} />
     ) : (
       <OrdinaryDashboard />
     )

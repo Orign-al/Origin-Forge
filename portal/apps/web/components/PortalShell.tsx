@@ -38,6 +38,30 @@ const UNPROVISIONED_USER_NAVIGATION = [
   ["帮助", "/help"],
 ] as const;
 
+const STAGED_USER_NAVIGATION = [
+  ["我的环境", "/"],
+  ["SSH密钥", "/ssh-keys"],
+  ["账号与安全", "/account/security"],
+  ["帮助", "/help"],
+] as const;
+
+const UNPROVISIONED_ALLOWED_PATHS = new Set([
+  "/",
+  "/compute-request",
+  "/ssh-keys",
+  "/account/security",
+  "/help",
+  "/change-password",
+]);
+
+const STAGED_ALLOWED_PATHS = new Set([
+  "/",
+  "/ssh-keys",
+  "/account/security",
+  "/help",
+  "/change-password",
+]);
+
 export function PortalShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
@@ -62,6 +86,20 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
       router.replace("/change-password");
     }
   }, [current.data?.user.password_state, pathname, router]);
+  useEffect(() => {
+    if (!current.isSuccess || current.data.role !== "user") return;
+    const state = current.data.user.resource_onboarding_state;
+    const allowed =
+      state === "NOT_ENROLLED"
+        ? UNPROVISIONED_ALLOWED_PATHS
+        : state === "STAGED"
+          ? STAGED_ALLOWED_PATHS
+          : null;
+    const protectedResourceProbe = pathname.startsWith("/compute-requests/");
+    if (allowed && !allowed.has(pathname) && !protectedResourceProbe) {
+      router.replace("/");
+    }
+  }, [current.data, current.isSuccess, pathname, router]);
   useEffect(() => {
     if (
       current.isSuccess &&
@@ -89,7 +127,9 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
     role === "user"
       ? user.resource_onboarding_state === "NOT_ENROLLED"
         ? UNPROVISIONED_USER_NAVIGATION
-        : USER_NAVIGATION
+        : user.resource_onboarding_state === "STAGED"
+          ? STAGED_USER_NAVIGATION
+          : USER_NAVIGATION
       : navigation;
   const alertData = alertQuery.data as { count?: unknown } | undefined;
   const alertCount =
@@ -111,8 +151,8 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
           <div className="brand-title">H100 管理平台</div>
           <div className="brand-subtitle">
             {role === "user"
-              ? "个人计算环境 · Portal-5A-1A"
-              : "单机控制面 · Portal-5A-1A"}
+              ? "个人计算环境 · Portal-5A-1B"
+              : "单机控制面 · Portal-5A-1B"}
           </div>
         </div>
         <nav className="nav-group" aria-label="主导航">
@@ -134,11 +174,15 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
             <>
               {user.resource_onboarding_state === "NOT_ENROLLED"
                 ? "计算资源未配置"
-                : "Host SSH 已禁用"}
+                : user.resource_onboarding_state === "STAGED"
+                  ? "等待 Container SSH 密钥"
+                  : "Host SSH 已禁用"}
               <br />
               {user.resource_onboarding_state === "NOT_ENROLLED"
                 ? "Portal Identity Only"
-                : "GPU 上限 1 · 租约受控"}
+                : user.resource_onboarding_state === "STAGED"
+                  ? "Container STOPPED · Lease 未开始"
+                  : "GPU 上限 1 · 租约受控"}
             </>
           ) : (
             <>
@@ -198,13 +242,14 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
           </div>
         </header>
         <main className="content">
-          {role !== "user" &&
-          current.data.ssh_enrollment?.required &&
+          {current.data.ssh_enrollment?.required &&
           current.data.ssh_enrollment.setup_path ? (
             <div className="onboarding-banner" role="status">
               <div>
-                <strong>完成 SSH 密钥设置后即可启用计算环境。</strong>
-                <span>宿主 SSH、容器 SSH 与 VS Code 连接仍保持关闭。</span>
+                <strong>
+                  完成 Container SSH 密钥设置后即可申请激活计算环境。
+                </strong>
+                <span>Host SSH、容器访问与 Lease 仍保持关闭。</span>
               </div>
               <Link
                 className="ui-button ui-button-primary"

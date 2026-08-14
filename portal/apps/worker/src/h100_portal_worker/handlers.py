@@ -72,6 +72,7 @@ BINARIES = {
     "squeue-fallback": "/usr/bin/squeue",
 }
 SCRIPT_ALLOWLIST = {
+    "h100-provision-stage": "/usr/local/sbin/h100-provision-stage",
     "h100-user-create": "/usr/local/sbin/h100-user-create",
     "h100-user-gpu-isolation": "/usr/local/sbin/h100-user-gpu-isolation",
     "h100-container-create": "/usr/local/sbin/h100-container-create",
@@ -83,6 +84,11 @@ SCRIPT_ALLOWLIST = {
     "h100-quota-show": "/usr/local/sbin/h100-quota-show",
     "h100-gpu-bypass-guard": "/usr/local/sbin/h100-gpu-bypass-guard",
     "h100-origin-pilot-acceptance": ("/opt/h100-portal/scripts/h100-origin-pilot-acceptance"),
+}
+INTEGRITY_FILE_ALLOWLIST = {
+    # h100-provision-stage sources this root-owned library before it performs
+    # any validation or writes, so it is part of the execution trust boundary.
+    "h100-platform-common": "/usr/local/lib/h100-platform/h100-platform-common.sh",
 }
 SCRIPT_HASH_CONFIG = Path("/etc/h100-portal/worker-scripts.json")
 GPU_ISOLATED_USERS = Path("/etc/h100-platform/gpu-isolated-users")
@@ -175,6 +181,14 @@ STAGE_REQUIRED_SCRIPTS = frozenset(
         "h100-user-gpu-isolation",
         "h100-container-create",
         "h100-container-stop",
+        "h100-gpu-bypass-guard",
+    }
+)
+COMPUTE_STAGE_REQUIRED_SCRIPTS = frozenset(
+    {
+        "h100-provision-stage",
+        "h100-platform-common",
+        "h100-user-gpu-isolation",
         "h100-gpu-bypass-guard",
     }
 )
@@ -1328,7 +1342,7 @@ def script_integrity() -> dict[str, Any]:
     except OSError, json.JSONDecodeError:
         pass
     result: dict[str, Any] = {}
-    for name, path_string in SCRIPT_ALLOWLIST.items():
+    for name, path_string in (SCRIPT_ALLOWLIST | INTEGRITY_FILE_ALLOWLIST).items():
         path = Path(path_string)
         try:
             file_stat = path.lstat()
@@ -2244,7 +2258,7 @@ def _candidate_uid_gid(
     return None, rejected, checks
 
 
-def _used_project_ids() -> set[int]:
+def _used_project_ids() -> tuple[set[int], bool]:
     used: set[int] = set()
     for path in (PROJECTS_FILE, PROJID_FILE):
         for line in _safe_file_lines(path):
@@ -2259,23 +2273,40 @@ def _used_project_ids() -> set[int]:
         value = record.get("PROJECT_ID", "")
         if value.isdigit():
             used.add(int(value))
-    return used
+    quota = run_fixed(
+        "xfs_quota",
+        ["-x", "-c", "report -p -b -n", str(PILOT_DATA_ROOT.parent)],
+        timeout=20,
+    )
+    if not quota.get("ok"):
+        return used, False
+    for line in str(quota.get("stdout", "")).splitlines():
+        fields = line.split()
+        if fields and re.fullmatch(r"#[0-9]+", fields[0]):
+            used.add(int(fields[0][1:]))
+    return used, True
 
 
 def _candidate_project_id(excluded: set[int] | None = None) -> tuple[int | None, dict[str, str]]:
-    used = _used_project_ids()
+    used, quota_readable = _used_project_ids()
     used.update(excluded or set())
+    if not quota_readable:
+        return None, {
+            "range": f"{PROJECT_ID_MIN}-{PROJECT_ID_MAX}",
+            "reservation": "NOT_AVAILABLE",
+            "source": "/etc/projects,/etc/projid,XFS quota report,platform state",
+        }
     for value in range(PROJECT_ID_FIRST, PROJECT_ID_MAX + 1):
         if value not in used:
             return value, {
                 "range": f"{PROJECT_ID_MIN}-{PROJECT_ID_MAX}",
                 "reservation": "PROPOSED — NOT RESERVED",
-                "source": "/etc/projects,/etc/projid,platform state",
+                "source": "/etc/projects,/etc/projid,XFS quota report,platform state",
             }
     return None, {
         "range": f"{PROJECT_ID_MIN}-{PROJECT_ID_MAX}",
         "reservation": "NOT_AVAILABLE",
-        "source": "/etc/projects,/etc/projid,platform state",
+        "source": "/etc/projects,/etc/projid,XFS quota report,platform state",
     }
 
 
@@ -2752,7 +2783,10 @@ def _compute_exact_resource_checks(payload: dict[str, Any]) -> list[dict[str, st
     gid = int(payload["gid"])
     used_uids, used_gids = _used_identity_numbers()
     ownership_status, _path = _ownership_conflict(uid)
-    project_available = int(payload["project_id"]) not in _used_project_ids()
+    used_project_ids, project_quota_readable = _used_project_ids()
+    project_available = (
+        project_quota_readable and int(payload["project_id"]) not in used_project_ids
+    )
     used_ports, ports_readable = _used_ssh_ports()
     port_available = ports_readable and int(payload["ssh_port"]) not in used_ports
     dropin = Path(f"/etc/systemd/system/user-{uid}.slice.d/{GPU_DROPIN_NAME}")
@@ -2839,6 +2873,595 @@ def _compute_provision_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
         },
         "infrastructure_side_effects": "NONE",
         "next_gate": "ADMINISTRATOR_PROVISION_APPROVAL_REQUIRED",
+    }
+
+
+def _compute_stage_argv(payload: dict[str, Any]) -> list[str]:
+    """Build the only host argv accepted by multi-user compute Stage."""
+    return [
+        SCRIPT_ALLOWLIST["h100-provision-stage"],
+        "--execute",
+        str(payload["username"]),
+        str(payload["uid"]),
+        str(payload["gid"]),
+        str(payload["project_id"]),
+        str(payload["ssh_port"]),
+        str(payload["slurm_account"]),
+        str(payload["slurm_qos"]),
+        str(payload["gpu_max"]),
+        str(payload["request_id"]),
+        str(payload["plan_id"]),
+        str(payload["dry_run_operation_id"]),
+        "--confirm-stage",
+        str(payload["username"]),
+    ]
+
+
+def _compute_stage_state(payload: dict[str, Any]) -> dict[str, str]:
+    path = PILOT_STATE_ROOT / f"{payload['username']}.state"
+    values: dict[str, str] = {}
+    for line in _safe_file_lines(path):
+        key, separator, value = line.partition("=")
+        if separator and re.fullmatch(r"[A-Z0-9_]{1,32}", key):
+            values[key] = value[:256]
+    expected = {
+        "VERSION": "3",
+        "STATUS": "STAGED",
+        "USERNAME": str(payload["username"]),
+        "UID": str(payload["uid"]),
+        "GID": str(payload["gid"]),
+        "PROJECT_ID": str(payload["project_id"]),
+        "SSH_PORT": str(payload["ssh_port"]),
+        "SLURM_ACCOUNT": str(payload["slurm_account"]),
+        "SLURM_QOS": str(payload["slurm_qos"]),
+        "MAX_GPUS": str(payload["gpu_max"]),
+        "REQUEST_ID": str(payload["request_id"]),
+        "PLAN_ID": str(payload["plan_id"]),
+        "DRY_RUN_OPERATION_ID": str(payload["dry_run_operation_id"]),
+        "SSH_KEY_STATE": "REQUIRED_BEFORE_ACTIVATION",
+        "LEASE_STATE": "NOT_STARTED",
+        "LEASE_START": "",
+        "LEASE_EXPIRES": "",
+    }
+    mismatches = sorted(key for key, value in expected.items() if values.get(key) != value)
+    if mismatches:
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED",
+            f"staged lifecycle state mismatch: {','.join(mismatches)}",
+        )
+    return values
+
+
+def _verified_guard_metrics_for_user(username: str, uid: int) -> dict[str, Any]:
+    content = _read_guard_metric_file()
+    scalar_metrics: dict[str, int] = {}
+    timestamp: int | None = None
+    user_success: int | None = None
+    scalar_pattern = re.compile(r"^(h100_gpu_bypass_guard_[a-z_]+) ([0-9]+)$")
+    user_pattern = re.compile(
+        rf'^h100_gpu_user_isolation_success\{{username="{re.escape(username)}",uid="{uid}"\}} ([01])$'
+    )
+    for line in content.splitlines():
+        scalar_match = scalar_pattern.fullmatch(line)
+        if scalar_match:
+            value = int(scalar_match.group(2))
+            if scalar_match.group(1) == "h100_gpu_bypass_guard_timestamp_seconds":
+                timestamp = value
+            else:
+                scalar_metrics[scalar_match.group(1)] = value
+        user_match = user_pattern.fullmatch(line)
+        if user_match:
+            user_success = int(user_match.group(1))
+    managed = scalar_metrics.get("h100_gpu_bypass_guard_managed_users")
+    verified = scalar_metrics.get("h100_gpu_bypass_guard_users_verified")
+    now = int(time.time())
+    if not (
+        scalar_metrics.get("h100_gpu_bypass_guard_last_success") == 1
+        and isinstance(managed, int)
+        and managed >= 1
+        and verified == managed
+        and scalar_metrics.get("h100_gpu_bypass_guard_policy_errors") == 0
+        and scalar_metrics.get("h100_gpu_bypass_guard_device_open_failures") == 0
+        and scalar_metrics.get("h100_gpu_bypass_guard_cuda_context_failures") == 0
+        and scalar_metrics.get("h100_gpu_bypass_guard_slurm_constrain_devices") == 1
+        and scalar_metrics.get("h100_gpu_bypass_guard_nvidia_gpu_count") == 4
+        and scalar_metrics.get("h100_gpu_bypass_guard_slurm_gpu_count") == 4
+        and user_success == 1
+        and timestamp is not None
+        and timestamp <= now + 60
+        and now - timestamp <= GUARD_METRIC_MAX_AGE_SECONDS
+    ):
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED",
+            "GPU bypass Guard metrics do not prove all managed identities",
+        )
+    return {
+        "status": "PASSING",
+        "managed_users": managed,
+        "users_verified": verified,
+        "target_user_verified": True,
+        "metric_timestamp": timestamp,
+    }
+
+
+def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
+    username = str(payload["username"])
+    _compute_stage_state(payload)
+    try:
+        account = pwd.getpwnam(username)
+        private_group = grp.getgrnam(username)
+    except KeyError as exc:
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED", "staged Linux identity is missing"
+        ) from exc
+    if (
+        account.pw_uid != payload["uid"]
+        or account.pw_gid != payload["gid"]
+        or private_group.gr_gid != payload["gid"]
+        or account.pw_shell != "/usr/sbin/nologin"
+        or set(_group_names(username, account.pw_gid)) != {username}
+    ):
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED", "staged Linux identity differs from plan"
+        )
+    password = run_fixed("passwd", ["-S", username], timeout=10)
+    password_fields = str(password.get("stdout", "")).split()
+    if not password.get("ok") or len(password_fields) < 2 or password_fields[1] != "L":
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED", "staged Linux password is not locked"
+        )
+    host_key = Path(account.pw_dir) / ".ssh/authorized_keys"
+    container_key = PILOT_DATA_ROOT / username / "home/.ssh/authorized_keys"
+    if any(path.exists() or path.is_symlink() for path in (host_key, container_key)):
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED", "authorized_keys exists before enrollment"
+        )
+
+    dropin = Path(f"/etc/systemd/system/user-{payload['uid']}.slice.d/{GPU_DROPIN_NAME}")
+    if not (
+        dropin.is_file()
+        and not dropin.is_symlink()
+        and dropin.read_text(encoding="utf-8") == GPU_DROPIN_CONTENT
+        and stat.S_IMODE(dropin.stat().st_mode) == 0o644
+        and dropin.stat().st_uid == 0
+        and dropin.stat().st_gid == 0
+    ):
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED", "per-UID GPU policy is invalid"
+        )
+    matching = [
+        item
+        for item in _registry_entries()
+        if item["username"] == username or item["uid"] == payload["uid"]
+    ]
+    if matching != [{"username": username, "uid": payload["uid"]}]:
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED", "GPU registry binding is invalid"
+        )
+
+    user_root = PILOT_DATA_ROOT / username
+    if f"{payload['project_id']}:{user_root}" not in _safe_file_lines(
+        PROJECTS_FILE
+    ) or f"h100_{username}:{payload['project_id']}" not in _safe_file_lines(PROJID_FILE):
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED", "XFS project mapping is missing"
+        )
+    quota = _verified_project_quota(int(payload["project_id"]), 300)
+
+    association = run_fixed(
+        "sacctmgr",
+        [
+            "-n",
+            "-P",
+            "show",
+            "assoc",
+            "where",
+            f"User={username}",
+            f"Account={payload['slurm_account']}",
+            "format=User,Account,QOS,DefaultQOS,MaxTRES",
+        ],
+        timeout=20,
+    )
+    association_matches = False
+    expected_max_tres = f"gres/gpu={payload['gpu_max']}"
+    if association.get("ok"):
+        for line in str(association.get("stdout", "")).splitlines():
+            fields = line.split("|")
+            if (
+                len(fields) >= 5
+                and fields[:2] == [username, payload["slurm_account"]]
+                and payload["slurm_qos"] in fields[2].split(",")
+                and fields[3] == payload["slurm_qos"]
+                and expected_max_tres in fields[4].split(",")
+            ):
+                association_matches = True
+                break
+    if not association_matches:
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED",
+            "Slurm association or association-level GPU entitlement differs from plan",
+        )
+
+    inspected = containers_inspect({"name": str(payload["container_name"])})
+    container = inspected.get("container", {})
+    state = container.get("state", {}) if isinstance(container, dict) else {}
+    mounts = container.get("mounts", []) if isinstance(container, dict) else []
+    expected_sources = {
+        str(user_root / "home"),
+        str(user_root / "workspace"),
+        str(user_root / "shared"),
+        f"/srv/gpu-platform/container-data/{username}/ssh-host-keys",
+    }
+    observed_sources = {str(item.get("Source", "")) for item in mounts if isinstance(item, dict)}
+    if not (
+        inspected.get("status") == "OK"
+        and isinstance(container, dict)
+        and str(container.get("name", "")).lstrip("/") == payload["container_name"]
+        and container.get("owner") == username
+        and container.get("cpu_limit") == 8.0
+        and container.get("memory_limit_bytes") == 32 * 1024**3
+        and container.get("pids_limit") == 4096
+        and container.get("ssh_port") == str(payload["ssh_port"])
+        and container.get("privileged") is False
+        and container.get("network_mode") != "host"
+        and container.get("pid_mode") != "host"
+        and container.get("ipc_mode") != "host"
+        and container.get("gpu") == "NONE"
+        and not container.get("docker_socket_mounted")
+        and not any(
+            str(item.get("Destination", "")) == "/run/munge"
+            or str(item.get("Source", "")) in {"/", str(PILOT_DATA_ROOT)}
+            for item in mounts
+            if isinstance(item, dict)
+        )
+        and isinstance(state, dict)
+        and state.get("Running") is False
+        and state.get("Status") in {"created", "exited"}
+        and observed_sources == expected_sources
+    ):
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED", "staged container security state is invalid"
+        )
+    listener = run_fixed("ss", ["-H", "-lnt", f"sport = :{payload['ssh_port']}"], timeout=10)
+    if not listener.get("ok") or str(listener.get("stdout", "")).strip():
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED", "staged container port is listening"
+        )
+    guard = _verified_guard_metrics_for_user(username, int(payload["uid"]))
+    return {
+        "username": username,
+        "uid": payload["uid"],
+        "gid": payload["gid"],
+        "shell": "/usr/sbin/nologin",
+        "password": "LOCKED",
+        "host_ssh": "DISABLED",
+        "host_authorized_keys": "ABSENT",
+        "container_authorized_keys": "ABSENT",
+        "gpu_policy": {
+            "unit": f"user-{payload['uid']}.slice",
+            "device_policy": "closed",
+            "open_probe": "DENIED",
+            "cuda_context_probe": "DENIED",
+        },
+        "quota": quota,
+        "storage_path": str(user_root),
+        "slurm": {
+            "account": payload["slurm_account"],
+            "qos": payload["slurm_qos"],
+            "max_gpus": payload["gpu_max"],
+            "max_tres": expected_max_tres,
+        },
+        "container": {
+            "name": payload["container_name"],
+            "state": "STOPPED",
+            "gpu": "NONE",
+            "ssh_port": payload["ssh_port"],
+            "image_digest": container.get("image_digest") or container.get("image_id"),
+        },
+        "guard": guard,
+        "filesystem_isolation": {
+            "origin_pilot_to_target": "DENIED",
+            "target_to_origin_pilot": "DENIED",
+            "markers_removed": True,
+        },
+        "lease": {"state": "NOT_STARTED", "starts_at": None, "expires_at": None},
+        "onboarding_state": "STAGED",
+        "ssh_key_state": "REQUIRED_BEFORE_ACTIVATION",
+    }
+
+
+def _compute_stage_retained_resources(payload: dict[str, Any]) -> list[str]:
+    username = str(payload["username"])
+    retained: set[str] = set()
+    for label, path in {
+        "host-home": MANAGED_HOME_ROOT / username,
+        "managed-data": PILOT_DATA_ROOT / username,
+        "container-data": Path("/srv/gpu-platform/container-data") / username,
+        "container-config": PILOT_COMPOSE_ROOT / username,
+        "lifecycle-state": PILOT_STATE_ROOT / f"{username}.state",
+        "gpu-policy": Path(f"/etc/systemd/system/user-{payload['uid']}.slice.d/{GPU_DROPIN_NAME}"),
+    }.items():
+        if path.exists() or path.is_symlink():
+            retained.add(label)
+    with suppress(KeyError):
+        pwd.getpwnam(username)
+        retained.add("linux-user")
+    with suppress(KeyError):
+        grp.getgrnam(username)
+        retained.add("linux-group")
+    with suppress(KeyError):
+        pwd.getpwuid(int(payload["uid"]))
+        retained.add("linux-uid")
+    with suppress(KeyError):
+        grp.getgrgid(int(payload["gid"]))
+        retained.add("linux-gid")
+    for label, identity_number in (
+        ("uid-ownership", int(payload["uid"])),
+        ("gid-ownership", int(payload["gid"])),
+    ):
+        ownership_status, _path = _ownership_conflict(identity_number)
+        if ownership_status == "CONFLICT":
+            retained.add(label)
+        elif ownership_status == "UNKNOWN":
+            retained.add(f"{label}-unknown")
+    association = _assoc_exists(username)
+    if association is True:
+        retained.add("slurm-association")
+    elif association is None:
+        retained.add("slurm-association-unknown")
+    container = run_fixed("docker", ["container", "inspect", str(payload["container_name"])])
+    if container.get("ok"):
+        retained.add("container")
+    elif "no such" not in str(container.get("stderr", "")).casefold():
+        retained.add("container-state-unknown")
+
+    used_ports, ports_readable = _used_ssh_ports()
+    if not ports_readable:
+        retained.add("ssh-port-state-unknown")
+    elif int(payload["ssh_port"]) in used_ports:
+        retained.add("ssh-port-allocation")
+
+    derived_image = f"h100-local/dev-container:ubuntu24.04-{username}-{payload['plan_id']}"
+    image = run_fixed("docker", ["image", "inspect", derived_image], timeout=20)
+    if image.get("ok"):
+        retained.add("derived-image")
+    elif "no such" not in str(image.get("stderr", "")).casefold():
+        retained.add("derived-image-state-unknown")
+
+    projects_entry = f"{payload['project_id']}:{PILOT_DATA_ROOT / username}"
+    projid_entry = f"h100_{username}:{payload['project_id']}"
+    if projects_entry in _safe_file_lines(PROJECTS_FILE) or projid_entry in _safe_file_lines(
+        PROJID_FILE
+    ):
+        retained.add("xfs-project-mapping")
+    quota = run_fixed(
+        "xfs_quota",
+        ["-x", "-c", "report -p -b -n", str(PILOT_DATA_ROOT.parent)],
+        timeout=20,
+    )
+    if quota.get("ok"):
+        project_prefix = f"#{payload['project_id']}"
+        if any(
+            line.split() and line.split()[0] == project_prefix
+            for line in str(quota.get("stdout", "")).splitlines()
+        ):
+            retained.add("xfs-project-quota")
+    else:
+        retained.add("xfs-quota-state-unknown")
+
+    registry_matches = [
+        item
+        for item in _registry_entries()
+        if item["username"] == username or item["uid"] == payload["uid"]
+    ]
+    if registry_matches:
+        retained.add("gpu-registry")
+    return sorted(retained)
+
+
+def _compute_retry_verification(payload: dict[str, Any]) -> dict[str, Any]:
+    integrity = script_integrity()
+    failed_scripts = sorted(
+        name
+        for name in COMPUTE_STAGE_REQUIRED_SCRIPTS
+        if not integrity.get(name, {}).get("integrity_ok", False)
+    )
+    retained = _compute_stage_retained_resources(payload)
+    unknown = sorted(item for item in retained if "unknown" in item)
+    ready = not failed_scripts and not retained
+    return {
+        "status": "DRY_RUN",
+        "handler": "compute.provision.retry_verify",
+        "retry_verification_status": "VERIFIED_ZERO_RESIDUE" if ready else "CONFLICT",
+        "request_id": payload["request_id"],
+        "plan_id": payload["plan_id"],
+        "stage_operation_id": payload["stage_operation_id"],
+        "script_integrity": "PASS" if not failed_scripts else "FAIL",
+        "failed_scripts": failed_scripts,
+        "resource_residue": retained,
+        "unknown_resource_state": unknown,
+        "infrastructure_side_effects": "NONE",
+        "execution_enabled": False,
+    }
+
+
+def _stage_evidence_marker(stderr: str, label: str) -> str | None:
+    pattern = re.compile(rf"^COMPUTE STAGE {re.escape(label)}: ([A-Z0-9_]+)$")
+    for line in stderr.splitlines():
+        match = pattern.fullmatch(line.strip())
+        if match:
+            return match.group(1)
+    return None
+
+
+def _compute_stage_failure_evidence(
+    execution: dict[str, Any], retained: list[str]
+) -> dict[str, Any]:
+    stderr = str(execution.get("stderr", ""))
+    declared = _stage_evidence_marker(stderr, "SIDE EFFECT CLASSIFICATION")
+    first_failed_step = _stage_evidence_marker(stderr, "FIRST FAILED STEP")
+    last_successful_step = _stage_evidence_marker(stderr, "LAST SUCCESSFUL STEP")
+    unknown_resources = any("unknown" in item for item in retained)
+    execution_error = str(execution.get("error_code", ""))
+    if unknown_resources or execution_error in {
+        "STAGE_EXECUTION_TIMEOUT",
+        "SCRIPT_EXECUTION_ERROR",
+    }:
+        classification = "PARTIAL_UNKNOWN"
+    elif retained:
+        classification = "PARTIAL_ROLLBACK_FAILED"
+    elif declared in {"NO_SIDE_EFFECT", "PARTIAL_ROLLED_BACK"}:
+        classification = declared
+    else:
+        classification = "PARTIAL_UNKNOWN"
+    rollback_status = {
+        "NO_SIDE_EFFECT": "NOT_REQUIRED",
+        "PARTIAL_ROLLED_BACK": "ROLLED_BACK",
+        "PARTIAL_ROLLBACK_FAILED": "ROLLBACK_FAILED",
+        "PARTIAL_UNKNOWN": "REQUIRES_MANUAL_REVIEW",
+    }[classification]
+    return {
+        "side_effect_classification": classification,
+        "rollback_status": rollback_status,
+        "last_successful_step": last_successful_step or "WORKER_PREFLIGHT",
+        "first_failed_step": first_failed_step or "FIXED_STAGE_SCRIPT",
+        "failed_handler": "h100-provision-stage",
+        "retained_resources": retained,
+    }
+
+
+def _execute_compute_provision_stage(
+    request: WorkerRequest, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if request.requested_by != request.approved_by or request.dry_run:
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "COMPUTE_STAGE_APPROVAL_BINDING_REJECTED",
+                "message": "real Stage requires one recently reauthenticated administrator",
+            },
+            "side_effect_classification": "NO_SIDE_EFFECT",
+            "rollback_status": "NOT_REQUIRED",
+            "last_successful_step": "NONE",
+            "first_failed_step": "WORKER_AUTHORIZATION",
+            "failed_handler": "compute.provision.stage",
+            "retained_resources": [],
+        }
+    if request.idempotency_key != f"compute-stage:{payload['stage_operation_id']}":
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "COMPUTE_STAGE_IDEMPOTENCY_BINDING_REJECTED",
+                "message": "Stage idempotency key is not bound to its Operation",
+            },
+            "side_effect_classification": "NO_SIDE_EFFECT",
+            "rollback_status": "NOT_REQUIRED",
+            "last_successful_step": "WORKER_AUTHORIZATION",
+            "first_failed_step": "WORKER_IDEMPOTENCY_BINDING",
+            "failed_handler": "compute.provision.stage",
+            "retained_resources": [],
+        }
+    integrity = script_integrity()
+    failed = sorted(
+        name
+        for name in COMPUTE_STAGE_REQUIRED_SCRIPTS
+        if not integrity.get(name, {}).get("integrity_ok", False)
+    )
+    if failed:
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "SCRIPT_INTEGRITY_FAILED",
+                "message": "fixed compute Stage script integrity check failed",
+                "scripts": failed,
+            },
+            "side_effect_classification": "NO_SIDE_EFFECT",
+            "rollback_status": "NOT_REQUIRED",
+            "last_successful_step": "WORKER_IDEMPOTENCY_BINDING",
+            "first_failed_step": "SCRIPT_INTEGRITY",
+            "failed_handler": "compute.provision.stage",
+            "retained_resources": [],
+        }
+    state_path = PILOT_STATE_ROOT / f"{payload['username']}.state"
+    if state_path.exists() or state_path.is_symlink():
+        try:
+            stage = _compute_stage_postconditions(payload)
+        except LifecycleValidationError as exc:
+            return {
+                "status": "ERROR",
+                "error": {"code": "IDEMPOTENCY_STATE_MISMATCH", "message": str(exc)},
+                "rollback_status": "REQUIRES_MANUAL_REVIEW",
+                "side_effect_classification": "PARTIAL_UNKNOWN",
+                "last_successful_step": "LIFECYCLE_STATE_PRESENT",
+                "first_failed_step": "IDEMPOTENCY_POSTCONDITION",
+                "failed_handler": "compute.provision.stage",
+                "retained_resources": _compute_stage_retained_resources(payload),
+            }
+        return {
+            "status": "SUCCEEDED",
+            "handler": "compute.provision.stage",
+            "execution_enabled": True,
+            "idempotent_replay": True,
+            "stage": stage,
+        }
+    preflight = _compute_provision_dry_run(
+        {
+            key: value
+            for key, value in payload.items()
+            if key not in {"dry_run_operation_id", "reservation_ids"}
+        }
+        | {"execution_enabled": False}
+    )
+    if preflight.get("dry_run_status") != "READY_FOR_PROVISION":
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "COMPUTE_STAGE_PREFLIGHT_CONFLICT",
+                "message": "reserved resources changed after dry-run",
+            },
+            "preflight": preflight,
+            "side_effect_classification": "NO_SIDE_EFFECT",
+            "rollback_status": "NOT_REQUIRED",
+            "last_successful_step": "SCRIPT_INTEGRITY",
+            "first_failed_step": "WORKER_PREFLIGHT",
+            "failed_handler": "compute.provision.stage",
+            "retained_resources": [],
+        }
+    execution = run_allowlisted_script(
+        _compute_stage_argv(payload), timeout=STAGE_EXECUTION_TIMEOUT_SECONDS
+    )
+    if not execution.get("ok"):
+        retained = _compute_stage_retained_resources(payload)
+        evidence = _compute_stage_failure_evidence(execution, retained)
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": str(execution.get("error_code", "COMPUTE_STAGE_FAILED"))[:64],
+                "message": "transactional compute Stage script failed",
+                "exit_code": execution.get("exit_code"),
+            },
+            **evidence,
+        }
+    try:
+        stage = _compute_stage_postconditions(payload)
+    except LifecycleValidationError as exc:
+        retained = _compute_stage_retained_resources(payload)
+        return {
+            "status": "ERROR",
+            "error": {"code": exc.code, "message": str(exc)},
+            "rollback_status": "REQUIRES_MANUAL_REVIEW",
+            "side_effect_classification": "PARTIAL_UNKNOWN",
+            "last_successful_step": "FIXED_STAGE_SCRIPT",
+            "first_failed_step": "WORKER_POSTCONDITION",
+            "failed_handler": "compute.provision.stage",
+            "retained_resources": retained,
+        }
+    return {
+        "status": "SUCCEEDED",
+        "handler": "compute.provision.stage",
+        "execution_enabled": True,
+        "idempotent_replay": False,
+        "stage": stage,
     }
 
 
@@ -6467,6 +7090,16 @@ def dry_run_plan(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, A
         return _compute_provision_plan(payload)
     if request.operation_type == "compute.provision.dry_run":
         return _compute_provision_dry_run(payload)
+    if request.operation_type == "compute.provision.retry_verify":
+        return _compute_retry_verification(payload)
+    if request.operation_type == "compute.provision.stage":
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "COMPUTE_STAGE_DRY_RUN_REJECTED",
+                "message": "Stage consumes a separately recorded compute.provision.dry_run",
+            },
+        }
     if request.operation_type == "user.ssh_client_validation.record":
         return _portal3f_client_validation_plan(payload)
     if request.operation_type == "user.pilot.acceptance":
@@ -6548,6 +7181,8 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
         }
     if request.operation_type in KNOWN_WRITES:
         if not request.dry_run:
+            if request.operation_type == "compute.provision.stage":
+                return _execute_compute_provision_stage(request, payload)
             if request.operation_type == "self.job.submit":
                 return _execute_self_job_submit(request, payload)
             if request.operation_type == "self.job.cancel":
@@ -6595,6 +7230,16 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
         except LifecycleValidationError as exc:
             return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
     try:
+        if request.operation_type == "compute.provision.retry_verify":
+            if not request.dry_run:
+                return {
+                    "status": "ERROR",
+                    "error": {
+                        "code": "COMPUTE_RETRY_VERIFY_EXECUTION_REJECTED",
+                        "message": "retry verification is read-only",
+                    },
+                }
+            return _compute_retry_verification(payload)
         if request.operation_type == "platform.health.read":
             return platform_health()
         if request.operation_type == "gpu.list":

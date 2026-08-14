@@ -71,7 +71,7 @@ Slurm DRAIN/RESUME、用户 Activate/Suspend、删除、quota/QOS、运行容器
 前端隐藏按钮不构成授权。`platform_owner` 可审批；其他角色按权限矩阵受限，auditor
 只读，user 只能访问自己的资源。
 
-## Portal-5A-1A 计算资源申请
+## Portal-5A-1A / Portal-5A-1B 计算资源申请与受控 Stage
 
 首次计算资源申请以 Portal Account 为 owner，因为此时 Managed Compute Identity 尚不存在。
 普通用户只通过 `/self/compute-request` 创建、读取和撤回自己的 `REQUESTED` 申请；API、
@@ -88,9 +88,31 @@ reservation 选择候选值，并建立 24 小时 Portal DB reservation。过期
 active key，Plan 标记为 `EXPIRED`，申请返回 `APPROVED` 等待重新规划。
 
 `compute.provision.dry_run` 重新绑定申请、Plan、owner 和五项精确 reservation，并调用 Root
-Worker 做只读宿主 preflight。通过后 Plan 为 `READY_FOR_PROVISION`，但固定
-`execution_enabled=false`，Lease 的 starts/expires 保持为空。本阶段的真实 Provision API
-始终返回 `PROVISION_EXECUTION_DISABLED_NEXT_GATE`；只有后续管理员阶段才能增加执行路径。
+Worker 做只读宿主 preflight。通过后 Plan 为 `READY_FOR_PROVISION`，此时仍固定
+`execution_enabled=false`，Lease 的 starts/expires 保持为空。
+
+Portal-5A-1B 只在原申请批准保持不变、reservation 未过期、精确 dry-run Operation 存在、
+管理员最近重新认证且本人不是申请人的前提下开放 `compute.provision.stage`。API 先持久化
+`PROVISIONING/RUNNING` 再调用 hash-pinned Root Worker；Worker 重新执行宿主 preflight，随后
+以固定 argv 创建 nologin/密码锁定 Linux identity、300GiB XFS quota、`company/general`
+association、per-UID GPU 隔离，以及 8 CPU/32GiB/GPU NONE 的停止容器。Stage 不安装
+authorized_keys、不监听容器 SSH 端口、不启动 Container 或 Lease，也不重复审批原申请。
+成功后进入 `KEY_ENROLLMENT_PENDING`，五项 reservation 转为 `CONSUMED`；响应不确定或
+检测到残留时资源坐标进入 `FAILED_HOLD`，必须人工对账，不能自动重试。
+
+Stage 失败后 Request 的运营状态可以为 `FAILED`，但 `approved_at`、审批 actor 和唯一审批 Audit
+保持不变；每一次 Provision 都由独立 `attempt_number` 表达。管理员不能从 `FAILED` 直接创建
+Plan，必须先经最近重新认证调用 `compute.provision.retry_authorize`。该 Gate 锁定并验证失败
+Plan/Stage Operation、原 payload 与五项 reservation UUID/值、`NO_SIDE_EFFECT` 或
+`PARTIAL_ROLLED_BACK` 分类、全部 `RELEASED`、Portal 零资源，并让 Root Worker 只读复核实时
+宿主零残留和修复脚本完整性。授权只把 Request 转为 `RETRY_AUTHORIZED` 并写 Operation/Audit，
+不创建任何资源。
+
+授权后的 allocator 必须插入新的 Plan row、新的五项 reservation rows 以及新的 Operation 和
+idempotency key；旧 Plan 保持 `FAILED`，旧 Reservations 保持 `RELEASED`，旧 Stage Operation
+保持 `FAILED`。新 Plan 通过 `previous_plan_id`、`failed_stage_operation_id` 和
+`retry_authorization_operation_id` 保存完整 lineage。`PARTIAL_ROLLBACK_FAILED`、
+`PARTIAL_UNKNOWN`、`FAILED_HOLD`、缺项或任何绑定漂移均要求人工对账，不能进入 retry Gate。
 
 ## Portal-3C 执行边界
 

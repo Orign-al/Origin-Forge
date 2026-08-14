@@ -238,5 +238,7 @@ def ssh_enrollment_status(db: Session, user: PortalUser) -> dict[str, Any]:
         "compute_state": state,
         "validated_key_count": validated_count,
         "ssh_key_state": managed.ssh_key_state,
-        "setup_path": f"/users/{user.id}?tab=ssh",
+        "setup_path": "/ssh-keys"
+        if any(role.name == "user" for role in user.roles)
+        else f"/users/{user.id}?tab=ssh",
     }

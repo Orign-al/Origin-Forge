@@ -265,6 +265,22 @@ def enroll_ssh_key(
         )
 
     managed = _managed_user(target, db, lock=True)
+    if (
+        managed.host_access_state == "DISABLED_BY_PLATFORM_POLICY"
+        and enrollment.scope != "CONTAINER"
+    ):
+        _record_rejection(
+            db,
+            request,
+            context,
+            target,
+            event_type="ssh_key.scope_rejected",
+            code="HOST_KEY_SCOPE_FORBIDDEN",
+        )
+        raise HTTPException(
+            status_code=403,
+            detail={"code": "HOST_KEY_SCOPE_FORBIDDEN", "message": "受管用户密钥仅可用于开发容器"},
+        )
     active_count = int(
         db.scalar(
             select(func.count(PortalSshKey.id)).where(

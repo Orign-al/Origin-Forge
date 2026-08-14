@@ -1,0 +1,515 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /usr/local/lib/h100-platform/h100-platform-common.sh
+
+readonly STATE_DIR=/etc/h100-platform/users
+readonly GPU_ISOLATION_TOOL=/usr/local/sbin/h100-user-gpu-isolation
+readonly PROJECTS_FILE=/etc/projects
+readonly PROJID_FILE=/etc/projid
+readonly COMPOSE_ROOT=/srv/gpu-platform/platform/config/dev-containers
+readonly CONTAINER_DATA_ROOT=/srv/gpu-platform/container-data
+readonly GUARD_SERVICE=h100-gpu-bypass-guard.service
+readonly UID_MIN=20000
+readonly UID_MAX=60000
+readonly PROJECT_MIN=30000
+readonly PROJECT_MAX=39999
+readonly PORT_MIN=22023
+readonly PORT_MAX=22999
+
+created_group=0
+created_user=0
+created_data=0
+created_container_data=0
+created_policy=0
+created_mapping=0
+created_association=0
+created_container=0
+created_compose=0
+created_image=0
+committed=0
+transaction_started=0
+backup_dir=
+temp_dir=
+username=
+uid=
+gid=
+project_id=
+ssh_port=
+slurm_account=
+slurm_qos=
+max_gpus=
+request_id=
+plan_id=
+dry_run_operation_id=
+project_name=
+user_root=
+container_name=
+compose_dir=
+compose_file=
+state_file=
+isolation_marker_one=
+isolation_marker_two=
+current_step=SCRIPT_ARGUMENT_COUNT
+last_successful_step=WORKER_FIXED_ARGV_DISPATCH
+
+usage() {
+  printf '%s\n' \
+    'Usage: h100-provision-stage --execute USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS MAX_GPUS REQUEST_ID PLAN_ID DRY_RUN_OPERATION_ID --confirm-stage USER'
+}
+
+fail() {
+  printf 'COMPUTE STAGE ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+uuid_valid() {
+  [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+}
+
+atomic_restore() {
+  local source=$1 target=$2 temp
+  temp="$(mktemp "${target}.rollback.XXXXXX")"
+  install -o root -g root -m 0644 "${source}" "${temp}"
+  sync -f "${temp}"
+  mv -f -- "${temp}" "${target}"
+}
+
+directory_contains_user_data() {
+  local target=$1
+  [[ -d "${target}" ]] || return 1
+  find "${target}" -xdev -mindepth 1 -type f \
+    ! -path "${target}/home/.ssh/*" \
+    ! -path "${target}/.stage-owner" \
+    -print -quit | grep -q .
+}
+
+rollback() {
+  local original_rc=$1 manual_review=0
+  set +e
+  [[ -z "${isolation_marker_one}" ]] || rm -f -- "${isolation_marker_one}"
+  [[ -z "${isolation_marker_two}" ]] || rm -f -- "${isolation_marker_two}"
+  printf 'COMPUTE STAGE ROLLBACK STARTED user=%s\n' "${username}" >&2
+  if directory_contains_user_data "${user_root}"; then
+    manual_review=1
+    printf 'ROLLBACK BLOCKED: managed data is non-empty; preserving identity and data\n' >&2
+  fi
+  if ((created_container == 1)); then
+    docker rm --force "${container_name}" >/dev/null 2>&1 || manual_review=1
+  fi
+  if ((created_compose == 1)); then
+    rm -f -- "${compose_file}"
+    rmdir -- "${compose_dir}" 2>/dev/null || true
+  fi
+  if ((created_image == 1)); then
+    docker image rm "${derived_image}" >/dev/null 2>&1 || manual_review=1
+  fi
+  if ((created_association == 1)); then
+    sacctmgr -i delete user where Name="${username}" Account="${slurm_account}" \
+      >/dev/null 2>&1 || manual_review=1
+  fi
+  if ((created_mapping == 1)); then
+    xfs_quota -x -c "limit -p bhard=0 ${project_name}" "${H100_DATA_ROOT}" \
+      >/dev/null 2>&1 || true
+    atomic_restore "${backup_dir}/projects.before" "${PROJECTS_FILE}" || manual_review=1
+    atomic_restore "${backup_dir}/projid.before" "${PROJID_FILE}" || manual_review=1
+  fi
+  if ((created_policy == 1)); then
+    "${GPU_ISOLATION_TOOL}" remove "${username}" >/dev/null 2>&1 || manual_review=1
+  fi
+  if ((manual_review == 0)); then
+    if ((created_container_data == 1)); then
+      rm -rf --one-file-system -- "${CONTAINER_DATA_ROOT:?}/${username}"
+    fi
+    if ((created_data == 1)); then
+      rm -rf --one-file-system -- "${user_root}"
+    fi
+    if ((created_user == 1)); then
+      userdel --remove "${username}" >/dev/null 2>&1 || manual_review=1
+    fi
+    if ((created_group == 1)); then
+      groupdel "${username}" >/dev/null 2>&1 || manual_review=1
+    fi
+  else
+    usermod --shell /usr/sbin/nologin "${username}" >/dev/null 2>&1 || true
+    passwd -l "${username}" >/dev/null 2>&1 || true
+  fi
+  rm -f -- "${state_file}"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if ((manual_review == 1)); then
+    printf 'COMPUTE STAGE ROLLBACK MANUAL REVIEW REQUIRED user=%s\n' "${username}" >&2
+    printf 'COMPUTE STAGE SIDE EFFECT CLASSIFICATION: PARTIAL_ROLLBACK_FAILED\n' >&2
+  else
+    printf 'COMPUTE STAGE ROLLED BACK user=%s\n' "${username}" >&2
+    printf 'COMPUTE STAGE SIDE EFFECT CLASSIFICATION: PARTIAL_ROLLED_BACK\n' >&2
+  fi
+  return "${original_rc}"
+}
+
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  if ((rc != 0)); then
+    printf 'COMPUTE STAGE FIRST FAILED STEP: %s\n' "${current_step}" >&2
+    printf 'COMPUTE STAGE LAST SUCCESSFUL STEP: %s\n' "${last_successful_step}" >&2
+    if ((committed == 0 && transaction_started == 1)); then
+      rollback "${rc}"
+      rc=$?
+    elif ((transaction_started == 0)); then
+      printf 'COMPUTE STAGE SIDE EFFECT CLASSIFICATION: NO_SIDE_EFFECT\n' >&2
+    else
+      printf 'COMPUTE STAGE SIDE EFFECT CLASSIFICATION: PARTIAL_UNKNOWN\n' >&2
+    fi
+  fi
+  if [[ -n "${temp_dir}" ]]; then
+    case "${temp_dir}" in
+      /tmp/h100-provision-stage.*) rm -rf -- "${temp_dir}" ;;
+    esac
+  fi
+  h100_audit compute-provision-stage "${username:-none}" "$([[ ${rc} == 0 ]] && printf SUCCESS || printf FAILED)" "${rc}"
+  exit "${rc}"
+}
+trap on_exit EXIT
+
+if [[ "${1:-}" == --help ]]; then
+  usage
+  exit 0
+fi
+if (($# != 14)); then
+  usage >&2
+  exit 2
+fi
+last_successful_step=SCRIPT_ARGUMENT_COUNT
+current_step=EXPLICIT_STAGE_CONFIRMATION_GATE
+[[ "${1:-}" == --execute && "${13:-}" == --confirm-stage && "${2:-}" == "${14:-}" ]] \
+  || fail 'explicit Stage confirmation is invalid'
+last_successful_step=EXPLICIT_STAGE_CONFIRMATION_GATE
+current_step=STATIC_INPUT_VALIDATION
+
+username=$2
+uid=$3
+gid=$4
+project_id=$5
+ssh_port=$6
+slurm_account=$7
+slurm_qos=$8
+max_gpus=$9
+request_id=${10}
+plan_id=${11}
+dry_run_operation_id=${12}
+
+h100_require_root
+h100_validate_username "${username}"
+case "${username}" in root|origin-al|codexops|nobody) fail 'protected username' ;; esac
+[[ "${uid}" =~ ^[0-9]+$ && "${gid}" =~ ^[0-9]+$ ]] || fail 'UID/GID must be numeric'
+((uid >= UID_MIN && uid <= UID_MAX && gid >= UID_MIN && gid <= UID_MAX)) \
+  || fail 'UID/GID outside managed range'
+[[ "${project_id}" =~ ^[0-9]+$ ]] || fail 'Project ID must be numeric'
+((project_id >= PROJECT_MIN && project_id <= PROJECT_MAX)) || fail 'Project ID outside range'
+h100_validate_port "${ssh_port}"
+((ssh_port >= PORT_MIN && ssh_port <= PORT_MAX)) || fail 'SSH port outside managed range'
+[[ "${slurm_account}" == company && "${slurm_qos}" == general ]] \
+  || fail 'Slurm policy differs from standard profile'
+[[ "${max_gpus}" == 0 || "${max_gpus}" == 1 ]] || fail 'GPU max must be zero or one'
+uuid_valid "${request_id}" && uuid_valid "${plan_id}" && uuid_valid "${dry_run_operation_id}" \
+  || fail 'operation binding UUID is invalid'
+
+last_successful_step=STATIC_INPUT_VALIDATION
+current_step=RESOURCE_PREFLIGHT
+h100_acquire_lock
+[[ ! -e /etc/systemd/system/user.slice.d/50-h100-gpu-isolation.conf ]] \
+  || fail 'forbidden global user.slice GPU policy exists'
+[[ ! -e /etc/systemd/system/user-.slice.d/50-h100-gpu-isolation.conf ]] \
+  || fail 'forbidden wildcard user-.slice GPU policy exists'
+project_name="h100_${username}"
+user_root="${H100_DATA_ROOT}/users/${username}"
+container_name="gpu-dev-${username}"
+derived_image="h100-local/dev-container:ubuntu24.04-${username}-${plan_id}"
+compose_dir="${COMPOSE_ROOT}/${username}"
+compose_file="${compose_dir}/compose.yml"
+state_file="${STATE_DIR}/${username}.state"
+
+getent passwd "${username}" >/dev/null && fail 'Linux user already exists'
+getent group "${username}" >/dev/null && fail 'Linux group already exists'
+getent passwd "${uid}" >/dev/null && fail 'UID already exists'
+getent group "${gid}" >/dev/null && fail 'GID already exists'
+[[ ! -e "${user_root}" && ! -e "${CONTAINER_DATA_ROOT}/${username}" ]] \
+  || fail 'target storage already exists'
+[[ ! -e "${state_file}" && ! -e "${compose_dir}" ]] || fail 'target lifecycle state exists'
+docker container inspect "${container_name}" >/dev/null 2>&1 && fail 'container already exists'
+ss -H -lnt "sport = :${ssh_port}" | grep -q . && fail 'reserved SSH port is listening'
+grep -Eq "^${project_id}:" "${PROJECTS_FILE}" && fail 'Project ID already mapped'
+grep -Eq ":${project_id}[[:space:]]*$" "${PROJID_FILE}" && fail 'Project ID already named'
+grep -Eq "^${project_name}:" "${PROJID_FILE}" && fail 'Project name already mapped'
+if ! quota_report="$(xfs_quota -x -c 'report -p -b -n' "${H100_DATA_ROOT}")"; then
+  fail 'XFS project quota report is unreadable'
+fi
+if awk -v id="#${project_id}" '$1 == id {found=1} END {exit found ? 0 : 1}' \
+  <<<"${quota_report}"; then
+  fail 'Project ID already has XFS quota state'
+fi
+sacctmgr -nP show assoc where User="${username}" format=User \
+  | awk -F'|' -v user="${username}" '$1 == user {found=1} END {exit found ? 0 : 1}' \
+  && fail 'Slurm association already exists'
+sacctmgr -nP show account company format=Account \
+  | awk -F'|' '$1 == "company" {found=1} END {exit found ? 0 : 1}' \
+  || fail 'Slurm account company is unavailable'
+sacctmgr -nP show qos general format=Name,MaxTRESPerUser \
+  | awk -F'|' '$1 == "general" && $2 ~ /gres\/gpu=1/ {found=1} END {exit found ? 0 : 1}' \
+  || fail 'general QOS does not enforce one GPU per user'
+xfs_quota -x -c state "${H100_DATA_ROOT}" | grep -A8 'Project quota state' \
+  | grep -q 'Enforcement: ON' || fail 'XFS project quota enforcement is unavailable'
+systemctl is-active --quiet docker.service || fail 'Docker service is unavailable'
+systemctl is-active --quiet slurmctld.service || fail 'Slurm controller is unavailable'
+systemctl is-active --quiet slurmd.service || fail 'Slurm daemon is unavailable'
+
+last_successful_step=RESOURCE_PREFLIGHT
+current_step=BACKUP_AND_TRANSACTION_START
+stamp="$(date +%Y%m%d-%H%M%S-%N)"
+backup_dir="${H100_PLATFORM_ROOT}/backups/compute-stage-${username}-${stamp}"
+install -d -o root -g gpu-platform-admin -m 0750 "${backup_dir}"
+cp -a -- "${PROJECTS_FILE}" "${backup_dir}/projects.before"
+cp -a -- "${PROJID_FILE}" "${backup_dir}/projid.before"
+temp_dir="$(mktemp -d /tmp/h100-provision-stage.XXXXXX)"
+transaction_started=1
+
+last_successful_step=BACKUP_AND_TRANSACTION_START
+current_step=LINUX_IDENTITY
+groupadd --gid "${gid}" "${username}"
+created_group=1
+useradd --uid "${uid}" --gid "${gid}" --create-home \
+  --home-dir "/home/${username}" --shell /usr/sbin/nologin "${username}"
+created_user=1
+passwd -l "${username}" >/dev/null
+[[ "$(passwd -S "${username}" | awk '{print $2}')" == L ]] || fail 'password lock failed'
+[[ "$(getent passwd "${username}" | cut -d: -f7)" == /usr/sbin/nologin ]] \
+  || fail 'host shell is not nologin'
+[[ ! -e "/home/${username}/.ssh/authorized_keys" ]] || fail 'host authorized_keys exists'
+chmod 0700 "/home/${username}"
+for forbidden in sudo docker video render gpu-platform-admin adm systemd-journal; do
+  id -nG "${username}" | tr ' ' '\n' | grep -Fxq "${forbidden}" \
+    && fail "managed user belongs to forbidden group: ${forbidden}"
+done
+
+last_successful_step=LINUX_IDENTITY
+current_step=GPU_POLICY
+"${GPU_ISOLATION_TOOL}" apply "${username}"
+created_policy=1
+"${GPU_ISOLATION_TOOL}" self-test "${username}"
+
+last_successful_step=GPU_POLICY
+current_step=PRIVATE_STORAGE
+install -d -o "${uid}" -g "${gid}" -m 0700 "${user_root}"
+created_data=1
+install -d -o "${uid}" -g "${gid}" -m 0700 \
+  "${user_root}/home" "${user_root}/home/.ssh" "${user_root}/workspace" "${user_root}/shared"
+install -d -o root -g root -m 0700 \
+  "${CONTAINER_DATA_ROOT}/${username}" \
+  "${CONTAINER_DATA_ROOT}/${username}/ssh-host-keys"
+created_container_data=1
+[[ ! -e "${user_root}/home/.ssh/authorized_keys" ]] || fail 'container authorized_keys exists'
+
+# Verify real OS-level isolation using disposable, non-sensitive markers. The
+# markers are removed before Stage commits and no existing user data is read.
+last_successful_step=PRIVATE_STORAGE
+current_step=CROSS_USER_FILESYSTEM_PROBE
+origin_uid="$(id -u origin-pilot)"
+origin_gid="$(id -g origin-pilot)"
+origin_root="${H100_DATA_ROOT}/users/origin-pilot"
+[[ "${origin_uid}" == 20001 && "${origin_gid}" == 20001 ]] \
+  || fail 'origin-pilot identity baseline differs from production policy'
+[[ -d "${origin_root}/workspace" ]] || fail 'origin-pilot private workspace is unavailable'
+isolation_marker_one="${origin_root}/workspace/.portal-stage-isolation-${plan_id}"
+isolation_marker_two="${user_root}/workspace/.portal-stage-isolation-${plan_id}"
+[[ ! -e "${isolation_marker_one}" && ! -e "${isolation_marker_two}" ]] \
+  || fail 'isolation marker collision'
+install -o "${origin_uid}" -g "${origin_gid}" -m 0600 /dev/null "${isolation_marker_one}"
+install -o "${uid}" -g "${gid}" -m 0600 /dev/null "${isolation_marker_two}"
+if setpriv --reuid="${origin_uid}" --regid="${origin_gid}" --clear-groups \
+  --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- \
+  test -r "${isolation_marker_two}" \
+  || setpriv --reuid="${origin_uid}" --regid="${origin_gid}" --clear-groups \
+    --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- \
+    test -w "${isolation_marker_two}"; then
+  fail 'origin-pilot can access second-user private marker'
+fi
+if setpriv --reuid="${uid}" --regid="${gid}" --clear-groups \
+  --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- \
+  test -r "${isolation_marker_one}" \
+  || setpriv --reuid="${uid}" --regid="${gid}" --clear-groups \
+    --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- \
+    test -w "${isolation_marker_one}"; then
+  fail 'second user can access origin-pilot private marker'
+fi
+rm -f -- "${isolation_marker_one}" "${isolation_marker_two}"
+isolation_marker_one=
+isolation_marker_two=
+
+last_successful_step=CROSS_USER_FILESYSTEM_PROBE
+current_step=XFS_PROJECT_QUOTA
+awk -v id="${project_id}" -v path="${user_root}" '1; END {print id ":" path}' \
+  "${PROJECTS_FILE}" >"${temp_dir}/projects"
+awk -v name="${project_name}" -v id="${project_id}" '1; END {print name ":" id}' \
+  "${PROJID_FILE}" >"${temp_dir}/projid"
+install -o root -g root -m 0644 "${temp_dir}/projects" "${PROJECTS_FILE}"
+install -o root -g root -m 0644 "${temp_dir}/projid" "${PROJID_FILE}"
+created_mapping=1
+xfs_quota -x -c "project -s ${project_name}" "${H100_DATA_ROOT}"
+xfs_quota -x -c "limit -p bhard=300g ${project_name}" "${H100_DATA_ROOT}"
+xfs_quota -x -c 'report -p -b -n' "${H100_DATA_ROOT}" \
+  | awk -v id="#${project_id}" '$1 == id && $4 == 314572800 {found=1} END {exit found ? 0 : 1}' \
+  || fail '300GB project quota validation failed'
+
+last_successful_step=XFS_PROJECT_QUOTA
+current_step=SLURM_ASSOCIATION
+sacctmgr -i add user "${username}" Cluster=h100 Account=company \
+  DefaultAccount=company QOS=general DefaultQOS=general >/dev/null
+created_association=1
+sacctmgr -i modify user where Name="${username}" Account=company \
+  set MaxTRES="gres/gpu=${max_gpus}" >/dev/null
+sacctmgr -nP show assoc where User="${username}" Account=company \
+  format=User,Account,QOS,DefaultQOS,MaxTRES \
+  | awk -F'|' -v user="${username}" -v gpu="${max_gpus}" \
+      '$1 == user && $2 == "company" && $3 ~ /general/ && $4 == "general" \
+       && $5 ~ ("(^|,)gres/gpu=" gpu "(,|$)") {found=1} END {exit found ? 0 : 1}' \
+  || fail 'Slurm association validation failed'
+
+last_successful_step=SLURM_ASSOCIATION
+current_step=CONTAINER_IMAGE
+base_image="$(docker inspect --format '{{.Config.Image}}' gpu-dev-origin-pilot)"
+[[ "${base_image}" =~ ^[A-Za-z0-9._/@:+-]+$ ]] || fail 'approved local image reference is invalid'
+base_image_id="$(docker inspect --format '{{.Image}}' gpu-dev-origin-pilot)"
+[[ "${base_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'approved local image ID is invalid'
+[[ "$(docker image inspect --format '{{.Id}}' "${base_image}")" == "${base_image_id}" ]] \
+  || fail 'origin-pilot container image no longer matches its local tag'
+docker image inspect "${base_image}" | jq -e \
+  '.[0].Config.Labels["h100.dev.user"] == "origin-pilot"
+   and .[0].Config.Labels["h100.dev.uid"] == "20001"
+   and .[0].Config.Labels["h100.dev.gid"] == "20001"' \
+  >/dev/null || fail 'origin-pilot image identity labels are invalid'
+docker image inspect "${base_image}" | jq -e \
+  '.[0].Config.User == "" or .[0].Config.User == "root"' \
+  >/dev/null || fail 'origin-pilot image does not build derived users as root'
+docker image inspect "${derived_image}" >/dev/null 2>&1 && fail 'derived image tag already exists'
+cat >"${temp_dir}/Dockerfile" <<EOF
+FROM ${base_image}
+USER root
+RUN old_user=origin-pilot; old_uid=20001; old_gid=20001; \\
+    rm -f /etc/sudoers.d/90-h100-dev-user; \\
+    if getent passwd "\${old_user}" >/dev/null; then userdel "\${old_user}"; fi; \\
+    if getent group "\${old_user}" >/dev/null; then groupdel "\${old_user}"; fi; \\
+    groupadd --gid ${gid} ${username}; \\
+    useradd --uid ${uid} --gid ${gid} --create-home --shell /bin/bash ${username}; \\
+    passwd --lock ${username}; \\
+    rm -rf /home/origin-pilot; \\
+    install -d -o ${uid} -g ${gid} -m 0700 /home/${username}
+ENV DEV_USER=${username}
+LABEL h100.dev.user="${username}" h100.dev.uid="${uid}" h100.dev.gid="${gid}" h100.stage.plan_id="${plan_id}"
+EOF
+docker build --pull=false --network=none --tag "${derived_image}" "${temp_dir}" >/dev/null
+created_image=1
+docker image inspect "${derived_image}" | jq -e \
+  --arg user "${username}" --arg uid "${uid}" --arg gid "${gid}" \
+  '.[0].Config.Labels["h100.dev.user"] == $user and .[0].Config.Labels["h100.dev.uid"] == $uid and .[0].Config.Labels["h100.dev.gid"] == $gid' \
+  >/dev/null || fail 'derived image identity labels are invalid'
+docker image inspect "${derived_image}" | jq -e '
+  (.[0].Config.User == "" or .[0].Config.User == "root")
+  and ((.[0].Config.Env // []) | map(select(startswith("NVIDIA_VISIBLE_DEVICES="))) | length == 0)
+  and ((.[0].Config.Env // []) | map(select(startswith("MUNGE_"))) | length == 0)
+  and ((.[0].Config.Volumes // {}) | keys | index("/var/run/docker.sock") | not)
+  and ((.[0].Config.Volumes // {}) | keys | index("/run/munge") | not)
+' >/dev/null || fail 'derived image inherited a forbidden runtime capability'
+
+last_successful_step=CONTAINER_IMAGE
+current_step=CONTAINER_DEFINITION
+install -d -o root -g gpu-platform-admin -m 0750 "${compose_dir}"
+cat >"${temp_dir}/compose.yml" <<EOF
+name: h100-dev-${username}
+services:
+  dev:
+    image: ${derived_image}
+    pull_policy: never
+    container_name: ${container_name}
+    hostname: ${container_name}
+    init: true
+    restart: unless-stopped
+    ports:
+      - target: 22
+        published: "${ssh_port}"
+        host_ip: ${H100_MANAGEMENT_IP}
+        protocol: tcp
+    volumes:
+      - {type: bind, source: ${user_root}/home, target: /home/${username}, bind: {propagation: rprivate}}
+      - {type: bind, source: ${user_root}/workspace, target: /workspace, bind: {propagation: rprivate}}
+      - {type: bind, source: ${user_root}/shared, target: /shared, bind: {propagation: rprivate}}
+      - {type: bind, source: ${CONTAINER_DATA_ROOT}/${username}/ssh-host-keys, target: /etc/ssh/persistent, bind: {propagation: rprivate}}
+    environment:
+      TZ: Asia/Shanghai
+    cpus: 8.0
+    mem_limit: 32g
+    pids_limit: 4096
+    shm_size: 8g
+    stop_grace_period: 30s
+EOF
+install -o root -g gpu-platform-admin -m 0640 "${temp_dir}/compose.yml" "${compose_file}"
+created_compose=1
+docker compose --project-directory "${compose_dir}" --file "${compose_file}" config --quiet
+docker compose --project-directory "${compose_dir}" --file "${compose_file}" create --no-build
+created_container=1
+[[ "$(docker inspect --format '{{.State.Status}}' "${container_name}")" == created ]] \
+  || fail 'container is not staged in created state'
+docker inspect "${container_name}" | jq -e \
+  --arg port "${ssh_port}" \
+  '.[0].HostConfig.Privileged == false
+   and .[0].HostConfig.NetworkMode != "host"
+   and .[0].HostConfig.PidMode != "host"
+   and .[0].HostConfig.IpcMode != "host"
+   and .[0].HostConfig.ReadonlyRootfs == false
+   and ((.[0].HostConfig.CapAdd // []) | length == 0)
+   and ((.[0].HostConfig.DeviceRequests // []) | length == 0)
+   and ((.[0].HostConfig.Devices // []) | length == 0)
+   and .[0].HostConfig.NanoCpus == 8000000000
+   and .[0].HostConfig.Memory == 34359738368
+   and .[0].HostConfig.PidsLimit == 4096
+   and .[0].HostConfig.PortBindings["22/tcp"][0].HostPort == $port
+   and ((.[0].Mounts // []) | map(.Destination) | index("/var/run/docker.sock") | not)
+   and ((.[0].Mounts // []) | map(.Destination) | index("/run/munge") | not)
+   and ((.[0].Mounts // []) | map(.Source) | index("/") | not)
+   and ((.[0].Mounts // []) | map(.Source) | index("/srv/gpu-platform/users") | not)' \
+  >/dev/null || fail 'staged container security validation failed'
+ss -H -lnt "sport = :${ssh_port}" | grep -q . && fail 'staged SSH port unexpectedly listens'
+
+last_successful_step=CONTAINER_DEFINITION
+current_step=LIFECYCLE_STATE
+install -d -o root -g gpu-platform-admin -m 0750 "${STATE_DIR}"
+cat >"${temp_dir}/state" <<EOF
+VERSION=3
+STATUS=STAGED
+USERNAME=${username}
+UID=${uid}
+GID=${gid}
+PROJECT_ID=${project_id}
+SSH_PORT=${ssh_port}
+SLURM_ACCOUNT=${slurm_account}
+SLURM_QOS=${slurm_qos}
+MAX_GPUS=${max_gpus}
+REQUEST_ID=${request_id}
+PLAN_ID=${plan_id}
+DRY_RUN_OPERATION_ID=${dry_run_operation_id}
+SSH_KEY_STATE=REQUIRED_BEFORE_ACTIVATION
+LEASE_STATE=NOT_STARTED
+LEASE_START=
+LEASE_EXPIRES=
+EOF
+install -o root -g gpu-platform-admin -m 0640 "${temp_dir}/state" "${state_file}"
+
+last_successful_step=LIFECYCLE_STATE
+current_step=GPU_GUARD_VERIFICATION
+systemctl start "${GUARD_SERVICE}"
+systemctl is-failed --quiet "${GUARD_SERVICE}" && fail 'GPU bypass Guard failed'
+"${GPU_ISOLATION_TOOL}" verify "${username}"
+last_successful_step=GPU_GUARD_VERIFICATION
+current_step=COMPLETED
+committed=1
+printf 'COMPUTE STAGED user=%s uid=%s gid=%s project_id=%s ssh_port=%s container=%s state=STOPPED lease=NOT_STARTED host_ssh=DISABLED\n' \
+  "${username}" "${uid}" "${gid}" "${project_id}" "${ssh_port}" "${container_name}"

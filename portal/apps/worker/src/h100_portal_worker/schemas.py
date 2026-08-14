@@ -27,10 +27,12 @@ KNOWN_READS = {
     "self.job.logs.read",
     "self.job.status.read",
     "self.storage.read",
+    "compute.provision.retry_verify",
 }
 KNOWN_WRITES = {
     "compute.provision.plan",
     "compute.provision.dry_run",
+    "compute.provision.stage",
     "user.plan",
     "user.stage",
     "user.activate",
@@ -377,6 +379,130 @@ def _validate_compute_provision_dry_run(payload: dict[str, Any]) -> dict[str, An
     return result
 
 
+def _validate_compute_provision_retry_verify(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "request_id",
+        "plan_id",
+        "stage_operation_id",
+        "portal_account_id",
+        "username",
+        "uid",
+        "gid",
+        "project_id",
+        "ssh_port",
+        "container_name",
+    }
+    if set(payload) != fields or set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+        raise PayloadValidationError(
+            "COMPUTE_RETRY_VERIFY_PAYLOAD_REJECTED",
+            "compute retry verification fields are invalid",
+        )
+    result: dict[str, Any] = _compute_request_identity(payload)
+    result["plan_id"] = _canonical_uuid(payload.get("plan_id"), "provision plan ID")
+    result["stage_operation_id"] = _canonical_uuid(
+        payload.get("stage_operation_id"), "failed Stage operation ID"
+    )
+    if payload.get("container_name") != f"gpu-dev-{result['username']}":
+        raise PayloadValidationError(
+            "COMPUTE_RETRY_VERIFY_PAYLOAD_REJECTED", "container name is not target-bound"
+        )
+    numbers = {
+        "uid": (PILOT_UID_MIN, PILOT_UID_MAX),
+        "gid": (PILOT_UID_MIN, PILOT_UID_MAX),
+        "project_id": (PROJECT_ID_MIN, PROJECT_ID_MAX),
+        "ssh_port": (PILOT_SSH_PORT_MIN, PILOT_SSH_PORT_MAX),
+    }
+    for field, (minimum, maximum) in numbers.items():
+        value = payload.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+            raise PayloadValidationError(
+                "COMPUTE_RETRY_VERIFY_PAYLOAD_REJECTED", f"invalid {field}"
+            )
+        result[field] = value
+    result["container_name"] = payload["container_name"]
+    return result
+
+
+def _validate_compute_provision_stage(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate the closed Stage contract produced from a reserved plan.
+
+    Reservation IDs are carried all the way to the Worker even though the
+    host script only consumes the allocator values.  That prevents a future
+    API caller from accidentally reducing Stage to an unbound user-create.
+    """
+    fields = {
+        "request_id",
+        "plan_id",
+        "portal_account_id",
+        "stage_operation_id",
+        "dry_run_operation_id",
+        "reservation_ids",
+        "username",
+        "uid",
+        "gid",
+        "project_id",
+        "ssh_port",
+        "container_name",
+        "storage_bytes",
+        "container_profile",
+        "container_cpus",
+        "container_memory_gb",
+        "container_pids_limit",
+        "container_gpu",
+        "slurm_account",
+        "slurm_qos",
+        "gpu_max",
+        "lease_seconds",
+        "lease_state",
+        "host_ssh",
+        "shell",
+        "password_state",
+        "execution_enabled",
+    }
+    if set(payload) != fields or set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+        raise PayloadValidationError(
+            "COMPUTE_STAGE_PAYLOAD_REJECTED", "compute Stage fields are invalid"
+        )
+    dry_run_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"stage_operation_id", "dry_run_operation_id", "reservation_ids"}
+    }
+    dry_run_payload["execution_enabled"] = False
+    result = _validate_compute_provision_dry_run(dry_run_payload)
+    if payload.get("execution_enabled") is not True:
+        raise PayloadValidationError(
+            "COMPUTE_STAGE_EXECUTION_GATE_REJECTED", "compute Stage execution is not enabled"
+        )
+    reservation_ids = payload.get("reservation_ids")
+    if not isinstance(reservation_ids, dict) or set(reservation_ids) != {
+        "UID",
+        "GID",
+        "PROJECT_ID",
+        "SSH_PORT",
+        "CONTAINER_NAME",
+    }:
+        raise PayloadValidationError(
+            "COMPUTE_STAGE_RESERVATION_REJECTED", "Stage reservation IDs are incomplete"
+        )
+    result.update(
+        {
+            "stage_operation_id": _canonical_uuid(
+                payload.get("stage_operation_id"), "Stage operation ID"
+            ),
+            "dry_run_operation_id": _canonical_uuid(
+                payload.get("dry_run_operation_id"), "dry-run operation ID"
+            ),
+            "reservation_ids": {
+                resource_type: _canonical_uuid(value, f"{resource_type} reservation ID")
+                for resource_type, value in sorted(reservation_ids.items())
+            },
+            "execution_enabled": True,
+        }
+    )
+    return result
+
+
 def _validate_user_stage(payload: dict[str, Any], allow_legacy_stage: bool) -> dict[str, Any]:
     if set(payload) & STAGE_PUBLIC_KEY_FIELDS:
         raise PayloadValidationError(
@@ -519,12 +645,20 @@ def _validate_ssh_key_prepare(payload: dict[str, Any]) -> dict[str, Any]:
         raise PayloadValidationError(
             "SSH_KEY_PREPARE_REJECTED", "SSH key content digest is invalid"
         )
-    if scope not in {"HOST", "CONTAINER", "BOTH"}:
-        raise PayloadValidationError("SSH_KEY_PREPARE_REJECTED", "SSH key scope is invalid")
     username = payload.get("username")
-    if username != "origin-pilot":
+    if (
+        not isinstance(username, str)
+        or not SAFE_USERNAME.fullmatch(username)
+        or username in {"root", "origin-al", "codexops", "nobody"}
+    ):
         raise PayloadValidationError(
-            "SSH_KEY_PREPARE_REJECTED", "current Pilot may prepare keys only for origin-pilot"
+            "SSH_KEY_PREPARE_REJECTED", "SSH key target username is invalid or protected"
+        )
+    if scope not in {"HOST", "CONTAINER", "BOTH"} or (
+        username != "origin-pilot" and scope != "CONTAINER"
+    ):
+        raise PayloadValidationError(
+            "SSH_KEY_PREPARE_REJECTED", "managed ordinary users require CONTAINER-only keys"
         )
     return {
         "record_id": _canonical_uuid(payload.get("record_id"), "SSH key record ID"),
@@ -1018,6 +1152,10 @@ def validate_payload(
         return _validate_compute_provision_plan(payload)
     if operation_type == "compute.provision.dry_run":
         return _validate_compute_provision_dry_run(payload)
+    if operation_type == "compute.provision.retry_verify":
+        return _validate_compute_provision_retry_verify(payload)
+    if operation_type == "compute.provision.stage":
+        return _validate_compute_provision_stage(payload)
     if operation_type == "containers.inspect":
         name = payload.get("name")
         if not isinstance(name, str) or not SAFE_IDENTIFIER.fullmatch(name):

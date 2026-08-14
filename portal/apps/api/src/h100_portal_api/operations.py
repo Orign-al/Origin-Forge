@@ -23,6 +23,10 @@ READ_OPERATION_TYPES = {
 }
 
 WRITE_OPERATION_TYPES = {
+    "compute.provision.plan",
+    "compute.provision.dry_run",
+    "compute.provision.retry_authorize",
+    "compute.provision.stage",
     "user.plan",
     "user.stage",
     "user.activate",
@@ -43,6 +47,7 @@ WRITE_OPERATION_TYPES = {
 }
 
 HIGH_RISK_OPERATION_TYPES = {
+    "compute.provision.stage",
     "user.stage",
     "user.activate",
     "user.pilot.acceptance",
@@ -57,6 +62,10 @@ HIGH_RISK_OPERATION_TYPES = {
 }
 
 OPERATION_PERMISSIONS = {
+    "compute.provision.plan": "compute_requests.plan",
+    "compute.provision.dry_run": "compute_requests.plan",
+    "compute.provision.retry_authorize": "compute_requests.plan",
+    "compute.provision.stage": "compute_requests.plan",
     "user.plan": "users.write",
     "user.stage": "users.write",
     "user.activate": "users.write",
@@ -79,6 +88,7 @@ OPERATION_PERMISSIONS = {
 
 def risk_for(operation_type: str) -> RiskLevel:
     if operation_type in {
+        "compute.provision.stage",
         "slurm.resume",
         "slurm.production_pilot.start",
         "user.activate",

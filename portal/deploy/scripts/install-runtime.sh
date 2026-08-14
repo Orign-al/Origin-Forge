@@ -9,6 +9,7 @@ readonly CONFIG_DIR=/etc/h100-portal
 readonly SSH_KEY_STAGING_DIR=/var/lib/h100-portal/ssh-key-staging
 readonly PORTAL3F_ACCEPTANCE_SOURCE="${PLATFORM_DIR}/scripts/h100-origin-pilot-acceptance"
 readonly PORTAL3F_GPU_PROBE_SOURCE="${PLATFORM_DIR}/tests/gpu-device-mapping/gpu-device-context-probe.c"
+readonly COMPUTE_STAGE_SOURCE="${PLATFORM_DIR}/scripts/h100-provision-stage"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "install-runtime.sh must run as root" >&2
@@ -26,6 +27,9 @@ for required in \
     exit 1
   fi
 done
+
+[[ -f "$COMPUTE_STAGE_SOURCE" && ! -L "$COMPUTE_STAGE_SOURCE" ]] \
+  || { echo "required deployment input missing: $COMPUTE_STAGE_SOURCE" >&2; exit 1; }
 
 rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
   --exclude=/node_modules/ \
@@ -58,6 +62,13 @@ install -d -o root -g root -m 0700 "${SSH_KEY_STAGING_DIR}"
 install -o root -g root -m 0640 \
   "$SOURCE_DIR/deploy/worker-scripts.json" \
   "$CONFIG_DIR/worker-scripts.json"
+
+# Multi-user Stage is reachable only through the hash-pinned Worker handler.
+# Installing this exact checked-in script here keeps code, manifest and host
+# lifecycle implementation in one deployment transaction.
+install -o root -g gpu-platform-admin -m 0750 \
+  "$COMPUTE_STAGE_SOURCE" \
+  /usr/local/sbin/h100-provision-stage
 
 install -o root -g root -m 0755 \
   "$PORTAL3F_ACCEPTANCE_SOURCE" \

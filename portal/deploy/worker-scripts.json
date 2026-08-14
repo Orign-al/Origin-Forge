@@ -1,4 +1,6 @@
 {
+  "h100-platform-common": "242a5595bc674ca86d7c0ede2b001020c3d27fe6bd3bc01bd495128f10dd3111",
+  "h100-provision-stage": "ad03b8fbf310e755ba06055e3cc6dfaa5430be6bc450d3d058a75d1327ad02e4",
   "h100-container-create": "449b8bc2f42d592aee79e98a87c9d94f868cb956fcacd4739e7e4cefbdd75043",
   "h100-container-delete": "1ed0e72e4558fe9ec137bc8aee437709427100b12bba34d24f153305825a79ed",
   "h100-container-rebuild": "bc76cfe9e8a253dd7f3b920460bf20e8f462923e3905ed8a87295501444f1f81",

@@ -168,8 +168,28 @@ reservation 集合；Worker 联合 `/etc/passwd`、group、legacy ownership、XF
 不运行 Guard 主程序。精确 dry-run payload 只接受已 reservation 的 UID/GID/Project ID/Port/
 Container Name 和固定 8 CPU、32GB、4096 PIDs、Container GPU NONE、Host SSH disabled、
 `/usr/sbin/nologin`、password locked、Lease NOT_STARTED。两种 operation 在 `dry_run=false`
-时均落入 `WRITE_EXECUTION_DISABLED`，没有 useradd、Docker、quota、sacctmgr、systemd 或 Lease
-写 handler。
+时仍落入 `WRITE_EXECUTION_DISABLED`。
+
+Portal-5A-1B 单独增加 `compute.provision.stage`，它不是上述 dry-run operation 的写模式。
+payload 额外精确绑定成功 dry-run Operation UUID 与五项 reservation UUID，并要求
+`execution_enabled=true`；Worker 只接受请求人和批准人相同的最近重新认证管理员 envelope。
+执行前重新运行固定 preflight，随后只调用 `/usr/local/sbin/h100-provision-stage` 的固定 argv。
+Stage 主脚本、其 source 的 platform common library、GPU isolation 与 Guard 脚本全部由
+root owner/mode/SHA-256 完整性 Gate 保护。后置条件必须证明 identity 锁定、双向私有目录
+隔离、quota/association/per-UID GPU policy、停止且无 GPU 的容器、无 authorized_keys 和
+Lease NOT_STARTED；任一不确定结果 fail closed 并保留对账证据。
+
+Stage 固定 argv 共 15 项（脚本路径加 14 个参数），确认门位于脚本参数 13/14；Bash 脚本必须
+使用 `${13:-}` 与 `${14:-}` 读取两位数 positional parameter。脚本和 Worker 对失败结果输出
+`last_successful_step`、`first_failed_step`、`failed_handler`，并把副作用严格分类为
+`NO_SIDE_EFFECT`、`PARTIAL_ROLLED_BACK`、`PARTIAL_ROLLBACK_FAILED` 或 `PARTIAL_UNKNOWN`。
+只有前两类且 retained scan 为空时 API 才释放 reservation；后两类一律 `FAILED_HOLD`。
+
+`compute.provision.retry_verify` 是单独的只读 Worker contract：它使用原 Plan 的精确 UID/GID、
+ProjectID、Port、Container Name 和失败 Stage Operation ID 检查 Linux、Docker、Slurm、XFS、
+per-UID policy、registry 与 lifecycle path 残留，并重新验证 Stage 所需脚本完整性。它不会运行
+allocator 或写宿主。通过后管理员仍需独立 `compute.provision.retry_authorize`，后续 Attempt
+只能使用新的 Plan、Reservations、Dry-run Operation、Stage Operation 和 idempotency key。
 
 ## 固定命令适配器
 

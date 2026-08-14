@@ -271,7 +271,7 @@ class PortalManagedUser(Base):
         ),
         CheckConstraint(
             "compute_environment_state IN "
-            "('ACTIVE', 'RECYCLED', 'RESTORE_PENDING', 'SUSPENDED', 'FAILED')",
+            "('STAGED', 'ACTIVE', 'RECYCLED', 'RESTORE_PENDING', 'SUSPENDED', 'FAILED')",
             name="ck_managed_user_compute_environment_state",
         ),
         CheckConstraint(
@@ -288,7 +288,7 @@ class PortalManagedUser(Base):
     )
     unix_username: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
     uid: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
-    gid: Mapped[int] = mapped_column(Integer, nullable=False)
+    gid: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
     shell: Mapped[str] = mapped_column(String(128), nullable=False)
     host_access_state: Mapped[str] = mapped_column(String(32), nullable=False)
     compute_environment_state: Mapped[str] = mapped_column(
@@ -330,7 +330,8 @@ class PortalComputeResourceRequest(Base):
     __table_args__ = (
         CheckConstraint(
             "status IN ('DRAFT', 'REQUESTED', 'UNDER_REVIEW', 'APPROVED', "
-            "'REJECTED', 'CANCELLED', 'PROVISION_PLAN_READY', 'PROVISIONING', "
+            "'REJECTED', 'CANCELLED', 'RETRY_AUTHORIZED', 'PROVISION_PLAN_READY', "
+            "'PROVISIONING', "
             "'STAGED', 'KEY_ENROLLMENT_PENDING', 'ACTIVE', 'FAILED')",
             name="ck_compute_resource_request_state",
         ),
@@ -356,9 +357,11 @@ class PortalComputeResourceRequest(Base):
         ),
         CheckConstraint(
             "(status IN ('DRAFT', 'REQUESTED', 'UNDER_REVIEW', 'APPROVED', "
-            "'PROVISION_PLAN_READY') AND active_slot = 1) OR "
+            "'RETRY_AUTHORIZED', 'PROVISION_PLAN_READY', 'PROVISIONING') "
+            "AND active_slot = 1) OR "
             "(status NOT IN ('DRAFT', 'REQUESTED', 'UNDER_REVIEW', 'APPROVED', "
-            "'PROVISION_PLAN_READY') AND active_slot IS NULL)",
+            "'RETRY_AUTHORIZED', 'PROVISION_PLAN_READY', 'PROVISIONING') "
+            "AND active_slot IS NULL)",
             name="ck_compute_resource_request_active_slot",
         ),
         UniqueConstraint(
@@ -414,13 +417,13 @@ class PortalComputeResourceRequest(Base):
 
 
 class PortalProvisionPlan(Base):
-    """Reserved, non-executable resource coordinates for one approved request."""
+    """Immutable-attempt resource coordinates for one approved request."""
 
     __tablename__ = "portal_provision_plans"
     __table_args__ = (
         CheckConstraint(
-            "state IN ('RESERVED', 'READY_FOR_PROVISION', 'CONSUMED', 'RELEASED', "
-            "'EXPIRED', 'FAILED')",
+            "state IN ('RESERVED', 'READY_FOR_PROVISION', 'PROVISIONING', 'STAGED', "
+            "'CONSUMED', 'RELEASED', 'EXPIRED', 'FAILED')",
             name="ck_portal_provision_plan_state",
         ),
         CheckConstraint("gpu_max BETWEEN 0 AND 1", name="ck_portal_provision_plan_gpu_max"),
@@ -435,7 +438,42 @@ class PortalProvisionPlan(Base):
         CheckConstraint("host_ssh_enabled = false", name="ck_provision_plan_host_ssh"),
         CheckConstraint("shell = '/usr/sbin/nologin'", name="ck_provision_plan_shell"),
         CheckConstraint("password_state = 'LOCKED'", name="ck_provision_plan_password"),
-        CheckConstraint("execution_enabled = false", name="ck_provision_plan_execution_gate"),
+        CheckConstraint(
+            "(state IN ('RESERVED', 'READY_FOR_PROVISION') AND execution_enabled = false) OR "
+            "(state IN ('PROVISIONING', 'STAGED') AND execution_enabled = true) OR "
+            "state IN ('CONSUMED', 'RELEASED', 'EXPIRED', 'FAILED')",
+            name="ck_provision_plan_execution_gate",
+        ),
+        CheckConstraint("attempt_number >= 1", name="ck_provision_plan_attempt_positive"),
+        CheckConstraint(
+            "attempt_reason IN ('INITIAL', 'RESERVATION_EXPIRED', 'STAGE_RETRY')",
+            name="ck_provision_plan_attempt_reason",
+        ),
+        CheckConstraint(
+            "(attempt_number = 1 AND attempt_reason = 'INITIAL' "
+            "AND previous_plan_id IS NULL AND failed_stage_operation_id IS NULL "
+            "AND retry_authorization_operation_id IS NULL) OR "
+            "(attempt_number > 1 AND previous_plan_id IS NOT NULL "
+            "AND ((attempt_reason = 'RESERVATION_EXPIRED' "
+            "AND failed_stage_operation_id IS NULL "
+            "AND retry_authorization_operation_id IS NULL) OR "
+            "(attempt_reason = 'STAGE_RETRY' "
+            "AND failed_stage_operation_id IS NOT NULL "
+            "AND retry_authorization_operation_id IS NOT NULL)))",
+            name="ck_provision_plan_attempt_lineage",
+        ),
+        CheckConstraint(
+            "previous_plan_id IS NULL OR previous_plan_id <> id", name="ck_plan_not_self"
+        ),
+        UniqueConstraint("request_id", "attempt_number", name="uq_provision_plan_attempt"),
+        UniqueConstraint("previous_plan_id", name="uq_provision_plan_previous"),
+        UniqueConstraint(
+            "failed_stage_operation_id", name="uq_provision_plan_failed_stage_operation"
+        ),
+        UniqueConstraint(
+            "retry_authorization_operation_id",
+            name="uq_provision_plan_retry_authorization_operation",
+        ),
         Index("ix_portal_provision_plan_account_state", "portal_account_id", "state"),
         Index("ix_portal_provision_plan_reservation_expiry", "state", "reservation_expires_at"),
     )
@@ -444,8 +482,32 @@ class PortalProvisionPlan(Base):
     request_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("portal_compute_resource_requests.id", ondelete="CASCADE"),
         nullable=False,
-        unique=True,
-        index=True,
+    )
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    attempt_reason: Mapped[str] = mapped_column(String(32), nullable=False, default="INITIAL")
+    previous_plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            "portal_provision_plans.id",
+            name="fk_provision_plan_previous",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
+    failed_stage_operation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            "portal_operations.id",
+            name="fk_provision_plan_failed_stage_operation",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
+    retry_authorization_operation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            "portal_operations.id",
+            name="fk_provision_plan_retry_authorization_operation",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
     )
     portal_account_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("portal_users.id", ondelete="CASCADE"), nullable=False, index=True
@@ -498,8 +560,19 @@ class PortalResourceReservation(Base):
             name="ck_portal_resource_reservation_type",
         ),
         CheckConstraint(
-            "state IN ('RESERVED', 'CONSUMED', 'RELEASED', 'EXPIRED')",
+            "state IN ('RESERVED', 'CONSUMED', 'RELEASED', 'EXPIRED', 'FAILED_HOLD')",
             name="ck_portal_resource_reservation_state",
+        ),
+        CheckConstraint(
+            "(state = 'RESERVED' AND active_key IS NOT NULL "
+            "AND consumed_at IS NULL AND released_at IS NULL) OR "
+            "(state = 'CONSUMED' AND active_key IS NULL "
+            "AND consumed_at IS NOT NULL AND released_at IS NULL) OR "
+            "(state IN ('RELEASED', 'EXPIRED') AND active_key IS NULL "
+            "AND consumed_at IS NULL AND released_at IS NOT NULL) OR "
+            "(state = 'FAILED_HOLD' AND active_key IS NOT NULL "
+            "AND consumed_at IS NULL AND released_at IS NULL)",
+            name="ck_portal_resource_reservation_lifecycle",
         ),
         UniqueConstraint("active_key", name="uq_portal_resource_reservation_active_key"),
         UniqueConstraint(
@@ -785,7 +858,7 @@ class PortalStorageResource(Base):
     __table_args__ = (
         CheckConstraint("quota_bytes > 0", name="ck_portal_storage_quota_positive"),
         CheckConstraint(
-            "state IN ('ACTIVE', 'PRESERVED', 'RESTORING', 'FAILED')",
+            "state IN ('STAGED', 'ACTIVE', 'PRESERVED', 'RESTORING', 'FAILED')",
             name="ck_portal_storage_state",
         ),
     )

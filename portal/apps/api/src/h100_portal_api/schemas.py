@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import uuid
 from datetime import datetime
 from typing import Any, Literal
@@ -116,6 +118,24 @@ class ComputeProvisionActionRequest(ApiModel):
     """Plan and dry-run actions accept no allocator or host parameters."""
 
     idempotency_key: uuid.UUID
+
+
+class ComputeProvisionRetryAuthorizationRequest(ApiModel):
+    """Administrator attestation required before a fresh Stage attempt."""
+
+    idempotency_key: uuid.UUID
+    failure_classification: Literal["NO_SIDE_EFFECT", "PARTIAL_ROLLED_BACK"]
+    safe_root_cause: str = Field(min_length=1, max_length=500)
+    authorization_reason: str = Field(min_length=1, max_length=500)
+    remediation_git_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+    @field_validator("safe_root_cause", "authorization_reason")
+    @classmethod
+    def normalize_safe_evidence(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("retry evidence must not be blank")
+        return normalized
 
 
 class ChangePasswordRequest(ApiModel):

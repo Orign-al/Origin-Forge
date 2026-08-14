@@ -87,14 +87,21 @@ export function OrdinaryUnprovisionedDashboard({ user }: { user: User }) {
   const pending = ["REQUESTED", "UNDER_REVIEW"].includes(
     computeRequest?.status ?? "",
   );
-  const approved = ["APPROVED", "PROVISION_PLAN_READY"].includes(
-    computeRequest?.status ?? "",
-  );
+  const approved = [
+    "APPROVED",
+    "RETRY_AUTHORIZED",
+    "PROVISION_PLAN_READY",
+    "PROVISIONING",
+  ].includes(computeRequest?.status ?? "");
+  const provisioning = computeRequest?.status === "PROVISIONING";
+  const failed = computeRequest?.status === "FAILED";
   const environmentLabel = pending
     ? "审批中"
     : approved
       ? "已批准，等待创建"
-      : "尚未申请";
+      : failed
+        ? "创建失败，管理员处理中"
+        : "尚未申请";
   return (
     <>
       <PageHeading
@@ -119,16 +126,22 @@ export function OrdinaryUnprovisionedDashboard({ user }: { user: User }) {
                   ? "PENDING APPROVAL"
                   : approved
                     ? "APPROVED"
-                    : "NOT PROVISIONED"
+                    : failed
+                      ? "FAILED"
+                      : "NOT PROVISIONED"
               }
             />
           </div>
           <div className="stat-detail">
             {approved
-              ? "资源尚未执行 Provision，Lease 尚未开始"
+              ? provisioning
+                ? "管理员正在执行受控 Stage；Lease 尚未开始"
+                : "资源尚未执行 Provision，Lease 尚未开始"
               : pending
                 ? "等待管理员审批，尚未创建任何资源"
-                : "尚未创建 Linux、Container 或 Lease"}
+                : failed
+                  ? "创建失败；原申请保留，Lease 未启动"
+                  : "尚未创建 Linux、Container 或 Lease"}
           </div>
         </Card>
       </div>
@@ -163,11 +176,25 @@ export function OrdinaryUnprovisionedDashboard({ user }: { user: User }) {
                 ) : null}
               </div>
             </>
+          ) : failed && computeRequest ? (
+            <>
+              <div className="notice">
+                {computeRequest.user_status_message ??
+                  "计算环境创建失败，平台管理员正在处理。你的申请仍被保留，无需重新提交。"}
+              </div>
+              <Link
+                className="ui-button ui-button-primary"
+                href="/compute-request"
+              >
+                查看处理状态
+              </Link>
+            </>
           ) : approved && computeRequest ? (
             <>
               <p>
-                申请已批准，正在等待创建。当前仍没有 Container、Quota、Slurm
-                Association 或 Lease。
+                {provisioning
+                  ? "申请已批准，受控 Stage 正在进行。Lease 仍未启动。"
+                  : "申请已批准，正在等待创建。当前仍没有 Container、Quota、Slurm Association 或 Lease。"}
               </p>
               <Link
                 className="ui-button ui-button-primary"
@@ -221,6 +248,56 @@ export function OrdinaryUnprovisionedDashboard({ user }: { user: User }) {
             查看开户与资源申请说明
           </Link>
         </SectionCard>
+      </div>
+    </>
+  );
+}
+
+export function OrdinaryStagedDashboard({ user }: { user: User }) {
+  return (
+    <>
+      <PageHeading
+        title="我的环境"
+        description="计算环境已准备，下一步设置 SSH 密钥"
+        action={<StatusBadge value="KEY ENROLLMENT PENDING" />}
+      />
+      <div className="grid-compact ordinary-stats">
+        <Card className="stat-panel">
+          <div className="stat-label">Portal 账号</div>
+          <div className="stat-value compact-stat">
+            <StatusBadge value={user.account_state} />
+          </div>
+          <div className="stat-detail">登录身份保持 ACTIVE</div>
+        </Card>
+        <Card className="stat-panel">
+          <div className="stat-label">计算环境</div>
+          <div className="stat-value compact-stat">
+            <StatusBadge value="STAGED" />
+          </div>
+          <div className="stat-detail">Container 已创建但保持停止</div>
+        </Card>
+        <Card className="stat-panel">
+          <div className="stat-label">Lease</div>
+          <div className="stat-value compact-stat">
+            <StatusBadge value="NOT STARTED" />
+          </div>
+          <div className="stat-detail">96小时倒计时尚未启动</div>
+        </Card>
+      </div>
+      <SectionCard
+        title="设置 Container SSH 密钥"
+        subtitle="Scope 固定为 CONTAINER；私钥只保存在你的电脑"
+      >
+        <p>
+          计算资源已经安全 Stage。登记你自己的 ED25519
+          公钥后，管理员才能在下一阶段激活环境。
+        </p>
+        <Link className="ui-button ui-button-primary" href="/ssh-keys">
+          设置 SSH 密钥
+        </Link>
+      </SectionCard>
+      <div className="notice">
+        当前不能启动容器、打开网页终端或提交作业；Host SSH 始终禁用。
       </div>
     </>
   );
@@ -911,8 +988,8 @@ export function OrdinarySshKeys() {
       <SectionCard title="容器公钥">
         <SshKeyEnrollment
           userId={current.data.user.id}
-          username="origin-pilot"
-          computeState="ACTIVE"
+          username={current.data.user.normalized_login}
+          computeState={current.data.ssh_enrollment.compute_state}
           managedUserId={current.data.ssh_enrollment.managed_user_id}
           containerOnly
         />
@@ -938,6 +1015,27 @@ export function OrdinaryHelp() {
           </SectionCard>
           <SectionCard title="下一步">
             <p>下一阶段通过资源申请与管理员审批进入 Compute Provisioning。</p>
+          </SectionCard>
+        </div>
+      </>
+    );
+  }
+  if (current.data.user.resource_onboarding_state === "STAGED") {
+    return (
+      <>
+        <PageHeading title="帮助" description="完成 Container SSH 密钥注册" />
+        <div className="section-grid">
+          <SectionCard title="当前状态">
+            <p>
+              计算身份、私有存储、Slurm association 与无 GPU 开发容器已经安全
+              Stage；Container 保持停止，Lease 尚未启动。
+            </p>
+          </SectionCard>
+          <SectionCard title="下一步">
+            <p>只登记你自己的 ED25519 公钥，Scope 固定为 CONTAINER。</p>
+            <Link className="table-link" href="/ssh-keys">
+              设置 SSH 密钥
+            </Link>
           </SectionCard>
         </div>
       </>

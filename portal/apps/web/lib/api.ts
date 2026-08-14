@@ -254,6 +254,8 @@ export type SelfTerminal = {
 
 export type ProvisionPlan = {
   id: string;
+  attempt_number: number;
+  attempt_reason: "INITIAL" | "RESERVATION_EXPIRED" | "STAGE_RETRY";
   state: string;
   username?: string;
   uid?: number;
@@ -275,11 +277,39 @@ export type ProvisionPlan = {
   host_ssh: "DISABLED";
   shell?: "/usr/sbin/nologin";
   password_state?: "LOCKED";
-  execution_enabled: false;
+  execution_enabled: boolean;
   reservation_expires_at: string;
   dry_run_at: string | null;
   allocator_result?: Record<string, unknown>;
   dry_run_result?: Record<string, unknown> | null;
+  previous_plan_id?: string | null;
+  failed_stage_operation_id?: string | null;
+  retry_authorization_operation_id?: string | null;
+};
+
+export type SafeProvisionOperation = {
+  id: string;
+  operation_type: string;
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  error_code: string | null;
+  rollback_status: string | null;
+  safe_summary: string | null;
+  safe_root_cause: string | null;
+  side_effect_classification: string | null;
+  last_successful_step: string | null;
+  first_failed_step: string | null;
+  failed_handler: string | null;
+};
+
+export type ProvisionAttempt = {
+  attempt_number: number;
+  attempt_reason: string;
+  plan: ProvisionPlan;
+  operations: Array<SafeProvisionOperation | null>;
+  stage_operation: SafeProvisionOperation | null;
+  reservations: Record<string, { id: string; state: string }>;
 };
 
 export type ComputeResourceRequest = {
@@ -289,6 +319,8 @@ export type ComputeResourceRequest = {
   managed_user_id?: string | null;
   username: string;
   status: string;
+  approval_state: string;
+  user_status_message?: string;
   requested_gpu_max: 0 | 1;
   requested_storage_bytes: 322122547200;
   requested_container_profile: "STANDARD_8CPU_32GB";
@@ -305,6 +337,9 @@ export type ComputeResourceRequest = {
   created_at: string;
   updated_at: string;
   plan: ProvisionPlan | null;
+  attempts?: ProvisionAttempt[];
+  retry_authorization_available?: boolean;
+  retry_state?: string;
   portal_user?: {
     login_name: string;
     display_name: string;
@@ -484,6 +519,11 @@ export const changePassword = (payload: {
     method: "POST",
     body: JSON.stringify(payload),
   });
+export const reauthenticate = (password: string) =>
+  apiFetch<{ reauthenticated: true }>("/auth/reauthenticate", {
+    method: "POST",
+    body: JSON.stringify({ password }),
+  });
 export const selfComputeRequest = () =>
   apiFetch<{
     status: string;
@@ -533,6 +573,27 @@ export const reviewComputeRequest = (
     `/admin/compute-resource-requests/${encodeURIComponent(id)}/review`,
     { method: "POST", body: JSON.stringify(payload) },
   );
+export const authorizeProvisionRetry = (
+  id: string,
+  payload: {
+    failure_classification: "NO_SIDE_EFFECT" | "PARTIAL_ROLLED_BACK";
+    safe_root_cause: string;
+    authorization_reason: string;
+    remediation_git_commit: string;
+  },
+) =>
+  apiFetch<{
+    status: "RETRY_AUTHORIZED";
+    operation_id: string;
+    idempotent_replay: boolean;
+    request: ComputeResourceRequest;
+  }>(
+    `/admin/compute-resource-requests/${encodeURIComponent(id)}/retry-authorize`,
+    {
+      method: "POST",
+      body: JSON.stringify({ ...payload, idempotency_key: randomUuid() }),
+    },
+  );
 export const createProvisionPlan = (id: string) =>
   apiFetch<{ status: string; plan: ProvisionPlan }>(
     `/admin/compute-resource-requests/${encodeURIComponent(id)}/plan`,
@@ -549,6 +610,17 @@ export const dryRunProvisionPlan = (id: string) =>
       body: JSON.stringify({ idempotency_key: randomUuid() }),
     },
   );
+export const provisionComputeEnvironment = (id: string) =>
+  apiFetch<{
+    status: "KEY_ENROLLMENT_PENDING";
+    operation_id: string;
+    managed_user_id: string;
+    plan: ProvisionPlan;
+    idempotent_replay: boolean;
+  }>(`/admin/compute-resource-requests/${encodeURIComponent(id)}/provision`, {
+    method: "POST",
+    body: JSON.stringify({ idempotency_key: randomUuid() }),
+  });
 export const selfEnvironment = () =>
   apiFetch<{ status: string; environment: SelfEnvironment }>(
     "/self/environment",

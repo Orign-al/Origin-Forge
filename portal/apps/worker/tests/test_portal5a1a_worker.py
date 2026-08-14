@@ -1,9 +1,15 @@
+import hashlib
 import json
+import subprocess
 import uuid
+from pathlib import Path
 
 import pytest
 from h100_portal_worker import handlers
 from h100_portal_worker.schemas import WorkerRequest, validate_payload
+
+PORTAL_ROOT = Path(__file__).resolve().parents[3]
+PLATFORM_ROOT = PORTAL_ROOT.parent
 
 
 def plan_payload() -> dict[str, object]:
@@ -52,6 +58,27 @@ def dry_run_payload() -> dict[str, object]:
     }
 
 
+def stage_payload() -> dict[str, object]:
+    payload = {**dry_run_payload(), "execution_enabled": True}
+    payload.update(
+        {
+            "stage_operation_id": str(uuid.uuid4()),
+            "dry_run_operation_id": str(uuid.uuid4()),
+            "reservation_ids": {
+                resource_type: str(uuid.uuid4())
+                for resource_type in (
+                    "UID",
+                    "GID",
+                    "PROJECT_ID",
+                    "SSH_PORT",
+                    "CONTAINER_NAME",
+                )
+            },
+        }
+    )
+    return payload
+
+
 def request(operation: str, payload: dict[str, object], *, dry_run: bool) -> WorkerRequest:
     return WorkerRequest(
         protocol_version=1,
@@ -60,7 +87,11 @@ def request(operation: str, payload: dict[str, object], *, dry_run: bool) -> Wor
         payload=payload,
         requested_by="fixture-admin",
         approved_by="fixture-admin",
-        idempotency_key=f"portal5a1a-{uuid.uuid4()}",
+        idempotency_key=(
+            f"compute-stage:{payload['stage_operation_id']}"
+            if operation == "compute.provision.stage"
+            else f"portal5a1a-{uuid.uuid4()}"
+        ),
         dry_run=dry_run,
     )
 
@@ -102,6 +133,87 @@ def test_compute_dry_run_schema_binds_every_reserved_value() -> None:
         validate_payload("compute.provision.dry_run", {**payload, "execution_enabled": True})
     with pytest.raises(ValueError, match="GPU_MAX_REJECTED"):
         validate_payload("compute.provision.dry_run", {**payload, "gpu_max": 4})
+
+
+def test_compute_stage_schema_binds_dry_run_and_all_reservations() -> None:
+    payload = stage_payload()
+    validated = validate_payload("compute.provision.stage", payload)
+    assert validated["execution_enabled"] is True
+    assert set(validated["reservation_ids"]) == {
+        "UID",
+        "GID",
+        "PROJECT_ID",
+        "SSH_PORT",
+        "CONTAINER_NAME",
+    }
+    with pytest.raises(ValueError, match="RESERVATION_REJECTED"):
+        validate_payload(
+            "compute.provision.stage",
+            {**payload, "reservation_ids": {"UID": str(uuid.uuid4())}},
+        )
+    with pytest.raises(ValueError, match="EXECUTION_GATE_REJECTED"):
+        validate_payload("compute.provision.stage", {**payload, "execution_enabled": False})
+    with pytest.raises(ValueError, match="fields are invalid"):
+        validate_payload("compute.provision.stage", {**payload, "command": "useradd root"})
+
+
+def test_compute_retry_verify_is_closed_and_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    stage = stage_payload()
+    payload = {
+        key: stage[key]
+        for key in {
+            "request_id",
+            "plan_id",
+            "stage_operation_id",
+            "portal_account_id",
+            "username",
+            "uid",
+            "gid",
+            "project_id",
+            "ssh_port",
+            "container_name",
+        }
+    }
+    validated = validate_payload("compute.provision.retry_verify", payload)
+    assert validated["stage_operation_id"] == payload["stage_operation_id"]
+    with pytest.raises(ValueError, match="fields are invalid"):
+        validate_payload(
+            "compute.provision.retry_verify", {**payload, "command": "useradd fixture-user"}
+        )
+
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {name: {"integrity_ok": True} for name in handlers.COMPUTE_STAGE_REQUIRED_SCRIPTS},
+    )
+    monkeypatch.setattr(handlers, "_compute_stage_retained_resources", lambda _payload: [])
+    verified = handlers.handle(request("compute.provision.retry_verify", payload, dry_run=True))
+    assert verified["retry_verification_status"] == "VERIFIED_ZERO_RESIDUE"
+    assert verified["script_integrity"] == "PASS"
+    assert verified["resource_residue"] == []
+    denied = handlers.handle(request("compute.provision.retry_verify", payload, dry_run=False))
+    assert denied["error"]["code"] == "COMPUTE_RETRY_VERIFY_EXECUTION_REJECTED"
+
+
+def test_ordinary_multi_user_ssh_key_prepare_is_container_only() -> None:
+    payload = {
+        "record_id": str(uuid.uuid4()),
+        "operation_id": str(uuid.uuid4()),
+        "managed_user_id": str(uuid.uuid4()),
+        "username": "origin-pilot2",
+        "public_key": "ssh-ed25519 " + "A" * 48,
+        "key_type": "ssh-ed25519",
+        "fingerprint_sha256": "SHA256:" + "A" * 43,
+        "content_sha256": "a" * 64,
+        "scope": "CONTAINER",
+    }
+    validated = validate_payload("ssh_key.prepare", payload)
+    assert validated["username"] == "origin-pilot2"
+    assert validated["scope"] == "CONTAINER"
+    with pytest.raises(ValueError, match="CONTAINER-only"):
+        validate_payload("ssh_key.prepare", {**payload, "scope": "HOST"})
+    with pytest.raises(ValueError, match="invalid or protected"):
+        validate_payload("ssh_key.prepare", {**payload, "username": "root"})
 
 
 def test_allocator_plan_excludes_portal_reservations_and_never_writes(
@@ -147,6 +259,36 @@ def test_allocator_plan_excludes_portal_reservations_and_never_writes(
     assert "command" not in json.dumps(result).casefold()
 
 
+def test_project_allocator_includes_xfs_quota_records_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(handlers, "_safe_file_lines", lambda _path: [])
+    monkeypatch.setattr(handlers, "_pilot_state_records", lambda: [])
+    monkeypatch.setattr(
+        handlers,
+        "run_fixed",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "stdout": "#30001 0 0 314572800 00 [------]\n#30002 0 0 0 00 [------]\n",
+        },
+    )
+    used, readable = handlers._used_project_ids()
+    assert readable is True
+    assert {30001, 30002}.issubset(used)
+    candidate, evidence = handlers._candidate_project_id()
+    assert candidate == 30003
+    assert "XFS quota report" in evidence["source"]
+
+    monkeypatch.setattr(
+        handlers,
+        "run_fixed",
+        lambda *_args, **_kwargs: {"ok": False, "stdout": "", "stderr": "unavailable"},
+    )
+    candidate, evidence = handlers._candidate_project_id()
+    assert candidate is None
+    assert evidence["reservation"] == "NOT_AVAILABLE"
+
+
 def test_exact_dry_run_reports_zero_side_effects_and_real_execution_is_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -177,3 +319,237 @@ def test_exact_dry_run_reports_zero_side_effects_and_real_execution_is_disabled(
     denied = handlers.handle(request("compute.provision.dry_run", payload, dry_run=False))
     assert denied["status"] == "ERROR"
     assert denied["error"]["code"] == "WRITE_EXECUTION_DISABLED"
+
+
+def test_compute_stage_runs_only_hash_pinned_fixed_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = stage_payload()
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {name: {"integrity_ok": True} for name in handlers.COMPUTE_STAGE_REQUIRED_SCRIPTS},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_compute_provision_dry_run",
+        lambda _payload: {"dry_run_status": "READY_FOR_PROVISION"},
+    )
+    observed: list[str] = []
+
+    def execute(argv: list[str], timeout: float) -> dict[str, object]:
+        observed.extend(argv)
+        assert timeout == handlers.STAGE_EXECUTION_TIMEOUT_SECONDS
+        return {"ok": True, "exit_code": 0, "stdout": "STAGED", "stderr": ""}
+
+    monkeypatch.setattr(handlers, "run_allowlisted_script", execute)
+    monkeypatch.setattr(handlers, "_compute_stage_postconditions", lambda _payload: {"ok": True})
+    monkeypatch.setattr(handlers.Path, "exists", lambda _path: False)
+    monkeypatch.setattr(handlers.Path, "is_symlink", lambda _path: False)
+    result = handlers.handle(request("compute.provision.stage", payload, dry_run=False))
+    assert result["status"] == "SUCCEEDED"
+    assert result["handler"] == "compute.provision.stage"
+    assert len(observed) == 15
+    assert observed[0] == "/usr/local/sbin/h100-provision-stage"
+    assert observed[-2:] == ["--confirm-stage", payload["username"]]
+
+    dry_run_denied = handlers.handle(request("compute.provision.stage", payload, dry_run=True))
+    assert dry_run_denied["status"] == "ERROR"
+    assert dry_run_denied["error"]["code"] == "COMPUTE_STAGE_DRY_RUN_REJECTED"
+
+
+@pytest.mark.parametrize(
+    ("declared", "expected_rollback"),
+    [
+        ("NO_SIDE_EFFECT", "NOT_REQUIRED"),
+        ("PARTIAL_ROLLED_BACK", "ROLLED_BACK"),
+    ],
+)
+def test_compute_stage_failure_classification_is_structured_and_zero_residue_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    declared: str,
+    expected_rollback: str,
+) -> None:
+    payload = stage_payload()
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {name: {"integrity_ok": True} for name in handlers.COMPUTE_STAGE_REQUIRED_SCRIPTS},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_compute_provision_dry_run",
+        lambda _payload: {"dry_run_status": "READY_FOR_PROVISION"},
+    )
+    monkeypatch.setattr(handlers, "_compute_stage_retained_resources", lambda _payload: [])
+    stderr = "\n".join(
+        [
+            "COMPUTE STAGE FIRST FAILED STEP: EXPLICIT_STAGE_CONFIRMATION_GATE",
+            "COMPUTE STAGE LAST SUCCESSFUL STEP: SCRIPT_ARGUMENT_COUNT",
+            f"COMPUTE STAGE SIDE EFFECT CLASSIFICATION: {declared}",
+        ]
+    )
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda _argv, timeout: {
+            "ok": False,
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": stderr,
+        },
+    )
+    result = handlers.handle(request("compute.provision.stage", payload, dry_run=False))
+    assert result["status"] == "ERROR"
+    assert result["side_effect_classification"] == declared
+    assert result["rollback_status"] == expected_rollback
+    assert result["first_failed_step"] == "EXPLICIT_STAGE_CONFIRMATION_GATE"
+    assert result["last_successful_step"] == "SCRIPT_ARGUMENT_COUNT"
+    assert result["retained_resources"] == []
+
+
+def test_compute_stage_idempotency_binding_fails_before_side_effects() -> None:
+    payload = stage_payload()
+    unbound = request("compute.provision.stage", payload, dry_run=False).model_copy(
+        update={"idempotency_key": f"compute-stage:{uuid.uuid4()}"}
+    )
+    result = handlers.handle(unbound)
+    assert result["error"]["code"] == "COMPUTE_STAGE_IDEMPOTENCY_BINDING_REJECTED"
+    assert result["side_effect_classification"] == "NO_SIDE_EFFECT"
+    assert result["rollback_status"] == "NOT_REQUIRED"
+
+
+def test_compute_stage_script_confirmation_uses_parameters_above_nine() -> None:
+    source = PLATFORM_ROOT / "scripts/h100-provision-stage"
+    manifest = json.loads((PORTAL_ROOT / "deploy/worker-scripts.json").read_text())
+    content = source.read_text()
+
+    subprocess.run(["/usr/bin/bash", "-n", str(source)], check=True)
+    assert '"${13:-}" == --confirm-stage' in content
+    assert '"${2:-}" == "${14:-}"' in content
+    assert '"$13"' not in content
+    assert '"$14"' not in content
+    assert manifest["h100-provision-stage"] == hashlib.sha256(source.read_bytes()).hexdigest()
+
+    argv = [
+        "--execute",
+        "fixture-user",
+        "20002",
+        "20002",
+        "30002",
+        "22024",
+        "company",
+        "general",
+        "1",
+        str(uuid.uuid4()),
+        str(uuid.uuid4()),
+        str(uuid.uuid4()),
+        "--confirm-stage",
+        "fixture-user",
+    ]
+    old_gate = '[[ "$1" == --execute && "$13" == --confirm-stage && "$2" == "$14" ]]'
+    fixed_gate = (
+        '[[ "${1:-}" == --execute && "${13:-}" == --confirm-stage && "${2:-}" == "${14:-}" ]]'
+    )
+    old = subprocess.run(["/usr/bin/bash", "-c", old_gate, "gate", *argv], check=False)
+    fixed = subprocess.run(["/usr/bin/bash", "-c", fixed_gate, "gate", *argv], check=False)
+    assert old.returncode != 0
+    assert fixed.returncode == 0
+
+
+def test_compute_stage_fails_closed_when_sourced_library_integrity_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = stage_payload()
+    integrity = {name: {"integrity_ok": True} for name in handlers.COMPUTE_STAGE_REQUIRED_SCRIPTS}
+    integrity["h100-platform-common"] = {"integrity_ok": False}
+    monkeypatch.setattr(handlers, "script_integrity", lambda: integrity)
+    result = handlers.handle(request("compute.provision.stage", payload, dry_run=False))
+    assert result["status"] == "ERROR"
+    assert result["error"]["code"] == "SCRIPT_INTEGRITY_FAILED"
+    assert result["error"]["scripts"] == ["h100-platform-common"]
+
+
+def test_compute_stage_retained_scan_holds_derived_image_mapping_quota_and_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = stage_payload()
+    username = str(payload["username"])
+    plan_id = str(payload["plan_id"])
+    project_id = int(payload["project_id"])
+    monkeypatch.setattr(handlers.Path, "exists", lambda _path: False)
+    monkeypatch.setattr(handlers.Path, "is_symlink", lambda _path: False)
+    monkeypatch.setattr(
+        handlers,
+        "_safe_file_lines",
+        lambda path: (
+            [f"{project_id}:{handlers.PILOT_DATA_ROOT / username}"]
+            if path == handlers.PROJECTS_FILE
+            else [f"h100_{username}:{project_id}"]
+            if path == handlers.PROJID_FILE
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_registry_entries",
+        lambda: [{"username": username, "uid": payload["uid"]}],
+    )
+    monkeypatch.setattr(handlers, "_assoc_exists", lambda _username: False)
+    monkeypatch.setattr(handlers, "_ownership_conflict", lambda _number: ("PASS", None))
+    monkeypatch.setattr(handlers, "_used_ssh_ports", lambda: (set(), True))
+
+    def fixed(binary: str, args: list[str], timeout: float = 20.0):  # type: ignore[no-untyped-def]
+        if binary == "docker" and args[:2] == ["image", "inspect"]:
+            assert args[2] == f"h100-local/dev-container:ubuntu24.04-{username}-{plan_id}"
+            return {"ok": True, "stdout": "[]", "stderr": ""}
+        if binary == "docker":
+            return {"ok": False, "stdout": "", "stderr": "No such container"}
+        if binary == "xfs_quota":
+            return {
+                "ok": True,
+                "stdout": f"#{project_id} 0 0 314572800 00 [--------]\n",
+                "stderr": "",
+            }
+        raise AssertionError((binary, args, timeout))
+
+    monkeypatch.setattr(handlers, "run_fixed", fixed)
+    retained = handlers._compute_stage_retained_resources(payload)
+    assert "derived-image" in retained
+    assert "xfs-project-mapping" in retained
+    assert "xfs-project-quota" in retained
+    assert "gpu-registry" in retained
+
+
+def test_compute_retry_retained_scan_checks_numeric_identity_and_ssh_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = stage_payload()
+    monkeypatch.setattr(handlers.Path, "exists", lambda _path: False)
+    monkeypatch.setattr(handlers.Path, "is_symlink", lambda _path: False)
+    monkeypatch.setattr(handlers, "_safe_file_lines", lambda _path: [])
+    monkeypatch.setattr(handlers, "_registry_entries", lambda: [])
+    monkeypatch.setattr(handlers, "_assoc_exists", lambda _username: False)
+    monkeypatch.setattr(handlers, "_ownership_conflict", lambda _number: ("CONFLICT", "/redacted"))
+    monkeypatch.setattr(handlers, "_used_ssh_ports", lambda: ({int(payload["ssh_port"])}, True))
+    monkeypatch.setattr(handlers.pwd, "getpwnam", lambda _username: (_ for _ in ()).throw(KeyError))
+    monkeypatch.setattr(handlers.grp, "getgrnam", lambda _username: (_ for _ in ()).throw(KeyError))
+    monkeypatch.setattr(handlers.pwd, "getpwuid", lambda _uid: object())
+    monkeypatch.setattr(handlers.grp, "getgrgid", lambda _gid: object())
+
+    def fixed(binary: str, _args: list[str], timeout: float = 20.0):  # type: ignore[no-untyped-def]
+        if binary == "docker":
+            return {"ok": False, "stdout": "", "stderr": "No such object"}
+        if binary == "xfs_quota":
+            return {"ok": True, "stdout": "", "stderr": ""}
+        raise AssertionError((binary, timeout))
+
+    monkeypatch.setattr(handlers, "run_fixed", fixed)
+    retained = handlers._compute_stage_retained_resources(payload)
+    assert {
+        "linux-uid",
+        "linux-gid",
+        "uid-ownership",
+        "gid-ownership",
+        "ssh-port-allocation",
+    }.issubset(retained)

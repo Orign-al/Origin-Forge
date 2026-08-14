@@ -22,7 +22,9 @@ const ACTIVE_STATES = [
   "REQUESTED",
   "UNDER_REVIEW",
   "APPROVED",
+  "RETRY_AUTHORIZED",
   "PROVISION_PLAN_READY",
+  "PROVISIONING",
 ];
 
 function localTime(value?: string | null) {
@@ -89,8 +91,15 @@ export default function ComputeRequestPage() {
   }
   const current = query.data.request;
   const active = current && ACTIVE_STATES.includes(current.status);
+  const failed = current?.status === "FAILED";
   const approved =
-    current && ["APPROVED", "PROVISION_PLAN_READY"].includes(current.status);
+    current &&
+    [
+      "APPROVED",
+      "RETRY_AUTHORIZED",
+      "PROVISION_PLAN_READY",
+      "PROVISIONING",
+    ].includes(current.status);
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -104,11 +113,17 @@ export default function ComputeRequestPage() {
         description="申请标准开发环境；资源只在后续管理员 Gate 获批后创建"
         action={<StatusBadge value={current?.status ?? "NOT REQUESTED"} />}
       />
-      {active && current ? (
+      {(active || failed) && current ? (
         <Card className="detail-panel">
           <div className="detail-section-heading">
             <div>
-              <h2>{approved ? "已批准，正在等待创建" : "等待管理员审批"}</h2>
+              <h2>
+                {failed
+                  ? "计算环境创建失败，管理员处理中"
+                  : approved
+                    ? "已批准，正在等待创建"
+                    : "等待管理员审批"}
+              </h2>
               <p className="muted">申请 ID：{current.id}</p>
             </div>
             <StatusBadge value={current.status} />
@@ -140,8 +155,10 @@ export default function ComputeRequestPage() {
             </div>
           </dl>
           <div className="notice">
-            当前尚未创建 Linux 用户、Container、Quota、Slurm Association、GPU
-            Policy 或 Lease。
+            {failed
+              ? (current.user_status_message ??
+                "计算环境创建失败，平台管理员正在处理。你的申请仍被保留，无需重新提交。")
+              : "当前尚未创建 Linux 用户、Container、Quota、Slurm Association、GPU Policy 或 Lease。"}
           </div>
           {current.status === "REQUESTED" ? (
             <div className="form-actions">
