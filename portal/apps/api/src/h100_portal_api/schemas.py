@@ -333,6 +333,20 @@ class RestoreDecisionRequest(ApiModel):
     comment: str | None = Field(default=None, max_length=500)
 
 
+class LeaseRecoveryApplyRequest(ApiModel):
+    idempotency_key: uuid.UUID
+    confirmation: uuid.UUID
+    safe_reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("safe_reason")
+    @classmethod
+    def normalize_safe_reason(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("recovery reason must not be blank")
+        return normalized
+
+
 class OperationResponse(ApiModel):
     id: uuid.UUID
     operation_type: str

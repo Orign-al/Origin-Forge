@@ -7,8 +7,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from h100_portal_api import expiry_service
 from h100_portal_api.audit import record_audit
-from h100_portal_api.auth import AuthContext, client_ip, require_session_csrf, user_agent
+from h100_portal_api.auth import (
+    AuthContext,
+    client_ip,
+    require_recent_reauthentication,
+    require_session_csrf,
+    user_agent,
+)
 from h100_portal_api.database import get_db
 from h100_portal_api.dependencies import permission_dependency
 from h100_portal_api.enums import OperationStatus, RiskLevel
@@ -22,9 +29,11 @@ from h100_portal_api.lease_service import (
     request_renewal,
 )
 from h100_portal_api.models import (
+    PortalComputeLease,
     PortalContainer,
     PortalJob,
     PortalLeaseRenewalRequest,
+    PortalManagedUser,
     PortalOperation,
     PortalResourceRecycleItem,
     PortalResourceRestoreRequest,
@@ -36,6 +45,7 @@ from h100_portal_api.models import (
 from h100_portal_api.rbac import highest_role
 from h100_portal_api.schemas import (
     LeaseDecisionRequest,
+    LeaseRecoveryApplyRequest,
     LeaseRenewalCreateRequest,
     RestoreCreateRequest,
     RestoreDecisionRequest,
@@ -1208,6 +1218,171 @@ def admin_decide_renewal(
         "renewal_request_id": str(renewal.id),
         "resulting_lease_id": str(successor.id) if successor else None,
     }
+
+
+def _expiry_operation(db: Session, lease: PortalComputeLease) -> PortalOperation | None:
+    return db.scalar(
+        select(PortalOperation)
+        .where(
+            PortalOperation.owner_managed_user_id == lease.owner_managed_user_id,
+            PortalOperation.idempotency_key == f"lease-expire:{lease.id}",
+        )
+        .order_by(PortalOperation.created_at.desc())
+    )
+
+
+@router.get("/admin/lease-recovery-incidents")
+def admin_lease_recovery_incidents(
+    context: AuthContext = Depends(permission_dependency("lease.recovery")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    now = utcnow()
+    rows = db.execute(
+        select(PortalComputeLease, PortalManagedUser, PortalContainer)
+        .join(
+            PortalManagedUser,
+            PortalManagedUser.id == PortalComputeLease.owner_managed_user_id,
+        )
+        .join(
+            PortalContainer,
+            PortalContainer.owner_managed_user_id == PortalManagedUser.id,
+        )
+        .where(
+            PortalComputeLease.expires_at <= now,
+            PortalComputeLease.recycled_at.is_(None),
+            PortalComputeLease.state.in_(expiry_service.DUE_STATES),
+        )
+        .order_by(PortalComputeLease.expires_at)
+    ).all()
+    incidents: list[dict[str, Any]] = []
+    for lease, managed, container in rows:
+        operation = _expiry_operation(db, lease)
+        evidence = expiry_service.cleanup_evidence(operation) if operation is not None else None
+        incidents.append(
+            {
+                "lease_id": str(lease.id),
+                "username": managed.unix_username,
+                "expires_at": ensure_utc(lease.expires_at).isoformat(),
+                "lease_state": lease.state,
+                "compute_environment_state": managed.compute_environment_state,
+                "container_name": container.name,
+                "container_desired_state": container.desired_state,
+                "container_observed_state": container.observed_state,
+                "operation_id": str(operation.id) if operation is not None else None,
+                "operation_status": operation.status if operation is not None else None,
+                "error_code": operation.error_code if operation is not None else None,
+                "attempt_count": evidence.get("attempt_count") if evidence else None,
+                "next_retry_at": evidence.get("next_retry_at") if evidence else None,
+                "manual_review_required": (
+                    evidence.get("manual_review_required") if evidence else True
+                ),
+                "recovery_available": bool(
+                    operation is not None and operation.status == OperationStatus.FAILED
+                ),
+                "data_delete_allowed": False,
+            }
+        )
+    return {"status": "OK", "incidents": incidents, "count": len(incidents)}
+
+
+@router.post("/admin/compute-leases/{lease_id}/recycle-retry")
+def admin_retry_lease_recycle(
+    lease_id: uuid.UUID,
+    body: LeaseRecoveryApplyRequest,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("lease.recovery")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_session_csrf(request, context)
+    require_recent_reauthentication(context)
+    if body.confirmation != lease_id:
+        raise _error(428, "LEASE_RECOVERY_CONFIRMATION_REQUIRED", "请输入准确 Lease ID 确认")
+    lease = db.scalar(
+        select(PortalComputeLease).where(PortalComputeLease.id == lease_id).with_for_update()
+    )
+    if lease is None:
+        raise _error(404, "LEASE_NOT_FOUND", "计算租约不存在")
+    key = f"lease-recycle-recovery:{lease.id}:{body.idempotency_key}"
+    existing = db.scalar(
+        select(PortalOperation).where(
+            PortalOperation.requested_by == context.user.id,
+            PortalOperation.idempotency_key == key,
+        )
+    )
+    if existing is not None:
+        return {
+            "status": existing.status,
+            "operation_id": str(existing.id),
+            "lease_id": str(lease.id),
+            "idempotent_replay": True,
+        }
+    if ensure_utc(lease.expires_at) > utcnow() or lease.recycled_at is not None:
+        raise _error(409, "LEASE_RECOVERY_TARGET_INVALID", "租约不是待恢复的过期资源")
+    prior = _expiry_operation(db, lease)
+    if prior is None or prior.status != OperationStatus.FAILED:
+        raise _error(409, "LEASE_RECOVERY_FAILURE_NOT_FOUND", "不存在失败的到期回收记录")
+    recycle_item = db.scalar(
+        select(PortalResourceRecycleItem).where(PortalResourceRecycleItem.lease_id == lease.id)
+    )
+    if recycle_item is not None:
+        raise _error(409, "LEASE_ALREADY_RECYCLED", "租约已经进入回收站")
+    now = utcnow()
+    operation = PortalOperation(
+        operation_type="lease.recycle.retry",
+        target_type="compute_lease",
+        target_id=str(lease.id),
+        requested_by=context.user.id,
+        owner_managed_user_id=lease.owner_managed_user_id,
+        approved_by=context.user.id,
+        approved_at=now,
+        request_summary="platform_owner approved retry of failed lease recycle cleanup",
+        validated_payload={
+            "lease_id": str(lease.id),
+            "failed_expiry_operation_id": str(prior.id),
+            "failed_error_code": prior.error_code,
+            "safe_reason": body.safe_reason,
+            "data_delete_allowed": False,
+        },
+        idempotency_key=key,
+        risk_level=RiskLevel.HIGH,
+        status=OperationStatus.RUNNING,
+        started_at=now,
+    )
+    db.add(operation)
+    db.flush()
+    succeeded = expiry_service.retry_failed_recycle(
+        db,
+        lease=lease,
+        operation=operation,
+        actor=context.user.normalized_login,
+    )
+    record_audit(
+        db,
+        event_type=("LEASE_RECOVERY_APPLIED" if succeeded else "LEASE_RECOVERY_FAILED"),
+        actor=context.user.normalized_login,
+        actor_role=highest_role(context.user),
+        source_ip=client_ip(request),
+        user_agent=user_agent(request),
+        object_type="compute_lease",
+        object_id=str(lease.id),
+        operation_id=operation.id,
+        result="SUCCESS" if succeeded else "FAILED",
+        metadata={
+            "prior_operation_id": str(prior.id),
+            "container_delete": False,
+            "data_delete": False,
+        },
+    )
+    db.commit()
+    response = {
+        "status": operation.status,
+        "operation_id": str(operation.id),
+        "lease_id": str(lease.id),
+        "idempotent_replay": False,
+    }
+    if not succeeded:
+        raise _error(409, operation.error_code or "LEASE_RECOVERY_FAILED", "租约回收恢复失败")
+    return response
 
 
 @router.post("/admin/restore-requests/{request_id}/decision")

@@ -49,6 +49,19 @@ def test_portal3f_acceptance_tool_is_integrity_bound_and_installed() -> None:
     assert '"$RUNTIME_DIR/tests/gpu-device-mapping/gpu-device-context-probe.c"' in install_text
 
 
+def test_container_stop_is_integrity_bound_and_installed() -> None:
+    source = PLATFORM_ROOT / "scripts/h100-container-stop"
+    installer = PORTAL_ROOT / "deploy/scripts/install-runtime.sh"
+    manifest = json.loads((PORTAL_ROOT / "deploy/worker-scripts.json").read_text())
+
+    assert source.is_file()
+    assert manifest["h100-container-stop"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    install_text = installer.read_text()
+    assert 'CONTAINER_STOP_SOURCE="${PLATFORM_DIR}/scripts/h100-container-stop"' in install_text
+    assert '"$CONTAINER_STOP_SOURCE"' in install_text
+    assert "/usr/local/sbin/h100-container-stop" in install_text
+
+
 def test_portal3f_worker_can_write_only_the_guard_metrics_directory() -> None:
     unit = (PORTAL_ROOT / "deploy/systemd/h100-portal-worker.service").read_text()
 

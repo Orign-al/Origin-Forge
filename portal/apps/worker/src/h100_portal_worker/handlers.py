@@ -7082,7 +7082,13 @@ def _active_user_slurm_jobs(username: str) -> list[tuple[int, str]]:
 
 
 def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    fingerprints: list[str] = []
+    cancelled_pending_ids: list[int] = []
+    cancelled_running_ids: list[int] = []
+    key_suspended = False
+    failed_step = "RECYCLE_PREFLIGHT"
     try:
+        failed_step = "ACCOUNT_SECURITY_GATE"
         account = _portal4a_account(payload)
         if account.pw_shell != "/usr/sbin/nologin":
             raise LifecycleValidationError(
@@ -7112,16 +7118,35 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
                 "CONTAINER_KEY_BINDING_REJECTED",
                 "container SSH authorization differs from the approved Portal key records",
             )
+        failed_step = "CONTAINER_KEY_SUSPEND"
+        if active.exists():
+            try:
+                os.replace(active, suspended)
+            except OSError as exc:
+                raise LifecycleValidationError(
+                    "CONTAINER_KEY_SUSPEND_FAILED",
+                    "container SSH authorization could not be suspended",
+                ) from exc
+        key_suspended = suspended.exists() and not active.exists()
+        if not key_suspended:
+            raise LifecycleValidationError(
+                "CONTAINER_KEY_SUSPEND_FAILED",
+                "container SSH authorization suspension is incomplete",
+            )
+        failed_step = "SLURM_JOB_DISCOVERY"
         jobs = _active_user_slurm_jobs(str(payload["username"]))
         pending_ids = [job_id for job_id, state in jobs if state.startswith("PEND")]
         running_ids = [job_id for job_id, state in jobs if not state.startswith("PEND")]
         if pending_ids:
+            failed_step = "PENDING_JOB_CANCEL"
             cancelled = run_fixed("scancel", [*(str(item) for item in pending_ids)], timeout=30)
             if not cancelled.get("ok"):
                 raise LifecycleValidationError(
                     "PENDING_JOB_CANCEL_FAILED", "pending jobs could not be cancelled"
                 )
+            cancelled_pending_ids = pending_ids
         if running_ids:
+            failed_step = "RUNNING_JOB_TERM"
             signalled = run_fixed(
                 "scancel",
                 ["--signal=TERM", "--full", *(str(item) for item in running_ids)],
@@ -7132,17 +7157,21 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
                     "RUNNING_JOB_SIGNAL_FAILED", "running jobs could not be signalled"
                 )
             time.sleep(2)
+            failed_step = "RUNNING_JOB_CANCEL"
             cancelled = run_fixed("scancel", [*(str(item) for item in running_ids)], timeout=30)
             if not cancelled.get("ok"):
                 raise LifecycleValidationError(
                     "RUNNING_JOB_CANCEL_FAILED", "running jobs could not be cancelled"
                 )
+            cancelled_running_ids = running_ids
         lifecycle_payload = {
             **payload,
             "name": payload["container_name"],
         }
+        failed_step = "CONTAINER_SECURITY_PREFLIGHT"
         container = _portal4a_container_security(lifecycle_payload, require_running=None)
         if bool(container.get("state", {}).get("Running")):
+            failed_step = "CONTAINER_STOP"
             integrity = script_integrity()
             if not integrity.get("h100-container-stop", {}).get("integrity_ok", False):
                 raise LifecycleValidationError(
@@ -7153,9 +7182,8 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
             )
             if not stopped.get("ok"):
                 raise LifecycleValidationError("CONTAINER_STOP_FAILED", "container stop failed")
+        failed_step = "RECYCLE_POSTCONDITION"
         _portal4a_container_security(lifecycle_payload, require_running=False)
-        if active.exists():
-            os.replace(active, suspended)
         if (
             active.exists()
             or not suspended.exists()
@@ -7169,19 +7197,36 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
             "handler": "resource.recycle",
             "request_id": request.request_id,
             "lease_id": payload["lease_id"],
-            "cancelled_pending_job_ids": pending_ids,
-            "cancelled_running_job_ids": running_ids,
+            "cancelled_pending_job_ids": cancelled_pending_ids,
+            "cancelled_running_job_ids": cancelled_running_ids,
             "container_state": "STOPPED",
             "container_gpu": "NONE",
             "container_key_state": "SUSPENDED_BY_RECYCLE",
             "container_key_fingerprints": fingerprints,
+            "new_access": "DENIED",
             "host_access": "DISABLED",
             "data_preserved": True,
             "container_definition_preserved": True,
             "auto_permanent_delete": False,
         }
     except LifecycleValidationError as exc:
-        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+        return {
+            "status": "ERROR",
+            "handler": "resource.recycle",
+            "request_id": request.request_id,
+            "lease_id": payload["lease_id"],
+            "error": {"code": exc.code, "message": str(exc)},
+            "first_failed_step": failed_step,
+            "cleanup_retryable": key_suspended,
+            "container_key_state": ("SUSPENDED_BY_RECYCLE" if key_suspended else "NOT_VERIFIED"),
+            "container_key_fingerprints": fingerprints,
+            "new_access": "DENIED" if key_suspended else "NOT_VERIFIED",
+            "cancelled_pending_job_ids": cancelled_pending_ids,
+            "cancelled_running_job_ids": cancelled_running_ids,
+            "data_preserved": True,
+            "container_definition_preserved": True,
+            "auto_permanent_delete": False,
+        }
 
 
 def _copy_root_only(source: Path, destination: Path) -> str:

@@ -2577,6 +2577,16 @@ def portal4a_restore_payload() -> dict[str, object]:
     }
 
 
+def portal4a_recycle_payload() -> dict[str, object]:
+    payload = {
+        **portal4a_restore_payload(),
+        "lease_id": str(uuid.uuid4()),
+        "expires_at": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+    }
+    payload.pop("restore_request_id")
+    return payload
+
+
 def test_portal4a_restore_is_idempotent_after_worker_success(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2726,12 +2736,7 @@ def test_portal4a_restore_stops_partial_start_before_resuspending_key(
 def test_portal4a_recycle_rejects_unapproved_key_before_runtime_changes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    payload = {
-        **portal4a_restore_payload(),
-        "lease_id": str(uuid.uuid4()),
-        "expires_at": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
-    }
-    payload.pop("restore_request_id")
+    payload = portal4a_recycle_payload()
     active = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys"
     active.parent.mkdir(parents=True)
     active.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
@@ -2763,3 +2768,175 @@ def test_portal4a_recycle_rejects_unapproved_key_before_runtime_changes(
     assert result["status"] == "ERROR"
     assert result["error"]["code"] == "CONTAINER_KEY_BINDING_REJECTED"
     assert active.exists()
+
+
+def test_recycle_suspends_new_ssh_access_before_container_stop_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = portal4a_recycle_payload()
+    active = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys"
+    active.parent.mkdir(parents=True)
+    active.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
+    suspended = active.with_name("authorized_keys.portal-recycle")
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", tmp_path / "users")
+    monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
+    monkeypatch.setattr(
+        handlers,
+        "_portal4a_account",
+        lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_installed_key_fingerprints",
+        lambda *_args: [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+    )
+    monkeypatch.setattr(handlers, "_active_user_slurm_jobs", lambda _username: [])
+    monkeypatch.setattr(
+        handlers,
+        "_portal4a_container_security",
+        lambda *_args, **_kwargs: {"state": {"Running": True}},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {"h100-container-stop": {"integrity_ok": True}},
+    )
+    secret_marker = "fixture-secret-must-not-leak"
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "exit_code": 1,
+            "stderr": secret_marker,
+        },
+    )
+
+    result = handlers._execute_resource_recycle(request("resource.recycle"), payload)
+
+    assert result["status"] == "ERROR"
+    assert result["error"]["code"] == "CONTAINER_STOP_FAILED"
+    assert result["first_failed_step"] == "CONTAINER_STOP"
+    assert result["container_key_state"] == "SUSPENDED_BY_RECYCLE"
+    assert result["new_access"] == "DENIED"
+    assert result["cleanup_retryable"] is True
+    assert result["data_preserved"] is True
+    assert not active.exists()
+    assert suspended.exists()
+    assert secret_marker not in json.dumps(result)
+
+
+def test_recycle_retry_after_stop_failure_is_idempotent_and_preserves_data(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = portal4a_recycle_payload()
+    suspended = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys.portal-recycle"
+    suspended.parent.mkdir(parents=True)
+    suspended.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
+    active = suspended.with_name("authorized_keys")
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", tmp_path / "users")
+    monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
+    monkeypatch.setattr(
+        handlers,
+        "_portal4a_account",
+        lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_installed_key_fingerprints",
+        lambda *_args: [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+    )
+    monkeypatch.setattr(handlers, "_active_user_slurm_jobs", lambda _username: [])
+    running = {"value": True}
+
+    def security(*_args, require_running=None, **_kwargs):  # type: ignore[no-untyped-def]
+        if require_running is False:
+            assert running["value"] is False
+        return {"state": {"Running": running["value"]}}
+
+    monkeypatch.setattr(handlers, "_portal4a_container_security", security)
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {"h100-container-stop": {"integrity_ok": True}},
+    )
+    script_calls = 0
+
+    def stop(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal script_calls
+        script_calls += 1
+        running["value"] = False
+        return {"ok": True}
+
+    monkeypatch.setattr(handlers, "run_allowlisted_script", stop)
+    first = handlers._execute_resource_recycle(request("resource.recycle"), payload)
+    second = handlers._execute_resource_recycle(request("resource.recycle"), payload)
+
+    assert first["status"] == second["status"] == "SUCCEEDED"
+    assert first["container_state"] == second["container_state"] == "STOPPED"
+    assert first["container_key_state"] == "SUSPENDED_BY_RECYCLE"
+    assert second["new_access"] == "DENIED"
+    assert first["data_preserved"] is second["data_preserved"] is True
+    assert script_calls == 1
+    assert suspended.exists()
+    assert not active.exists()
+
+
+def test_recycle_running_job_uses_controlled_cancel_and_preserves_history_binding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = portal4a_recycle_payload()
+    active = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys"
+    active.parent.mkdir(parents=True)
+    active.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", tmp_path / "users")
+    monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
+    monkeypatch.setattr(
+        handlers,
+        "_portal4a_account",
+        lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_installed_key_fingerprints",
+        lambda *_args: [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+    )
+    job_queries = 0
+
+    def jobs(_username: str) -> list[tuple[int, str]]:
+        nonlocal job_queries
+        job_queries += 1
+        return [(701, "RUNNING")] if job_queries == 1 else []
+
+    monkeypatch.setattr(handlers, "_active_user_slurm_jobs", jobs)
+    monkeypatch.setattr(handlers.time, "sleep", lambda _seconds: None)
+    commands: list[tuple[str, list[str]]] = []
+
+    def fixed(binary: str, args: list[str], **_kwargs):  # type: ignore[no-untyped-def]
+        commands.append((binary, args))
+        return {"ok": True}
+
+    monkeypatch.setattr(handlers, "run_fixed", fixed)
+    monkeypatch.setattr(
+        handlers,
+        "_portal4a_container_security",
+        lambda *_args, **_kwargs: {"state": {"Running": False}},
+    )
+
+    result = handlers._execute_resource_recycle(request("resource.recycle"), payload)
+
+    assert result["status"] == "SUCCEEDED"
+    assert result["cancelled_running_job_ids"] == [701]
+    assert commands == [
+        ("scancel", ["--signal=TERM", "--full", "701"]),
+        ("scancel", ["701"]),
+    ]
+    assert result["data_preserved"] is True
+    assert result["auto_permanent_delete"] is False
+
+
+def test_container_stop_script_does_not_require_global_slurm_drain() -> None:
+    script = Path(__file__).resolve().parents[4] / "scripts/h100-container-stop"
+    source = script.read_text(encoding="utf-8")
+    assert "h100_require_slurm_drained" not in source
+    assert 'docker stop --time 30 "${container}"' in source

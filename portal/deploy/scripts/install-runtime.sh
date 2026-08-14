@@ -10,6 +10,7 @@ readonly SSH_KEY_STAGING_DIR=/var/lib/h100-portal/ssh-key-staging
 readonly PORTAL3F_ACCEPTANCE_SOURCE="${PLATFORM_DIR}/scripts/h100-origin-pilot-acceptance"
 readonly PORTAL3F_GPU_PROBE_SOURCE="${PLATFORM_DIR}/tests/gpu-device-mapping/gpu-device-context-probe.c"
 readonly COMPUTE_STAGE_SOURCE="${PLATFORM_DIR}/scripts/h100-provision-stage"
+readonly CONTAINER_STOP_SOURCE="${PLATFORM_DIR}/scripts/h100-container-stop"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "install-runtime.sh must run as root" >&2
@@ -30,6 +31,8 @@ done
 
 [[ -f "$COMPUTE_STAGE_SOURCE" && ! -L "$COMPUTE_STAGE_SOURCE" ]] \
   || { echo "required deployment input missing: $COMPUTE_STAGE_SOURCE" >&2; exit 1; }
+[[ -f "$CONTAINER_STOP_SOURCE" && ! -L "$CONTAINER_STOP_SOURCE" ]] \
+  || { echo "required deployment input missing: $CONTAINER_STOP_SOURCE" >&2; exit 1; }
 
 rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
   --exclude=/node_modules/ \
@@ -58,6 +61,13 @@ rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
 # Activate accepts UUID key records from this Worker-only directory. The API
 # never passes an arbitrary host path and cannot write this root-owned tree.
 install -d -o root -g root -m 0700 "${SSH_KEY_STAGING_DIR}"
+
+# Resource recycle uses this fixed root-owned artifact. Install it before the
+# matching manifest: any interrupted deployment therefore fails closed on an
+# integrity mismatch instead of executing an unbound lifecycle script.
+install -o root -g gpu-platform-admin -m 0750 \
+  "$CONTAINER_STOP_SOURCE" \
+  /usr/local/sbin/h100-container-stop
 
 install -o root -g root -m 0640 \
   "$SOURCE_DIR/deploy/worker-scripts.json" \

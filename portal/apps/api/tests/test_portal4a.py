@@ -42,7 +42,6 @@ from h100_portal_api.models import (
 )
 from h100_portal_api.security import hash_password
 from h100_portal_api.terminal_service import TerminalServiceError
-from h100_portal_api.worker_client import WorkerClientError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -416,7 +415,7 @@ def test_admin_boundary_response_commits_expired_and_cancelled(
     assert database.get(PortalLeaseRenewalRequest, renewal.id).state == "CANCELLED"
 
 
-def test_expiry_skips_superseded_lease_and_retries_worker_failure(
+def test_expiry_skips_superseded_lease_and_retries_cleanup_failure_fail_safe(
     database: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     identity = _identity(database, remaining_hours=0)
@@ -457,21 +456,133 @@ def test_expiry_skips_superseded_lease_and_retries_worker_failure(
         remaining_hours=0,
     )
     database.commit()
+    clock = ensure_utc(retry_identity.lease.expires_at) + timedelta(seconds=1)
+    monkeypatch.setattr(expiry_service, "utcnow", lambda: clock)
     calls = 0
 
-    def unavailable(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+    def fail_then_succeed(*_args, **_kwargs):  # type: ignore[no-untyped-def]
         nonlocal calls
         calls += 1
-        raise WorkerClientError("WORKER_UNAVAILABLE", "test outage")
+        if calls == 1:
+            return {
+                "status": "ERROR",
+                "request_id": str(uuid.uuid4()),
+                "error": {"code": "CONTAINER_STOP_FAILED", "message": "fixture stop failed"},
+                "first_failed_step": "CONTAINER_STOP",
+                "cleanup_retryable": True,
+                "container_key_state": "SUSPENDED_BY_RECYCLE",
+                "container_key_fingerprints": [retry_identity.key.fingerprint_sha256],
+                "new_access": "DENIED",
+                "cancelled_pending_job_ids": [],
+                "cancelled_running_job_ids": [],
+                "data_preserved": True,
+            }
+        return {
+            "status": "SUCCEEDED",
+            "request_id": str(uuid.uuid4()),
+            "container_state": "STOPPED",
+            "container_gpu": "NONE",
+            "container_key_state": "SUSPENDED_BY_RECYCLE",
+            "container_key_fingerprints": [retry_identity.key.fingerprint_sha256],
+            "cancelled_pending_job_ids": [],
+            "cancelled_running_job_ids": [],
+            "data_preserved": True,
+        }
 
-    monkeypatch.setattr(expiry_service, "call_worker", unavailable)
-    assert expiry_service.process_due_leases() == (1, 0)
+    monkeypatch.setattr(expiry_service, "call_worker", fail_then_succeed)
     assert expiry_service.process_due_leases() == (1, 0)
     database.expire_all()
+    failed = database.get(PortalComputeLease, retry_identity.lease.id)
+    failed_operation = database.scalar(
+        select(PortalOperation).where(
+            PortalOperation.idempotency_key == f"lease-expire:{retry_identity.lease.id}"
+        )
+    )
+    failed_storage = database.scalar(
+        select(PortalStorageResource).where(
+            PortalStorageResource.owner_managed_user_id == retry_identity.managed.id
+        )
+    )
+    assert failed.state == "EXPIRED"
+    assert failed.expired_at is not None
+    assert retry_identity.managed.compute_environment_state == "SUSPENDED"
+    assert retry_identity.container.desired_state == "STOPPED"
+    assert retry_identity.container.observed_state == "RUNNING"
+    assert retry_identity.key.container_install_state == "SUSPENDED_BY_RECYCLE"
+    assert failed_storage.state == "PRESERVED"
+    assert failed_operation.result_summary == (
+        "Lease entitlement expired; cleanup incomplete; automatic retry scheduled"
+    )
+    evidence = expiry_service.cleanup_evidence(failed_operation)
+    assert evidence == {
+        "version": expiry_service.RECYCLE_EVIDENCE_VERSION,
+        "mode": "AUTOMATIC",
+        "attempt_count": 1,
+        "status": "FAILED",
+        "error_code": "CONTAINER_STOP_FAILED",
+        "first_failed_step": "CONTAINER_STOP",
+        "lease_entitlement": "EXPIRED",
+        "new_access": "DENIED",
+        "container_stop": "FAILED",
+        "container_key_state": "SUSPENDED_BY_RECYCLE",
+        "cancelled_pending_job_ids": [],
+        "cancelled_running_job_ids": [],
+        "data_preserved": True,
+        "quota_preserved": True,
+        "linux_identity_preserved": True,
+        "slurm_history_preserved": True,
+        "auto_permanent_delete": False,
+        "automatic_retry": True,
+        "next_retry_at": (clock + timedelta(seconds=60)).isoformat(),
+        "manual_review_required": False,
+        "raw_argv_recorded": False,
+    }
+    # The every-minute scanner may see the row, but backoff prevents a second
+    # Worker side effect until the structured retry deadline.
+    assert expiry_service.process_due_leases() == (1, 0)
+    assert calls == 1
+    clock += timedelta(seconds=61)
+    assert expiry_service.process_due_leases() == (1, 1)
+    database.expire_all()
     retried = database.get(PortalComputeLease, retry_identity.lease.id)
-    assert retried.state == "ACTIVE"
-    assert retried.expired_at is None
+    assert retried.state == "RECYCLE_BIN"
+    assert retried.expired_at is not None
+    assert retried.recycled_at is not None
     assert calls == 2
+
+
+def test_legacy_failed_expiry_is_manual_review_and_not_replayed(
+    database: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity(database, remaining_hours=0)
+    operation = PortalOperation(
+        operation_type="lease.expire",
+        target_type="compute_lease",
+        target_id=str(identity.lease.id),
+        requested_by=identity.user.id,
+        owner_managed_user_id=identity.managed.id,
+        request_summary="legacy failed expiry fixture",
+        validated_payload={},
+        idempotency_key=f"lease-expire:{identity.lease.id}",
+        risk_level=RiskLevel.HIGH,
+        status=OperationStatus.FAILED,
+        error_code="CONTAINER_STOP_FAILED",
+    )
+    database.add(operation)
+    database.commit()
+    factory = sessionmaker(bind=database.get_bind(), autoflush=False, expire_on_commit=False)
+    monkeypatch.setattr(expiry_service, "SessionLocal", factory)
+    monkeypatch.setattr(
+        expiry_service,
+        "call_worker",
+        lambda *_args, **_kwargs: pytest.fail("legacy incident requires platform_owner recovery"),
+    )
+
+    assert expiry_service.process_due_leases() == (1, 0)
+    database.expire_all()
+    assert database.get(PortalComputeLease, identity.lease.id).state == "ACTIVE"
+    assert operation.status == OperationStatus.FAILED
+    assert expiry_service.cleanup_evidence(operation) is None
 
 
 def test_expiry_recycles_owned_resources_and_binds_the_approved_key(
@@ -670,6 +781,199 @@ def test_job_and_container_operations_enforce_active_lease_gpu_and_time(
     )
     assert expired_job.status_code == 409
     assert expired_job.json()["detail"]["code"] == "LEASE_INACTIVE"
+
+
+def test_expired_timestamp_denies_new_access_even_when_database_state_is_active(
+    client,
+    database: Session,
+    origin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(database)
+    identity.lease.expires_at = utcnow() - timedelta(seconds=1)
+    identity.lease.starts_at = identity.lease.expires_at - timedelta(
+        seconds=MAX_LEASE_DURATION_SECONDS
+    )
+    identity.lease.state = "ACTIVE"
+    database.commit()
+    headers = _login(client, origin_headers, identity.user.normalized_login)
+    monkeypatch.setattr(
+        "h100_portal_api.routes.self_service.call_worker",
+        lambda *_args, **_kwargs: pytest.fail("expired entitlement must fail before Worker"),
+    )
+
+    environment = client.get("/api/v1/self/environment")
+    connection = client.get("/api/v1/self/container/connection")
+    terminal = client.post(
+        "/api/v1/self/container/terminal/sessions",
+        headers=headers,
+        json={"idempotency_key": str(uuid.uuid4()), "cols": 120, "rows": 32},
+    )
+    container_start = client.post(
+        "/api/v1/self/container/start",
+        headers=headers,
+        json={"idempotency_key": str(uuid.uuid4())},
+    )
+    job = client.post(
+        "/api/v1/self/jobs",
+        headers=headers,
+        json={
+            "name": "expired-denied",
+            "script_path": "workspace/job.sh",
+            "workdir": "workspace",
+            "cpus": 1,
+            "memory_mb": 1024,
+            "gpu_count": 0,
+            "time_limit_seconds": 600,
+            "image_ref": None,
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    renewal = client.post(
+        "/api/v1/self/lease/renewals",
+        headers=headers,
+        json={"duration_seconds": 3600, "idempotency_key": str(uuid.uuid4())},
+    )
+
+    assert environment.status_code == 200
+    assert environment.json()["environment"]["lease"]["state"] == "EXPIRED"
+    assert environment.json()["environment"]["lease"]["active"] is False
+    assert connection.status_code == 200
+    assert connection.json()["connection"]["available"] is False
+    assert connection.json()["connection"]["command"] is None
+    assert terminal.status_code == 409
+    assert terminal.json()["detail"]["code"] == "LEASE_INACTIVE"
+    assert container_start.status_code == 409
+    assert container_start.json()["detail"]["code"] == "CONTAINER_OPERATION_DENIED_LEASE_INACTIVE"
+    assert job.status_code == 409
+    assert job.json()["detail"]["code"] == "LEASE_INACTIVE"
+    assert renewal.status_code == 409
+    assert renewal.json()["detail"]["code"] == "LEASE_EXPIRED_RESTORE_REQUIRED"
+
+
+def test_platform_owner_recovery_route_is_csrf_reauth_bound_and_idempotent(
+    client,
+    database: Session,
+    origin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(database, remaining_hours=0)
+    prior = PortalOperation(
+        operation_type="lease.expire",
+        target_type="compute_lease",
+        target_id=str(identity.lease.id),
+        requested_by=identity.user.id,
+        owner_managed_user_id=identity.managed.id,
+        request_summary="failed automatic expiry fixture",
+        validated_payload={},
+        idempotency_key=f"lease-expire:{identity.lease.id}",
+        risk_level=RiskLevel.HIGH,
+        status=OperationStatus.FAILED,
+        error_code="CONTAINER_STOP_FAILED",
+    )
+    database.add(prior)
+    admin = _admin(database)
+    database.commit()
+    ordinary_headers = _login(client, origin_headers, identity.user.normalized_login)
+    body = {
+        "idempotency_key": str(uuid.uuid4()),
+        "confirmation": str(identity.lease.id),
+        "safe_reason": "approved fixture cleanup recovery",
+    }
+    ordinary = client.post(
+        f"/api/v1/admin/compute-leases/{identity.lease.id}/recycle-retry",
+        headers=ordinary_headers,
+        json=body,
+    )
+    assert ordinary.status_code == 403
+
+    client.cookies.clear()
+    admin_headers = _login(client, origin_headers, admin.normalized_login)
+    without_reauth = client.post(
+        f"/api/v1/admin/compute-leases/{identity.lease.id}/recycle-retry",
+        headers=admin_headers,
+        json=body,
+    )
+    assert without_reauth.status_code == 428
+    assert without_reauth.json()["detail"]["code"] == "REAUTH_REQUIRED"
+    missing_csrf = client.post(
+        f"/api/v1/admin/compute-leases/{identity.lease.id}/recycle-retry",
+        headers=origin_headers,
+        json=body,
+    )
+    assert missing_csrf.status_code == 403
+    assert missing_csrf.json()["detail"]["code"] == "CSRF_REJECTED"
+    reauthenticated = client.post(
+        "/api/v1/auth/reauthenticate",
+        headers=admin_headers,
+        json={"password": PASSWORD},
+    )
+    assert reauthenticated.status_code == 200
+    wrong_confirmation = client.post(
+        f"/api/v1/admin/compute-leases/{identity.lease.id}/recycle-retry",
+        headers=admin_headers,
+        json={**body, "confirmation": str(uuid.uuid4())},
+    )
+    assert wrong_confirmation.status_code == 428
+    calls = 0
+
+    def recycle(operation_type: str, **_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        assert operation_type == "resource.recycle"
+        return {
+            "status": "SUCCEEDED",
+            "request_id": str(uuid.uuid4()),
+            "container_state": "STOPPED",
+            "container_gpu": "NONE",
+            "container_key_state": "SUSPENDED_BY_RECYCLE",
+            "container_key_fingerprints": [identity.key.fingerprint_sha256],
+            "cancelled_pending_job_ids": [],
+            "cancelled_running_job_ids": [],
+            "data_preserved": True,
+        }
+
+    monkeypatch.setattr(expiry_service, "call_worker", recycle)
+    applied = client.post(
+        f"/api/v1/admin/compute-leases/{identity.lease.id}/recycle-retry",
+        headers=admin_headers,
+        json=body,
+    )
+    assert applied.status_code == 200
+    assert applied.json()["status"] == "SUCCEEDED"
+    assert applied.json()["idempotent_replay"] is False
+    replay = client.post(
+        f"/api/v1/admin/compute-leases/{identity.lease.id}/recycle-retry",
+        headers=admin_headers,
+        json=body,
+    )
+    assert replay.status_code == 200
+    assert replay.json()["operation_id"] == applied.json()["operation_id"]
+    assert replay.json()["idempotent_replay"] is True
+    assert calls == 1
+    database.expire_all()
+    lease = database.get(PortalComputeLease, identity.lease.id)
+    storage = database.scalar(
+        select(PortalStorageResource).where(
+            PortalStorageResource.owner_managed_user_id == identity.managed.id
+        )
+    )
+    item = database.scalar(
+        select(PortalResourceRecycleItem).where(
+            PortalResourceRecycleItem.lease_id == identity.lease.id
+        )
+    )
+    recovery = database.get(PortalOperation, uuid.UUID(applied.json()["operation_id"]))
+    assert lease.state == "RECYCLE_BIN"
+    assert identity.managed.compute_environment_state == "RECYCLED"
+    assert identity.container.desired_state == identity.container.observed_state == "STOPPED"
+    assert identity.key.container_install_state == "SUSPENDED_BY_RECYCLE"
+    assert storage.state == "PRESERVED"
+    assert item.data_preserved is True
+    assert item.auto_permanent_delete is False
+    assert recovery.requested_by == admin.id
+    assert recovery.approved_by == admin.id
+    assert recovery.status == OperationStatus.SUCCEEDED
 
 
 def test_web_terminal_is_owner_scoped_lease_gated_and_does_not_audit_input(

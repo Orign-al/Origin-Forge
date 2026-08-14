@@ -29,6 +29,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "compute_requests.read",
         "compute_requests.review",
         "compute_requests.plan",
+        "lease.recovery",
     },
     "platform_admin": {
         "platform.read",
