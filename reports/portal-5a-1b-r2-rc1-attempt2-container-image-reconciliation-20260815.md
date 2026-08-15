@@ -285,7 +285,7 @@ MIG: DISABLED
 c65c6577af89c8ae26ee215e9b8646493eae17c2bd79fd98d885c4b2adc4546c
 ```
 
-本地控制面实现 commit：`b3b7b7dbebe6651d73cbbbf2857ab57671ccb9c1`；该 commit 尚未部署到
+本地控制面实现 commit：`7ae81916733b94b994f7073aac92eddbe3195b66`；该 commit 尚未部署到
 生产，因此生产 runtime 仍按下方旧 hash 运行。
 
 生产当前仍是旧 handler SHA256：
