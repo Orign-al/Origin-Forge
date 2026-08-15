@@ -410,6 +410,23 @@ export type FailedProvisionReconciliationResult = {
   request: ComputeResourceRequest;
 };
 
+export type FailedProvisionReconciliationReadiness = {
+  status: "ZERO_VERIFIED" | "CONFLICT";
+  checked_at: string;
+  request_id: string;
+  attempt_number: number;
+  plan_id: string;
+  failed_stage_operation_id: string;
+  rollback_status: "REQUIRES_MANUAL_REVIEW";
+  failed_hold_reservations: number;
+  portal_residue: string[];
+  host_residue: string[];
+  unknown_resource_state: string[];
+  script_integrity: "PASS" | "FAIL" | "UNKNOWN";
+  state_changed: false;
+  attempt_created: false;
+};
+
 export const getCsrf = () => apiFetch<{ csrf_token: string }>("/auth/csrf");
 export const login = (payload: { username: string; password: string }) =>
   apiFetch<{ user: User; ssh_enrollment: SshEnrollment }>("/auth/login", {
@@ -671,6 +688,19 @@ export const authorizeProvisionRetry = (
       body: JSON.stringify({ ...payload, idempotency_key: randomUuid() }),
     },
   );
+export const failedProvisionReconciliationReadiness = (
+  id: string,
+  planId: string,
+  failedStageOperationId: string,
+) => {
+  const query = new URLSearchParams({
+    plan_id: planId,
+    failed_stage_operation_id: failedStageOperationId,
+  });
+  return apiFetch<FailedProvisionReconciliationReadiness>(
+    `/admin/compute-resource-requests/${encodeURIComponent(id)}/failed-provision-reconciliation-readiness?${query.toString()}`,
+  );
+};
 export const reconcileFailedProvision = (
   id: string,
   payload: {

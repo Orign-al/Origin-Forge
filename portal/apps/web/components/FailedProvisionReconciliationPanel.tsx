@@ -8,6 +8,7 @@ import {
   ApiError,
   type ComputeResourceRequest,
   adminComputeRequest,
+  failedProvisionReconciliationReadiness,
   me,
   reauthenticate,
   reconcileFailedProvision,
@@ -132,6 +133,31 @@ export function FailedProvisionReconciliationPanel({
   const [password, setPassword] = useState("");
   const [consequencesConfirmed, setConsequencesConfirmed] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const readiness = useQuery({
+    queryKey: [
+      "failed-provision-reconciliation-readiness",
+      binding?.requestId,
+      binding?.planId,
+      binding?.stageOperationId,
+    ],
+    queryFn: async () => {
+      if (!binding) {
+        throw new ApiError(
+          409,
+          "PROVISION_RECONCILIATION_NOT_ELIGIBLE",
+          "失败 Attempt 不满足零残留核验条件。",
+        );
+      }
+      return failedProvisionReconciliationReadiness(
+        binding.requestId,
+        binding.planId,
+        binding.stageOperationId,
+      );
+    },
+    enabled: Boolean(binding && current.data?.role === "platform_owner"),
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
 
   const reconciliation = useMutation({
     mutationFn: async () => {
@@ -168,6 +194,9 @@ export function FailedProvisionReconciliationPanel({
         }),
         queryClient.invalidateQueries({ queryKey: ["admin-compute-requests"] }),
         queryClient.invalidateQueries({ queryKey: ["operations"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["failed-provision-reconciliation-readiness"],
+        }),
       ]);
     },
     onSettled: () => setPassword(""),
@@ -175,6 +204,21 @@ export function FailedProvisionReconciliationPanel({
 
   if (!binding || current.data?.role !== "platform_owner") return null;
 
+  const readinessVerified = Boolean(
+    readiness.data?.status === "ZERO_VERIFIED" &&
+    readiness.data.request_id === binding.requestId &&
+    readiness.data.attempt_number === binding.attemptNumber &&
+    readiness.data.plan_id === binding.planId &&
+    readiness.data.failed_stage_operation_id === binding.stageOperationId &&
+    readiness.data.rollback_status === binding.rollbackStatus &&
+    readiness.data.failed_hold_reservations === binding.reservations.length &&
+    readiness.data.portal_residue.length === 0 &&
+    readiness.data.host_residue.length === 0 &&
+    readiness.data.unknown_resource_state.length === 0 &&
+    readiness.data.script_integrity === "PASS" &&
+    readiness.data.state_changed === false &&
+    readiness.data.attempt_created === false,
+  );
   const confirmationsMatch =
     requestConfirmation === binding.requestId &&
     attemptConfirmation === String(binding.attemptNumber) &&
@@ -182,6 +226,7 @@ export function FailedProvisionReconciliationPanel({
     stageConfirmation === binding.stageOperationId;
   const ready =
     confirmationsMatch &&
+    readinessVerified &&
     reviewNote.trim().length > 0 &&
     password.length > 0 &&
     consequencesConfirmed;
@@ -226,7 +271,21 @@ export function FailedProvisionReconciliationPanel({
         </div>
         <div className="kv">
           <dt>Fresh Host Residue</dt>
-          <dd>提交时由 Root Worker 重新验证</dd>
+          <dd>
+            {readiness.isPending
+              ? "VERIFYING"
+              : readiness.isError
+                ? "UNKNOWN — FAILED_HOLD 保持"
+                : readinessVerified
+                  ? `ZERO VERIFIED · ${readiness.data.checked_at}`
+                  : `CONFLICT · ${
+                      [
+                        ...readiness.data.portal_residue,
+                        ...readiness.data.host_residue,
+                        ...readiness.data.unknown_resource_state,
+                      ].join(", ") || "UNKNOWN"
+                    }`}
+          </dd>
         </div>
       </dl>
       <h3 className="subheading">FAILED_HOLD Reservations</h3>

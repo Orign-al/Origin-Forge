@@ -31,6 +31,7 @@ from h100_portal_api.routes.compute_requests import (
     assert_zero_compute_side_effects,
     authorize_provision_retry,
     create_provision_plan,
+    failed_provision_reconciliation_readiness,
     reconcile_failed_provision,
 )
 from h100_portal_api.schemas import (
@@ -1299,6 +1300,33 @@ def test_failed_hold_reconciliation_is_owner_only_recent_auth_bound_and_idempote
         select(func.count())
         .select_from(PortalAuditEvent)
         .where(PortalAuditEvent.event_type == "COMPUTE_RESOURCE_REQUEST_APPROVED")
+    )
+    operation_count = database.scalar(select(func.count()).select_from(PortalOperation))
+    readiness = failed_provision_reconciliation_readiness(
+        str(item.id), plan.id, failed_stage.id, context, database
+    )
+    assert readiness == {
+        "status": "ZERO_VERIFIED",
+        "checked_at": readiness["checked_at"],
+        "request_id": str(item.id),
+        "attempt_number": plan.attempt_number,
+        "plan_id": str(plan.id),
+        "failed_stage_operation_id": str(failed_stage.id),
+        "rollback_status": "REQUIRES_MANUAL_REVIEW",
+        "failed_hold_reservations": 5,
+        "portal_residue": [],
+        "host_residue": [],
+        "unknown_resource_state": [],
+        "script_integrity": "PASS",
+        "state_changed": False,
+        "attempt_created": False,
+    }
+    assert database.scalar(select(func.count()).select_from(PortalOperation)) == operation_count
+    assert all(
+        row.state == "FAILED_HOLD"
+        for row in database.scalars(
+            select(PortalResourceReservation).where(PortalResourceReservation.plan_id == plan.id)
+        ).all()
     )
     reconciled = reconcile_failed_provision(str(item.id), body, request, context, database)
     assert reconciled["status"] == "RECONCILED"

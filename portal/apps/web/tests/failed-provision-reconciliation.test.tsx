@@ -15,6 +15,7 @@ import {
 import {
   type ComputeResourceRequest,
   adminComputeRequest,
+  failedProvisionReconciliationReadiness,
   me,
   reauthenticate,
   reconcileFailedProvision,
@@ -25,6 +26,7 @@ vi.mock("../lib/api", async (importOriginal) => {
   return {
     ...actual,
     adminComputeRequest: vi.fn(),
+    failedProvisionReconciliationReadiness: vi.fn(),
     me: vi.fn(),
     reauthenticate: vi.fn(),
     reconcileFailedProvision: vi.fn(),
@@ -163,13 +165,32 @@ function current(role: string) {
   };
 }
 
-function renderPanel(role = "platform_owner") {
+function renderPanel(
+  role = "platform_owner",
+  readinessStatus: "ZERO_VERIFIED" | "CONFLICT" = "ZERO_VERIFIED",
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   const session = current(role);
   client.setQueryData(["me"], session);
   vi.mocked(me).mockResolvedValue(session);
+  vi.mocked(failedProvisionReconciliationReadiness).mockResolvedValue({
+    status: readinessStatus,
+    checked_at: "2026-08-15T14:43:02Z",
+    request_id: REQUEST_ID,
+    attempt_number: 2,
+    plan_id: PLAN_ID,
+    failed_stage_operation_id: STAGE_ID,
+    rollback_status: "REQUIRES_MANUAL_REVIEW",
+    failed_hold_reservations: 5,
+    portal_residue: [],
+    host_residue: readinessStatus === "CONFLICT" ? ["slurm-association"] : [],
+    unknown_resource_state: [],
+    script_integrity: "PASS",
+    state_changed: false,
+    attempt_created: false,
+  });
   return render(
     <QueryClientProvider client={client}>
       <FailedProvisionReconciliationPanel request={request} />
@@ -228,6 +249,12 @@ describe("failed Provision reconciliation UI", () => {
     ).toBeInTheDocument();
     expect(screen.getByText(/5 条 Reservation/)).toBeInTheDocument();
     expect(screen.getAllByText(/FAILED_HOLD/).length).toBeGreaterThanOrEqual(5);
+    expect(await screen.findByText(/ZERO VERIFIED/)).toBeInTheDocument();
+    expect(failedProvisionReconciliationReadiness).toHaveBeenCalledWith(
+      REQUEST_ID,
+      PLAN_ID,
+      STAGE_ID,
+    );
     const submit = screen.getByRole("button", {
       name: "Reconcile Failed Provision",
     });
@@ -275,6 +302,7 @@ describe("failed Provision reconciliation UI", () => {
       request: changed,
     });
     renderPanel();
+    await screen.findByText(/ZERO VERIFIED/);
     completeConfirmation();
     fireEvent.click(
       screen.getByRole("button", { name: "Reconcile Failed Provision" }),
@@ -284,6 +312,17 @@ describe("failed Provision reconciliation UI", () => {
       await screen.findByText(/FAILED_HOLD 已变化；未提交 Reconcile/),
     ).toBeInTheDocument();
     expect(reconcileFailedProvision).not.toHaveBeenCalled();
+  });
+
+  it("keeps the formal action disabled when fresh Root Worker evidence conflicts", async () => {
+    renderPanel("platform_owner", "CONFLICT");
+    expect(
+      await screen.findByText(/CONFLICT · slurm-association/),
+    ).toBeInTheDocument();
+    completeConfirmation();
+    expect(
+      screen.getByRole("button", { name: "Reconcile Failed Provision" }),
+    ).toBeDisabled();
   });
 
   it("does not render for an ineligible failed attempt", () => {

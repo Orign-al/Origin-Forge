@@ -4,6 +4,7 @@ import { apiFetch } from "@h100-portal/api-client";
 import {
   closeSelfTerminal,
   enrollSshKey,
+  failedProvisionReconciliationReadiness,
   reconcileFailedProvision,
   resizeSelfTerminal,
   retryLeaseRecycle,
@@ -87,6 +88,36 @@ describe("API client", () => {
       failed_stage_operation_id: stageId,
       review_note: "fresh zero-residue evidence reviewed",
     });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("reads reconciliation readiness without sending a write or credential", async () => {
+    const requestId = "25aafaf9-b4f8-4cb7-beb0-127ed9923d83";
+    const planId = "70c75dac-71ba-47b6-9e4d-fc10dc1dddfb";
+    const stageId = "981a7fa1-f246-4e6c-bf70-291537291fb6";
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), "http://portal.test");
+        expect(url.pathname).toBe(
+          `/api/v1/admin/compute-resource-requests/${requestId}/failed-provision-reconciliation-readiness`,
+        );
+        expect(url.searchParams.get("plan_id")).toBe(planId);
+        expect(url.searchParams.get("failed_stage_operation_id")).toBe(stageId);
+        expect(init?.method ?? "GET").toBe("GET");
+        expect(init?.body).toBeUndefined();
+        expect(new Headers(init?.headers).has("X-CSRF-Token")).toBe(false);
+        return new Response(
+          JSON.stringify({
+            status: "ZERO_VERIFIED",
+            checked_at: "2026-08-15T14:43:02Z",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await failedProvisionReconciliationReadiness(requestId, planId, stageId);
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 

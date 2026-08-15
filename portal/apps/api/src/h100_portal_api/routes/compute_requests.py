@@ -798,30 +798,30 @@ def _retry_verification_payload(
 def _failed_stage_reconciliation_source(
     db: Session,
     item: PortalComputeResourceRequest,
-    body: ComputeProvisionReconciliationRequest,
+    *,
+    plan_id: uuid.UUID,
+    failed_stage_operation_id: uuid.UUID,
+    lock: bool,
 ) -> tuple[PortalProvisionPlan, list[PortalResourceReservation], PortalOperation]:
-    """Lock the exact manual-review Stage and its five allocator holds."""
-    if item.provision_plan_id != body.plan_id or item.managed_user_id is not None:
+    """Validate the exact manual-review Stage and its five allocator holds."""
+    if item.provision_plan_id != plan_id or item.managed_user_id is not None:
         raise _error(
             409,
             "PROVISION_RECONCILIATION_BINDING_FAILED",
             "人工对账未绑定当前失败 Attempt",
         )
-    plan = db.scalar(
-        select(PortalProvisionPlan).where(PortalProvisionPlan.id == body.plan_id).with_for_update()
+    plan_query = select(PortalProvisionPlan).where(PortalProvisionPlan.id == plan_id)
+    stage_query = select(PortalOperation).where(PortalOperation.id == failed_stage_operation_id)
+    reservation_query = select(PortalResourceReservation).where(
+        PortalResourceReservation.plan_id == plan_id
     )
-    failed_stage = db.scalar(
-        select(PortalOperation)
-        .where(PortalOperation.id == body.failed_stage_operation_id)
-        .with_for_update()
-    )
-    reservations = list(
-        db.scalars(
-            select(PortalResourceReservation)
-            .where(PortalResourceReservation.plan_id == body.plan_id)
-            .with_for_update()
-        ).all()
-    )
+    if lock:
+        plan_query = plan_query.with_for_update()
+        stage_query = stage_query.with_for_update()
+        reservation_query = reservation_query.with_for_update()
+    plan = db.scalar(plan_query)
+    failed_stage = db.scalar(stage_query)
+    reservations = list(db.scalars(reservation_query).all())
     expected_values = (
         {
             ("UID", str(plan.uid)),
@@ -1197,6 +1197,64 @@ def review_compute_request(
     return {"status": item.status, "request": _request_view(db, item, internal=True)}
 
 
+@router.get(
+    "/admin/compute-resource-requests/{request_id}/failed-provision-reconciliation-readiness"
+)
+def failed_provision_reconciliation_readiness(
+    request_id: str,
+    plan_id: uuid.UUID,
+    failed_stage_operation_id: uuid.UUID,
+    context: AuthContext = Depends(permission_dependency("compute_requests.reconcile")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Read-only, target-bound preview of the formal reconciliation gate."""
+    item = _admin_request(db, _request_id(request_id))
+    _deny_self_administration(item, context)
+    plan, reservations, failed_stage = _failed_stage_reconciliation_source(
+        db,
+        item,
+        plan_id=plan_id,
+        failed_stage_operation_id=failed_stage_operation_id,
+        lock=False,
+    )
+    portal_checks = assert_zero_compute_side_effects(db, item.portal_account_id)
+    verification = _worker_dry_run(
+        "compute.provision.retry_verify",
+        payload=_retry_verification_payload(item, plan, failed_stage),
+        context=context,
+        idempotency_key=f"compute-reconcile-readiness:{failed_stage.id}",
+    )
+    host_residue = verification.get("resource_residue")
+    unknown_state = verification.get("unknown_resource_state")
+    portal_residue = sorted(name for name, passed in portal_checks.items() if not passed)
+    verified = bool(
+        not portal_residue
+        and verification.get("handler") == "compute.provision.retry_verify"
+        and verification.get("retry_verification_status") == "VERIFIED_ZERO_RESIDUE"
+        and verification.get("script_integrity") == "PASS"
+        and host_residue == []
+        and unknown_state == []
+    )
+    return {
+        "status": "ZERO_VERIFIED" if verified else "CONFLICT",
+        "checked_at": utcnow(),
+        "request_id": str(item.id),
+        "attempt_number": plan.attempt_number,
+        "plan_id": str(plan.id),
+        "failed_stage_operation_id": str(failed_stage.id),
+        "rollback_status": failed_stage.rollback_status,
+        "failed_hold_reservations": len(reservations),
+        "portal_residue": portal_residue,
+        "host_residue": host_residue if isinstance(host_residue, list) else ["UNKNOWN"],
+        "unknown_resource_state": (
+            unknown_state if isinstance(unknown_state, list) else ["UNKNOWN"]
+        ),
+        "script_integrity": verification.get("script_integrity", "UNKNOWN"),
+        "state_changed": False,
+        "attempt_created": False,
+    }
+
+
 @router.post("/admin/compute-resource-requests/{request_id}/reconcile-failed-provision")
 def reconcile_failed_provision(
     request_id: str,
@@ -1237,7 +1295,13 @@ def reconcile_failed_provision(
             "request": _request_view(db, item, internal=True),
         }
 
-    plan, reservations, failed_stage = _failed_stage_reconciliation_source(db, item, body)
+    plan, reservations, failed_stage = _failed_stage_reconciliation_source(
+        db,
+        item,
+        plan_id=body.plan_id,
+        failed_stage_operation_id=body.failed_stage_operation_id,
+        lock=True,
+    )
     portal_zero_residue = assert_zero_compute_side_effects(db, item.portal_account_id)
     if not all(portal_zero_residue.values()):
         raise _error(
