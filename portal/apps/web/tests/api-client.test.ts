@@ -4,6 +4,7 @@ import { apiFetch } from "@h100-portal/api-client";
 import {
   closeSelfTerminal,
   enrollSshKey,
+  reconcileFailedProvision,
   resizeSelfTerminal,
   retryLeaseRecycle,
   sendSelfTerminalInput,
@@ -38,6 +39,54 @@ describe("API client", () => {
         body: JSON.stringify({}),
       }),
     ).resolves.toEqual({ ok: true });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("binds formal reconciliation to CSRF and exact failed-stage identifiers", async () => {
+    document.cookie = "h100_csrf=test-csrf-value; Path=/";
+    const requestId = "25aafaf9-b4f8-4cb7-beb0-127ed9923d83";
+    const planId = "70c75dac-71ba-47b6-9e4d-fc10dc1dddfb";
+    const stageId = "981a7fa1-f246-4e6c-bf70-291537291fb6";
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        expect(String(input)).toBe(
+          `/api/v1/admin/compute-resource-requests/${requestId}/reconcile-failed-provision`,
+        );
+        expect(init?.method).toBe("POST");
+        expect(new Headers(init?.headers).get("X-CSRF-Token")).toBe(
+          "test-csrf-value",
+        );
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        expect(body.plan_id).toBe(planId);
+        expect(body.failed_stage_operation_id).toBe(stageId);
+        expect(body.review_note).toBe("fresh zero-residue evidence reviewed");
+        expect(body.idempotency_key).toMatch(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+        );
+        expect(body).not.toHaveProperty("password");
+        expect(body).not.toHaveProperty("session");
+        expect(body).not.toHaveProperty("csrf");
+        return new Response(
+          JSON.stringify({
+            status: "RECONCILED",
+            operation_id: "20000000-0000-4000-8000-000000000003",
+            idempotent_replay: false,
+            attempt_created: false,
+            rollback: "VERIFIED",
+            reservation_state: "RELEASED",
+            request: {},
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await reconcileFailedProvision(requestId, {
+      plan_id: planId,
+      failed_stage_operation_id: stageId,
+      review_note: "fresh zero-residue evidence reviewed",
+    });
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
