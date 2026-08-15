@@ -47,6 +47,10 @@ user_root=
 container_name=
 compose_dir=
 compose_file=
+base_image=
+base_image_id=
+base_image_digest=
+derived_image=
 state_file=
 isolation_marker_one=
 isolation_marker_two=
@@ -60,6 +64,7 @@ usage() {
 
 fail() {
   printf 'COMPUTE STAGE ERROR: %s\n' "$*" >&2
+  printf 'COMPUTE STAGE FAILURE CODE: %s_FAILED\n' "${current_step}" >&2
   exit 1
 }
 
@@ -84,6 +89,45 @@ directory_contains_user_data() {
     -print -quit | grep -q .
 }
 
+validate_base_image() {
+  base_image="$(docker inspect --format '{{.Config.Image}}' gpu-dev-origin-pilot)"
+  [[ "${base_image}" =~ ^[A-Za-z0-9._/@:+-]+$ ]] \
+    || fail 'approved local image reference is invalid'
+  base_image_id="$(docker inspect --format '{{.Image}}' gpu-dev-origin-pilot)"
+  [[ "${base_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || fail 'approved local image ID is invalid'
+  [[ "$(docker image inspect --format '{{.Id}}' "${base_image}")" == "${base_image_id}" ]] \
+    || fail 'origin-pilot container image no longer matches its local tag'
+  base_image_digest="$(docker image inspect --format '{{json .RepoDigests}}' "${base_image}" \
+    | jq -r --arg image_id "${base_image_id}" \
+      '((. // []) | map(select(type == "string" and test("@sha256:[0-9a-f]{64}$") and endswith("@" + $image_id)))) | .[0] // empty')"
+  [[ "${base_image_digest}" =~ ^[A-Za-z0-9._/@:+-]+@sha256:[0-9a-f]{64}$ ]] \
+    || fail 'approved local image has no RepoDigest bound to its image ID'
+  docker image inspect "${base_image}" | jq -e \
+    '.[0].Config.Labels["h100.dev.user"] == "origin-pilot"
+     and .[0].Config.Labels["h100.dev.uid"] == "20001"
+     and .[0].Config.Labels["h100.dev.gid"] == "20001"' \
+    >/dev/null || fail 'origin-pilot image identity labels are invalid'
+  # Docker represents an omitted Config.User as null; the effective default
+  # user is root and is equivalent to an explicit root declaration here.
+  docker image inspect "${base_image}" | jq -e \
+    '((.[0].Config.User // "") == "" or .[0].Config.User == "root")' \
+    >/dev/null || fail 'origin-pilot image does not build derived users as root'
+}
+
+assert_derived_image_absent() {
+  local output
+  if output="$(docker image inspect "${derived_image}" 2>&1)"; then
+    fail 'derived image tag already exists'
+  elif ! grep -Eqi 'no such (image|object)' <<<"${output}"; then
+    fail 'derived image state cannot be safely confirmed'
+  fi
+}
+
+rollback_mark() {
+  printf 'COMPUTE STAGE ROLLBACK STEP: %s=%s\n' "$1" "$2" >&2
+}
+
 rollback() {
   local original_rc=$1 manual_review=0
   set +e
@@ -92,49 +136,134 @@ rollback() {
   printf 'COMPUTE STAGE ROLLBACK STARTED user=%s\n' "${username}" >&2
   if directory_contains_user_data "${user_root}"; then
     manual_review=1
+    rollback_mark DATA_SAFETY BLOCKED
     printf 'ROLLBACK BLOCKED: managed data is non-empty; preserving identity and data\n' >&2
+  else
+    rollback_mark DATA_SAFETY SUCCEEDED
   fi
   if ((created_container == 1)); then
-    docker rm --force "${container_name}" >/dev/null 2>&1 || manual_review=1
+    if docker rm --force "${container_name}" >/dev/null 2>&1; then
+      rollback_mark CONTAINER SUCCEEDED
+    else
+      rollback_mark CONTAINER FAILED
+      manual_review=1
+    fi
+  else
+    rollback_mark CONTAINER NOT_REQUIRED
   fi
   if ((created_compose == 1)); then
-    rm -f -- "${compose_file}"
-    rmdir -- "${compose_dir}" 2>/dev/null || true
+    if rm -f -- "${compose_file}" && rmdir -- "${compose_dir}" 2>/dev/null; then
+      rollback_mark CONTAINER_DEFINITION SUCCEEDED
+    else
+      rollback_mark CONTAINER_DEFINITION FAILED
+      manual_review=1
+    fi
+  else
+    rollback_mark CONTAINER_DEFINITION NOT_REQUIRED
   fi
   if ((created_image == 1)); then
-    docker image rm "${derived_image}" >/dev/null 2>&1 || manual_review=1
+    if docker image rm "${derived_image}" >/dev/null 2>&1; then
+      rollback_mark DERIVED_IMAGE SUCCEEDED
+    else
+      rollback_mark DERIVED_IMAGE FAILED
+      manual_review=1
+    fi
+  else
+    rollback_mark DERIVED_IMAGE NOT_REQUIRED
   fi
   if ((created_association == 1)); then
-    sacctmgr -i delete user where Name="${username}" Account="${slurm_account}" \
-      >/dev/null 2>&1 || manual_review=1
+    if sacctmgr -i delete user where Name="${username}" Account="${slurm_account}" \
+      >/dev/null 2>&1; then
+      rollback_mark SLURM_ASSOCIATION SUCCEEDED
+    else
+      rollback_mark SLURM_ASSOCIATION FAILED
+      manual_review=1
+    fi
+  else
+    rollback_mark SLURM_ASSOCIATION NOT_REQUIRED
   fi
   if ((created_mapping == 1)); then
-    xfs_quota -x -c "limit -p bhard=0 ${project_name}" "${H100_DATA_ROOT}" \
-      >/dev/null 2>&1 || true
-    atomic_restore "${backup_dir}/projects.before" "${PROJECTS_FILE}" || manual_review=1
-    atomic_restore "${backup_dir}/projid.before" "${PROJID_FILE}" || manual_review=1
+    if xfs_quota -x -c "limit -p bhard=0 ${project_name}" "${H100_DATA_ROOT}" \
+      >/dev/null 2>&1 \
+      && atomic_restore "${backup_dir}/projects.before" "${PROJECTS_FILE}" \
+      && atomic_restore "${backup_dir}/projid.before" "${PROJID_FILE}"; then
+      rollback_mark XFS_PROJECT_QUOTA SUCCEEDED
+    else
+      rollback_mark XFS_PROJECT_QUOTA FAILED
+      manual_review=1
+    fi
+  else
+    rollback_mark XFS_PROJECT_QUOTA NOT_REQUIRED
   fi
   if ((created_policy == 1)); then
-    "${GPU_ISOLATION_TOOL}" remove "${username}" >/dev/null 2>&1 || manual_review=1
+    if "${GPU_ISOLATION_TOOL}" remove "${username}" >/dev/null 2>&1; then
+      rollback_mark GPU_POLICY SUCCEEDED
+    else
+      rollback_mark GPU_POLICY FAILED
+      manual_review=1
+    fi
+  else
+    rollback_mark GPU_POLICY NOT_REQUIRED
   fi
   if ((manual_review == 0)); then
     if ((created_container_data == 1)); then
-      rm -rf --one-file-system -- "${CONTAINER_DATA_ROOT:?}/${username}"
+      if rm -rf --one-file-system -- "${CONTAINER_DATA_ROOT:?}/${username}"; then
+        rollback_mark CONTAINER_STORAGE SUCCEEDED
+      else
+        rollback_mark CONTAINER_STORAGE FAILED
+        manual_review=1
+      fi
+    else
+      rollback_mark CONTAINER_STORAGE NOT_REQUIRED
     fi
     if ((created_data == 1)); then
-      rm -rf --one-file-system -- "${user_root}"
+      if rm -rf --one-file-system -- "${user_root}"; then
+        rollback_mark PRIVATE_STORAGE SUCCEEDED
+      else
+        rollback_mark PRIVATE_STORAGE FAILED
+        manual_review=1
+      fi
+    else
+      rollback_mark PRIVATE_STORAGE NOT_REQUIRED
     fi
     if ((created_user == 1)); then
-      userdel --remove "${username}" >/dev/null 2>&1 || manual_review=1
+      if ! getent passwd "${username}" >/dev/null \
+        || userdel --remove "${username}" >/dev/null 2>&1; then
+        rollback_mark LINUX_USER SUCCEEDED
+      else
+        rollback_mark LINUX_USER FAILED
+        manual_review=1
+      fi
+    else
+      rollback_mark LINUX_USER NOT_REQUIRED
     fi
     if ((created_group == 1)); then
-      groupdel "${username}" >/dev/null 2>&1 || manual_review=1
+      # userdel commonly removes a same-name private group.  Absence is the
+      # desired idempotent postcondition, not a rollback failure.
+      if ! getent group "${username}" >/dev/null \
+        || groupdel "${username}" >/dev/null 2>&1; then
+        rollback_mark LINUX_GROUP SUCCEEDED
+      else
+        rollback_mark LINUX_GROUP FAILED
+        manual_review=1
+      fi
+    else
+      rollback_mark LINUX_GROUP NOT_REQUIRED
     fi
   else
+    rollback_mark CONTAINER_STORAGE BLOCKED
+    rollback_mark PRIVATE_STORAGE BLOCKED
+    rollback_mark LINUX_USER BLOCKED
+    rollback_mark LINUX_GROUP BLOCKED
     usermod --shell /usr/sbin/nologin "${username}" >/dev/null 2>&1 || true
     passwd -l "${username}" >/dev/null 2>&1 || true
   fi
-  rm -f -- "${state_file}"
+  if rm -f -- "${state_file}"; then
+    rollback_mark LIFECYCLE_STATE SUCCEEDED
+  else
+    rollback_mark LIFECYCLE_STATE FAILED
+    manual_review=1
+  fi
   systemctl daemon-reload >/dev/null 2>&1 || true
   if ((manual_review == 1)); then
     printf 'COMPUTE STAGE ROLLBACK MANUAL REVIEW REQUIRED user=%s\n' "${username}" >&2
@@ -264,6 +393,11 @@ systemctl is-active --quiet slurmctld.service || fail 'Slurm controller is unava
 systemctl is-active --quiet slurmd.service || fail 'Slurm daemon is unavailable'
 
 last_successful_step=RESOURCE_PREFLIGHT
+current_step=CONTAINER_IMAGE_PREWRITE_GATE
+validate_base_image
+assert_derived_image_absent
+
+last_successful_step=CONTAINER_IMAGE_PREWRITE_GATE
 current_step=BACKUP_AND_TRANSACTION_START
 stamp="$(date +%Y%m%d-%H%M%S-%N)"
 backup_dir="${H100_PLATFORM_ROOT}/backups/compute-stage-${username}-${stamp}"
@@ -376,23 +510,12 @@ sacctmgr -nP show assoc where User="${username}" Account=company \
 
 last_successful_step=SLURM_ASSOCIATION
 current_step=CONTAINER_IMAGE
-base_image="$(docker inspect --format '{{.Config.Image}}' gpu-dev-origin-pilot)"
-[[ "${base_image}" =~ ^[A-Za-z0-9._/@:+-]+$ ]] || fail 'approved local image reference is invalid'
-base_image_id="$(docker inspect --format '{{.Image}}' gpu-dev-origin-pilot)"
-[[ "${base_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'approved local image ID is invalid'
-[[ "$(docker image inspect --format '{{.Id}}' "${base_image}")" == "${base_image_id}" ]] \
-  || fail 'origin-pilot container image no longer matches its local tag'
-docker image inspect "${base_image}" | jq -e \
-  '.[0].Config.Labels["h100.dev.user"] == "origin-pilot"
-   and .[0].Config.Labels["h100.dev.uid"] == "20001"
-   and .[0].Config.Labels["h100.dev.gid"] == "20001"' \
-  >/dev/null || fail 'origin-pilot image identity labels are invalid'
-docker image inspect "${base_image}" | jq -e \
-  '.[0].Config.User == "" or .[0].Config.User == "root"' \
-  >/dev/null || fail 'origin-pilot image does not build derived users as root'
-docker image inspect "${derived_image}" >/dev/null 2>&1 && fail 'derived image tag already exists'
+docker image inspect "${base_image_id}" >/dev/null 2>&1 \
+  || fail 'validated base image disappeared before derived build'
+docker image inspect "${base_image_digest}" >/dev/null 2>&1 \
+  || fail 'validated base image digest disappeared before derived build'
 cat >"${temp_dir}/Dockerfile" <<EOF
-FROM ${base_image}
+FROM ${base_image_digest}
 USER root
 RUN old_user=origin-pilot; old_uid=20001; old_gid=20001; \\
     rm -f /etc/sudoers.d/90-h100-dev-user; \\
@@ -413,7 +536,7 @@ docker image inspect "${derived_image}" | jq -e \
   '.[0].Config.Labels["h100.dev.user"] == $user and .[0].Config.Labels["h100.dev.uid"] == $uid and .[0].Config.Labels["h100.dev.gid"] == $gid' \
   >/dev/null || fail 'derived image identity labels are invalid'
 docker image inspect "${derived_image}" | jq -e '
-  (.[0].Config.User == "" or .[0].Config.User == "root")
+  ((.[0].Config.User // "") == "" or .[0].Config.User == "root")
   and ((.[0].Config.Env // []) | map(select(startswith("NVIDIA_VISIBLE_DEVICES="))) | length == 0)
   and ((.[0].Config.Env // []) | map(select(startswith("MUNGE_"))) | length == 0)
   and ((.[0].Config.Volumes // {}) | keys | index("/var/run/docker.sock") | not)

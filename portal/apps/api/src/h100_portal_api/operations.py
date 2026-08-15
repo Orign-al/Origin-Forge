@@ -26,6 +26,7 @@ WRITE_OPERATION_TYPES = {
     "compute.provision.plan",
     "compute.provision.dry_run",
     "compute.provision.retry_authorize",
+    "compute.provision.reconcile",
     "compute.provision.stage",
     "user.plan",
     "user.stage",
@@ -65,6 +66,7 @@ OPERATION_PERMISSIONS = {
     "compute.provision.plan": "compute_requests.plan",
     "compute.provision.dry_run": "compute_requests.plan",
     "compute.provision.retry_authorize": "compute_requests.plan",
+    "compute.provision.reconcile": "compute_requests.reconcile",
     "compute.provision.stage": "compute_requests.plan",
     "user.plan": "users.write",
     "user.stage": "users.write",
@@ -94,6 +96,7 @@ def risk_for(operation_type: str) -> RiskLevel:
         "user.activate",
         "user.suspend",
         "user.pilot.acceptance",
+        "compute.provision.reconcile",
     }:
         return RiskLevel.CRITICAL
     if operation_type in HIGH_RISK_OPERATION_TYPES:

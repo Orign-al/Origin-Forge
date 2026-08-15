@@ -11,6 +11,26 @@ from h100_portal_worker.schemas import WorkerRequest, validate_payload
 
 PORTAL_ROOT = Path(__file__).resolve().parents[3]
 PLATFORM_ROOT = PORTAL_ROOT.parent
+REAL_IMAGE_VALIDATOR = handlers._standard_dev_image_identity
+
+
+def image_identity(*, image_id: str = "sha256:" + "d" * 64) -> dict[str, object]:
+    return {
+        "status": "PASS",
+        "validator_version": "compute-provision-stage-image-validator-v1",
+        "identity_sha256": "e" * 64,
+        "reference": "h100-local/dev-container:ubuntu24.04-origin-pilot-20260804",
+        "image_id": image_id,
+        "repo_digests": [f"h100-local/dev-container@{image_id}"],
+        "created_at": "2026-08-04T00:00:00Z",
+        "build_user": "DEFAULT_ROOT",
+        "failure_code": None,
+    }
+
+
+@pytest.fixture(autouse=True)
+def stable_standard_image(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(handlers, "_standard_dev_image_identity", image_identity)
 
 
 def plan_payload() -> dict[str, object]:
@@ -149,6 +169,117 @@ def test_compute_dry_run_schema_binds_every_reserved_value() -> None:
         validate_payload("compute.provision.dry_run", {**payload, "gpu_max": 4})
 
 
+def test_standard_image_validator_accepts_docker_default_root_when_config_user_is_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_id = "sha256:" + "d" * 64
+
+    def fixed(binary: str, args: list[str], timeout: float = 20.0):  # type: ignore[no-untyped-def]
+        assert binary == "docker"
+        assert timeout in {15, 20}
+        if args[:2] == ["container", "inspect"]:
+            return {
+                "ok": True,
+                "stdout": json.dumps(
+                    [{"Config": {"Image": "h100-local/dev-container:accepted"}, "Image": image_id}]
+                ),
+                "stderr": "",
+            }
+        assert args[:2] == ["image", "inspect"]
+        return {
+            "ok": True,
+            "stdout": json.dumps(
+                [
+                    {
+                        "Id": image_id,
+                        "RepoDigests": [f"h100-local/dev-container@{image_id}"],
+                        "Created": "2026-08-04T00:00:00Z",
+                        "Config": {
+                            "User": None,
+                            "Labels": {
+                                "h100.dev.user": "origin-pilot",
+                                "h100.dev.uid": "20001",
+                                "h100.dev.gid": "20001",
+                            },
+                        },
+                    }
+                ]
+            ),
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(handlers, "run_fixed", fixed)
+    monkeypatch.setattr(handlers, "_standard_dev_image_identity", REAL_IMAGE_VALIDATOR)
+    observed = handlers._standard_dev_image_identity()
+    assert observed["status"] == "PASS"
+    assert observed["build_user"] == "DEFAULT_ROOT"
+    assert observed["image_id"] == image_id
+
+
+def test_standard_image_validator_requires_repo_digest_bound_to_image_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_id = "sha256:" + "d" * 64
+
+    def fixed(binary: str, args: list[str], timeout: float = 20.0):  # type: ignore[no-untyped-def]
+        assert binary == "docker"
+        assert timeout in {15, 20}
+        if args[:2] == ["container", "inspect"]:
+            return {
+                "ok": True,
+                "stdout": json.dumps(
+                    [{"Config": {"Image": "h100-local/dev-container:accepted"}, "Image": image_id}]
+                ),
+                "stderr": "",
+            }
+        return {
+            "ok": True,
+            "stdout": json.dumps(
+                [
+                    {
+                        "Id": image_id,
+                        "RepoDigests": ["h100-local/dev-container@sha256:" + "e" * 64],
+                        "Created": "2026-08-04T00:00:00Z",
+                        "Config": {
+                            "User": None,
+                            "Labels": {
+                                "h100.dev.user": "origin-pilot",
+                                "h100.dev.uid": "20001",
+                                "h100.dev.gid": "20001",
+                            },
+                        },
+                    }
+                ]
+            ),
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(handlers, "run_fixed", fixed)
+    monkeypatch.setattr(handlers, "_standard_dev_image_identity", REAL_IMAGE_VALIDATOR)
+    observed = handlers._standard_dev_image_identity()
+    assert observed["status"] == "FAIL"
+    assert observed["failure_code"] == "IMAGE_REPO_DIGEST_INVALID"
+
+
+def test_stage_image_identity_change_requires_new_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = stage_payload()
+    monkeypatch.setattr(handlers, "script_integrity", stage_integrity)
+    changed = image_identity(image_id="sha256:" + "f" * 64)
+    changed["identity_sha256"] = "f" * 64
+    monkeypatch.setattr(handlers, "_standard_dev_image_identity", lambda: changed)
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: pytest.fail("image identity drift must fail before execution"),
+    )
+    result = handlers.handle(request("compute.provision.stage", payload, dry_run=False))
+    assert result["error"]["code"] == "DRY_RUN_STAGE_CONTRACT_MISMATCH"
+    assert "IMAGE_IDENTITY" in result["contract_verification"]["mismatches"]
+    assert result["side_effect_classification"] == "NO_SIDE_EFFECT"
+
+
 def test_compute_stage_schema_binds_dry_run_and_all_reservations() -> None:
     payload = stage_payload()
     validated = validate_payload("compute.provision.stage", payload)
@@ -241,7 +372,7 @@ def test_allocator_plan_excludes_portal_reservations_and_never_writes(
         lambda _username, _container: [passed("target")],
     )
     monkeypatch.setattr(
-        handlers, "_compute_platform_checks", lambda _username: [passed("platform")]
+        handlers, "_compute_platform_checks", lambda _username, **_kwargs: [passed("platform")]
     )
 
     def uid_candidate(excluded: set[int]):
@@ -316,7 +447,7 @@ def test_exact_dry_run_reports_zero_side_effects_and_real_execution_is_disabled(
         handlers, "_compute_exact_resource_checks", lambda _payload: [passed("reservation")]
     )
     monkeypatch.setattr(
-        handlers, "_compute_platform_checks", lambda _username: [passed("platform")]
+        handlers, "_compute_platform_checks", lambda _username, **_kwargs: [passed("platform")]
     )
     monkeypatch.setattr(handlers, "script_integrity", stage_integrity)
     result = handlers.handle(request("compute.provision.dry_run", payload, dry_run=True))
@@ -364,7 +495,7 @@ def test_dry_run_argument_binding_mismatch_is_contract_incomplete_and_read_only(
         handlers, "_compute_exact_resource_checks", lambda _payload: [passed("reservation")]
     )
     monkeypatch.setattr(
-        handlers, "_compute_platform_checks", lambda _username: [passed("platform")]
+        handlers, "_compute_platform_checks", lambda _username, **_kwargs: [passed("platform")]
     )
     monkeypatch.setattr(handlers, "script_integrity", stage_integrity)
     original_builder = handlers._compute_stage_argv
@@ -628,6 +759,92 @@ def test_compute_stage_script_confirmation_uses_parameters_above_nine() -> None:
     fixed = subprocess.run(["/usr/bin/bash", "-c", fixed_gate, "gate", *argv], check=False)
     assert old.returncode != 0
     assert fixed.returncode == 0
+
+
+def test_stage_image_gate_precedes_any_compute_write_and_pins_repo_digest() -> None:
+    source = (PLATFORM_ROOT / "scripts/h100-provision-stage").read_text()
+    assert source.index("current_step=CONTAINER_IMAGE_PREWRITE_GATE") < source.index(
+        "current_step=LINUX_IDENTITY"
+    )
+    assert '((.[0].Config.User // "") == "" or .[0].Config.User == "root")' in source
+    assert "FROM ${base_image_digest}" in source
+    assert "FROM ${base_image_id}" not in source
+
+
+def test_stage_rollback_evidence_parser_preserves_idempotent_group_cleanup() -> None:
+    stderr = "\n".join(
+        [
+            "COMPUTE STAGE ROLLBACK STEP: LINUX_USER=SUCCEEDED",
+            "COMPUTE STAGE ROLLBACK STEP: LINUX_GROUP=SUCCEEDED",
+            "COMPUTE STAGE SIDE EFFECT CLASSIFICATION: PARTIAL_ROLLED_BACK",
+        ]
+    )
+    assert handlers._stage_rollback_steps(stderr) == {
+        "LINUX_GROUP": "SUCCEEDED",
+        "LINUX_USER": "SUCCEEDED",
+    }
+
+
+def test_stage_rollback_treats_private_group_removed_by_userdel_as_success() -> None:
+    source = (PLATFORM_ROOT / "scripts/h100-provision-stage").read_text()
+    rollback_mark = source[source.index("rollback_mark() {") : source.index("\nrollback() {")]
+    rollback = source[source.index("rollback() {") : source.index("\non_exit() {")]
+    fixture = f"""
+{rollback_mark}
+{rollback}
+directory_contains_user_data() {{ return 1; }}
+rm() {{ return 0; }}
+systemctl() {{ return 0; }}
+usermod() {{ return 0; }}
+passwd() {{ return 0; }}
+group_present=1
+getent() {{
+  if [[ $1 == passwd ]]; then return 0; fi
+  ((group_present == 1))
+}}
+userdel() {{ group_present=0; return 0; }}
+groupdel() {{ printf 'GROUPDEL_CALLED\\n' >&2; return 1; }}
+created_container=0
+created_compose=0
+created_image=0
+created_association=0
+created_mapping=0
+created_policy=0
+created_container_data=0
+created_data=0
+created_user=1
+created_group=1
+isolation_marker_one=
+isolation_marker_two=
+username=fixture-user
+user_root=/fixture/users/fixture-user
+state_file=/fixture/state
+container_name=gpu-dev-fixture-user
+compose_file=/fixture/compose.yml
+compose_dir=/fixture
+derived_image=fixture-image
+slurm_account=company
+project_name=h100_fixture-user
+H100_DATA_ROOT=/fixture
+backup_dir=/fixture/backup
+PROJECTS_FILE=/fixture/projects
+PROJID_FILE=/fixture/projid
+GPU_ISOLATION_TOOL=/fixture/isolation
+CONTAINER_DATA_ROOT=/fixture/container-data
+rollback 1
+exit 0
+"""
+    result = subprocess.run(
+        ["/usr/bin/bash", "-c", fixture],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "GROUPDEL_CALLED" not in result.stderr
+    assert "COMPUTE STAGE ROLLBACK STEP: LINUX_USER=SUCCEEDED" in result.stderr
+    assert "COMPUTE STAGE ROLLBACK STEP: LINUX_GROUP=SUCCEEDED" in result.stderr
+    assert "COMPUTE STAGE SIDE EFFECT CLASSIFICATION: PARTIAL_ROLLED_BACK" in result.stderr
 
 
 def test_compute_stage_fails_closed_when_sourced_library_integrity_is_unknown(

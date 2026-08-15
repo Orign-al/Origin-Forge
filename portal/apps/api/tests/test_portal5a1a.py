@@ -23,6 +23,7 @@ from h100_portal_api.models import (
     ensure_utc,
     utcnow,
 )
+from h100_portal_api.rbac import has_permission
 from h100_portal_api.routes.compute_requests import (
     _active_reservations,
     _rolled_back_stage_retry,
@@ -30,9 +31,11 @@ from h100_portal_api.routes.compute_requests import (
     assert_zero_compute_side_effects,
     authorize_provision_retry,
     create_provision_plan,
+    reconcile_failed_provision,
 )
 from h100_portal_api.schemas import (
     ComputeProvisionActionRequest,
+    ComputeProvisionReconciliationRequest,
     ComputeProvisionRetryAuthorizationRequest,
 )
 from h100_portal_api.security import hash_password
@@ -170,6 +173,17 @@ def stage_contract_fixture() -> dict[str, object]:
             "validator_version": "compute-provision-stage-confirmation-validator-v1",
             "validator_sha256": "c" * 64,
             "status": "PASS",
+        },
+        "image_contract": {
+            "status": "PASS",
+            "validator_version": "compute-provision-stage-image-validator-v1",
+            "identity_sha256": "e" * 64,
+            "reference": "h100-local/dev-container:ubuntu24.04-origin-pilot-20260804",
+            "image_id": "sha256:" + "d" * 64,
+            "repo_digests": ["h100-local/dev-container@sha256:" + "d" * 64],
+            "created_at": "2026-08-04T00:00:00Z",
+            "build_user": "DEFAULT_ROOT",
+            "failure_code": None,
         },
     }
 
@@ -396,6 +410,24 @@ def failed_stage_fixture(database, *, login: str = "rolled-back-stage-user"):
         rollback_status="ROLLED_BACK",
     )
     database.add(operation)
+    database.commit()
+    return owner, item, plan, reservations, operation
+
+
+def manual_review_stage_fixture(database, *, login: str = "manual-review-stage-user"):
+    owner, item, plan, reservations, operation = failed_stage_fixture(database, login=login)
+    operation.rollback_status = "REQUIRES_MANUAL_REVIEW"
+    operation.dry_run_result = {
+        "side_effect_classification": "PARTIAL_UNKNOWN",
+        "rollback_status": "REQUIRES_MANUAL_REVIEW",
+        "last_successful_step": "SLURM_ASSOCIATION",
+        "first_failed_step": "CONTAINER_IMAGE",
+        "retained_resources": [],
+    }
+    for row in reservations:
+        row.state = "FAILED_HOLD"
+        row.active_key = f"{row.resource_type}:{row.resource_value}"
+        row.released_at = None
     database.commit()
     return owner, item, plan, reservations, operation
 
@@ -1217,6 +1249,202 @@ def test_failed_stage_retry_rejects_unknown_rollback_failed_hold_and_binding_dri
         _rolled_back_stage_retry(database, item)
     assert getattr(drifted.value, "detail", {}).get("code") == (
         "PROVISION_STAGE_RETRY_RECONCILIATION_REQUIRED"
+    )
+
+
+def test_failed_hold_reconciliation_is_owner_only_recent_auth_bound_and_idempotent(
+    database, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _owner, item, plan, _reservations, failed_stage = manual_review_stage_fixture(database)
+    platform_admin = account(database, login="reconcile-platform-admin", role="platform_admin")
+    platform_owner = account(database, login="reconcile-platform-owner", role="platform_owner")
+    assert has_permission(platform_owner, "compute_requests.reconcile") is True
+    assert has_permission(platform_admin, "compute_requests.reconcile") is False
+    session = PortalSession(
+        user_id=platform_owner.id,
+        session_hash="1" * 64,
+        csrf_hash="2" * 64,
+        source_ip="127.0.0.1",
+        user_agent_digest="3" * 64,
+        idle_expires_at=utcnow() + timedelta(hours=1),
+        absolute_expires_at=utcnow() + timedelta(hours=1),
+    )
+    database.add(session)
+    database.commit()
+    context = AuthContext(platform_owner, session, "fixture")
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/", "headers": [], "client": None}
+    )
+    security_checks = {"csrf": 0, "recent_auth": 0}
+
+    def csrf_check(*_args):  # type: ignore[no-untyped-def]
+        security_checks["csrf"] += 1
+
+    def recent_auth_check(*_args):  # type: ignore[no-untyped-def]
+        security_checks["recent_auth"] += 1
+
+    monkeypatch.setattr("h100_portal_api.routes.compute_requests.require_session_csrf", csrf_check)
+    monkeypatch.setattr(
+        "h100_portal_api.routes.compute_requests.require_recent_reauthentication",
+        recent_auth_check,
+    )
+    monkeypatch.setattr("h100_portal_api.routes.compute_requests.call_worker", worker_plan())
+    body = ComputeProvisionReconciliationRequest(
+        idempotency_key=uuid.uuid4(),
+        plan_id=plan.id,
+        failed_stage_operation_id=failed_stage.id,
+        review_note="host and Portal zero-residue evidence independently verified",
+    )
+    approval_count = database.scalar(
+        select(func.count())
+        .select_from(PortalAuditEvent)
+        .where(PortalAuditEvent.event_type == "COMPUTE_RESOURCE_REQUEST_APPROVED")
+    )
+    reconciled = reconcile_failed_provision(str(item.id), body, request, context, database)
+    assert reconciled["status"] == "RECONCILED"
+    assert reconciled["rollback"] == "VERIFIED"
+    assert reconciled["attempt_created"] is False
+    assert security_checks == {"csrf": 1, "recent_auth": 1}
+
+    database.expire_all()
+    preserved_plan = database.get(PortalProvisionPlan, plan.id)
+    preserved_stage = database.get(PortalOperation, failed_stage.id)
+    preserved_item = database.get(PortalComputeResourceRequest, item.id)
+    assert preserved_plan is not None and preserved_plan.state == "FAILED"
+    assert preserved_item is not None and preserved_item.status == "FAILED"
+    assert preserved_item.provision_plan_id == plan.id and preserved_item.active_slot is None
+    assert preserved_stage is not None and preserved_stage.status == "FAILED"
+    assert preserved_stage.rollback_status == "ROLLED_BACK"
+    assert preserved_stage.dry_run_result is not None
+    assert preserved_stage.dry_run_result["side_effect_classification"] == "PARTIAL_UNKNOWN"
+    released = database.scalars(
+        select(PortalResourceReservation).where(PortalResourceReservation.plan_id == plan.id)
+    ).all()
+    assert len(released) == 5
+    assert all(
+        row.state == "RELEASED" and row.active_key is None and row.released_at is not None
+        for row in released
+    )
+    reconciliation = database.scalar(
+        select(PortalOperation).where(
+            PortalOperation.operation_type == "compute.provision.reconcile"
+        )
+    )
+    assert reconciliation is not None and reconciliation.status == "SUCCEEDED"
+    assert reconciliation.validated_payload["failed_stage_operation_id"] == str(failed_stage.id)
+    assert reconciliation.validated_payload["rollback_verified"] is True
+    assert reconciliation.validated_payload["attempt_created"] is False
+    assert database.scalar(select(func.count()).select_from(PortalProvisionPlan)) == 1
+    assert (
+        database.scalar(
+            select(func.count())
+            .select_from(PortalAuditEvent)
+            .where(PortalAuditEvent.event_type == "COMPUTE_RESOURCE_REQUEST_APPROVED")
+        )
+        == approval_count
+    )
+
+    replay = reconcile_failed_provision(str(item.id), body, request, context, database)
+    assert replay["idempotent_replay"] is True
+    assert replay["operation_id"] == str(reconciliation.id)
+    assert (
+        database.scalar(
+            select(func.count())
+            .select_from(PortalOperation)
+            .where(PortalOperation.operation_type == "compute.provision.reconcile")
+        )
+        == 1
+    )
+    retry_authorized = authorize_provision_retry(
+        str(item.id),
+        ComputeProvisionRetryAuthorizationRequest(
+            idempotency_key=uuid.uuid4(),
+            failure_classification="PARTIAL_ROLLED_BACK",
+            safe_root_cause="Docker default root was rejected as a missing Config.User field",
+            authorization_reason="formal reconciliation proved zero residue",
+            remediation_git_commit="a" * 40,
+        ),
+        request,
+        context,
+        database,
+    )
+    assert retry_authorized["status"] == "RETRY_AUTHORIZED"
+    assert database.scalar(select(func.count()).select_from(PortalProvisionPlan)) == 1
+
+
+def test_failed_hold_reconciliation_verification_failure_preserves_holds(
+    database, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _owner, item, plan, _reservations, failed_stage = manual_review_stage_fixture(
+        database, login="reconcile-residue-user"
+    )
+    admin = account(database, login="reconcile-residue-owner", role="platform_owner")
+    session = PortalSession(
+        user_id=admin.id,
+        session_hash="d" * 64,
+        csrf_hash="e" * 64,
+        source_ip="127.0.0.1",
+        user_agent_digest="f" * 64,
+        idle_expires_at=utcnow() + timedelta(hours=1),
+        absolute_expires_at=utcnow() + timedelta(hours=1),
+    )
+    database.add(session)
+    database.commit()
+    context = AuthContext(admin, session, "fixture")
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/", "headers": [], "client": None}
+    )
+    monkeypatch.setattr(
+        "h100_portal_api.routes.compute_requests.require_session_csrf", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        "h100_portal_api.routes.compute_requests.require_recent_reauthentication",
+        lambda *_args: None,
+    )
+
+    def residue_worker(operation_type, **_kwargs):  # type: ignore[no-untyped-def]
+        assert operation_type == "compute.provision.retry_verify"
+        return {
+            "status": "DRY_RUN",
+            "handler": operation_type,
+            "retry_verification_status": "CONFLICT",
+            "script_integrity": "PASS",
+            "resource_residue": ["slurm-association"],
+            "unknown_resource_state": [],
+        }
+
+    monkeypatch.setattr("h100_portal_api.routes.compute_requests.call_worker", residue_worker)
+    with pytest.raises(HTTPException) as blocked:
+        reconcile_failed_provision(
+            str(item.id),
+            ComputeProvisionReconciliationRequest(
+                idempotency_key=uuid.uuid4(),
+                plan_id=plan.id,
+                failed_stage_operation_id=failed_stage.id,
+                review_note="fixture still has a retained Slurm association",
+            ),
+            request,
+            context,
+            database,
+        )
+    assert getattr(blocked.value, "detail", {}).get("code") == (
+        "PROVISION_RECONCILIATION_VERIFICATION_FAILED"
+    )
+    database.expire_all()
+    assert database.get(PortalOperation, failed_stage.id).rollback_status == (
+        "REQUIRES_MANUAL_REVIEW"
+    )
+    held = database.scalars(
+        select(PortalResourceReservation).where(PortalResourceReservation.plan_id == plan.id)
+    ).all()
+    assert all(row.state == "FAILED_HOLD" and row.active_key for row in held)
+    assert (
+        database.scalar(
+            select(func.count())
+            .select_from(PortalOperation)
+            .where(PortalOperation.operation_type == "compute.provision.reconcile")
+        )
+        == 0
     )
 
 

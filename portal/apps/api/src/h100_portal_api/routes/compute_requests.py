@@ -45,6 +45,7 @@ from h100_portal_api.models import (
 from h100_portal_api.rbac import highest_role
 from h100_portal_api.schemas import (
     ComputeProvisionActionRequest,
+    ComputeProvisionReconciliationRequest,
     ComputeProvisionRetryAuthorizationRequest,
     ComputeResourceRequestCancel,
     ComputeResourceRequestCreate,
@@ -94,11 +95,19 @@ def _ready_stage_contract(result: Any) -> dict[str, Any] | None:
     handler = contract.get("handler")
     argv_contract = contract.get("argv_contract")
     confirmation_gate = contract.get("confirmation_gate")
+    image_contract = contract.get("image_contract")
     argument_13 = argv_contract.get("argument_13") if isinstance(argv_contract, dict) else None
     argument_14 = argv_contract.get("argument_14") if isinstance(argv_contract, dict) else None
     if (
         set(contract)
-        != {"status", "contract_sha256", "handler", "argv_contract", "confirmation_gate"}
+        != {
+            "status",
+            "contract_sha256",
+            "handler",
+            "argv_contract",
+            "confirmation_gate",
+            "image_contract",
+        }
         or not isinstance(contract_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", contract_sha256) is None
         or not isinstance(handler, dict)
@@ -145,6 +154,41 @@ def _ready_stage_contract(result: Any) -> dict[str, Any] | None:
         or not isinstance(confirmation_gate.get("validator_sha256"), str)
         or re.fullmatch(r"[0-9a-f]{64}", confirmation_gate["validator_sha256"]) is None
         or confirmation_gate.get("status") != "PASS"
+        or not isinstance(image_contract, dict)
+        or set(image_contract)
+        != {
+            "status",
+            "validator_version",
+            "identity_sha256",
+            "reference",
+            "image_id",
+            "repo_digests",
+            "created_at",
+            "build_user",
+            "failure_code",
+        }
+        or image_contract.get("status") != "PASS"
+        or image_contract.get("validator_version") != "compute-provision-stage-image-validator-v1"
+        or not isinstance(image_contract.get("identity_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", image_contract["identity_sha256"]) is None
+        or not isinstance(image_contract.get("reference"), str)
+        or re.fullmatch(r"[A-Za-z0-9._/@:+-]+", image_contract["reference"]) is None
+        or not isinstance(image_contract.get("image_id"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_contract["image_id"]) is None
+        or not isinstance(image_contract.get("repo_digests"), list)
+        or not all(
+            isinstance(value, str)
+            and re.fullmatch(r"[A-Za-z0-9._/@:+-]+@sha256:[0-9a-f]{64}", value)
+            for value in image_contract["repo_digests"]
+        )
+        or not any(
+            value.endswith(f"@{image_contract['image_id']}")
+            for value in image_contract["repo_digests"]
+        )
+        or not isinstance(image_contract.get("created_at"), str)
+        or len(image_contract["created_at"]) > 64
+        or image_contract.get("build_user") not in {"DEFAULT_ROOT", "EXPLICIT_ROOT"}
+        or image_contract.get("failure_code") is not None
     ):
         return None
     return contract
@@ -195,6 +239,7 @@ def _operation(
     payload: dict[str, Any],
     status_value: OperationStatus = OperationStatus.SUCCEEDED,
     result_summary: str | None = None,
+    risk_level: RiskLevel = RiskLevel.MEDIUM,
 ) -> PortalOperation:
     now = utcnow()
     operation = PortalOperation(
@@ -207,7 +252,7 @@ def _operation(
         request_summary=summary,
         validated_payload=payload,
         idempotency_key=f"{operation_type}:{idempotency_key}",
-        risk_level=RiskLevel.MEDIUM,
+        risk_level=risk_level,
         status=status_value,
         created_at=now,
         approved_at=now,
@@ -308,6 +353,9 @@ def _safe_operation_view(operation: PortalOperation | None) -> dict[str, Any] | 
         "last_successful_step": evidence.get("last_successful_step"),
         "first_failed_step": evidence.get("first_failed_step"),
         "failed_handler": evidence.get("failed_handler"),
+        "retained_resources": evidence.get("retained_resources"),
+        "rollback_steps": evidence.get("rollback_steps"),
+        "stage_failure_code": evidence.get("stage_failure_code"),
     }
 
 
@@ -332,6 +380,7 @@ def _attempt_history(
                         "compute.provision.plan",
                         "compute.provision.dry_run",
                         "compute.provision.retry_authorize",
+                        "compute.provision.reconcile",
                         "compute.provision.stage",
                     }
                 ),
@@ -361,7 +410,7 @@ def _attempt_history(
                     "compute.provision.stage",
                 }
             )
-        bound.sort(key=lambda operation: operation.created_at)
+        bound.sort(key=lambda operation: ensure_utc(operation.created_at))
         stage = next(
             (
                 operation
@@ -746,6 +795,116 @@ def _retry_verification_payload(
     }
 
 
+def _failed_stage_reconciliation_source(
+    db: Session,
+    item: PortalComputeResourceRequest,
+    body: ComputeProvisionReconciliationRequest,
+) -> tuple[PortalProvisionPlan, list[PortalResourceReservation], PortalOperation]:
+    """Lock the exact manual-review Stage and its five allocator holds."""
+    if item.provision_plan_id != body.plan_id or item.managed_user_id is not None:
+        raise _error(
+            409,
+            "PROVISION_RECONCILIATION_BINDING_FAILED",
+            "人工对账未绑定当前失败 Attempt",
+        )
+    plan = db.scalar(
+        select(PortalProvisionPlan).where(PortalProvisionPlan.id == body.plan_id).with_for_update()
+    )
+    failed_stage = db.scalar(
+        select(PortalOperation)
+        .where(PortalOperation.id == body.failed_stage_operation_id)
+        .with_for_update()
+    )
+    reservations = list(
+        db.scalars(
+            select(PortalResourceReservation)
+            .where(PortalResourceReservation.plan_id == body.plan_id)
+            .with_for_update()
+        ).all()
+    )
+    expected_values = (
+        {
+            ("UID", str(plan.uid)),
+            ("GID", str(plan.gid)),
+            ("PROJECT_ID", str(plan.project_id)),
+            ("SSH_PORT", str(plan.container_ssh_port)),
+            ("CONTAINER_NAME", plan.container_name),
+        }
+        if plan is not None
+        else set()
+    )
+    reservation_ids = {row.resource_type: str(row.id) for row in reservations}
+    stage_payload = failed_stage.validated_payload if failed_stage is not None else {}
+    stage_result = failed_stage.dry_run_result if failed_stage is not None else {}
+    eligible = (
+        item.status == "FAILED"
+        and item.active_slot is None
+        and plan is not None
+        and plan.request_id == item.id
+        and plan.portal_account_id == item.portal_account_id
+        and plan.state == "FAILED"
+        and plan.execution_enabled
+        and failed_stage is not None
+        and failed_stage.operation_type == "compute.provision.stage"
+        and failed_stage.target_id == str(item.id)
+        and failed_stage.status == OperationStatus.FAILED
+        and failed_stage.rollback_status == "REQUIRES_MANUAL_REVIEW"
+        and isinstance(stage_result, dict)
+        and stage_result.get("side_effect_classification")
+        in {"PARTIAL_UNKNOWN", "PARTIAL_ROLLBACK_FAILED"}
+        and stage_payload.get("request_id") == str(item.id)
+        and stage_payload.get("plan_id") == str(plan.id)
+        and stage_payload.get("reservation_ids") == reservation_ids
+        and len(reservations) == 5
+        and {(row.resource_type, row.resource_value) for row in reservations} == expected_values
+        and all(
+            row.request_id == item.id
+            and row.portal_account_id == item.portal_account_id
+            and row.state == "FAILED_HOLD"
+            and row.active_key == f"{row.resource_type}:{row.resource_value}"
+            and row.consumed_at is None
+            and row.released_at is None
+            for row in reservations
+        )
+    )
+    if not eligible or plan is None or failed_stage is None:
+        raise _error(
+            409,
+            "PROVISION_RECONCILIATION_NOT_ELIGIBLE",
+            "失败 Attempt 不满足人工 rollback 对账条件",
+        )
+    return plan, reservations, failed_stage
+
+
+def _successful_reconciliation(
+    db: Session,
+    item: PortalComputeResourceRequest,
+    plan: PortalProvisionPlan,
+    failed_stage: PortalOperation,
+) -> PortalOperation | None:
+    reconciliation = db.scalar(
+        select(PortalOperation)
+        .where(
+            PortalOperation.operation_type == "compute.provision.reconcile",
+            PortalOperation.target_id == str(item.id),
+            PortalOperation.status == OperationStatus.SUCCEEDED,
+        )
+        .order_by(PortalOperation.created_at.desc())
+    )
+    payload = reconciliation.validated_payload if reconciliation is not None else {}
+    if (
+        reconciliation is None
+        or payload.get("request_id") != str(item.id)
+        or payload.get("plan_id") != str(plan.id)
+        or payload.get("failed_stage_operation_id") != str(failed_stage.id)
+        or payload.get("rollback_verified") is not True
+        or payload.get("verified_classification") != "PARTIAL_ROLLED_BACK"
+        or payload.get("reservation_state") != "RELEASED"
+    ):
+        return None
+    return reconciliation
+
+
 def _authorized_retry_source(
     db: Session, item: PortalComputeResourceRequest
 ) -> tuple[
@@ -1038,6 +1197,157 @@ def review_compute_request(
     return {"status": item.status, "request": _request_view(db, item, internal=True)}
 
 
+@router.post("/admin/compute-resource-requests/{request_id}/reconcile-failed-provision")
+def reconcile_failed_provision(
+    request_id: str,
+    body: ComputeProvisionReconciliationRequest,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("compute_requests.reconcile")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Formally verify zero residue, then release only the bound FAILED_HOLD rows."""
+    require_session_csrf(request, context)
+    require_recent_reauthentication(context)
+    item = _admin_request(db, _request_id(request_id), lock=True)
+    _deny_self_administration(item, context)
+    idempotency_key = f"compute.provision.reconcile:{body.idempotency_key}"
+    existing = db.scalar(
+        select(PortalOperation).where(
+            PortalOperation.operation_type == "compute.provision.reconcile",
+            PortalOperation.target_id == str(item.id),
+            PortalOperation.idempotency_key == idempotency_key,
+            PortalOperation.status == OperationStatus.SUCCEEDED,
+        )
+    )
+    if existing is not None:
+        payload = existing.validated_payload
+        if payload.get("plan_id") != str(body.plan_id) or payload.get(
+            "failed_stage_operation_id"
+        ) != str(body.failed_stage_operation_id):
+            raise _error(
+                409,
+                "PROVISION_RECONCILIATION_IDEMPOTENCY_CONFLICT",
+                "对账幂等键已绑定其他失败 Attempt",
+            )
+        return {
+            "status": "RECONCILED",
+            "operation_id": str(existing.id),
+            "idempotent_replay": True,
+            "attempt_created": False,
+            "request": _request_view(db, item, internal=True),
+        }
+
+    plan, reservations, failed_stage = _failed_stage_reconciliation_source(db, item, body)
+    portal_zero_residue = assert_zero_compute_side_effects(db, item.portal_account_id)
+    if not all(portal_zero_residue.values()):
+        raise _error(
+            409,
+            "PROVISION_RECONCILIATION_PORTAL_RESIDUE_DETECTED",
+            "Portal 仍记录计算资源，FAILED_HOLD 保持不变",
+        )
+    verification = _worker_dry_run(
+        "compute.provision.retry_verify",
+        payload=_retry_verification_payload(item, plan, failed_stage),
+        context=context,
+        idempotency_key=f"compute-reconcile-verify:{failed_stage.id}:{body.idempotency_key}",
+    )
+    if (
+        verification.get("handler") != "compute.provision.retry_verify"
+        or verification.get("retry_verification_status") != "VERIFIED_ZERO_RESIDUE"
+        or verification.get("script_integrity") != "PASS"
+        or verification.get("resource_residue") != []
+        or verification.get("unknown_resource_state") != []
+    ):
+        raise _error(
+            409,
+            "PROVISION_RECONCILIATION_VERIFICATION_FAILED",
+            "Root Worker 未能形式化证明零残留；FAILED_HOLD 保持不变",
+        )
+
+    initial_result = (
+        failed_stage.dry_run_result if isinstance(failed_stage.dry_run_result, dict) else {}
+    )
+    initial_classification = str(
+        initial_result.get("side_effect_classification", "PARTIAL_UNKNOWN")
+    )[:64]
+    operation = _operation(
+        db,
+        context=context,
+        operation_type="compute.provision.reconcile",
+        target_id=item.id,
+        idempotency_key=str(body.idempotency_key),
+        summary="Platform owner verified failed Provision rollback",
+        payload={
+            "request_id": str(item.id),
+            "plan_id": str(plan.id),
+            "failed_stage_operation_id": str(failed_stage.id),
+            "reservation_ids": {
+                row.resource_type: str(row.id)
+                for row in sorted(reservations, key=lambda row: row.resource_type)
+            },
+            "initial_classification": initial_classification,
+            "verified_classification": "PARTIAL_ROLLED_BACK",
+            "rollback_verified": True,
+            "portal_zero_residue": True,
+            "worker_zero_residue": True,
+            "script_integrity": "PASS",
+            "reservation_state": "RELEASED",
+            "review_note": body.review_note,
+            "approval_repeated": False,
+            "attempt_created": False,
+        },
+        result_summary=(
+            "Rollback verified from Portal and Root Worker zero-residue evidence; "
+            "FAILED_HOLD reservations released; no retry attempt created"
+        ),
+        risk_level=RiskLevel.CRITICAL,
+    )
+    now = utcnow()
+    failed_stage.rollback_status = "ROLLED_BACK"
+    for reservation in reservations:
+        reservation.state = "RELEASED"
+        reservation.active_key = None
+        reservation.consumed_at = None
+        reservation.released_at = now
+    _audit(
+        db,
+        request,
+        context,
+        event_type="COMPUTE_PROVISION_ROLLBACK_RECONCILED",
+        object_type="provision_plan",
+        object_id=str(plan.id),
+        metadata={
+            "request_id": str(item.id),
+            "failed_stage_operation_id": str(failed_stage.id),
+            "initial_classification": initial_classification,
+            "verified_classification": "PARTIAL_ROLLED_BACK",
+            "rollback_verified": True,
+            "reservation_state": "RELEASED",
+            "approval_repeated": False,
+            "attempt_created": False,
+        },
+        operation_id=operation.id,
+    )
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise _error(
+            409,
+            "PROVISION_RECONCILIATION_CONFLICT",
+            "失败 Attempt 对账并发冲突；请刷新后重新核验",
+        ) from exc
+    return {
+        "status": "RECONCILED",
+        "operation_id": str(operation.id),
+        "idempotent_replay": False,
+        "attempt_created": False,
+        "rollback": "VERIFIED",
+        "reservation_state": "RELEASED",
+        "request": _request_view(db, item, internal=True),
+    }
+
+
 @router.post("/admin/compute-resource-requests/{request_id}/retry-authorize")
 def authorize_provision_retry(
     request_id: str,
@@ -1086,9 +1396,13 @@ def authorize_provision_retry(
         )
     recorded = failed_stage.dry_run_result if isinstance(failed_stage.dry_run_result, dict) else {}
     recorded_classification = recorded.get("side_effect_classification")
-    if (
-        recorded_classification is not None
-        and recorded_classification != body.failure_classification
+    reconciled_classification = bool(
+        recorded_classification in {"PARTIAL_UNKNOWN", "PARTIAL_ROLLBACK_FAILED"}
+        and body.failure_classification == "PARTIAL_ROLLED_BACK"
+        and _successful_reconciliation(db, item, failed_plan, failed_stage) is not None
+    )
+    if recorded_classification is not None and (
+        recorded_classification != body.failure_classification and not reconciled_classification
     ):
         raise _error(
             409,
@@ -1916,6 +2230,17 @@ def provision_reserved_compute_environment(
             if isinstance(raw_retained, list)
             else ["UNKNOWN"]
         )
+        raw_rollback_steps = worker.get("rollback_steps")
+        rollback_steps = (
+            {
+                str(key)[:64]: str(value)[:32]
+                for key, value in sorted(raw_rollback_steps.items())
+                if re.fullmatch(r"[A-Z0-9_]+", str(key))
+                and str(value) in {"SUCCEEDED", "FAILED", "BLOCKED", "NOT_REQUIRED"}
+            }
+            if isinstance(raw_rollback_steps, dict)
+            else {}
+        )
         expected_rollback = {
             "NO_SIDE_EFFECT": "NOT_REQUIRED",
             "PARTIAL_ROLLED_BACK": "ROLLED_BACK",
@@ -1939,6 +2264,10 @@ def provision_reserved_compute_environment(
             "failed_handler": str(worker.get("failed_handler", "compute.provision.stage"))[:128],
             "safe_error_message": str(error.get("message", "Compute Stage failed"))[:500],
             "retained_resources": retained,
+            "rollback_steps": rollback_steps,
+            "stage_failure_code": str(
+                worker.get("stage_failure_code", "FIXED_STAGE_SCRIPT_FAILED")
+            )[:128],
         }
         for reservation in reservations:
             reservation.state = "FAILED_HOLD" if held else "RELEASED"

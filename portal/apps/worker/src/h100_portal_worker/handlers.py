@@ -34,6 +34,7 @@ from h100_portal_worker.schemas import (
     COMPUTE_STAGE_CONFIRMATION_VALIDATOR_VERSION,
     COMPUTE_STAGE_HANDLER_IDENTITY,
     COMPUTE_STAGE_HANDLER_PATH,
+    COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION,
     KNOWN_WRITES,
     STANDARD_COMPUTE_LEASE_SECONDS,
     STANDARD_COMPUTE_PROFILE,
@@ -2548,23 +2549,149 @@ def _xfs_project_quota_capable() -> bool:
     )
 
 
-def _standard_dev_image_available() -> bool:
-    """Bind the future standard profile to the already accepted Pilot image."""
+def _standard_dev_image_identity() -> dict[str, Any]:
+    """Validate and identify the accepted local image without exposing its environment."""
+    failed: dict[str, Any] = {
+        "status": "FAIL",
+        "validator_version": COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION,
+        "identity_sha256": None,
+        "reference": None,
+        "image_id": None,
+        "repo_digests": [],
+        "created_at": None,
+        "build_user": "UNKNOWN",
+        "failure_code": "SOURCE_CONTAINER_UNAVAILABLE",
+    }
     source = run_fixed("docker", ["container", "inspect", "gpu-dev-origin-pilot"], timeout=15)
     if not source.get("ok"):
-        return False
+        return failed
     try:
         parsed = json.loads(str(source.get("stdout", "")))
         item = parsed[0] if isinstance(parsed, list) and parsed else {}
+        image_reference = (
+            item.get("Config", {}).get("Image")
+            if isinstance(item, dict) and isinstance(item.get("Config"), dict)
+            else None
+        )
         image_id = item.get("Image") if isinstance(item, dict) else None
     except json.JSONDecodeError, IndexError:
-        return False
+        return {**failed, "failure_code": "SOURCE_CONTAINER_IDENTITY_INVALID"}
+    if not isinstance(image_reference, str) or not re.fullmatch(
+        r"[A-Za-z0-9._/@:+-]+", image_reference
+    ):
+        return {**failed, "failure_code": "IMAGE_REFERENCE_INVALID"}
     if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
-        return False
-    return bool(run_fixed("docker", ["image", "inspect", image_id], timeout=20).get("ok"))
+        return {
+            **failed,
+            "reference": image_reference,
+            "failure_code": "IMAGE_ID_INVALID",
+        }
+    inspected = run_fixed("docker", ["image", "inspect", image_reference], timeout=20)
+    if not inspected.get("ok"):
+        return {
+            **failed,
+            "reference": image_reference,
+            "image_id": image_id,
+            "failure_code": "IMAGE_UNAVAILABLE",
+        }
+    try:
+        parsed_images = json.loads(str(inspected.get("stdout", "")))
+        image = parsed_images[0] if isinstance(parsed_images, list) and parsed_images else {}
+    except json.JSONDecodeError, IndexError:
+        return {
+            **failed,
+            "reference": image_reference,
+            "image_id": image_id,
+            "failure_code": "IMAGE_METADATA_INVALID",
+        }
+    if not isinstance(image, dict) or image.get("Id") != image_id:
+        return {
+            **failed,
+            "reference": image_reference,
+            "image_id": image_id,
+            "failure_code": "IMAGE_TAG_ID_MISMATCH",
+        }
+    config = image.get("Config")
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    expected_labels = {
+        "h100.dev.user": "origin-pilot",
+        "h100.dev.uid": "20001",
+        "h100.dev.gid": "20001",
+    }
+    if not isinstance(labels, dict) or any(
+        labels.get(key) != value for key, value in expected_labels.items()
+    ):
+        return {
+            **failed,
+            "reference": image_reference,
+            "image_id": image_id,
+            "failure_code": "IMAGE_IDENTITY_LABELS_INVALID",
+        }
+    config_user = config.get("User") if isinstance(config, dict) else None
+    if config_user not in {None, "", "root"}:
+        return {
+            **failed,
+            "reference": image_reference,
+            "image_id": image_id,
+            "failure_code": "IMAGE_BUILD_USER_INVALID",
+        }
+    repo_digests = image.get("RepoDigests")
+    safe_repo_digests = (
+        sorted(item for item in repo_digests if isinstance(item, str))
+        if isinstance(repo_digests, list)
+        else []
+    )
+    digest_pattern = r"[A-Za-z0-9._/@:+-]+@sha256:[0-9a-f]{64}"
+    if (
+        not safe_repo_digests
+        or any(re.fullmatch(digest_pattern, item) is None for item in safe_repo_digests)
+        or not any(item.endswith(f"@{image_id}") for item in safe_repo_digests)
+    ):
+        return {
+            **failed,
+            "reference": image_reference,
+            "image_id": image_id,
+            "failure_code": "IMAGE_REPO_DIGEST_INVALID",
+        }
+    created_at = image.get("Created")
+    if not isinstance(created_at, str) or not created_at or len(created_at) > 64:
+        return {
+            **failed,
+            "reference": image_reference,
+            "image_id": image_id,
+            "failure_code": "IMAGE_CREATED_AT_INVALID",
+        }
+    build_user = "DEFAULT_ROOT" if config_user in {None, ""} else "EXPLICIT_ROOT"
+    identity = {
+        "validator_version": COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION,
+        "reference": image_reference,
+        "image_id": image_id,
+        "repo_digests": safe_repo_digests,
+        "created_at": created_at,
+        "build_user": build_user,
+        "identity_labels": expected_labels,
+    }
+    return {
+        "status": "PASS",
+        "validator_version": COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION,
+        "identity_sha256": _stage_contract_sha256(identity),
+        "reference": image_reference,
+        "image_id": image_id,
+        "repo_digests": safe_repo_digests,
+        "created_at": created_at,
+        "build_user": build_user,
+        "failure_code": None,
+    }
 
 
-def _compute_platform_checks(username: str) -> list[dict[str, str]]:
+def _standard_dev_image_available() -> bool:
+    """Compatibility predicate backed by the complete Stage image validator."""
+    return bool(_standard_dev_image_identity().get("status") == "PASS")
+
+
+def _compute_platform_checks(
+    username: str, *, image_identity: dict[str, Any] | None = None
+) -> list[dict[str, str]]:
     checks: list[dict[str, str]] = []
     data_parent_ok = PILOT_DATA_ROOT.exists() and PILOT_DATA_ROOT.is_dir()
     checks.append(
@@ -2624,12 +2751,13 @@ def _compute_platform_checks(username: str) -> list[dict[str, str]]:
             "Guard timer readiness 无法证明",
         )
     )
+    observed_image = _standard_dev_image_identity() if image_identity is None else image_identity
     checks.append(
         _check(
             "standard_container_image_available",
-            _standard_dev_image_available(),
-            "已验收 Pilot 开发容器镜像在本机可用",
-            "标准开发容器镜像不可用",
+            observed_image.get("status") == "PASS",
+            "已验收 Pilot 开发容器镜像身份、标签与 build user 均通过",
+            f"标准开发容器镜像校验失败：{observed_image.get('failure_code', 'UNKNOWN')}",
         )
     )
     return checks
@@ -2865,7 +2993,10 @@ def _stage_contract_sha256(value: Any) -> str:
 
 
 def _compute_stage_contract(
-    payload: dict[str, Any], *, integrity: dict[str, Any] | None = None
+    payload: dict[str, Any],
+    *,
+    integrity: dict[str, Any] | None = None,
+    image_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate and identify the deployed Stage artifact without exposing argv values."""
     observed_integrity = script_integrity() if integrity is None else integrity
@@ -2905,6 +3036,17 @@ def _compute_stage_contract(
         shape_valid and argv[2] == username and argv[14] == username and argv[2] == argv[14]
     )
     confirmation_valid = argument_13_valid and argument_14_valid
+    image_contract = (
+        _standard_dev_image_identity() if image_identity is None else dict(image_identity)
+    )
+    image_valid = bool(
+        image_contract.get("status") == "PASS"
+        and image_contract.get("validator_version") == COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION
+        and isinstance(image_contract.get("identity_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", str(image_contract.get("identity_sha256")))
+        and isinstance(image_contract.get("image_id"), str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(image_contract.get("image_id")))
+    )
 
     binding_identity = [
         {
@@ -2944,6 +3086,8 @@ def _compute_stage_contract(
             "argv_contract_sha256": argv_contract_sha256,
             "confirmation_validator_version": COMPUTE_STAGE_CONFIRMATION_VALIDATOR_VERSION,
             "confirmation_validator_sha256": validator_sha256,
+            "image_validator_version": image_contract.get("validator_version"),
+            "image_identity_sha256": image_contract.get("identity_sha256"),
         }
     )
     passed = (
@@ -2952,6 +3096,7 @@ def _compute_stage_contract(
         and shape_valid
         and bindings_valid
         and confirmation_valid
+        and image_valid
     )
     return {
         "status": "PASS" if passed else "FAIL",
@@ -2988,15 +3133,17 @@ def _compute_stage_contract(
             "validator_sha256": validator_sha256,
             "status": "PASS" if confirmation_valid else "FAIL",
         },
+        "image_contract": image_contract,
     }
 
 
 def _compute_provision_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
     username = str(payload["username"])
+    image_identity = _standard_dev_image_identity()
     checks = _compute_target_checks(username, str(payload["container_name"]))
     checks.extend(_compute_exact_resource_checks(payload))
-    checks.extend(_compute_platform_checks(username))
-    stage_contract = _compute_stage_contract(payload)
+    checks.extend(_compute_platform_checks(username, image_identity=image_identity))
+    stage_contract = _compute_stage_contract(payload, image_identity=image_identity)
     checks.extend(
         [
             _check(
@@ -3460,6 +3607,19 @@ def _stage_evidence_marker(stderr: str, label: str) -> str | None:
     return None
 
 
+def _stage_rollback_steps(stderr: str) -> dict[str, str]:
+    pattern = re.compile(
+        r"^COMPUTE STAGE ROLLBACK STEP: "
+        r"([A-Z0-9_]+)=(SUCCEEDED|FAILED|BLOCKED|NOT_REQUIRED)$"
+    )
+    steps: dict[str, str] = {}
+    for line in stderr.splitlines():
+        match = pattern.fullmatch(line.strip())
+        if match:
+            steps[match.group(1)] = match.group(2)
+    return dict(sorted(steps.items()))
+
+
 def _compute_stage_failure_evidence(
     execution: dict[str, Any], retained: list[str]
 ) -> dict[str, Any]:
@@ -3467,6 +3627,7 @@ def _compute_stage_failure_evidence(
     declared = _stage_evidence_marker(stderr, "SIDE EFFECT CLASSIFICATION")
     first_failed_step = _stage_evidence_marker(stderr, "FIRST FAILED STEP")
     last_successful_step = _stage_evidence_marker(stderr, "LAST SUCCESSFUL STEP")
+    stage_failure_code = _stage_evidence_marker(stderr, "FAILURE CODE")
     unknown_resources = any("unknown" in item for item in retained)
     execution_error = str(execution.get("error_code", ""))
     if unknown_resources or execution_error in {
@@ -3493,6 +3654,8 @@ def _compute_stage_failure_evidence(
         "first_failed_step": first_failed_step or "FIXED_STAGE_SCRIPT",
         "failed_handler": "h100-provision-stage",
         "retained_resources": retained,
+        "rollback_steps": _stage_rollback_steps(stderr),
+        "stage_failure_code": stage_failure_code or "FIXED_STAGE_SCRIPT_FAILED",
     }
 
 
@@ -3540,6 +3703,26 @@ def _compute_stage_contract_mismatches(
         "CONFIRMATION_GATE_STATUS": (
             expected.get("confirmation_gate", {}).get("status"),
             current.get("confirmation_gate", {}).get("status"),
+        ),
+        "IMAGE_VALIDATOR_VERSION": (
+            expected.get("image_contract", {}).get("validator_version"),
+            current.get("image_contract", {}).get("validator_version"),
+        ),
+        "IMAGE_IDENTITY": (
+            expected.get("image_contract", {}).get("identity_sha256"),
+            current.get("image_contract", {}).get("identity_sha256"),
+        ),
+        "IMAGE_REFERENCE": (
+            expected.get("image_contract", {}).get("reference"),
+            current.get("image_contract", {}).get("reference"),
+        ),
+        "IMAGE_ID": (
+            expected.get("image_contract", {}).get("image_id"),
+            current.get("image_contract", {}).get("image_id"),
+        ),
+        "IMAGE_VALIDATION_STATUS": (
+            expected.get("image_contract", {}).get("status"),
+            current.get("image_contract", {}).get("status"),
         ),
     }
     return sorted(label for label, values in checks.items() if values[0] != values[1])

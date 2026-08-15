@@ -85,6 +85,7 @@ COMPUTE_STAGE_HANDLER_IDENTITY = "h100-provision-stage"
 COMPUTE_STAGE_HANDLER_PATH = "/usr/local/sbin/h100-provision-stage"
 COMPUTE_STAGE_ARGV_CONTRACT_VERSION = "compute-provision-stage-argv-v1"
 COMPUTE_STAGE_CONFIRMATION_VALIDATOR_VERSION = "compute-provision-stage-confirmation-validator-v1"
+COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION = "compute-provision-stage-image-validator-v1"
 COMPUTE_STAGE_CONTRACT_HASH = re.compile(r"^[0-9a-f]{64}$")
 APPROVED_SSH_KEY_TYPES = {
     "ssh-ed25519",
@@ -436,6 +437,7 @@ def _validate_compute_stage_contract(value: Any) -> dict[str, Any]:
         "handler",
         "argv_contract",
         "confirmation_gate",
+        "image_contract",
     }:
         raise PayloadValidationError(
             "DRY_RUN_STAGE_CONTRACT_INCOMPLETE",
@@ -444,6 +446,7 @@ def _validate_compute_stage_contract(value: Any) -> dict[str, Any]:
     handler = value.get("handler")
     argv_contract = value.get("argv_contract")
     confirmation_gate = value.get("confirmation_gate")
+    image_contract = value.get("image_contract")
     if (
         value.get("status") != "PASS"
         or not isinstance(value.get("contract_sha256"), str)
@@ -482,6 +485,40 @@ def _validate_compute_stage_contract(value: Any) -> dict[str, Any]:
         or not isinstance(confirmation_gate.get("validator_sha256"), str)
         or not COMPUTE_STAGE_CONTRACT_HASH.fullmatch(confirmation_gate["validator_sha256"])
         or confirmation_gate.get("status") != "PASS"
+        or not isinstance(image_contract, dict)
+        or set(image_contract)
+        != {
+            "status",
+            "validator_version",
+            "identity_sha256",
+            "reference",
+            "image_id",
+            "repo_digests",
+            "created_at",
+            "build_user",
+            "failure_code",
+        }
+        or image_contract.get("status") != "PASS"
+        or image_contract.get("validator_version") != COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION
+        or not isinstance(image_contract.get("identity_sha256"), str)
+        or not COMPUTE_STAGE_CONTRACT_HASH.fullmatch(image_contract["identity_sha256"])
+        or not isinstance(image_contract.get("reference"), str)
+        or not re.fullmatch(r"[A-Za-z0-9._/@:+-]+", image_contract["reference"])
+        or not isinstance(image_contract.get("image_id"), str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_contract["image_id"])
+        or not isinstance(image_contract.get("repo_digests"), list)
+        or not all(
+            isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9._/@:+-]+@sha256:[0-9a-f]{64}", item)
+            for item in image_contract["repo_digests"]
+        )
+        or not any(
+            item.endswith(f"@{image_contract['image_id']}")
+            for item in image_contract["repo_digests"]
+        )
+        or not isinstance(image_contract.get("created_at"), str)
+        or len(image_contract["created_at"]) > 64
+        or image_contract.get("build_user") not in {"DEFAULT_ROOT", "EXPLICIT_ROOT"}
+        or image_contract.get("failure_code") is not None
     ):
         raise PayloadValidationError(
             "DRY_RUN_STAGE_CONTRACT_INCOMPLETE",
@@ -521,6 +558,10 @@ def _validate_compute_stage_contract(value: Any) -> dict[str, Any]:
             "argument_14": dict(argv_contract["argument_14"]),
         },
         "confirmation_gate": dict(confirmation_gate),
+        "image_contract": {
+            **image_contract,
+            "repo_digests": list(image_contract["repo_digests"]),
+        },
     }
 
 

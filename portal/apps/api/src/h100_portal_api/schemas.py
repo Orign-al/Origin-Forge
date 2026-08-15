@@ -138,6 +138,23 @@ class ComputeProvisionRetryAuthorizationRequest(ApiModel):
         return normalized
 
 
+class ComputeProvisionReconciliationRequest(ApiModel):
+    """Typed, owner-only attestation for a failed Stage host reconciliation."""
+
+    idempotency_key: uuid.UUID
+    plan_id: uuid.UUID
+    failed_stage_operation_id: uuid.UUID
+    review_note: str = Field(min_length=1, max_length=500)
+
+    @field_validator("review_note")
+    @classmethod
+    def normalize_review_note(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("review note must not be blank")
+        return normalized
+
+
 class ChangePasswordRequest(ApiModel):
     current_password: str = Field(min_length=1, max_length=128)
     new_password: str = Field(min_length=14, max_length=128)
