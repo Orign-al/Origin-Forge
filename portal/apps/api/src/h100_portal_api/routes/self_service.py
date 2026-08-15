@@ -1258,27 +1258,92 @@ def admin_lease_recovery_incidents(
     for lease, managed, container in rows:
         operation = _expiry_operation(db, lease)
         evidence = expiry_service.cleanup_evidence(operation) if operation is not None else None
+        recycle_item = db.scalar(
+            select(PortalResourceRecycleItem).where(PortalResourceRecycleItem.lease_id == lease.id)
+        )
+        key_states = sorted(
+            {
+                key.container_install_state
+                for key in db.scalars(
+                    select(PortalSshKey).where(
+                        PortalSshKey.owner_managed_user_id == managed.id,
+                        PortalSshKey.active.is_(True),
+                    )
+                ).all()
+            }
+        )
+        container_ssh_authorization = (
+            "KEY_INSTALLED"
+            if "INSTALLED" in key_states
+            else (
+                "SUSPENDED_BY_RECYCLE" if "SUSPENDED_BY_RECYCLE" in key_states else "NOT_INSTALLED"
+            )
+        )
+        operation_status = (
+            operation.status.value
+            if operation is not None and hasattr(operation.status, "value")
+            else (str(operation.status) if operation is not None else None)
+        )
+        manual_review_required = evidence.get("manual_review_required") if evidence else True
+        recovery_available = bool(
+            operation is not None
+            and operation_status == OperationStatus.FAILED.value
+            and manual_review_required is True
+            and recycle_item is None
+        )
+        last_transition_at = (
+            operation.finished_at or operation.started_at or operation.created_at
+            if operation is not None
+            else lease.expired_at or lease.recycled_at or lease.created_at
+        )
         incidents.append(
             {
                 "lease_id": str(lease.id),
+                "portal_user_id": str(managed.portal_user_id),
                 "username": managed.unix_username,
+                "owner": managed.unix_username,
+                "starts_at": ensure_utc(lease.starts_at).isoformat(),
                 "expires_at": ensure_utc(lease.expires_at).isoformat(),
+                "current_time": ensure_utc(now).isoformat(),
+                "time_expired": ensure_utc(lease.expires_at) <= ensure_utc(now),
                 "lease_state": lease.state,
+                "recycle_state": (
+                    recycle_item.state if recycle_item is not None else operation_status
+                ),
+                "last_transition_at": (
+                    ensure_utc(last_transition_at).isoformat()
+                    if last_transition_at is not None
+                    else None
+                ),
                 "compute_environment_state": managed.compute_environment_state,
                 "container_name": container.name,
                 "container_desired_state": container.desired_state,
                 "container_observed_state": container.observed_state,
+                "connection_authorization_state": "DENIED_EXPIRED_LEASE",
+                "container_ssh_authorization_state": container_ssh_authorization,
                 "operation_id": str(operation.id) if operation is not None else None,
-                "operation_status": operation.status if operation is not None else None,
+                "operation_type": operation.operation_type if operation is not None else None,
+                "operation_status": operation_status,
+                "operation_started_at": (
+                    ensure_utc(operation.started_at).isoformat()
+                    if operation is not None and operation.started_at is not None
+                    else None
+                ),
+                "operation_finished_at": (
+                    ensure_utc(operation.finished_at).isoformat()
+                    if operation is not None and operation.finished_at is not None
+                    else None
+                ),
                 "error_code": operation.error_code if operation is not None else None,
+                "safe_error_message": (
+                    "到期回收未完成；需要平台所有者人工确认后重试。"
+                    if operation_status == OperationStatus.FAILED.value
+                    else None
+                ),
                 "attempt_count": evidence.get("attempt_count") if evidence else None,
                 "next_retry_at": evidence.get("next_retry_at") if evidence else None,
-                "manual_review_required": (
-                    evidence.get("manual_review_required") if evidence else True
-                ),
-                "recovery_available": bool(
-                    operation is not None and operation.status == OperationStatus.FAILED
-                ),
+                "manual_review_required": manual_review_required,
+                "recovery_available": recovery_available,
                 "data_delete_allowed": False,
             }
         )

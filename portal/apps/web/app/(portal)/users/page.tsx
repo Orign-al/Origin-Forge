@@ -50,7 +50,21 @@ const USER_COLUMNS: SimpleColumnDef[] = [
   },
   { accessorKey: "password", header: "密码状态" },
   { accessorKey: "compute", header: "计算环境" },
-  { accessorKey: "lease", header: "Lease" },
+  {
+    accessorKey: "lease",
+    header: "Lease",
+    cell: (info) =>
+      typeof info.getValue() === "string" && info.getValue() ? (
+        <Link
+          className="table-link"
+          href={`/users/${String(info.row.original.id)}?tab=lease`}
+        >
+          查看详情
+        </Link>
+      ) : (
+        <span className="muted">—</span>
+      ),
+  },
   { accessorKey: "last_login", header: "最后登录" },
   { accessorKey: "created", header: "创建时间" },
 ];
@@ -132,8 +146,9 @@ export default function UsersPage() {
         user.resource_onboarding_state === "NOT_ENROLLED"
           ? (user.compute_request?.status ?? "NOT PROVISIONED")
           : user.resource_onboarding_state,
-      lease:
-        user.resource_onboarding_state === "NOT_ENROLLED" ? "—" : "查看详情",
+      lease: user.compute_lifecycle?.has_lease
+        ? (user.compute_lifecycle.lease_id ?? null)
+        : null,
       last_login: localTime(user.last_login_at),
       created: localTime(user.created_at),
     }));

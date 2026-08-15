@@ -29,6 +29,7 @@ from h100_portal_api.enums import (
     RiskLevel,
 )
 from h100_portal_api.models import (
+    PortalComputeLease,
     PortalComputeResourceRequest,
     PortalContainer,
     PortalManagedUser,
@@ -162,6 +163,32 @@ def _admin_user_payload(user: PortalUser, db: Session) -> dict[str, Any]:
         if compute_request is not None
         else None
     )
+    managed = db.scalar(
+        select(PortalManagedUser).where(PortalManagedUser.portal_user_id == user.id)
+    )
+    lease = (
+        db.scalar(
+            select(PortalComputeLease)
+            .where(PortalComputeLease.owner_managed_user_id == managed.id)
+            .order_by(PortalComputeLease.expires_at.desc())
+        )
+        if managed is not None
+        else None
+    )
+    now = utcnow()
+    item["compute_lifecycle"] = (
+        {
+            "has_lease": True,
+            "lease_id": str(lease.id),
+            "owner": managed.unix_username,
+            "starts_at": ensure_utc(lease.starts_at).isoformat(),
+            "expires_at": ensure_utc(lease.expires_at).isoformat(),
+            "time_expired": ensure_utc(lease.expires_at) <= now,
+            "lease_state": lease.state,
+        }
+        if managed is not None and lease is not None
+        else {"has_lease": False}
+    )
     return item
 
 
@@ -187,6 +214,7 @@ def resource_view(
         "gid": resource.gid,
         "shell": resource.shell,
         "host_access_state": resource.host_access_state,
+        "compute_environment_state": resource.compute_environment_state,
         "gpu_isolation_state": resource.gpu_isolation_state,
         "onboarding_state": resource.onboarding_state,
         "ssh_key_state": resource.ssh_key_state,

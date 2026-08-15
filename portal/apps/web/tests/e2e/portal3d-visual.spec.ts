@@ -507,7 +507,7 @@ test("首次登录无 Key 时进入统一 SSH 密钥设置流程", async ({ page
   await page.getByRole("button", { name: "登录" }).click();
   await expect(page).toHaveURL(new RegExp(`/users/${USER_ID}\\?tab=ssh$`, "u"));
   await expect(
-    page.getByText("完成 SSH 密钥设置后即可启用计算环境。"),
+    page.getByText("完成 Container SSH 密钥设置后即可申请激活计算环境。"),
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "生成新密钥" })).toBeVisible();
   await expect(

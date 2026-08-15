@@ -28,11 +28,13 @@ import {
   type SimpleRow,
 } from "../../../../components/Tables";
 import { SshKeyEnrollment } from "../../../../components/SshKeyEnrollment";
+import { LeaseLifecyclePanel } from "../../../../components/LeaseLifecyclePanel";
 
 const TABS = [
   "概览",
   "登录安全",
   "计算资源",
+  "租约 / 生命周期",
   "Linux 身份",
   "GPU 隔离",
   "Slurm",
@@ -265,7 +267,12 @@ export default function UserDetailPage() {
     null,
   );
   const activeTab =
-    selectedTab ?? (searchParams.get("tab") === "ssh" ? "SSH 公钥" : "概览");
+    selectedTab ??
+    (searchParams.get("tab") === "ssh"
+      ? "SSH 公钥"
+      : searchParams.get("tab") === "lease"
+        ? "租约 / 生命周期"
+        : "概览");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const query = useQuery({
@@ -288,6 +295,7 @@ export default function UserDetailPage() {
     );
   const user = query.data.user;
   const linux = user.linux_identity ?? {};
+  const hasManagedCompute = Boolean(linux.managed_user_id);
   const compute = user.compute_onboarding;
   const plan = asRecord(compute?.plan);
   const hostAccess = asRecord(plan.proposed_host_access);
@@ -715,6 +723,51 @@ export default function UserDetailPage() {
                 </>
               )}
             </div>
+          ) : hasManagedCompute ? (
+            <div className="compute-plan">
+              <div className="detail-section-heading">
+                <div>
+                  <h2>现有受管计算环境</h2>
+                  <p className="muted">
+                    该用户使用既存 Managed Compute
+                    Identity；页面直接显示真实资源记录，不伪造新式 Provision
+                    Request。
+                  </p>
+                </div>
+                <StatusBadge
+                  value={String(
+                    linux.compute_environment_state ??
+                      linux.onboarding_state ??
+                      user.resource_onboarding_state,
+                  )}
+                />
+              </div>
+              {kv([
+                ["计算身份", linux.unix_username],
+                ["Managed User ID", linux.managed_user_id],
+                ["UID", linux.uid],
+                ["GID", linux.gid],
+                ["Shell", linux.shell],
+                ["Host access", linux.host_access_state],
+                ["资源 onboarding", linux.onboarding_state],
+                ["Compute environment", linux.compute_environment_state],
+                ["Container", linux.container_name],
+                ["Container runtime", linux.container_state],
+                ["Container GPU", linux.container_gpu ?? "NONE"],
+                ["Slurm account", linux.slurm_account],
+                ["Slurm QOS", linux.slurm_qos],
+                ["Project ID", linux.project_id],
+                ["Quota bytes", linux.quota_bytes],
+              ])}
+              {user.compute_lifecycle?.has_lease ? (
+                <Link
+                  className="table-link"
+                  href={`/users/${user.id}?tab=lease`}
+                >
+                  打开 Lease / 生命周期
+                </Link>
+              ) : null}
+            </div>
           ) : (
             <div className="compute-plan">
               <EmptyState
@@ -735,6 +788,9 @@ export default function UserDetailPage() {
               ) : null}
             </div>
           )
+        ) : null}
+        {activeTab === "租约 / 生命周期" ? (
+          <LeaseLifecyclePanel user={user} />
         ) : null}
         {activeTab === "Linux 身份"
           ? kv([

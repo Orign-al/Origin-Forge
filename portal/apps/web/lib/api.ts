@@ -4,6 +4,55 @@ import { randomUuid } from "./random-uuid";
 
 export { ApiError };
 
+export type ComputeLifecycleSummary = {
+  has_lease: boolean;
+  lease_id?: string;
+  owner?: string;
+  starts_at?: string;
+  expires_at?: string;
+  time_expired?: boolean;
+  lease_state?: string;
+};
+
+export type AdminLeaseRecoveryIncident = {
+  lease_id: string;
+  portal_user_id: string;
+  username: string;
+  owner: string;
+  starts_at: string;
+  expires_at: string;
+  current_time: string;
+  time_expired: boolean;
+  lease_state: string;
+  recycle_state: string | null;
+  last_transition_at: string | null;
+  compute_environment_state: string;
+  container_name: string;
+  container_desired_state: string;
+  container_observed_state: string;
+  connection_authorization_state: string;
+  container_ssh_authorization_state: string;
+  operation_id: string | null;
+  operation_type: string | null;
+  operation_status: string | null;
+  operation_started_at: string | null;
+  operation_finished_at: string | null;
+  error_code: string | null;
+  safe_error_message: string | null;
+  attempt_count: number | null;
+  next_retry_at: string | null;
+  manual_review_required: boolean;
+  recovery_available: boolean;
+  data_delete_allowed: false;
+};
+
+export type LeaseRecoveryOperationResult = {
+  status: "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED";
+  operation_id: string;
+  lease_id: string;
+  idempotent_replay: boolean;
+};
+
 export type User = {
   id: string;
   login_name: string;
@@ -27,6 +76,7 @@ export type User = {
     gpu_max: 0 | 1;
     submitted_at: string | null;
   } | null;
+  compute_lifecycle?: ComputeLifecycleSummary;
   linux_identity?: Record<string, unknown>;
   compute_onboarding?: {
     status: string;
@@ -557,6 +607,23 @@ export const adminComputeRequests = () =>
     requests: ComputeResourceRequest[];
     count: number;
   }>("/admin/compute-resource-requests");
+export const adminLeaseRecoveryIncidents = () =>
+  apiFetch<{
+    status: string;
+    incidents: AdminLeaseRecoveryIncident[];
+    count: number;
+  }>("/admin/lease-recovery-incidents");
+export const retryLeaseRecycle = (
+  leaseId: string,
+  payload: { confirmation: string; safe_reason: string },
+) =>
+  apiFetch<LeaseRecoveryOperationResult>(
+    `/admin/compute-leases/${encodeURIComponent(leaseId)}/recycle-retry`,
+    {
+      method: "POST",
+      body: JSON.stringify({ ...payload, idempotency_key: randomUuid() }),
+    },
+  );
 export const adminComputeRequest = (id: string) =>
   apiFetch<{ status: string; request: ComputeResourceRequest }>(
     `/admin/compute-resource-requests/${encodeURIComponent(id)}`,

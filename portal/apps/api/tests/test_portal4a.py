@@ -976,6 +976,80 @@ def test_platform_owner_recovery_route_is_csrf_reauth_bound_and_idempotent(
     assert recovery.status == OperationStatus.SUCCEEDED
 
 
+def test_admin_recovery_incident_read_model_is_safe_and_owner_only(
+    client,
+    database: Session,
+    origin_headers: dict[str, str],
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(database, remaining_hours=0)
+    prior = PortalOperation(
+        operation_type="lease.expire",
+        target_type="compute_lease",
+        target_id=str(identity.lease.id),
+        requested_by=identity.user.id,
+        owner_managed_user_id=identity.managed.id,
+        request_summary="failed automatic expiry fixture",
+        validated_payload={"secret_marker": "MUST_NOT_REACH_ADMIN_UI"},
+        idempotency_key=f"lease-expire:{identity.lease.id}",
+        risk_level=RiskLevel.HIGH,
+        status=OperationStatus.FAILED,
+        error_code="CONTAINER_STOP_FAILED",
+        result_summary="internal traceback MUST_NOT_REACH_ADMIN_UI",
+        started_at=utcnow(),
+        finished_at=utcnow(),
+    )
+    database.add(prior)
+    admin = _admin(database)
+    database.commit()
+
+    ordinary_headers = _login(client, origin_headers, identity.user.normalized_login)
+    ordinary = client.get("/api/v1/admin/lease-recovery-incidents", headers=ordinary_headers)
+    assert ordinary.status_code == 403
+
+    client.cookies.clear()
+    admin_headers = _login(client, origin_headers, admin.normalized_login)
+    response = client.get("/api/v1/admin/lease-recovery-incidents", headers=admin_headers)
+    assert response.status_code == 200
+    assert response.json()["count"] == 1
+    incident = response.json()["incidents"][0]
+    assert incident == {
+        **incident,
+        "lease_id": str(identity.lease.id),
+        "portal_user_id": str(identity.user.id),
+        "username": "origin-pilot",
+        "owner": "origin-pilot",
+        "time_expired": True,
+        "lease_state": "ACTIVE",
+        "recycle_state": "FAILED",
+        "compute_environment_state": "ACTIVE",
+        "container_name": "gpu-dev-origin-pilot",
+        "container_desired_state": "RUNNING",
+        "container_observed_state": "RUNNING",
+        "connection_authorization_state": "DENIED_EXPIRED_LEASE",
+        "container_ssh_authorization_state": "KEY_INSTALLED",
+        "operation_id": str(prior.id),
+        "operation_type": "lease.expire",
+        "operation_status": "FAILED",
+        "error_code": "CONTAINER_STOP_FAILED",
+        "attempt_count": None,
+        "next_retry_at": None,
+        "manual_review_required": True,
+        "recovery_available": True,
+        "data_delete_allowed": False,
+    }
+    serialized = json.dumps(response.json())
+    assert "MUST_NOT_REACH_ADMIN_UI" not in serialized
+    assert "traceback" not in serialized.lower()
+
+    detail = client.get(f"/api/v1/users/{identity.user.id}", headers=admin_headers)
+    assert detail.status_code == 200
+    lifecycle = detail.json()["user"]["compute_lifecycle"]
+    assert lifecycle["has_lease"] is True
+    assert lifecycle["lease_id"] == str(identity.lease.id)
+    assert lifecycle["time_expired"] is True
+    assert lifecycle["lease_state"] == "ACTIVE"
+
+
 def test_web_terminal_is_owner_scoped_lease_gated_and_does_not_audit_input(
     client,
     database: Session,

@@ -5,6 +5,7 @@ import {
   closeSelfTerminal,
   enrollSshKey,
   resizeSelfTerminal,
+  retryLeaseRecycle,
   sendSelfTerminalInput,
   startManagedContainer,
   startSelfTerminal,
@@ -212,5 +213,46 @@ describe("API client", () => {
         expect.objectContaining({ command: expect.anything() }),
       );
     }
+  });
+
+  it("binds Lease recovery to CSRF and the typed Lease ID without browser secrets", async () => {
+    document.cookie = "h100_csrf=test-csrf-value; Path=/";
+    const leaseId = "54314628-7b46-4986-bfbd-895f97e0e70f";
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        expect(String(input)).toBe(
+          `/api/v1/admin/compute-leases/${leaseId}/recycle-retry`,
+        );
+        expect(init?.method).toBe("POST");
+        expect(new Headers(init?.headers).get("X-CSRF-Token")).toBe(
+          "test-csrf-value",
+        );
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        expect(body.confirmation).toBe(leaseId);
+        expect(body.safe_reason).toBe("approved fixture recovery");
+        expect(body.idempotency_key).toMatch(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+        );
+        expect(body).not.toHaveProperty("password");
+        expect(body).not.toHaveProperty("session");
+        expect(body).not.toHaveProperty("csrf");
+        return new Response(
+          JSON.stringify({
+            status: "SUCCEEDED",
+            operation_id: "30000000-0000-4000-8000-000000000001",
+            lease_id: leaseId,
+            idempotent_replay: false,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await retryLeaseRecycle(leaseId, {
+      confirmation: leaseId,
+      safe_reason: "approved fixture recovery",
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });
