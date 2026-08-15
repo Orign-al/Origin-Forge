@@ -400,6 +400,16 @@ export type ComputeResourceRequest = {
   };
 };
 
+export type FailedProvisionReconciliationResult = {
+  status: "RECONCILED";
+  operation_id: string;
+  idempotent_replay: boolean;
+  attempt_created: false;
+  rollback?: "VERIFIED";
+  reservation_state?: "RELEASED";
+  request: ComputeResourceRequest;
+};
+
 export const getCsrf = () => apiFetch<{ csrf_token: string }>("/auth/csrf");
 export const login = (payload: { username: string; password: string }) =>
   apiFetch<{ user: User; ssh_enrollment: SshEnrollment }>("/auth/login", {
@@ -656,6 +666,21 @@ export const authorizeProvisionRetry = (
     request: ComputeResourceRequest;
   }>(
     `/admin/compute-resource-requests/${encodeURIComponent(id)}/retry-authorize`,
+    {
+      method: "POST",
+      body: JSON.stringify({ ...payload, idempotency_key: randomUuid() }),
+    },
+  );
+export const reconcileFailedProvision = (
+  id: string,
+  payload: {
+    plan_id: string;
+    failed_stage_operation_id: string;
+    review_note: string;
+  },
+) =>
+  apiFetch<FailedProvisionReconciliationResult>(
+    `/admin/compute-resource-requests/${encodeURIComponent(id)}/reconcile-failed-provision`,
     {
       method: "POST",
       body: JSON.stringify({ ...payload, idempotency_key: randomUuid() }),

@@ -27,6 +27,7 @@ import {
   reviewComputeRequest,
 } from "../../../../lib/api";
 import { randomUuid } from "../../../../lib/random-uuid";
+import { FailedProvisionReconciliationPanel } from "../../../../components/FailedProvisionReconciliationPanel";
 
 const VALIDATION_COLUMNS: SimpleColumnDef[] = [
   { accessorKey: "check", header: "检查项" },
@@ -461,6 +462,7 @@ export default function ComputeRequestDetailPage() {
           )}
         </Card>
       ) : null}
+      <FailedProvisionReconciliationPanel request={item} />
       {item.status === "RETRY_AUTHORIZED" ? (
         <Card className="detail-panel">
           <h2>Provision Retry 已授权</h2>
