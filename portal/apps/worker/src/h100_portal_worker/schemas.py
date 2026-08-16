@@ -85,7 +85,7 @@ COMPUTE_STAGE_HANDLER_IDENTITY = "h100-provision-stage"
 COMPUTE_STAGE_HANDLER_PATH = "/usr/local/sbin/h100-provision-stage"
 COMPUTE_STAGE_ARGV_CONTRACT_VERSION = "compute-provision-stage-argv-v1"
 COMPUTE_STAGE_CONFIRMATION_VALIDATOR_VERSION = "compute-provision-stage-confirmation-validator-v1"
-COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION = "compute-provision-stage-image-validator-v1"
+COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION = "compute-provision-stage-local-image-v2"
 COMPUTE_STAGE_CONTRACT_HASH = re.compile(r"^[0-9a-f]{64}$")
 APPROVED_SSH_KEY_TYPES = {
     "ssh-ed25519",
@@ -490,34 +490,41 @@ def _validate_compute_stage_contract(value: Any) -> dict[str, Any]:
         != {
             "status",
             "validator_version",
-            "identity_sha256",
-            "reference",
-            "image_id",
-            "repo_digests",
-            "created_at",
-            "build_user",
+            "source_type",
+            "canonical_local_image_identity",
+            "artifact_path",
+            "manifest_digest",
+            "platform",
+            "effective_user",
+            "source_reference",
+            "source_build_version",
+            "approved_deployment_version",
             "failure_code",
         }
         or image_contract.get("status") != "PASS"
         or image_contract.get("validator_version") != COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION
-        or not isinstance(image_contract.get("identity_sha256"), str)
-        or not COMPUTE_STAGE_CONTRACT_HASH.fullmatch(image_contract["identity_sha256"])
-        or not isinstance(image_contract.get("reference"), str)
-        or not re.fullmatch(r"[A-Za-z0-9._/@:+-]+", image_contract["reference"])
-        or not isinstance(image_contract.get("image_id"), str)
-        or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_contract["image_id"])
-        or not isinstance(image_contract.get("repo_digests"), list)
-        or not all(
-            isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9._/@:+-]+@sha256:[0-9a-f]{64}", item)
-            for item in image_contract["repo_digests"]
+        or image_contract.get("source_type") != "LOCAL_OCI_LAYOUT"
+        or not isinstance(image_contract.get("canonical_local_image_identity"), str)
+        or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", image_contract["canonical_local_image_identity"]
         )
-        or not any(
-            item.endswith(f"@{image_contract['image_id']}")
-            for item in image_contract["repo_digests"]
+        or not isinstance(image_contract.get("artifact_path"), str)
+        or not re.fullmatch(
+            r"/srv/gpu-platform/artifacts/oci/standard-dev-base/[0-9a-f]{64}/layout",
+            image_contract["artifact_path"],
         )
-        or not isinstance(image_contract.get("created_at"), str)
-        or len(image_contract["created_at"]) > 64
-        or image_contract.get("build_user") not in {"DEFAULT_ROOT", "EXPLICIT_ROOT"}
+        or not isinstance(image_contract.get("manifest_digest"), str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_contract["manifest_digest"])
+        or not image_contract["artifact_path"].endswith(
+            f"/{image_contract['manifest_digest'].removeprefix('sha256:')}/layout"
+        )
+        or image_contract.get("platform") != "linux/amd64"
+        or image_contract.get("effective_user") != "root"
+        or image_contract.get("source_reference")
+        != "h100-local/dev-container:ubuntu24.04-origin-pilot-20260804"
+        or image_contract.get("source_build_version") != "ubuntu24.04-origin-pilot-20260804"
+        or not isinstance(image_contract.get("approved_deployment_version"), str)
+        or not re.fullmatch(r"[0-9a-f]{40}", image_contract["approved_deployment_version"])
         or image_contract.get("failure_code") is not None
     ):
         raise PayloadValidationError(
@@ -558,10 +565,7 @@ def _validate_compute_stage_contract(value: Any) -> dict[str, Any]:
             "argument_14": dict(argv_contract["argument_14"]),
         },
         "confirmation_gate": dict(confirmation_gate),
-        "image_contract": {
-            **image_contract,
-            "repo_digests": list(image_contract["repo_digests"]),
-        },
+        "image_contract": dict(image_contract),
     }
 
 

@@ -35,6 +35,7 @@ from h100_portal_api.routes.compute_requests import (
     failed_provision_reconciliation_readiness,
     reconcile_failed_provision,
 )
+from h100_portal_api.runtime_identity import deployment_version
 from h100_portal_api.schemas import (
     ComputeProvisionActionRequest,
     ComputeProvisionReconciliationRequest,
@@ -178,13 +179,18 @@ def stage_contract_fixture() -> dict[str, object]:
         },
         "image_contract": {
             "status": "PASS",
-            "validator_version": "compute-provision-stage-image-validator-v1",
-            "identity_sha256": "e" * 64,
-            "reference": "h100-local/dev-container:ubuntu24.04-origin-pilot-20260804",
-            "image_id": "sha256:" + "d" * 64,
-            "repo_digests": ["h100-local/dev-container@sha256:" + "d" * 64],
-            "created_at": "2026-08-04T00:00:00Z",
-            "build_user": "DEFAULT_ROOT",
+            "validator_version": "compute-provision-stage-local-image-v2",
+            "source_type": "LOCAL_OCI_LAYOUT",
+            "canonical_local_image_identity": "sha256:" + "e" * 64,
+            "artifact_path": (
+                "/srv/gpu-platform/artifacts/oci/standard-dev-base/" + "d" * 64 + "/layout"
+            ),
+            "manifest_digest": "sha256:" + "d" * 64,
+            "platform": "linux/amd64",
+            "effective_user": "root",
+            "source_reference": ("h100-local/dev-container:ubuntu24.04-origin-pilot-20260804"),
+            "source_build_version": "ubuntu24.04-origin-pilot-20260804",
+            "approved_deployment_version": "f" * 40,
             "failure_code": None,
         },
     }
@@ -1734,7 +1740,7 @@ def test_single_approval_runs_complete_provision_and_replays_idempotently(
     assert len(top_level) == 1
     assert top_level[0].status == "SUCCEEDED"
     assert top_level[0].validated_payload["canonical_execution_contract"] == "d" * 64
-    assert top_level[0].validated_payload["deployment_version"] == "SOURCE_WORKTREE"
+    assert top_level[0].validated_payload["deployment_version"] == deployment_version()
     assert all(
         row.validated_payload.get("visibility") == "INTERNAL_STEP"
         for row in operations

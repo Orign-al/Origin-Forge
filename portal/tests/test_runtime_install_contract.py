@@ -87,3 +87,13 @@ def test_runtime_version_and_automatic_provision_reconciliation_are_system_bound
     assert "RestrictAddressFamilies=AF_UNIX" in service
     assert "CapabilityBoundingSet=" in service
     assert "OnUnitActiveSec=5min" in timer
+
+
+def test_runtime_publishes_local_oci_base_before_installing_stage_handler() -> None:
+    installer = (PORTAL_ROOT / "deploy/scripts/install-runtime.sh").read_text()
+
+    publish = '"$RUNTIME_DIR/venv/bin/h100-portal-local-image" publish'
+    stage_install = "/usr/local/sbin/h100-provision-stage"
+    assert publish in installer
+    assert '--deployment-version "$deployment_version"' in installer
+    assert installer.index(publish) < installer.index(stage_install)

@@ -168,35 +168,41 @@ def _ready_stage_contract(result: Any) -> dict[str, Any] | None:
         != {
             "status",
             "validator_version",
-            "identity_sha256",
-            "reference",
-            "image_id",
-            "repo_digests",
-            "created_at",
-            "build_user",
+            "source_type",
+            "canonical_local_image_identity",
+            "artifact_path",
+            "manifest_digest",
+            "platform",
+            "effective_user",
+            "source_reference",
+            "source_build_version",
+            "approved_deployment_version",
             "failure_code",
         }
         or image_contract.get("status") != "PASS"
-        or image_contract.get("validator_version") != "compute-provision-stage-image-validator-v1"
-        or not isinstance(image_contract.get("identity_sha256"), str)
-        or re.fullmatch(r"[0-9a-f]{64}", image_contract["identity_sha256"]) is None
-        or not isinstance(image_contract.get("reference"), str)
-        or re.fullmatch(r"[A-Za-z0-9._/@:+-]+", image_contract["reference"]) is None
-        or not isinstance(image_contract.get("image_id"), str)
-        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_contract["image_id"]) is None
-        or not isinstance(image_contract.get("repo_digests"), list)
-        or not all(
-            isinstance(value, str)
-            and re.fullmatch(r"[A-Za-z0-9._/@:+-]+@sha256:[0-9a-f]{64}", value)
-            for value in image_contract["repo_digests"]
+        or image_contract.get("validator_version") != "compute-provision-stage-local-image-v2"
+        or image_contract.get("source_type") != "LOCAL_OCI_LAYOUT"
+        or not isinstance(image_contract.get("canonical_local_image_identity"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_contract["canonical_local_image_identity"])
+        is None
+        or not isinstance(image_contract.get("artifact_path"), str)
+        or re.fullmatch(
+            r"/srv/gpu-platform/artifacts/oci/standard-dev-base/[0-9a-f]{64}/layout",
+            image_contract["artifact_path"],
         )
-        or not any(
-            value.endswith(f"@{image_contract['image_id']}")
-            for value in image_contract["repo_digests"]
+        is None
+        or not isinstance(image_contract.get("manifest_digest"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_contract["manifest_digest"]) is None
+        or not image_contract["artifact_path"].endswith(
+            f"/{image_contract['manifest_digest'].removeprefix('sha256:')}/layout"
         )
-        or not isinstance(image_contract.get("created_at"), str)
-        or len(image_contract["created_at"]) > 64
-        or image_contract.get("build_user") not in {"DEFAULT_ROOT", "EXPLICIT_ROOT"}
+        or image_contract.get("platform") != "linux/amd64"
+        or image_contract.get("effective_user") != "root"
+        or image_contract.get("source_reference")
+        != "h100-local/dev-container:ubuntu24.04-origin-pilot-20260804"
+        or image_contract.get("source_build_version") != "ubuntu24.04-origin-pilot-20260804"
+        or not isinstance(image_contract.get("approved_deployment_version"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", image_contract["approved_deployment_version"]) is None
         or image_contract.get("failure_code") is not None
     ):
         return None
@@ -391,6 +397,7 @@ def _safe_operation_view(operation: PortalOperation | None) -> dict[str, Any] | 
         "workflow_steps": _workflow_steps(operation),
         "deployment_version": payload.get("deployment_version"),
         "canonical_execution_contract": payload.get("canonical_execution_contract"),
+        "canonical_local_image_identity": payload.get("canonical_local_image_identity"),
         "reconciliation_status": safe_reconciliation.get("status"),
         "resource_residue": safe_reconciliation.get("host_residue"),
         "unknown_resource_state": safe_reconciliation.get("unknown_resource_state"),
@@ -2888,6 +2895,9 @@ def dry_run_provision_plan(
                 )
             parent_payload = dict(parent_operation.validated_payload)
             parent_payload["canonical_execution_contract"] = stage_contract["contract_sha256"]
+            parent_payload["canonical_local_image_identity"] = stage_contract["image_contract"][
+                "canonical_local_image_identity"
+            ]
             parent_operation.validated_payload = parent_payload
             db.commit()
         return {
@@ -2936,6 +2946,9 @@ def dry_run_provision_plan(
             )
         parent_payload = dict(parent_operation.validated_payload)
         parent_payload["canonical_execution_contract"] = stage_contract["contract_sha256"]
+        parent_payload["canonical_local_image_identity"] = stage_contract["image_contract"][
+            "canonical_local_image_identity"
+        ]
         parent_operation.validated_payload = parent_payload
     operation = _operation(
         db,
@@ -3063,6 +3076,8 @@ def provision_reserved_compute_environment(
             or parent_payload.get("deployment_version") != deployment_version()
             or parent_payload.get("canonical_execution_contract")
             != stage_contract["contract_sha256"]
+            or parent_payload.get("canonical_local_image_identity")
+            != stage_contract["image_contract"]["canonical_local_image_identity"]
         ):
             raise _error(
                 409,

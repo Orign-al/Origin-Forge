@@ -11,19 +11,25 @@ from h100_portal_worker.schemas import WorkerRequest, validate_payload
 
 PORTAL_ROOT = Path(__file__).resolve().parents[3]
 PLATFORM_ROOT = PORTAL_ROOT.parent
-REAL_IMAGE_VALIDATOR = handlers._standard_dev_image_identity
 
 
-def image_identity(*, image_id: str = "sha256:" + "d" * 64) -> dict[str, object]:
+def image_identity(*, identity: str = "sha256:" + "e" * 64) -> dict[str, object]:
+    manifest_digest = "sha256:" + "d" * 64
     return {
         "status": "PASS",
-        "validator_version": "compute-provision-stage-image-validator-v1",
-        "identity_sha256": "e" * 64,
-        "reference": "h100-local/dev-container:ubuntu24.04-origin-pilot-20260804",
-        "image_id": image_id,
-        "repo_digests": [f"h100-local/dev-container@{image_id}"],
-        "created_at": "2026-08-04T00:00:00Z",
-        "build_user": "DEFAULT_ROOT",
+        "validator_version": "compute-provision-stage-local-image-v2",
+        "source_type": "LOCAL_OCI_LAYOUT",
+        "canonical_local_image_identity": identity,
+        "artifact_path": (
+            "/srv/gpu-platform/artifacts/oci/standard-dev-base/"
+            f"{manifest_digest.removeprefix('sha256:')}/layout"
+        ),
+        "manifest_digest": manifest_digest,
+        "platform": "linux/amd64",
+        "effective_user": "root",
+        "source_reference": "h100-local/dev-container:ubuntu24.04-origin-pilot-20260804",
+        "source_build_version": "ubuntu24.04-origin-pilot-20260804",
+        "approved_deployment_version": "f" * 40,
         "failure_code": None,
     }
 
@@ -169,105 +175,12 @@ def test_compute_dry_run_schema_binds_every_reserved_value() -> None:
         validate_payload("compute.provision.dry_run", {**payload, "gpu_max": 4})
 
 
-def test_standard_image_validator_accepts_docker_default_root_when_config_user_is_null(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    image_id = "sha256:" + "d" * 64
-
-    def fixed(binary: str, args: list[str], timeout: float = 20.0):  # type: ignore[no-untyped-def]
-        assert binary == "docker"
-        assert timeout in {15, 20}
-        if args[:2] == ["container", "inspect"]:
-            return {
-                "ok": True,
-                "stdout": json.dumps(
-                    [{"Config": {"Image": "h100-local/dev-container:accepted"}, "Image": image_id}]
-                ),
-                "stderr": "",
-            }
-        assert args[:2] == ["image", "inspect"]
-        return {
-            "ok": True,
-            "stdout": json.dumps(
-                [
-                    {
-                        "Id": image_id,
-                        "RepoDigests": [f"h100-local/dev-container@{image_id}"],
-                        "Created": "2026-08-04T00:00:00Z",
-                        "Config": {
-                            "User": None,
-                            "Labels": {
-                                "h100.dev.user": "origin-pilot",
-                                "h100.dev.uid": "20001",
-                                "h100.dev.gid": "20001",
-                            },
-                        },
-                    }
-                ]
-            ),
-            "stderr": "",
-        }
-
-    monkeypatch.setattr(handlers, "run_fixed", fixed)
-    monkeypatch.setattr(handlers, "_standard_dev_image_identity", REAL_IMAGE_VALIDATOR)
-    observed = handlers._standard_dev_image_identity()
-    assert observed["status"] == "PASS"
-    assert observed["build_user"] == "DEFAULT_ROOT"
-    assert observed["image_id"] == image_id
-
-
-def test_standard_image_validator_requires_repo_digest_bound_to_image_id(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    image_id = "sha256:" + "d" * 64
-
-    def fixed(binary: str, args: list[str], timeout: float = 20.0):  # type: ignore[no-untyped-def]
-        assert binary == "docker"
-        assert timeout in {15, 20}
-        if args[:2] == ["container", "inspect"]:
-            return {
-                "ok": True,
-                "stdout": json.dumps(
-                    [{"Config": {"Image": "h100-local/dev-container:accepted"}, "Image": image_id}]
-                ),
-                "stderr": "",
-            }
-        return {
-            "ok": True,
-            "stdout": json.dumps(
-                [
-                    {
-                        "Id": image_id,
-                        "RepoDigests": ["h100-local/dev-container@sha256:" + "e" * 64],
-                        "Created": "2026-08-04T00:00:00Z",
-                        "Config": {
-                            "User": None,
-                            "Labels": {
-                                "h100.dev.user": "origin-pilot",
-                                "h100.dev.uid": "20001",
-                                "h100.dev.gid": "20001",
-                            },
-                        },
-                    }
-                ]
-            ),
-            "stderr": "",
-        }
-
-    monkeypatch.setattr(handlers, "run_fixed", fixed)
-    monkeypatch.setattr(handlers, "_standard_dev_image_identity", REAL_IMAGE_VALIDATOR)
-    observed = handlers._standard_dev_image_identity()
-    assert observed["status"] == "FAIL"
-    assert observed["failure_code"] == "IMAGE_REPO_DIGEST_INVALID"
-
-
 def test_stage_image_identity_change_requires_new_dry_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = stage_payload()
     monkeypatch.setattr(handlers, "script_integrity", stage_integrity)
-    changed = image_identity(image_id="sha256:" + "f" * 64)
-    changed["identity_sha256"] = "f" * 64
+    changed = image_identity(identity="sha256:" + "f" * 64)
     monkeypatch.setattr(handlers, "_standard_dev_image_identity", lambda: changed)
     monkeypatch.setattr(
         handlers,
@@ -276,7 +189,7 @@ def test_stage_image_identity_change_requires_new_dry_run(
     )
     result = handlers.handle(request("compute.provision.stage", payload, dry_run=False))
     assert result["error"]["code"] == "DRY_RUN_STAGE_CONTRACT_MISMATCH"
-    assert "IMAGE_IDENTITY" in result["contract_verification"]["mismatches"]
+    assert "CANONICAL_LOCAL_IMAGE_IDENTITY" in result["contract_verification"]["mismatches"]
     assert result["side_effect_classification"] == "NO_SIDE_EFFECT"
 
 
@@ -529,13 +442,19 @@ def test_compute_stage_runs_only_hash_pinned_fixed_handler(
     monkeypatch.setattr(
         handlers,
         "_compute_provision_dry_run",
-        lambda _payload: {"dry_run_status": "READY_FOR_PROVISION"},
+        lambda _payload, **_kwargs: {"dry_run_status": "READY_FOR_PROVISION"},
     )
     observed: list[str] = []
 
-    def execute(argv: list[str], timeout: float) -> dict[str, object]:
+    def execute(
+        argv: list[str],
+        timeout: float,
+        *,
+        expected_local_image_identity: str | None = None,
+    ) -> dict[str, object]:
         observed.extend(argv)
         assert timeout == handlers.STAGE_EXECUTION_TIMEOUT_SECONDS
+        assert expected_local_image_identity == image_identity()["canonical_local_image_identity"]
         return {"ok": True, "exit_code": 0, "stdout": "STAGED", "stderr": ""}
 
     monkeypatch.setattr(handlers, "run_allowlisted_script", execute)
@@ -683,7 +602,7 @@ def test_compute_stage_failure_classification_is_structured_and_zero_residue_bou
     monkeypatch.setattr(
         handlers,
         "_compute_provision_dry_run",
-        lambda _payload: {"dry_run_status": "READY_FOR_PROVISION"},
+        lambda _payload, **_kwargs: {"dry_run_status": "READY_FOR_PROVISION"},
     )
     monkeypatch.setattr(handlers, "_compute_stage_retained_resources", lambda _payload: [])
     stderr = "\n".join(
@@ -696,7 +615,7 @@ def test_compute_stage_failure_classification_is_structured_and_zero_residue_bou
     monkeypatch.setattr(
         handlers,
         "run_allowlisted_script",
-        lambda _argv, timeout: {
+        lambda _argv, timeout, **_kwargs: {
             "ok": False,
             "exit_code": 1,
             "stdout": "",
@@ -761,14 +680,20 @@ def test_compute_stage_script_confirmation_uses_parameters_above_nine() -> None:
     assert fixed.returncode == 0
 
 
-def test_stage_image_gate_precedes_any_compute_write_and_pins_repo_digest() -> None:
+def test_stage_image_gate_builds_from_local_oci_before_any_compute_write() -> None:
     source = (PLATFORM_ROOT / "scripts/h100-provision-stage").read_text()
     assert source.index("current_step=CONTAINER_IMAGE_PREWRITE_GATE") < source.index(
         "current_step=LINUX_IDENTITY"
     )
+    assert source.index("docker buildx build") < source.index("current_step=LINUX_IDENTITY")
     assert '((.[0].Config.User // "") == "" or .[0].Config.User == "root")' in source
-    assert "FROM ${base_image_digest}" in source
-    assert "FROM ${base_image_id}" not in source
+    assert "FROM h100_base" in source
+    assert "RUN --network=none" in source
+    assert "h100_base=${local_base_context}" in source
+    assert "oci-layout://${local_artifact_path}@${local_manifest_digest}" in source
+    assert "REMOTE REGISTRY" not in source
+    assert "FROM ${base_image_digest}" not in source
+    assert "docker pull" not in source
 
 
 def test_stage_rollback_evidence_parser_preserves_idempotent_group_cleanup() -> None:

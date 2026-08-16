@@ -9,6 +9,7 @@ readonly PROJECTS_FILE=/etc/projects
 readonly PROJID_FILE=/etc/projid
 readonly COMPOSE_ROOT=/srv/gpu-platform/platform/config/dev-containers
 readonly CONTAINER_DATA_ROOT=/srv/gpu-platform/container-data
+readonly LOCAL_IMAGE_TOOL=/opt/h100-portal/venv/bin/h100-portal-local-image
 readonly GUARD_SERVICE=h100-gpu-bypass-guard.service
 readonly UID_MIN=20000
 readonly UID_MAX=60000
@@ -47,9 +48,11 @@ user_root=
 container_name=
 compose_dir=
 compose_file=
-base_image=
-base_image_id=
-base_image_digest=
+local_image_identity=
+local_artifact_path=
+local_manifest_digest=
+local_base_context=
+expected_local_image_identity=
 derived_image=
 state_file=
 isolation_marker_one=
@@ -90,29 +93,32 @@ directory_contains_user_data() {
 }
 
 validate_base_image() {
-  base_image="$(docker inspect --format '{{.Config.Image}}' gpu-dev-origin-pilot)"
-  [[ "${base_image}" =~ ^[A-Za-z0-9._/@:+-]+$ ]] \
-    || fail 'approved local image reference is invalid'
-  base_image_id="$(docker inspect --format '{{.Image}}' gpu-dev-origin-pilot)"
-  [[ "${base_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || fail 'approved local image ID is invalid'
-  [[ "$(docker image inspect --format '{{.Id}}' "${base_image}")" == "${base_image_id}" ]] \
-    || fail 'origin-pilot container image no longer matches its local tag'
-  base_image_digest="$(docker image inspect --format '{{json .RepoDigests}}' "${base_image}" \
-    | jq -r --arg image_id "${base_image_id}" \
-      '((. // []) | map(select(type == "string" and test("@sha256:[0-9a-f]{64}$") and endswith("@" + $image_id)))) | .[0] // empty')"
-  [[ "${base_image_digest}" =~ ^[A-Za-z0-9._/@:+-]+@sha256:[0-9a-f]{64}$ ]] \
-    || fail 'approved local image has no RepoDigest bound to its image ID'
-  docker image inspect "${base_image}" | jq -e \
-    '.[0].Config.Labels["h100.dev.user"] == "origin-pilot"
-     and .[0].Config.Labels["h100.dev.uid"] == "20001"
-     and .[0].Config.Labels["h100.dev.gid"] == "20001"' \
-    >/dev/null || fail 'origin-pilot image identity labels are invalid'
-  # Docker represents an omitted Config.User as null; the effective default
-  # user is root and is equivalent to an explicit root declaration here.
-  docker image inspect "${base_image}" | jq -e \
-    '((.[0].Config.User // "") == "" or .[0].Config.User == "root")' \
-    >/dev/null || fail 'origin-pilot image does not build derived users as root'
+  local contract artifact_digest
+  [[ -x "${LOCAL_IMAGE_TOOL}" && ! -L "${LOCAL_IMAGE_TOOL}" ]] \
+    || fail 'local OCI image validator is unavailable'
+  contract="$("${LOCAL_IMAGE_TOOL}" verify)" \
+    || fail 'approved local OCI image source is unavailable'
+  jq -e \
+    --arg expected_identity "${expected_local_image_identity}" \
+    '.status == "PASS"
+     and .source_type == "LOCAL_OCI_LAYOUT"
+     and .canonical_local_image_identity == $expected_identity
+     and (.artifact_path | type == "string")
+     and (.manifest_digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
+     and .platform == "linux/amd64"
+     and .effective_user == "root"
+     and .failure_code == null' \
+    <<<"${contract}" >/dev/null \
+    || fail 'local OCI image contract does not match the dry-run identity'
+  local_image_identity="$(jq -r '.canonical_local_image_identity' <<<"${contract}")"
+  local_artifact_path="$(jq -r '.artifact_path' <<<"${contract}")"
+  local_manifest_digest="$(jq -r '.manifest_digest' <<<"${contract}")"
+  artifact_digest=${local_manifest_digest#sha256:}
+  [[ "${local_image_identity}" == "${expected_local_image_identity}" ]] \
+    || fail 'local OCI image identity changed after dry-run'
+  [[ "${local_artifact_path}" == "/srv/gpu-platform/artifacts/oci/standard-dev-base/${artifact_digest}/layout" ]] \
+    || fail 'local OCI image artifact path is outside the approved root'
+  local_base_context="oci-layout://${local_artifact_path}@${local_manifest_digest}"
 }
 
 assert_derived_image_absent() {
@@ -326,8 +332,12 @@ max_gpus=$9
 request_id=${10}
 plan_id=${11}
 dry_run_operation_id=${12}
+expected_local_image_identity=${H100_EXPECTED_LOCAL_IMAGE_IDENTITY:-}
+unset H100_EXPECTED_LOCAL_IMAGE_IDENTITY
 
 h100_require_root
+[[ "${expected_local_image_identity}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+  || fail 'canonical local image identity binding is invalid'
 h100_validate_username "${username}"
 case "${username}" in root|origin-al|codexops|nobody) fail 'protected username' ;; esac
 [[ "${uid}" =~ ^[0-9]+$ && "${gid}" =~ ^[0-9]+$ ]] || fail 'UID/GID must be numeric'
@@ -396,16 +406,58 @@ last_successful_step=RESOURCE_PREFLIGHT
 current_step=CONTAINER_IMAGE_PREWRITE_GATE
 validate_base_image
 assert_derived_image_absent
+temp_dir="$(mktemp -d /tmp/h100-provision-stage.XXXXXX)"
+cat >"${temp_dir}/Dockerfile" <<EOF
+FROM h100_base
+USER root
+RUN --network=none old_user=origin-pilot; old_uid=20001; old_gid=20001; \\
+    rm -f /etc/sudoers.d/90-h100-dev-user; \\
+    if getent passwd "\${old_user}" >/dev/null; then userdel "\${old_user}"; fi; \\
+    if getent group "\${old_user}" >/dev/null; then groupdel "\${old_user}"; fi; \\
+    groupadd --gid ${gid} ${username}; \\
+    useradd --uid ${uid} --gid ${gid} --create-home --shell /bin/bash ${username}; \\
+    passwd --lock ${username}; \\
+    rm -rf /home/origin-pilot; \\
+    install -d -o ${uid} -g ${gid} -m 0700 /home/${username}
+ENV DEV_USER=${username}
+LABEL h100.dev.user="${username}" h100.dev.uid="${uid}" h100.dev.gid="${gid}" h100.stage.plan_id="${plan_id}"
+EOF
 
-last_successful_step=CONTAINER_IMAGE_PREWRITE_GATE
+# The derived image is prepared before Linux, storage, quota, GPU, or Slurm
+# writes.  It is the only possible pre-write artifact and rollback removes it.
+transaction_started=1
+current_step=CONTAINER_IMAGE
+if ! docker buildx build \
+  --pull=false \
+  --network=none \
+  --provenance=false \
+  --sbom=false \
+  --build-context "h100_base=${local_base_context}" \
+  --load \
+  --tag "${derived_image}" \
+  "${temp_dir}" >/dev/null; then
+  fail 'local-only derived image build failed'
+fi
+created_image=1
+docker image inspect "${derived_image}" | jq -e \
+  --arg user "${username}" --arg uid "${uid}" --arg gid "${gid}" \
+  '.[0].Config.Labels["h100.dev.user"] == $user and .[0].Config.Labels["h100.dev.uid"] == $uid and .[0].Config.Labels["h100.dev.gid"] == $gid' \
+  >/dev/null || fail 'derived image identity labels are invalid'
+docker image inspect "${derived_image}" | jq -e '
+  ((.[0].Config.User // "") == "" or .[0].Config.User == "root")
+  and ((.[0].Config.Env // []) | map(select(startswith("NVIDIA_VISIBLE_DEVICES="))) | length == 0)
+  and ((.[0].Config.Env // []) | map(select(startswith("MUNGE_"))) | length == 0)
+  and ((.[0].Config.Volumes // {}) | keys | index("/var/run/docker.sock") | not)
+  and ((.[0].Config.Volumes // {}) | keys | index("/run/munge") | not)
+' >/dev/null || fail 'derived image inherited a forbidden runtime capability'
+
+last_successful_step=CONTAINER_IMAGE
 current_step=BACKUP_AND_TRANSACTION_START
 stamp="$(date +%Y%m%d-%H%M%S-%N)"
 backup_dir="${H100_PLATFORM_ROOT}/backups/compute-stage-${username}-${stamp}"
 install -d -o root -g gpu-platform-admin -m 0750 "${backup_dir}"
 cp -a -- "${PROJECTS_FILE}" "${backup_dir}/projects.before"
 cp -a -- "${PROJID_FILE}" "${backup_dir}/projid.before"
-temp_dir="$(mktemp -d /tmp/h100-provision-stage.XXXXXX)"
-transaction_started=1
 
 last_successful_step=BACKUP_AND_TRANSACTION_START
 current_step=LINUX_IDENTITY
@@ -509,41 +561,6 @@ sacctmgr -nP show assoc where User="${username}" Account=company \
   || fail 'Slurm association validation failed'
 
 last_successful_step=SLURM_ASSOCIATION
-current_step=CONTAINER_IMAGE
-docker image inspect "${base_image_id}" >/dev/null 2>&1 \
-  || fail 'validated base image disappeared before derived build'
-docker image inspect "${base_image_digest}" >/dev/null 2>&1 \
-  || fail 'validated base image digest disappeared before derived build'
-cat >"${temp_dir}/Dockerfile" <<EOF
-FROM ${base_image_digest}
-USER root
-RUN old_user=origin-pilot; old_uid=20001; old_gid=20001; \\
-    rm -f /etc/sudoers.d/90-h100-dev-user; \\
-    if getent passwd "\${old_user}" >/dev/null; then userdel "\${old_user}"; fi; \\
-    if getent group "\${old_user}" >/dev/null; then groupdel "\${old_user}"; fi; \\
-    groupadd --gid ${gid} ${username}; \\
-    useradd --uid ${uid} --gid ${gid} --create-home --shell /bin/bash ${username}; \\
-    passwd --lock ${username}; \\
-    rm -rf /home/origin-pilot; \\
-    install -d -o ${uid} -g ${gid} -m 0700 /home/${username}
-ENV DEV_USER=${username}
-LABEL h100.dev.user="${username}" h100.dev.uid="${uid}" h100.dev.gid="${gid}" h100.stage.plan_id="${plan_id}"
-EOF
-docker build --pull=false --network=none --tag "${derived_image}" "${temp_dir}" >/dev/null
-created_image=1
-docker image inspect "${derived_image}" | jq -e \
-  --arg user "${username}" --arg uid "${uid}" --arg gid "${gid}" \
-  '.[0].Config.Labels["h100.dev.user"] == $user and .[0].Config.Labels["h100.dev.uid"] == $uid and .[0].Config.Labels["h100.dev.gid"] == $gid' \
-  >/dev/null || fail 'derived image identity labels are invalid'
-docker image inspect "${derived_image}" | jq -e '
-  ((.[0].Config.User // "") == "" or .[0].Config.User == "root")
-  and ((.[0].Config.Env // []) | map(select(startswith("NVIDIA_VISIBLE_DEVICES="))) | length == 0)
-  and ((.[0].Config.Env // []) | map(select(startswith("MUNGE_"))) | length == 0)
-  and ((.[0].Config.Volumes // {}) | keys | index("/var/run/docker.sock") | not)
-  and ((.[0].Config.Volumes // {}) | keys | index("/run/munge") | not)
-' >/dev/null || fail 'derived image inherited a forbidden runtime capability'
-
-last_successful_step=CONTAINER_IMAGE
 current_step=CONTAINER_DEFINITION
 install -d -o root -g gpu-platform-admin -m 0750 "${compose_dir}"
 cat >"${temp_dir}/compose.yml" <<EOF

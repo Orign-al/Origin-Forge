@@ -68,6 +68,14 @@ rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
 "$RUNTIME_DIR/venv/bin/pip" install --no-deps --no-build-isolation "$RUNTIME_DIR"
 "$RUNTIME_DIR/venv/bin/pip" check
 
+# Publish the approved daemon image once per platform deployment as an
+# immutable, root-owned OCI layout. Provision attempts only validate and
+# consume this local artifact; they never convert, pull, or resolve a registry
+# reference. A publish failure stops deployment before the new Stage handler
+# and integrity manifest are installed.
+"$RUNTIME_DIR/venv/bin/h100-portal-local-image" publish \
+  --deployment-version "$deployment_version"
+
 # Activate accepts UUID key records from this Worker-only directory. The API
 # never passes an arbitrary host path and cannot write this root-owned tree.
 install -d -o root -g root -m 0700 "${SSH_KEY_STAGING_DIR}"

@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from h100_portal_worker.local_image import local_image_contract
 from h100_portal_worker.schemas import (
     APPROVED_CLIENT_VALIDATION_PAYLOAD,
     APPROVED_PILOT_ACCEPTANCE_PAYLOAD,
@@ -297,7 +298,12 @@ def run_fixed(binary: str, args: list[str], timeout: float = 20.0) -> dict[str, 
     }
 
 
-def run_allowlisted_script(argv: list[str], timeout: float) -> dict[str, Any]:
+def run_allowlisted_script(
+    argv: list[str],
+    timeout: float,
+    *,
+    expected_local_image_identity: str | None = None,
+) -> dict[str, Any]:
     """Run one exact management-script argv without a shell.
 
     The caller must validate the operation payload and script hashes first.
@@ -319,11 +325,27 @@ def run_allowlisted_script(argv: list[str], timeout: float) -> dict[str, Any]:
             "stdout": "",
             "stderr": "",
         }
+    environment = FIXED_ENV
+    if expected_local_image_identity is not None:
+        if (
+            argv[0] != COMPUTE_STAGE_HANDLER_PATH
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", expected_local_image_identity) is None
+        ):
+            return {
+                "ok": False,
+                "error_code": "LOCAL_IMAGE_IDENTITY_ARGUMENT_INVALID",
+                "stdout": "",
+                "stderr": "",
+            }
+        environment = {
+            **FIXED_ENV,
+            "H100_EXPECTED_LOCAL_IMAGE_IDENTITY": expected_local_image_identity,
+        }
     try:
         completed = subprocess.run(
             argv,
             cwd="/",
-            env=FIXED_ENV,
+            env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -2550,138 +2572,8 @@ def _xfs_project_quota_capable() -> bool:
 
 
 def _standard_dev_image_identity() -> dict[str, Any]:
-    """Validate and identify the accepted local image without exposing its environment."""
-    failed: dict[str, Any] = {
-        "status": "FAIL",
-        "validator_version": COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION,
-        "identity_sha256": None,
-        "reference": None,
-        "image_id": None,
-        "repo_digests": [],
-        "created_at": None,
-        "build_user": "UNKNOWN",
-        "failure_code": "SOURCE_CONTAINER_UNAVAILABLE",
-    }
-    source = run_fixed("docker", ["container", "inspect", "gpu-dev-origin-pilot"], timeout=15)
-    if not source.get("ok"):
-        return failed
-    try:
-        parsed = json.loads(str(source.get("stdout", "")))
-        item = parsed[0] if isinstance(parsed, list) and parsed else {}
-        image_reference = (
-            item.get("Config", {}).get("Image")
-            if isinstance(item, dict) and isinstance(item.get("Config"), dict)
-            else None
-        )
-        image_id = item.get("Image") if isinstance(item, dict) else None
-    except json.JSONDecodeError, IndexError:
-        return {**failed, "failure_code": "SOURCE_CONTAINER_IDENTITY_INVALID"}
-    if not isinstance(image_reference, str) or not re.fullmatch(
-        r"[A-Za-z0-9._/@:+-]+", image_reference
-    ):
-        return {**failed, "failure_code": "IMAGE_REFERENCE_INVALID"}
-    if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
-        return {
-            **failed,
-            "reference": image_reference,
-            "failure_code": "IMAGE_ID_INVALID",
-        }
-    inspected = run_fixed("docker", ["image", "inspect", image_reference], timeout=20)
-    if not inspected.get("ok"):
-        return {
-            **failed,
-            "reference": image_reference,
-            "image_id": image_id,
-            "failure_code": "IMAGE_UNAVAILABLE",
-        }
-    try:
-        parsed_images = json.loads(str(inspected.get("stdout", "")))
-        image = parsed_images[0] if isinstance(parsed_images, list) and parsed_images else {}
-    except json.JSONDecodeError, IndexError:
-        return {
-            **failed,
-            "reference": image_reference,
-            "image_id": image_id,
-            "failure_code": "IMAGE_METADATA_INVALID",
-        }
-    if not isinstance(image, dict) or image.get("Id") != image_id:
-        return {
-            **failed,
-            "reference": image_reference,
-            "image_id": image_id,
-            "failure_code": "IMAGE_TAG_ID_MISMATCH",
-        }
-    config = image.get("Config")
-    labels = config.get("Labels") if isinstance(config, dict) else None
-    expected_labels = {
-        "h100.dev.user": "origin-pilot",
-        "h100.dev.uid": "20001",
-        "h100.dev.gid": "20001",
-    }
-    if not isinstance(labels, dict) or any(
-        labels.get(key) != value for key, value in expected_labels.items()
-    ):
-        return {
-            **failed,
-            "reference": image_reference,
-            "image_id": image_id,
-            "failure_code": "IMAGE_IDENTITY_LABELS_INVALID",
-        }
-    config_user = config.get("User") if isinstance(config, dict) else None
-    if config_user not in {None, "", "root"}:
-        return {
-            **failed,
-            "reference": image_reference,
-            "image_id": image_id,
-            "failure_code": "IMAGE_BUILD_USER_INVALID",
-        }
-    repo_digests = image.get("RepoDigests")
-    safe_repo_digests = (
-        sorted(item for item in repo_digests if isinstance(item, str))
-        if isinstance(repo_digests, list)
-        else []
-    )
-    digest_pattern = r"[A-Za-z0-9._/@:+-]+@sha256:[0-9a-f]{64}"
-    if (
-        not safe_repo_digests
-        or any(re.fullmatch(digest_pattern, item) is None for item in safe_repo_digests)
-        or not any(item.endswith(f"@{image_id}") for item in safe_repo_digests)
-    ):
-        return {
-            **failed,
-            "reference": image_reference,
-            "image_id": image_id,
-            "failure_code": "IMAGE_REPO_DIGEST_INVALID",
-        }
-    created_at = image.get("Created")
-    if not isinstance(created_at, str) or not created_at or len(created_at) > 64:
-        return {
-            **failed,
-            "reference": image_reference,
-            "image_id": image_id,
-            "failure_code": "IMAGE_CREATED_AT_INVALID",
-        }
-    build_user = "DEFAULT_ROOT" if config_user in {None, ""} else "EXPLICIT_ROOT"
-    identity = {
-        "validator_version": COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION,
-        "reference": image_reference,
-        "image_id": image_id,
-        "repo_digests": safe_repo_digests,
-        "created_at": created_at,
-        "build_user": build_user,
-        "identity_labels": expected_labels,
-    }
-    return {
-        "status": "PASS",
-        "validator_version": COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION,
-        "identity_sha256": _stage_contract_sha256(identity),
-        "reference": image_reference,
-        "image_id": image_id,
-        "repo_digests": safe_repo_digests,
-        "created_at": created_at,
-        "build_user": build_user,
-        "failure_code": None,
-    }
+    """Resolve the accepted base strictly through its root-owned local OCI artifact."""
+    return local_image_contract()
 
 
 def _standard_dev_image_available() -> bool:
@@ -3042,10 +2934,27 @@ def _compute_stage_contract(
     image_valid = bool(
         image_contract.get("status") == "PASS"
         and image_contract.get("validator_version") == COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION
-        and isinstance(image_contract.get("identity_sha256"), str)
-        and re.fullmatch(r"[0-9a-f]{64}", str(image_contract.get("identity_sha256")))
-        and isinstance(image_contract.get("image_id"), str)
-        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(image_contract.get("image_id")))
+        and image_contract.get("source_type") == "LOCAL_OCI_LAYOUT"
+        and isinstance(image_contract.get("canonical_local_image_identity"), str)
+        and re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(image_contract.get("canonical_local_image_identity")),
+        )
+        and isinstance(image_contract.get("artifact_path"), str)
+        and re.fullmatch(
+            r"/srv/gpu-platform/artifacts/oci/standard-dev-base/[0-9a-f]{64}/layout",
+            str(image_contract.get("artifact_path")),
+        )
+        and isinstance(image_contract.get("manifest_digest"), str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(image_contract.get("manifest_digest")))
+        and str(image_contract.get("artifact_path")).endswith(
+            f"/{str(image_contract.get('manifest_digest')).removeprefix('sha256:')}/layout"
+        )
+        and image_contract.get("platform") == "linux/amd64"
+        and image_contract.get("effective_user") == "root"
+        and isinstance(image_contract.get("approved_deployment_version"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", str(image_contract.get("approved_deployment_version")))
+        and image_contract.get("failure_code") is None
     )
 
     binding_identity = [
@@ -3087,7 +2996,7 @@ def _compute_stage_contract(
             "confirmation_validator_version": COMPUTE_STAGE_CONFIRMATION_VALIDATOR_VERSION,
             "confirmation_validator_sha256": validator_sha256,
             "image_validator_version": image_contract.get("validator_version"),
-            "image_identity_sha256": image_contract.get("identity_sha256"),
+            "canonical_local_image_identity": image_contract.get("canonical_local_image_identity"),
         }
     )
     passed = (
@@ -3137,13 +3046,22 @@ def _compute_stage_contract(
     }
 
 
-def _compute_provision_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
+def _compute_provision_dry_run(
+    payload: dict[str, Any],
+    *,
+    image_identity: dict[str, Any] | None = None,
+    integrity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     username = str(payload["username"])
-    image_identity = _standard_dev_image_identity()
+    observed_image = _standard_dev_image_identity() if image_identity is None else image_identity
     checks = _compute_target_checks(username, str(payload["container_name"]))
     checks.extend(_compute_exact_resource_checks(payload))
-    checks.extend(_compute_platform_checks(username, image_identity=image_identity))
-    stage_contract = _compute_stage_contract(payload, image_identity=image_identity)
+    checks.extend(_compute_platform_checks(username, image_identity=observed_image))
+    stage_contract = _compute_stage_contract(
+        payload,
+        integrity=integrity,
+        image_identity=observed_image,
+    )
     checks.extend(
         [
             _check(
@@ -3708,17 +3626,25 @@ def _compute_stage_contract_mismatches(
             expected.get("image_contract", {}).get("validator_version"),
             current.get("image_contract", {}).get("validator_version"),
         ),
-        "IMAGE_IDENTITY": (
-            expected.get("image_contract", {}).get("identity_sha256"),
-            current.get("image_contract", {}).get("identity_sha256"),
+        "CANONICAL_LOCAL_IMAGE_IDENTITY": (
+            expected.get("image_contract", {}).get("canonical_local_image_identity"),
+            current.get("image_contract", {}).get("canonical_local_image_identity"),
         ),
-        "IMAGE_REFERENCE": (
-            expected.get("image_contract", {}).get("reference"),
-            current.get("image_contract", {}).get("reference"),
+        "LOCAL_IMAGE_SOURCE_TYPE": (
+            expected.get("image_contract", {}).get("source_type"),
+            current.get("image_contract", {}).get("source_type"),
         ),
-        "IMAGE_ID": (
-            expected.get("image_contract", {}).get("image_id"),
-            current.get("image_contract", {}).get("image_id"),
+        "LOCAL_IMAGE_ARTIFACT_PATH": (
+            expected.get("image_contract", {}).get("artifact_path"),
+            current.get("image_contract", {}).get("artifact_path"),
+        ),
+        "LOCAL_IMAGE_MANIFEST_DIGEST": (
+            expected.get("image_contract", {}).get("manifest_digest"),
+            current.get("image_contract", {}).get("manifest_digest"),
+        ),
+        "LOCAL_IMAGE_DEPLOYMENT_VERSION": (
+            expected.get("image_contract", {}).get("approved_deployment_version"),
+            current.get("image_contract", {}).get("approved_deployment_version"),
         ),
         "IMAGE_VALIDATION_STATUS": (
             expected.get("image_contract", {}).get("status"),
@@ -3781,7 +3707,12 @@ def _execute_compute_provision_stage(
             "retained_resources": [],
         }
     expected_contract = payload["dry_run_stage_contract"]
-    current_contract = _compute_stage_contract(payload, integrity=integrity)
+    current_image_identity = _standard_dev_image_identity()
+    current_contract = _compute_stage_contract(
+        payload,
+        integrity=integrity,
+        image_identity=current_image_identity,
+    )
     contract_mismatches = _compute_stage_contract_mismatches(expected_contract, current_contract)
     if current_contract.get("status") != "PASS" or contract_mismatches:
         return {
@@ -3836,7 +3767,9 @@ def _execute_compute_provision_stage(
                 "reservation_ids",
             }
         }
-        | {"execution_enabled": False}
+        | {"execution_enabled": False},
+        image_identity=current_image_identity,
+        integrity=integrity,
     )
     if preflight.get("dry_run_status") != "READY_FOR_PROVISION":
         return {
@@ -3854,7 +3787,9 @@ def _execute_compute_provision_stage(
             "retained_resources": [],
         }
     execution = run_allowlisted_script(
-        _compute_stage_argv(payload), timeout=STAGE_EXECUTION_TIMEOUT_SECONDS
+        _compute_stage_argv(payload),
+        timeout=STAGE_EXECUTION_TIMEOUT_SECONDS,
+        expected_local_image_identity=str(current_image_identity["canonical_local_image_identity"]),
     )
     if not execution.get("ok"):
         retained = _compute_stage_retained_resources(payload)
