@@ -23,6 +23,7 @@ from h100_portal_api.models import (
     ensure_utc,
     utcnow,
 )
+from h100_portal_api.provision_reconciliation import pending_plan_ids, reconcile_plan
 from h100_portal_api.rbac import has_permission
 from h100_portal_api.routes.compute_requests import (
     _active_reservations,
@@ -634,6 +635,7 @@ def test_admin_approval_reservation_and_dry_run_remain_zero_side_effect_before_s
     approved = review(client, admin_headers, request_id, "APPROVE", "标准规格批准")
     assert approved.status_code == 200
     assert approved.json()["request"]["status"] == "APPROVED"
+    assert approved.json()["request"]["lifecycle_state"] == "PROVISIONING"
 
     monkeypatch.setattr("h100_portal_api.routes.compute_requests.call_worker", worker_plan())
     planned = client.post(
@@ -855,7 +857,7 @@ def test_reserved_stage_requires_reauth_consumes_plan_without_reapproval_or_leas
     )
 
 
-def test_stage_worker_timeout_persists_failed_hold_and_never_reapproves(
+def test_stage_worker_timeout_auto_converges_when_authoritative_verifier_proves_absence(
     client, database, origin_headers, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
     user = account(database, login="uncertain-stage-user")
@@ -932,13 +934,17 @@ def test_stage_worker_timeout_persists_failed_hold_and_never_reapproves(
         select(PortalResourceReservation).where(PortalResourceReservation.plan_id == plan.id)
     ).all()
     assert len(reservations) == 5
-    assert all(row.state == "FAILED_HOLD" and row.active_key for row in reservations)
+    assert all(
+        row.state == "RELEASED" and row.active_key is None and row.released_at is not None
+        for row in reservations
+    )
     operation = database.scalar(
         select(PortalOperation).where(PortalOperation.operation_type == "compute.provision.stage")
     )
     assert operation is not None
     assert operation.status == "FAILED"
-    assert operation.rollback_status == "REQUIRES_MANUAL_REVIEW"
+    assert operation.rollback_status == "ROLLED_BACK"
+    assert operation.dry_run_result["automatic_reconciliation"]["status"] == "VERIFIED"
     assert (
         database.scalar(
             select(func.count())
@@ -947,6 +953,66 @@ def test_stage_worker_timeout_persists_failed_hold_and_never_reapproves(
         )
         == approval_count
     )
+
+
+def test_stage_failure_keeps_failed_hold_only_when_authoritative_state_is_unknown(
+    client, database, origin_headers, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    user = account(database, login="unknown-stage-user")
+    admin = account(database, login="unknown-stage-admin", role="platform_owner")
+    request_id = submit(client, login(client, origin_headers, user.normalized_login)).json()[
+        "request"
+    ]["id"]
+    admin_headers = login(client, origin_headers, admin.normalized_login)
+    assert review(client, admin_headers, request_id, "APPROVE", "approved once").status_code == 200
+    plan_worker = worker_plan()
+
+    def unavailable_worker(operation_type, **kwargs):  # type: ignore[no-untyped-def]
+        if operation_type in {"compute.provision.stage", "compute.provision.retry_verify"}:
+            raise WorkerClientError("WORKER_UNAVAILABLE", "state cannot be determined")
+        return plan_worker(operation_type, **kwargs)
+
+    monkeypatch.setattr("h100_portal_api.routes.compute_requests.call_worker", unavailable_worker)
+    for action in ("plan", "dry-run"):
+        response = client.post(
+            f"/api/v1/admin/compute-resource-requests/{request_id}/{action}",
+            headers=admin_headers,
+            json={"idempotency_key": str(uuid.uuid4())},
+        )
+        assert response.status_code == 200
+    assert (
+        client.post(
+            "/api/v1/auth/reauthenticate",
+            headers=admin_headers,
+            json={"password": PASSWORD},
+        ).status_code
+        == 200
+    )
+    failed = client.post(
+        f"/api/v1/admin/compute-resource-requests/{request_id}/provision",
+        headers=admin_headers,
+        json={"idempotency_key": str(uuid.uuid4())},
+    )
+    assert failed.status_code == 503
+
+    database.expire_all()
+    item = database.get(PortalComputeResourceRequest, uuid.UUID(request_id))
+    assert item is not None and item.status == "FAILED"
+    plan = database.get(PortalProvisionPlan, item.provision_plan_id)
+    assert plan is not None and plan.state == "FAILED"
+    reservations = database.scalars(
+        select(PortalResourceReservation).where(PortalResourceReservation.plan_id == plan.id)
+    ).all()
+    assert len(reservations) == 5
+    assert all(row.state == "FAILED_HOLD" and row.active_key for row in reservations)
+    operation = database.scalar(
+        select(PortalOperation).where(PortalOperation.operation_type == "compute.provision.stage")
+    )
+    assert operation is not None
+    assert operation.rollback_status == "REQUIRES_MANUAL_REVIEW"
+    evidence = operation.dry_run_result["automatic_reconciliation"]
+    assert evidence["status"] == "MANUAL_REVIEW"
+    assert evidence["unknown_resource_state"] == ["ROOT_WORKER:WORKER_UNAVAILABLE"]
 
 
 def test_first_stage_gate_failure_records_no_side_effect_and_preserves_approval(
@@ -1611,3 +1677,535 @@ def test_failed_hold_remains_an_allocator_exclusion(database) -> None:  # type: 
     database.commit()
 
     assert "20009" in _active_reservations(database)["UID"]
+
+
+def test_single_approval_runs_complete_provision_and_replays_idempotently(
+    client, database, origin_headers, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    user = account(database, login="single-approval-user")
+    admin = account(database, login="single-approval-admin", role="platform_owner")
+    request_id = submit(client, login(client, origin_headers, user.normalized_login)).json()[
+        "request"
+    ]["id"]
+    admin_headers = login(client, origin_headers, admin.normalized_login)
+    assert (
+        client.post(
+            "/api/v1/auth/reauthenticate",
+            headers=admin_headers,
+            json={"password": PASSWORD},
+        ).status_code
+        == 200
+    )
+    calls: list[str] = []
+    stage_worker = worker_stage()
+
+    def observed_worker(operation_type, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(operation_type)
+        return stage_worker(operation_type, **kwargs)
+
+    monkeypatch.setattr("h100_portal_api.routes.compute_requests.call_worker", observed_worker)
+    idempotency_key = str(uuid.uuid4())
+    response = client.post(
+        f"/api/v1/admin/compute-resource-requests/{request_id}/approve-and-provision",
+        headers=admin_headers,
+        json={"review_note": None, "idempotency_key": idempotency_key},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "KEY_ENROLLMENT_PENDING"
+    assert payload["idempotent_replay"] is False
+    assert payload["request"]["lifecycle_state"] == "STAGED"
+    assert calls == [
+        "compute.provision.plan",
+        "compute.provision.dry_run",
+        "compute.provision.stage",
+    ]
+
+    database.expire_all()
+    item = database.get(PortalComputeResourceRequest, uuid.UUID(request_id))
+    assert item is not None and item.status == "KEY_ENROLLMENT_PENDING"
+    assert item.approved_at is not None and item.reviewed_by == admin.id
+    plan = database.get(PortalProvisionPlan, item.provision_plan_id)
+    assert plan is not None and plan.attempt_number == 1 and plan.state == "STAGED"
+    operations = database.scalars(
+        select(PortalOperation).where(PortalOperation.target_id == request_id)
+    ).all()
+    top_level = [row for row in operations if row.operation_type == "compute.provision"]
+    assert len(top_level) == 1
+    assert top_level[0].status == "SUCCEEDED"
+    assert top_level[0].validated_payload["canonical_execution_contract"] == "d" * 64
+    assert top_level[0].validated_payload["deployment_version"] == "SOURCE_WORKTREE"
+    assert all(
+        row.validated_payload.get("visibility") == "INTERNAL_STEP"
+        for row in operations
+        if row.operation_type
+        in {"compute.provision.plan", "compute.provision.dry_run", "compute.provision.stage"}
+    )
+    visible_operations = client.get("/api/v1/operations", headers=admin_headers)
+    assert visible_operations.status_code == 200
+    visible_types = {row["operation_type"] for row in visible_operations.json()["operations"]}
+    assert "compute.provision" in visible_types
+    assert not visible_types.intersection(
+        {"compute.provision.plan", "compute.provision.dry_run", "compute.provision.stage"}
+    )
+
+    admin_sessions = database.scalars(
+        select(PortalSession).where(
+            PortalSession.user_id == admin.id,
+            PortalSession.revoked_at.is_(None),
+        )
+    ).all()
+    assert len(admin_sessions) == 1
+    admin_sessions[0].reauthenticated_at = None
+    database.commit()
+
+    replay = client.post(
+        f"/api/v1/admin/compute-resource-requests/{request_id}/approve-and-provision",
+        headers=admin_headers,
+        json={"review_note": None, "idempotency_key": idempotency_key},
+    )
+    assert replay.status_code == 200
+    assert replay.json()["operation_id"] == payload["operation_id"]
+    assert replay.json()["idempotent_replay"] is True
+    assert calls == [
+        "compute.provision.plan",
+        "compute.provision.dry_run",
+        "compute.provision.stage",
+    ]
+    assert (
+        database.scalar(
+            select(func.count())
+            .select_from(PortalProvisionPlan)
+            .where(PortalProvisionPlan.request_id == uuid.UUID(request_id))
+        )
+        == 1
+    )
+
+
+def test_internal_dry_run_replay_uses_durable_result_without_duplicate_worker_call(
+    client, database, origin_headers, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    user = account(database, login="dry-run-replay-user")
+    admin = account(database, login="dry-run-replay-admin", role="platform_owner")
+    request_id = submit(client, login(client, origin_headers, user.normalized_login)).json()[
+        "request"
+    ]["id"]
+    admin_headers = login(client, origin_headers, admin.normalized_login)
+    assert review(client, admin_headers, request_id, "APPROVE", "approved once").status_code == 200
+    worker = worker_plan()
+    calls: list[str] = []
+
+    def observed_worker(operation_type, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(operation_type)
+        return worker(operation_type, **kwargs)
+
+    monkeypatch.setattr("h100_portal_api.routes.compute_requests.call_worker", observed_worker)
+    assert (
+        client.post(
+            f"/api/v1/admin/compute-resource-requests/{request_id}/plan",
+            headers=admin_headers,
+            json={"idempotency_key": str(uuid.uuid4())},
+        ).status_code
+        == 200
+    )
+    dry_run_key = str(uuid.uuid4())
+    first = client.post(
+        f"/api/v1/admin/compute-resource-requests/{request_id}/dry-run",
+        headers=admin_headers,
+        json={"idempotency_key": dry_run_key},
+    )
+    replay = client.post(
+        f"/api/v1/admin/compute-resource-requests/{request_id}/dry-run",
+        headers=admin_headers,
+        json={"idempotency_key": dry_run_key},
+    )
+    assert first.status_code == 200 and replay.status_code == 200
+    assert replay.json()["idempotent_replay"] is True
+    assert calls == ["compute.provision.plan", "compute.provision.dry_run"]
+    assert (
+        database.scalar(
+            select(func.count())
+            .select_from(PortalOperation)
+            .where(
+                PortalOperation.target_id == request_id,
+                PortalOperation.operation_type == "compute.provision.dry_run",
+            )
+        )
+        == 1
+    )
+
+
+def test_approve_and_provision_reuses_one_recent_auth_check_for_internal_stage(
+    client, database, origin_headers, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    user = account(database, login="recent-auth-workflow-user")
+    admin = account(database, login="recent-auth-workflow-admin", role="platform_owner")
+    request_id = submit(client, login(client, origin_headers, user.normalized_login)).json()[
+        "request"
+    ]["id"]
+    admin_headers = login(client, origin_headers, admin.normalized_login)
+    denied = client.post(
+        f"/api/v1/admin/compute-resource-requests/{request_id}/approve-and-provision",
+        headers=admin_headers,
+        json={"review_note": None, "idempotency_key": str(uuid.uuid4())},
+    )
+    assert denied.status_code == 428
+
+    checks = 0
+
+    def count_recent_auth(_context):  # type: ignore[no-untyped-def]
+        nonlocal checks
+        checks += 1
+
+    monkeypatch.setattr(
+        "h100_portal_api.routes.compute_requests.require_recent_reauthentication",
+        count_recent_auth,
+    )
+    monkeypatch.setattr(
+        "h100_portal_api.routes.compute_requests.call_worker",
+        worker_stage(),
+    )
+    completed = client.post(
+        f"/api/v1/admin/compute-resource-requests/{request_id}/approve-and-provision",
+        headers=admin_headers,
+        json={"review_note": None, "idempotency_key": str(uuid.uuid4())},
+    )
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "KEY_ENROLLMENT_PENDING"
+    assert checks == 1
+
+
+def test_single_retry_creates_one_fresh_attempt_without_retry_authorization_ceremony(
+    client, database, origin_headers, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _owner, item, failed_plan, _reservations, failed_stage = failed_stage_fixture(
+        database, login="single-retry-user"
+    )
+    admin = account(database, login="single-retry-admin", role="platform_owner")
+    admin_headers = login(client, origin_headers, admin.normalized_login)
+    assert (
+        client.post(
+            "/api/v1/auth/reauthenticate",
+            headers=admin_headers,
+            json={"password": PASSWORD},
+        ).status_code
+        == 200
+    )
+    monkeypatch.setattr(
+        "h100_portal_api.routes.compute_requests.call_worker",
+        worker_stage(),
+    )
+    response = client.post(
+        f"/api/v1/admin/compute-resource-requests/{item.id}/retry",
+        headers=admin_headers,
+        json={"admin_note": None, "idempotency_key": str(uuid.uuid4())},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "KEY_ENROLLMENT_PENDING"
+
+    database.expire_all()
+    updated = database.get(PortalComputeResourceRequest, item.id)
+    assert updated is not None and updated.status == "KEY_ENROLLMENT_PENDING"
+    retry_plan = database.get(PortalProvisionPlan, updated.provision_plan_id)
+    assert retry_plan is not None
+    assert retry_plan.attempt_number == 2 and retry_plan.previous_plan_id == failed_plan.id
+    assert retry_plan.failed_stage_operation_id == failed_stage.id
+    retry_operations = database.scalars(
+        select(PortalOperation).where(
+            PortalOperation.target_id == str(item.id),
+            PortalOperation.operation_type == "compute.provision.retry",
+        )
+    ).all()
+    assert len(retry_operations) == 1
+    assert retry_plan.retry_authorization_operation_id == retry_operations[0].id
+    assert (
+        database.scalar(
+            select(func.count())
+            .select_from(PortalOperation)
+            .where(PortalOperation.operation_type == "compute.provision.retry_authorize")
+        )
+        == 0
+    )
+
+
+def test_simplified_retry_contract_rejects_typed_ids_and_incident_ceremony(
+    client, database, origin_headers
+) -> None:  # type: ignore[no-untyped-def]
+    _owner, item, _plan, _reservations, _stage = failed_stage_fixture(
+        database, login="closed-retry-contract-user"
+    )
+    admin = account(database, login="closed-retry-contract-admin", role="platform_owner")
+    admin_headers = login(client, origin_headers, admin.normalized_login)
+    response = client.post(
+        f"/api/v1/admin/compute-resource-requests/{item.id}/retry",
+        headers=admin_headers,
+        json={
+            "idempotency_key": str(uuid.uuid4()),
+            "request_id": str(item.id),
+            "plan_id": str(item.provision_plan_id),
+            "stage_id": str(uuid.uuid4()),
+            "root_cause": "human supplied",
+            "retry_reason": "human supplied",
+            "remediation_git_sha": "a" * 40,
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_top_level_provision_failure_auto_verifies_absence_and_releases_reservations(
+    client, database, origin_headers, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    user = account(database, login="auto-rollback-user")
+    admin = account(database, login="auto-rollback-admin", role="platform_owner")
+    request_id = submit(client, login(client, origin_headers, user.normalized_login)).json()[
+        "request"
+    ]["id"]
+    admin_headers = login(client, origin_headers, admin.normalized_login)
+    assert (
+        client.post(
+            "/api/v1/auth/reauthenticate",
+            headers=admin_headers,
+            json={"password": PASSWORD},
+        ).status_code
+        == 200
+    )
+    read_worker = worker_plan()
+
+    def failed_stage(operation_type, **kwargs):  # type: ignore[no-untyped-def]
+        if operation_type != "compute.provision.stage":
+            return read_worker(operation_type, **kwargs)
+        return {
+            "status": "ERROR",
+            "handler": operation_type,
+            "error": {
+                "code": "COMPUTE_STAGE_FAILED",
+                "message": "Container image validation failed",
+            },
+            "side_effect_classification": "PARTIAL_UNKNOWN",
+            "rollback_status": "REQUIRES_MANUAL_REVIEW",
+            "last_successful_step": "SLURM_ASSOCIATION",
+            "first_failed_step": "CONTAINER_IMAGE",
+            "failed_handler": "h100-provision-stage",
+            "rollback_steps": {
+                "LINUX_IDENTITY": "SUCCEEDED",
+                "STORAGE": "SUCCEEDED",
+                "XFS_QUOTA": "SUCCEEDED",
+                "GPU_POLICY": "SUCCEEDED",
+                "SLURM_ASSOCIATION": "SUCCEEDED",
+            },
+        }
+
+    monkeypatch.setattr("h100_portal_api.routes.compute_requests.call_worker", failed_stage)
+    response = client.post(
+        f"/api/v1/admin/compute-resource-requests/{request_id}/approve-and-provision",
+        headers=admin_headers,
+        json={"review_note": None, "idempotency_key": str(uuid.uuid4())},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "FAILED"
+    assert response.json()["operation"]["rollback_status"] == "ROLLED_BACK"
+
+    database.expire_all()
+    item = database.get(PortalComputeResourceRequest, uuid.UUID(request_id))
+    assert item is not None and item.status == "FAILED" and item.active_slot is None
+    plan = database.get(PortalProvisionPlan, item.provision_plan_id)
+    assert plan is not None and plan.state == "FAILED" and plan.attempt_number == 1
+    reservations = database.scalars(
+        select(PortalResourceReservation).where(PortalResourceReservation.plan_id == plan.id)
+    ).all()
+    assert len(reservations) == 5
+    assert all(
+        row.state == "RELEASED" and row.active_key is None and row.released_at is not None
+        for row in reservations
+    )
+    stage = database.scalar(
+        select(PortalOperation).where(
+            PortalOperation.target_id == request_id,
+            PortalOperation.operation_type == "compute.provision.stage",
+        )
+    )
+    top_level = database.scalar(
+        select(PortalOperation).where(
+            PortalOperation.target_id == request_id,
+            PortalOperation.operation_type == "compute.provision",
+        )
+    )
+    assert stage is not None and stage.status == "FAILED"
+    assert stage.rollback_status == "ROLLED_BACK"
+    assert stage.dry_run_result["automatic_reconciliation"]["status"] == "VERIFIED"
+    assert top_level is not None and top_level.status == "FAILED"
+    assert top_level.rollback_status == "ROLLED_BACK"
+    assert (
+        database.scalar(
+            select(func.count())
+            .select_from(PortalProvisionPlan)
+            .where(PortalProvisionPlan.request_id == item.id)
+        )
+        == 1
+    )
+
+
+def test_top_level_provision_failure_holds_only_authoritatively_unknown_resources(
+    client, database, origin_headers, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    user = account(database, login="auto-rollback-unknown-user")
+    admin = account(database, login="auto-rollback-unknown-admin", role="platform_owner")
+    request_id = submit(client, login(client, origin_headers, user.normalized_login)).json()[
+        "request"
+    ]["id"]
+    admin_headers = login(client, origin_headers, admin.normalized_login)
+    assert (
+        client.post(
+            "/api/v1/auth/reauthenticate",
+            headers=admin_headers,
+            json={"password": PASSWORD},
+        ).status_code
+        == 200
+    )
+    read_worker = worker_plan()
+
+    def unknown_stage(operation_type, **kwargs):  # type: ignore[no-untyped-def]
+        if operation_type == "compute.provision.retry_verify":
+            raise WorkerClientError("WORKER_UNAVAILABLE", "host state is unknown")
+        if operation_type != "compute.provision.stage":
+            return read_worker(operation_type, **kwargs)
+        return {
+            "status": "ERROR",
+            "handler": operation_type,
+            "error": {
+                "code": "COMPUTE_STAGE_FAILED",
+                "message": "Container image validation failed",
+            },
+            "side_effect_classification": "PARTIAL_UNKNOWN",
+            "rollback_status": "REQUIRES_MANUAL_REVIEW",
+            "last_successful_step": "SLURM_ASSOCIATION",
+            "first_failed_step": "CONTAINER_IMAGE",
+            "failed_handler": "h100-provision-stage",
+        }
+
+    monkeypatch.setattr("h100_portal_api.routes.compute_requests.call_worker", unknown_stage)
+    response = client.post(
+        f"/api/v1/admin/compute-resource-requests/{request_id}/approve-and-provision",
+        headers=admin_headers,
+        json={"review_note": None, "idempotency_key": str(uuid.uuid4())},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "FAILED"
+    operation_view = response.json()["operation"]
+    assert operation_view["rollback_status"] == "REQUIRES_MANUAL_REVIEW"
+    assert operation_view["unknown_resource_state"] == ["ROOT_WORKER:WORKER_UNAVAILABLE"]
+
+    database.expire_all()
+    item = database.get(PortalComputeResourceRequest, uuid.UUID(request_id))
+    assert item is not None and item.status == "FAILED"
+    plan = database.get(PortalProvisionPlan, item.provision_plan_id)
+    assert plan is not None and plan.state == "FAILED"
+    reservations = database.scalars(
+        select(PortalResourceReservation).where(PortalResourceReservation.plan_id == plan.id)
+    ).all()
+    assert len(reservations) == 5
+    assert all(row.state == "FAILED_HOLD" and row.active_key for row in reservations)
+    assert pending_plan_ids(database) == [plan.id]
+    assert (
+        database.scalar(
+            select(func.count())
+            .select_from(PortalProvisionPlan)
+            .where(PortalProvisionPlan.request_id == item.id)
+        )
+        == 1
+    )
+
+
+def test_automatic_reconciler_is_idempotent_and_never_creates_a_retry_attempt(
+    database, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _owner, item, plan, reservations, stage = manual_review_stage_fixture(
+        database, login="automatic-reconcile-user"
+    )
+    monkeypatch.setattr(
+        "h100_portal_api.provision_reconciliation.call_worker",
+        worker_plan(),
+    )
+
+    first = reconcile_plan(database, plan.id)
+    database.commit()
+    assert first.status == "VERIFIED" and first.changed is True
+    assert first.stage_operation_id == stage.id
+    assert stage.status == "FAILED" and stage.rollback_status == "ROLLED_BACK"
+    assert item.status == "FAILED" and item.provision_plan_id == plan.id
+    assert all(
+        row.state == "RELEASED" and row.active_key is None and row.released_at is not None
+        for row in reservations
+    )
+
+    second = reconcile_plan(database, plan.id)
+    database.commit()
+    assert second.status == "VERIFIED" and second.changed is False
+    assert (
+        database.scalar(
+            select(func.count())
+            .select_from(PortalProvisionPlan)
+            .where(PortalProvisionPlan.request_id == item.id)
+        )
+        == 1
+    )
+
+
+def test_automatic_reconciler_preserves_failed_hold_when_root_worker_is_unknown(
+    database, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _owner, item, plan, reservations, stage = manual_review_stage_fixture(
+        database, login="automatic-reconcile-unknown-user"
+    )
+
+    def unavailable_worker(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise WorkerClientError("WORKER_UNAVAILABLE", "host state is unknown")
+
+    monkeypatch.setattr(
+        "h100_portal_api.provision_reconciliation.call_worker",
+        unavailable_worker,
+    )
+    result = reconcile_plan(database, plan.id)
+    database.commit()
+
+    assert result.status == "MANUAL_REVIEW" and result.changed is False
+    assert stage.status == "FAILED" and stage.rollback_status == "REQUIRES_MANUAL_REVIEW"
+    assert item.status == "FAILED" and item.provision_plan_id == plan.id
+    assert all(row.state == "FAILED_HOLD" and row.active_key for row in reservations)
+    evidence = stage.dry_run_result["automatic_reconciliation"]
+    assert evidence["status"] == "MANUAL_REVIEW"
+    assert evidence["unknown_resource_state"] == ["ROOT_WORKER:WORKER_UNAVAILABLE"]
+
+
+def test_automatic_reconciler_fails_closed_on_malformed_worker_residue_schema(
+    database, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    _owner, item, plan, reservations, stage = manual_review_stage_fixture(
+        database, login="automatic-reconcile-malformed-user"
+    )
+
+    def malformed_worker(operation_type, **_kwargs):  # type: ignore[no-untyped-def]
+        assert operation_type == "compute.provision.retry_verify"
+        return {
+            "status": "DRY_RUN",
+            "handler": operation_type,
+            "retry_verification_status": "VERIFIED_ZERO_RESIDUE",
+            "script_integrity": "PASS",
+            "resource_residue": "not-a-list",
+            "unknown_resource_state": [],
+        }
+
+    monkeypatch.setattr(
+        "h100_portal_api.provision_reconciliation.call_worker",
+        malformed_worker,
+    )
+    result = reconcile_plan(database, plan.id)
+    database.commit()
+
+    assert result.status == "MANUAL_REVIEW" and result.changed is False
+    assert stage.status == "FAILED" and stage.rollback_status == "REQUIRES_MANUAL_REVIEW"
+    assert item.status == "FAILED" and item.provision_plan_id == plan.id
+    assert all(row.state == "FAILED_HOLD" and row.active_key for row in reservations)
+    evidence = stage.dry_run_result["automatic_reconciliation"]
+    assert evidence["status"] == "MANUAL_REVIEW"
+    assert evidence["unknown_resource_state"] == ["ROOT_WORKER_RESULT"]

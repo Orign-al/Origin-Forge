@@ -1,7 +1,8 @@
 import re
 import uuid
+from contextvars import ContextVar
 from datetime import timedelta
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
@@ -42,11 +43,15 @@ from h100_portal_api.models import (
     ensure_utc,
     utcnow,
 )
+from h100_portal_api.provision_reconciliation import authoritative_zero_residue
 from h100_portal_api.rbac import highest_role
+from h100_portal_api.runtime_identity import deployment_version
 from h100_portal_api.schemas import (
     ComputeProvisionActionRequest,
+    ComputeProvisionApprovalRequest,
     ComputeProvisionReconciliationRequest,
     ComputeProvisionRetryAuthorizationRequest,
+    ComputeProvisionRetryRequest,
     ComputeResourceRequestCancel,
     ComputeResourceRequestCreate,
     ComputeResourceReviewRequest,
@@ -54,6 +59,10 @@ from h100_portal_api.schemas import (
 from h100_portal_api.worker_client import WorkerClientError, call_worker
 
 router = APIRouter(tags=["compute-resource-requests"])
+
+_ORCHESTRATION_OPERATION_ID: ContextVar[uuid.UUID | None] = ContextVar(
+    "compute_provision_orchestration_operation_id", default=None
+)
 
 STANDARD_STORAGE_BYTES = 300 * 1024**3
 STANDARD_CONTAINER_PROFILE = "STANDARD_8CPU_32GB"
@@ -213,6 +222,18 @@ def _audit(
     metadata: dict[str, Any] | None = None,
     operation_id: uuid.UUID | None = None,
 ) -> None:
+    parent_operation_id = _ORCHESTRATION_OPERATION_ID.get()
+    if parent_operation_id is not None and operation_id != parent_operation_id:
+        db.add(
+            PortalOperationEvent(
+                operation_id=parent_operation_id,
+                from_status=OperationStatus.RUNNING,
+                to_status=OperationStatus.RUNNING,
+                safe_message=f"Internal step {event_type}: {result}"[:1000],
+                created_at=utcnow(),
+            )
+        )
+        return
     record_audit(
         db,
         event_type=event_type,
@@ -242,6 +263,15 @@ def _operation(
     risk_level: RiskLevel = RiskLevel.MEDIUM,
 ) -> PortalOperation:
     now = utcnow()
+    parent_operation_id = _ORCHESTRATION_OPERATION_ID.get()
+    validated_payload = dict(payload)
+    if parent_operation_id is not None:
+        validated_payload.update(
+            {
+                "parent_operation_id": str(parent_operation_id),
+                "visibility": "INTERNAL_STEP",
+            }
+        )
     operation = PortalOperation(
         operation_type=operation_type,
         target_type="compute_resource_request",
@@ -250,7 +280,7 @@ def _operation(
         owner_managed_user_id=None,
         approved_by=context.user.id,
         request_summary=summary,
-        validated_payload=payload,
+        validated_payload=validated_payload,
         idempotency_key=f"{operation_type}:{idempotency_key}",
         risk_level=risk_level,
         status=status_value,
@@ -329,6 +359,8 @@ def _safe_operation_view(operation: PortalOperation | None) -> dict[str, Any] | 
     evidence = operation.dry_run_result if isinstance(operation.dry_run_result, dict) else {}
     legacy = IMMUTABLE_STAGE_FAILURE_EVIDENCE.get(str(operation.id))
     payload = operation.validated_payload if isinstance(operation.validated_payload, dict) else {}
+    reconciliation = evidence.get("automatic_reconciliation")
+    safe_reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
     if (
         not evidence
         and legacy is not None
@@ -356,6 +388,12 @@ def _safe_operation_view(operation: PortalOperation | None) -> dict[str, Any] | 
         "retained_resources": evidence.get("retained_resources"),
         "rollback_steps": evidence.get("rollback_steps"),
         "stage_failure_code": evidence.get("stage_failure_code"),
+        "workflow_steps": _workflow_steps(operation),
+        "deployment_version": payload.get("deployment_version"),
+        "canonical_execution_contract": payload.get("canonical_execution_contract"),
+        "reconciliation_status": safe_reconciliation.get("status"),
+        "resource_residue": safe_reconciliation.get("host_residue"),
+        "unknown_resource_state": safe_reconciliation.get("unknown_resource_state"),
     }
 
 
@@ -382,6 +420,8 @@ def _attempt_history(
                         "compute.provision.retry_authorize",
                         "compute.provision.reconcile",
                         "compute.provision.stage",
+                        "compute.provision",
+                        "compute.provision.retry",
                     }
                 ),
             )
@@ -419,6 +459,15 @@ def _attempt_history(
             ),
             None,
         )
+        provision_operation = next(
+            (
+                operation
+                for operation in reversed(bound)
+                if operation.operation_type in {"compute.provision", "compute.provision.retry"}
+            ),
+            None,
+        )
+        lifecycle_operation = stage or provision_operation
         reservations = list(
             db.scalars(
                 select(PortalResourceReservation).where(
@@ -435,7 +484,8 @@ def _attempt_history(
                 "attempt_reason": plan.attempt_reason,
                 "plan": _plan_view(plan, internal=True),
                 "operations": [_safe_operation_view(operation) for operation in bound],
-                "stage_operation": _safe_operation_view(stage),
+                "provision_operation": _safe_operation_view(provision_operation),
+                "stage_operation": _safe_operation_view(lifecycle_operation),
                 "reservations": reservation_states,
             }
         )
@@ -443,9 +493,9 @@ def _attempt_history(
             item.status == "FAILED"
             and item.provision_plan_id == plan.id
             and plan.state == "FAILED"
-            and stage is not None
-            and stage.status == OperationStatus.FAILED
-            and stage.rollback_status in {"NOT_REQUIRED", "ROLLED_BACK"}
+            and lifecycle_operation is not None
+            and lifecycle_operation.status == OperationStatus.FAILED
+            and lifecycle_operation.rollback_status in {"NOT_REQUIRED", "ROLLED_BACK"}
             and len(reservations) == 5
             and all(
                 row.state == "RELEASED"
@@ -463,11 +513,20 @@ def _request_view(
     db: Session, item: PortalComputeResourceRequest, *, internal: bool
 ) -> dict[str, Any]:
     plan = db.get(PortalProvisionPlan, item.provision_plan_id) if item.provision_plan_id else None
+    lifecycle_state = {
+        "REQUESTED": "PENDING",
+        "UNDER_REVIEW": "PENDING",
+        "APPROVED": "PROVISIONING",
+        "RETRY_AUTHORIZED": "PROVISIONING",
+        "PROVISION_PLAN_READY": "PROVISIONING",
+        "KEY_ENROLLMENT_PENDING": "STAGED",
+    }.get(item.status, item.status)
     result: dict[str, Any] = {
         "id": str(item.id),
         "portal_account_id": str(item.portal_account_id),
         "username": item.username,
         "status": item.status,
+        "lifecycle_state": lifecycle_state,
         "approval_state": "APPROVED" if item.approved_at is not None else "NOT_APPROVED",
         "requested_gpu_max": item.requested_gpu_max,
         "requested_storage_bytes": item.requested_storage_bytes,
@@ -508,13 +567,16 @@ def _request_view(
                     else "UNKNOWN",
                 },
                 "attempts": attempts,
+                "retry_available": retry_available,
+                # Compatibility projection for historical clients. New Portal
+                # workflows use retry_available and create no authorization step.
                 "retry_authorization_available": retry_available,
                 "retry_state": (
-                    "AUTHORIZED"
-                    if item.status == "RETRY_AUTHORIZED"
-                    else "AWAITING_ADMINISTRATOR"
+                    "PROVISIONING"
+                    if item.status in {"RETRY_AUTHORIZED", "PROVISION_PLAN_READY", "PROVISIONING"}
+                    else "RETRY_ELIGIBLE"
                     if item.status == "FAILED" and retry_available
-                    else "RECONCILIATION_REQUIRED"
+                    else "MANUAL_REVIEW"
                     if item.status == "FAILED"
                     else "NOT_REQUIRED"
                 ),
@@ -774,6 +836,96 @@ def _rolled_back_stage_retry(
             "失败的 Stage 需要人工对账，不能重新规划",
         )
     return plan, reservations, operation
+
+
+def _retryable_failed_attempt(
+    db: Session, item: PortalComputeResourceRequest
+) -> tuple[PortalProvisionPlan, list[PortalResourceReservation], PortalOperation]:
+    """Return one immutable failed attempt whose rollback truth is already known."""
+    if item.provision_plan_id is None or item.managed_user_id is not None:
+        raise _error(
+            409,
+            "PROVISION_RETRY_NOT_ELIGIBLE",
+            "失败的 Provision Attempt 尚未满足安全重试条件",
+        )
+    plan = db.scalar(
+        select(PortalProvisionPlan)
+        .where(PortalProvisionPlan.id == item.provision_plan_id)
+        .with_for_update()
+    )
+    reservations = list(
+        db.scalars(
+            select(PortalResourceReservation)
+            .where(PortalResourceReservation.plan_id == item.provision_plan_id)
+            .with_for_update()
+        ).all()
+    )
+    operations = list(
+        db.scalars(
+            select(PortalOperation)
+            .where(
+                PortalOperation.target_type == "compute_resource_request",
+                PortalOperation.target_id == str(item.id),
+                PortalOperation.operation_type.in_(
+                    {
+                        "compute.provision.stage",
+                        "compute.provision",
+                        "compute.provision.retry",
+                    }
+                ),
+                PortalOperation.status == OperationStatus.FAILED,
+            )
+            .order_by(PortalOperation.created_at.desc())
+            .with_for_update()
+        ).all()
+    )
+    failure = next(
+        (
+            operation
+            for operation in operations
+            if isinstance(operation.validated_payload, dict)
+            and operation.validated_payload.get("plan_id") == str(item.provision_plan_id)
+        ),
+        None,
+    )
+    expected_values = (
+        {
+            ("UID", str(plan.uid)),
+            ("GID", str(plan.gid)),
+            ("PROJECT_ID", str(plan.project_id)),
+            ("SSH_PORT", str(plan.container_ssh_port)),
+            ("CONTAINER_NAME", plan.container_name),
+        }
+        if plan is not None
+        else set()
+    )
+    eligible = bool(
+        item.status in {"FAILED", "RETRY_AUTHORIZED"}
+        and plan is not None
+        and plan.request_id == item.id
+        and plan.portal_account_id == item.portal_account_id
+        and plan.state == "FAILED"
+        and failure is not None
+        and failure.rollback_status in {"NOT_REQUIRED", "ROLLED_BACK"}
+        and len(reservations) == 5
+        and {(row.resource_type, row.resource_value) for row in reservations} == expected_values
+        and all(
+            row.request_id == item.id
+            and row.portal_account_id == item.portal_account_id
+            and row.state == "RELEASED"
+            and row.active_key is None
+            and row.consumed_at is None
+            and row.released_at is not None
+            for row in reservations
+        )
+    )
+    if not eligible or plan is None or failure is None:
+        raise _error(
+            409,
+            "UNKNOWN_RESOURCE_STATE",
+            "Rollback 尚未被权威验证；FAILED_HOLD 保持不变",
+        )
+    return plan, reservations, failure
 
 
 def _retry_verification_payload(
@@ -1129,7 +1281,7 @@ def admin_compute_request_detail(
     return {"status": "OK", "request": _request_view(db, item, internal=True)}
 
 
-@router.post("/admin/compute-resource-requests/{request_id}/review")
+@router.post("/admin/compute-resource-requests/{request_id}/review", deprecated=True)
 def review_compute_request(
     request_id: str,
     body: ComputeResourceReviewRequest,
@@ -1197,8 +1349,666 @@ def review_compute_request(
     return {"status": item.status, "request": _request_view(db, item, internal=True)}
 
 
+def _workflow_steps(operation: PortalOperation) -> dict[str, str]:
+    result = operation.dry_run_result if isinstance(operation.dry_run_result, dict) else {}
+    raw = result.get("workflow_steps")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in raw.items()
+        if str(key) in {"PREPARING", "VALIDATING", "CREATING_ENVIRONMENT", "FINALIZING"}
+        and str(value) in {"PENDING", "RUNNING", "SUCCEEDED", "FAILED"}
+    }
+
+
+def _set_workflow_step(
+    db: Session,
+    operation_id: uuid.UUID,
+    step: str,
+    state: str,
+) -> None:
+    operation = db.get(PortalOperation, operation_id)
+    if operation is None or operation.status != OperationStatus.RUNNING:
+        raise _error(
+            409,
+            "PROVISION_ORCHESTRATION_STATE_INVALID",
+            "顶层 Provision Operation 状态不完整",
+        )
+    steps = _workflow_steps(operation)
+    steps[step] = state
+    result = operation.dry_run_result if isinstance(operation.dry_run_result, dict) else {}
+    operation.dry_run_result = {**result, "workflow_steps": steps}
+    db.add(
+        PortalOperationEvent(
+            operation_id=operation.id,
+            from_status=OperationStatus.RUNNING,
+            to_status=OperationStatus.RUNNING,
+            safe_message=f"{step}: {state}",
+            created_at=utcnow(),
+        )
+    )
+    db.commit()
+
+
+def _active_orchestration(
+    db: Session, item: PortalComputeResourceRequest
+) -> PortalOperation | None:
+    return db.scalar(
+        select(PortalOperation)
+        .where(
+            PortalOperation.target_type == "compute_resource_request",
+            PortalOperation.target_id == str(item.id),
+            PortalOperation.operation_type.in_({"compute.provision", "compute.provision.retry"}),
+            PortalOperation.status == OperationStatus.RUNNING,
+        )
+        .order_by(PortalOperation.created_at.desc())
+    )
+
+
+def _orchestration_by_key(
+    db: Session,
+    *,
+    item: PortalComputeResourceRequest,
+    context: AuthContext,
+    operation_type: str,
+    idempotency_key: uuid.UUID,
+) -> PortalOperation | None:
+    return db.scalar(
+        select(PortalOperation).where(
+            PortalOperation.requested_by == context.user.id,
+            PortalOperation.target_id == str(item.id),
+            PortalOperation.operation_type == operation_type,
+            PortalOperation.idempotency_key == f"{operation_type}:{idempotency_key}",
+        )
+    )
+
+
+def _orchestration_response(
+    db: Session,
+    item: PortalComputeResourceRequest,
+    operation: PortalOperation,
+    *,
+    idempotent_replay: bool,
+) -> dict[str, Any]:
+    public_status = (
+        "PROVISIONING"
+        if operation.status == OperationStatus.RUNNING
+        else "KEY_ENROLLMENT_PENDING"
+        if operation.status == OperationStatus.SUCCEEDED
+        else "FAILED"
+    )
+    return {
+        "status": public_status,
+        "operation_id": str(operation.id),
+        "operation": _safe_operation_view(operation),
+        "idempotent_replay": idempotent_replay,
+        "request": _request_view(db, item, internal=True),
+    }
+
+
+def _new_orchestration_operation(
+    db: Session,
+    *,
+    item: PortalComputeResourceRequest,
+    context: AuthContext,
+    operation_type: str,
+    idempotency_key: uuid.UUID,
+    payload: dict[str, Any],
+    summary: str,
+) -> PortalOperation:
+    now = utcnow()
+    operation = PortalOperation(
+        operation_type=operation_type,
+        target_type="compute_resource_request",
+        target_id=str(item.id),
+        requested_by=context.user.id,
+        owner_managed_user_id=None,
+        approved_by=context.user.id,
+        request_summary=summary,
+        validated_payload={
+            "request_id": str(item.id),
+            "portal_account_id": str(item.portal_account_id),
+            "deployment_version": deployment_version(),
+            **payload,
+        },
+        idempotency_key=f"{operation_type}:{idempotency_key}",
+        risk_level=RiskLevel.CRITICAL,
+        status=OperationStatus.RUNNING,
+        created_at=now,
+        approved_at=now,
+        started_at=now,
+        rollback_status="NOT_REQUIRED",
+        dry_run_result={
+            "workflow_steps": {
+                "PREPARING": "PENDING",
+                "VALIDATING": "PENDING",
+                "CREATING_ENVIRONMENT": "PENDING",
+                "FINALIZING": "PENDING",
+            }
+        },
+    )
+    db.add(operation)
+    db.flush()
+    db.add(
+        PortalOperationEvent(
+            operation_id=operation.id,
+            from_status=None,
+            to_status=OperationStatus.RUNNING,
+            safe_message="Provision orchestration accepted; internal safety steps started",
+            created_at=now,
+        )
+    )
+    return operation
+
+
+def _attempt_failure_operation(
+    db: Session,
+    item: PortalComputeResourceRequest,
+    plan: PortalProvisionPlan | None,
+) -> PortalOperation | None:
+    if plan is None:
+        return None
+    operations = db.scalars(
+        select(PortalOperation)
+        .where(
+            PortalOperation.target_type == "compute_resource_request",
+            PortalOperation.target_id == str(item.id),
+            PortalOperation.status == OperationStatus.FAILED,
+            PortalOperation.operation_type.in_(
+                {
+                    "compute.provision.stage",
+                    "compute.provision",
+                    "compute.provision.retry",
+                }
+            ),
+        )
+        .order_by(PortalOperation.created_at.desc())
+    ).all()
+    return next(
+        (
+            operation
+            for operation in operations
+            if isinstance(operation.validated_payload, dict)
+            and operation.validated_payload.get("plan_id") == str(plan.id)
+        ),
+        None,
+    )
+
+
+def _finalize_orchestration_failure(
+    db: Session,
+    request: Request,
+    context: AuthContext,
+    *,
+    request_id: uuid.UUID,
+    operation_id: uuid.UUID,
+    error_code: str,
+    safe_error: str,
+) -> dict[str, Any]:
+    db.rollback()
+    item = _admin_request(db, request_id, lock=True)
+    operation = db.get(PortalOperation, operation_id)
+    if operation is None:
+        raise _error(409, "PROVISION_ORCHESTRATION_STATE_INVALID", "顶层 Operation 不存在")
+    if operation.status != OperationStatus.RUNNING:
+        return _orchestration_response(db, item, operation, idempotent_replay=True)
+    plan = db.get(PortalProvisionPlan, item.provision_plan_id) if item.provision_plan_id else None
+    failure = _attempt_failure_operation(db, item, plan)
+    now = utcnow()
+    if (
+        failure is None
+        and plan is not None
+        and plan.state
+        in {
+            "RESERVED",
+            "READY_FOR_PROVISION",
+        }
+    ):
+        reservations = list(
+            db.scalars(
+                select(PortalResourceReservation)
+                .where(PortalResourceReservation.plan_id == plan.id)
+                .with_for_update()
+            ).all()
+        )
+        for reservation in reservations:
+            if reservation.state == "RESERVED":
+                reservation.state = "RELEASED"
+                reservation.active_key = None
+                reservation.consumed_at = None
+                reservation.released_at = now
+        plan.state = "FAILED"
+        plan.execution_enabled = False
+        plan.updated_at = now
+    if item.status not in {"FAILED", "KEY_ENROLLMENT_PENDING", "STAGED"}:
+        item.status = "FAILED"
+        item.active_slot = None
+        item.updated_at = now
+    operation.status = OperationStatus.FAILED
+    operation.finished_at = now
+    operation.error_code = error_code[:64]
+    operation.rollback_status = failure.rollback_status if failure is not None else "NOT_REQUIRED"
+    operation.result_summary = safe_error[:1000]
+    result = operation.dry_run_result if isinstance(operation.dry_run_result, dict) else {}
+    steps = _workflow_steps(operation)
+    running_step = next((name for name, state in steps.items() if state == "RUNNING"), None)
+    if running_step is not None:
+        steps[running_step] = "FAILED"
+    failure_evidence = (
+        failure.dry_run_result
+        if failure is not None and isinstance(failure.dry_run_result, dict)
+        else {}
+    )
+    operation.dry_run_result = {
+        **result,
+        "workflow_steps": steps,
+        "side_effect_classification": failure_evidence.get(
+            "side_effect_classification", "NO_SIDE_EFFECT"
+        ),
+        "rollback_status": operation.rollback_status,
+        "first_failed_step": failure_evidence.get("first_failed_step", running_step),
+        "last_successful_step": failure_evidence.get("last_successful_step"),
+        "safe_error_message": safe_error[:500],
+        "automatic_reconciliation": failure_evidence.get("automatic_reconciliation"),
+    }
+    db.add(
+        PortalOperationEvent(
+            operation_id=operation.id,
+            from_status=OperationStatus.RUNNING,
+            to_status=OperationStatus.FAILED,
+            safe_message=(
+                "Provision failed; automatic rollback convergence completed or failed closed"
+            ),
+            created_at=now,
+        )
+    )
+    _audit(
+        db,
+        request,
+        context,
+        event_type="COMPUTE_PROVISION_FAILED",
+        object_type="compute_resource_request",
+        object_id=str(item.id),
+        result="FAILED",
+        metadata={
+            "attempt_number": plan.attempt_number if plan is not None else None,
+            "error_code": operation.error_code,
+            "rollback_result": (
+                "VERIFIED"
+                if operation.rollback_status in {"NOT_REQUIRED", "ROLLED_BACK"}
+                else "MANUAL_REVIEW"
+            ),
+            "deployment_version": operation.validated_payload.get("deployment_version"),
+        },
+        operation_id=operation.id,
+    )
+    db.commit()
+    return _orchestration_response(db, item, operation, idempotent_replay=False)
+
+
+def _finalize_orchestration_success(
+    db: Session,
+    request: Request,
+    context: AuthContext,
+    *,
+    request_id: uuid.UUID,
+    operation_id: uuid.UUID,
+) -> dict[str, Any]:
+    item = _admin_request(db, request_id, lock=True)
+    operation = db.get(PortalOperation, operation_id)
+    plan = db.get(PortalProvisionPlan, item.provision_plan_id) if item.provision_plan_id else None
+    if (
+        operation is None
+        or operation.status != OperationStatus.RUNNING
+        or plan is None
+        or plan.state != "STAGED"
+        or item.status != "KEY_ENROLLMENT_PENDING"
+        or item.managed_user_id is None
+    ):
+        raise _error(
+            409,
+            "PROVISION_ORCHESTRATION_POSTCONDITION_FAILED",
+            "Provision 成功结果与 Portal 状态不一致",
+        )
+    now = utcnow()
+    steps = _workflow_steps(operation)
+    steps["FINALIZING"] = "SUCCEEDED"
+    operation.owner_managed_user_id = item.managed_user_id
+    operation.status = OperationStatus.SUCCEEDED
+    operation.finished_at = now
+    operation.rollback_status = "NOT_REQUIRED"
+    operation.result_summary = (
+        "Compute environment STAGED; container key enrollment and Lease activation remain pending"
+    )
+    result = operation.dry_run_result if isinstance(operation.dry_run_result, dict) else {}
+    operation.dry_run_result = {
+        **result,
+        "workflow_steps": steps,
+        "environment_checks": "PASS",
+        "image": "PASS",
+        "storage": "PASS",
+        "slurm": "PASS",
+        "gpu_policy": "PASS",
+    }
+    db.add(
+        PortalOperationEvent(
+            operation_id=operation.id,
+            from_status=OperationStatus.RUNNING,
+            to_status=OperationStatus.SUCCEEDED,
+            safe_message="Provision orchestration completed at STAGED",
+            created_at=now,
+        )
+    )
+    _audit(
+        db,
+        request,
+        context,
+        event_type="COMPUTE_PROVISION_COMPLETED",
+        object_type="compute_resource_request",
+        object_id=str(item.id),
+        metadata={
+            "attempt_number": plan.attempt_number,
+            "result": "STAGED",
+            "deployment_version": operation.validated_payload.get("deployment_version"),
+            "rollback_result": "NOT_REQUIRED",
+        },
+        operation_id=operation.id,
+    )
+    db.commit()
+    return _orchestration_response(db, item, operation, idempotent_replay=False)
+
+
+def _run_provision_orchestration(
+    db: Session,
+    request: Request,
+    context: AuthContext,
+    *,
+    request_id: uuid.UUID,
+    operation_id: uuid.UUID,
+) -> dict[str, Any]:
+    current_item = _admin_request(db, request_id)
+    current_operation = db.get(PortalOperation, operation_id)
+    if current_operation is None:
+        raise _error(409, "PROVISION_ORCHESTRATION_STATE_INVALID", "顶层 Operation 不存在")
+    if current_item.status in {"KEY_ENROLLMENT_PENDING", "STAGED"}:
+        return _finalize_orchestration_success(
+            db,
+            request,
+            context,
+            request_id=request_id,
+            operation_id=operation_id,
+        )
+    if current_item.status == "FAILED":
+        return _finalize_orchestration_failure(
+            db,
+            request,
+            context,
+            request_id=request_id,
+            operation_id=operation_id,
+            error_code="PROVISION_FAILED",
+            safe_error="Provision failed safely",
+        )
+    if current_item.status == "PROVISIONING":
+        return _orchestration_response(db, current_item, current_operation, idempotent_replay=True)
+    token = _ORCHESTRATION_OPERATION_ID.set(operation_id)
+    try:
+        _set_workflow_step(db, operation_id, "PREPARING", "RUNNING")
+        create_provision_plan(
+            str(request_id),
+            ComputeProvisionActionRequest(
+                idempotency_key=uuid.uuid5(operation_id, "allocate-and-reserve")
+            ),
+            request,
+            context,
+            db,
+        )
+        _set_workflow_step(db, operation_id, "PREPARING", "SUCCEEDED")
+        _set_workflow_step(db, operation_id, "VALIDATING", "RUNNING")
+        dry_run_provision_plan(
+            str(request_id),
+            ComputeProvisionActionRequest(
+                idempotency_key=uuid.uuid5(operation_id, "automatic-dry-run")
+            ),
+            request,
+            context,
+            db,
+        )
+        _set_workflow_step(db, operation_id, "VALIDATING", "SUCCEEDED")
+        _set_workflow_step(db, operation_id, "CREATING_ENVIRONMENT", "RUNNING")
+        provision_reserved_compute_environment(
+            str(request_id),
+            ComputeProvisionActionRequest(
+                idempotency_key=uuid.uuid5(operation_id, "automatic-stage")
+            ),
+            request,
+            context,
+            db,
+        )
+        _set_workflow_step(db, operation_id, "CREATING_ENVIRONMENT", "SUCCEEDED")
+        _set_workflow_step(db, operation_id, "FINALIZING", "RUNNING")
+        return _finalize_orchestration_success(
+            db,
+            request,
+            context,
+            request_id=request_id,
+            operation_id=operation_id,
+        )
+    except HTTPException as exc:
+        detail = cast(dict[str, Any], exc.detail)
+        return _finalize_orchestration_failure(
+            db,
+            request,
+            context,
+            request_id=request_id,
+            operation_id=operation_id,
+            error_code=str(detail.get("code", "PROVISION_FAILED")),
+            safe_error=str(detail.get("message", "Provision failed safely")),
+        )
+    except Exception:
+        return _finalize_orchestration_failure(
+            db,
+            request,
+            context,
+            request_id=request_id,
+            operation_id=operation_id,
+            error_code="PROVISION_ORCHESTRATION_FAILED",
+            safe_error="Provision orchestration failed closed",
+        )
+    finally:
+        _ORCHESTRATION_OPERATION_ID.reset(token)
+
+
+@router.post("/admin/compute-resource-requests/{request_id}/approve-and-provision")
+def approve_and_provision(
+    request_id: str,
+    body: ComputeProvisionApprovalRequest,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("compute_requests.review")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """One Approval action starts the complete fixed Provision orchestration."""
+    require_session_csrf(request, context)
+    parsed_request_id = _request_id(request_id)
+    item = _admin_request(db, parsed_request_id, lock=True)
+    _deny_self_administration(item, context)
+    existing = _orchestration_by_key(
+        db,
+        item=item,
+        context=context,
+        operation_type="compute.provision",
+        idempotency_key=body.idempotency_key,
+    )
+    if existing is not None:
+        if existing.status == OperationStatus.RUNNING:
+            db.commit()
+            return _run_provision_orchestration(
+                db,
+                request,
+                context,
+                request_id=parsed_request_id,
+                operation_id=existing.id,
+            )
+        return _orchestration_response(db, item, existing, idempotent_replay=True)
+    running = _active_orchestration(db, item)
+    if running is not None:
+        return _orchestration_response(db, item, running, idempotent_replay=True)
+    require_recent_reauthentication(context)
+    if item.status not in {"REQUESTED", "UNDER_REVIEW"}:
+        raise _error(409, "COMPUTE_REQUEST_ALREADY_REVIEWED", "申请当前状态不能再次审批")
+    account = db.get(PortalUser, item.portal_account_id)
+    if account is None:
+        raise _error(409, "PORTAL_ACCOUNT_NOT_FOUND", "申请所属 Portal 账号不存在")
+    _assert_identity_only(db, account)
+    now = utcnow()
+    item.reviewed_at = now
+    item.reviewed_by = context.user.id
+    item.review_note = body.review_note
+    item.approved_at = now
+    item.status = "APPROVED"
+    item.active_slot = 1
+    item.updated_at = now
+    operation = _new_orchestration_operation(
+        db,
+        item=item,
+        context=context,
+        operation_type="compute.provision",
+        idempotency_key=body.idempotency_key,
+        payload={
+            "action": "APPROVE_AND_PROVISION",
+            "approval_repeated": False,
+            "review_note": body.review_note,
+        },
+        summary="Administrator approved request and started fixed Provision orchestration",
+    )
+    _audit(
+        db,
+        request,
+        context,
+        event_type="COMPUTE_PROVISION_STARTED",
+        object_type="compute_resource_request",
+        object_id=str(item.id),
+        metadata={"action": "APPROVE_AND_PROVISION", "approval_count": 1},
+        operation_id=operation.id,
+    )
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise _error(
+            409,
+            "PROVISION_ORCHESTRATION_CONFLICT",
+            "Provision 已由另一个管理员动作启动",
+        ) from exc
+    return _run_provision_orchestration(
+        db,
+        request,
+        context,
+        request_id=parsed_request_id,
+        operation_id=operation.id,
+    )
+
+
+@router.post("/admin/compute-resource-requests/{request_id}/retry")
+def retry_provision(
+    request_id: str,
+    body: ComputeProvisionRetryRequest,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("compute_requests.plan")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """One recently authenticated action runs a complete fresh retry attempt."""
+    require_session_csrf(request, context)
+    parsed_request_id = _request_id(request_id)
+    item = _admin_request(db, parsed_request_id, lock=True)
+    _deny_self_administration(item, context)
+    existing = _orchestration_by_key(
+        db,
+        item=item,
+        context=context,
+        operation_type="compute.provision.retry",
+        idempotency_key=body.idempotency_key,
+    )
+    if existing is not None:
+        if existing.status == OperationStatus.RUNNING:
+            db.commit()
+            return _run_provision_orchestration(
+                db,
+                request,
+                context,
+                request_id=parsed_request_id,
+                operation_id=existing.id,
+            )
+        return _orchestration_response(db, item, existing, idempotent_replay=True)
+    running = _active_orchestration(db, item)
+    if running is not None:
+        return _orchestration_response(db, item, running, idempotent_replay=True)
+    require_recent_reauthentication(context)
+    if item.status != "FAILED":
+        raise _error(409, "PROVISION_RETRY_NOT_ELIGIBLE", "当前申请不能执行 Retry")
+    previous_plan, _released, failure = _retryable_failed_attempt(db, item)
+    account = db.get(PortalUser, item.portal_account_id)
+    if account is None:
+        raise _error(409, "PORTAL_ACCOUNT_NOT_FOUND", "申请所属 Portal 账号不存在")
+    _assert_identity_only(db, account)
+    failure_evidence = failure.dry_run_result if isinstance(failure.dry_run_result, dict) else {}
+    operation = _new_orchestration_operation(
+        db,
+        item=item,
+        context=context,
+        operation_type="compute.provision.retry",
+        idempotency_key=body.idempotency_key,
+        payload={
+            "action": "RETRY_PROVISION",
+            "failed_plan_id": str(previous_plan.id),
+            "failed_operation_id": str(failure.id),
+            "previous_attempt_number": previous_plan.attempt_number,
+            "previous_error_code": failure.error_code,
+            "previous_failed_step": failure_evidence.get("first_failed_step"),
+            "rollback_verified": True,
+            "approval_repeated": False,
+            "admin_note": body.admin_note,
+        },
+        summary="Administrator started one complete fresh Provision retry",
+    )
+    item.status = "RETRY_AUTHORIZED"
+    item.active_slot = 1
+    item.updated_at = utcnow()
+    _audit(
+        db,
+        request,
+        context,
+        event_type="COMPUTE_PROVISION_RETRY_STARTED",
+        object_type="compute_resource_request",
+        object_id=str(item.id),
+        metadata={
+            "previous_attempt_number": previous_plan.attempt_number,
+            "rollback_result": "VERIFIED",
+            "approval_repeated": False,
+        },
+        operation_id=operation.id,
+    )
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise _error(
+            409,
+            "PROVISION_RETRY_CONFLICT",
+            "Retry 已由另一个管理员动作启动",
+        ) from exc
+    return _run_provision_orchestration(
+        db,
+        request,
+        context,
+        request_id=parsed_request_id,
+        operation_id=operation.id,
+    )
+
+
 @router.get(
-    "/admin/compute-resource-requests/{request_id}/failed-provision-reconciliation-readiness"
+    "/admin/compute-resource-requests/{request_id}/failed-provision-reconciliation-readiness",
+    deprecated=True,
 )
 def failed_provision_reconciliation_readiness(
     request_id: str,
@@ -1255,7 +2065,10 @@ def failed_provision_reconciliation_readiness(
     }
 
 
-@router.post("/admin/compute-resource-requests/{request_id}/reconcile-failed-provision")
+@router.post(
+    "/admin/compute-resource-requests/{request_id}/reconcile-failed-provision",
+    deprecated=True,
+)
 def reconcile_failed_provision(
     request_id: str,
     body: ComputeProvisionReconciliationRequest,
@@ -1412,7 +2225,10 @@ def reconcile_failed_provision(
     }
 
 
-@router.post("/admin/compute-resource-requests/{request_id}/retry-authorize")
+@router.post(
+    "/admin/compute-resource-requests/{request_id}/retry-authorize",
+    deprecated=True,
+)
 def authorize_provision_retry(
     request_id: str,
     body: ComputeProvisionRetryAuthorizationRequest,
@@ -1554,7 +2370,7 @@ def authorize_provision_retry(
     }
 
 
-@router.post("/admin/compute-resource-requests/{request_id}/plan")
+@router.post("/admin/compute-resource-requests/{request_id}/plan", deprecated=True)
 def create_provision_plan(
     request_id: str,
     body: ComputeProvisionActionRequest,
@@ -1591,12 +2407,38 @@ def create_provision_plan(
     attempt_number = 1
     attempt_reason = "INITIAL"
     if item.status == "RETRY_AUTHORIZED":
-        (
-            previous_plan,
-            _released_reservations,
-            failed_stage,
-            retry_authorization,
-        ) = _authorized_retry_source(db, item)
+        parent_operation_id = _ORCHESTRATION_OPERATION_ID.get()
+        if parent_operation_id is None:
+            (
+                previous_plan,
+                _released_reservations,
+                failed_stage,
+                retry_authorization,
+            ) = _authorized_retry_source(db, item)
+        else:
+            retry_authorization = db.get(PortalOperation, parent_operation_id)
+            previous_plan, _released_reservations, failed_stage = _retryable_failed_attempt(
+                db, item
+            )
+            authorization_payload = (
+                retry_authorization.validated_payload
+                if retry_authorization is not None
+                and isinstance(retry_authorization.validated_payload, dict)
+                else {}
+            )
+            if (
+                retry_authorization is None
+                or retry_authorization.operation_type != "compute.provision.retry"
+                or retry_authorization.status != OperationStatus.RUNNING
+                or authorization_payload.get("failed_plan_id") != str(previous_plan.id)
+                or authorization_payload.get("failed_operation_id") != str(failed_stage.id)
+                or authorization_payload.get("rollback_verified") is not True
+            ):
+                raise _error(
+                    409,
+                    "PROVISION_RETRY_ORCHESTRATION_INVALID",
+                    "顶层 Retry Operation 与失败 Attempt 绑定不完整",
+                )
         attempt_number = previous_plan.attempt_number + 1
         attempt_reason = "STAGE_RETRY"
     elif item.status == "APPROVED" and item.provision_plan_id is not None:
@@ -1720,6 +2562,31 @@ def create_provision_plan(
                 expires_at=reservation_expires_at,
             )
         )
+    parent_operation_id = _ORCHESTRATION_OPERATION_ID.get()
+    if parent_operation_id is not None:
+        parent_operation = db.get(PortalOperation, parent_operation_id)
+        if parent_operation is None or parent_operation.status != OperationStatus.RUNNING:
+            raise _error(
+                409,
+                "PROVISION_ORCHESTRATION_STATE_INVALID",
+                "顶层 Provision Operation 状态不完整",
+            )
+        parent_payload = dict(parent_operation.validated_payload)
+        parent_payload.update(
+            {
+                "plan_id": str(plan.id),
+                "attempt_number": plan.attempt_number,
+                "reservation_ids": {
+                    row.resource_type: str(row.id)
+                    for row in db.scalars(
+                        select(PortalResourceReservation).where(
+                            PortalResourceReservation.plan_id == plan.id
+                        )
+                    ).all()
+                },
+            }
+        )
+        parent_operation.validated_payload = parent_payload
     item.status = "PROVISION_PLAN_READY"
     item.active_slot = 1
     item.provision_plan_id = plan.id
@@ -1872,24 +2739,40 @@ def _hold_uncertain_stage(
     error_code: str,
     summary: str,
 ) -> None:
-    """Persist a non-retriable hold whenever host truth may have changed."""
+    """Verify host truth once; release only when every source is authoritative and absent."""
     failed_at = utcnow()
+    verification = authoritative_zero_residue(
+        db,
+        item,
+        plan,
+        operation,
+        actor=context.user.normalized_login,
+        worker_call=call_worker,
+    )
+    verified = verification.all_absent
     operation.status = OperationStatus.FAILED
     operation.finished_at = failed_at
     operation.error_code = error_code[:64]
-    operation.rollback_status = "REQUIRES_MANUAL_REVIEW"
+    operation.rollback_status = "ROLLED_BACK" if verified else "REQUIRES_MANUAL_REVIEW"
     operation.result_summary = summary[:1000]
     operation.dry_run_result = {
-        "side_effect_classification": "PARTIAL_UNKNOWN",
-        "rollback_status": "REQUIRES_MANUAL_REVIEW",
+        "side_effect_classification": ("PARTIAL_ROLLED_BACK" if verified else "PARTIAL_UNKNOWN"),
+        "rollback_status": operation.rollback_status,
         "last_successful_step": "UNKNOWN",
         "first_failed_step": "WORKER_RESPONSE_OR_PERSISTENCE",
         "failed_handler": "compute.provision.stage",
-        "retained_resources": sorted(
-            f"{row.resource_type}:{row.resource_value}"
-            for row in reservations
-            if row.state in {"RESERVED", "FAILED_HOLD"}
+        "retained_resources": (
+            []
+            if verified
+            else sorted(
+                {
+                    *verification.portal_residue,
+                    *verification.host_residue,
+                    *verification.unknown_resource_state,
+                }
+            )
         ),
+        "automatic_reconciliation": verification.evidence(),
     }
     item.status = "FAILED"
     item.active_slot = None
@@ -1898,7 +2781,12 @@ def _hold_uncertain_stage(
     plan.execution_enabled = True
     plan.updated_at = failed_at
     for reservation in reservations:
-        if reservation.state == "RESERVED":
+        if verified:
+            reservation.state = "RELEASED"
+            reservation.active_key = None
+            reservation.consumed_at = None
+            reservation.released_at = failed_at
+        elif reservation.state == "RESERVED":
             reservation.state = "FAILED_HOLD"
             reservation.active_key = f"{reservation.resource_type}:{reservation.resource_value}"
             reservation.consumed_at = None
@@ -1908,7 +2796,11 @@ def _hold_uncertain_stage(
             operation_id=operation.id,
             from_status=OperationStatus.RUNNING,
             to_status=OperationStatus.FAILED,
-            safe_message="Host truth is uncertain; reservations held for manual reconciliation",
+            safe_message=(
+                "Authoritative verifier proved zero residue; reservations released"
+                if verified
+                else "Resource state is unknown; reservations held for manual review"
+            ),
             created_at=failed_at,
         )
     )
@@ -1924,14 +2816,15 @@ def _hold_uncertain_stage(
             "request_id": str(item.id),
             "error_code": operation.error_code,
             "rollback_status": operation.rollback_status,
-            "reservation_state": "FAILED_HOLD",
+            "reservation_state": "RELEASED" if verified else "FAILED_HOLD",
+            "unknown_resource_state": list(verification.unknown_resource_state),
             "approval_repeated": False,
         },
         operation_id=operation.id,
     )
 
 
-@router.post("/admin/compute-resource-requests/{request_id}/dry-run")
+@router.post("/admin/compute-resource-requests/{request_id}/dry-run", deprecated=True)
 def dry_run_provision_plan(
     request_id: str,
     body: ComputeProvisionActionRequest,
@@ -1957,6 +2850,51 @@ def dry_run_provision_plan(
     if account is None:
         raise _error(409, "PORTAL_ACCOUNT_NOT_FOUND", "申请所属 Portal 账号不存在")
     _assert_identity_only(db, account)
+    operation_key = f"compute.provision.dry_run:{body.idempotency_key}"
+    existing_operation = db.scalar(
+        select(PortalOperation).where(
+            PortalOperation.requested_by == context.user.id,
+            PortalOperation.target_id == str(item.id),
+            PortalOperation.operation_type == "compute.provision.dry_run",
+            PortalOperation.idempotency_key == operation_key,
+        )
+    )
+    if plan.state == "READY_FOR_PROVISION" and existing_operation is not None:
+        existing_payload = (
+            existing_operation.validated_payload
+            if isinstance(existing_operation.validated_payload, dict)
+            else {}
+        )
+        stage_contract = _ready_stage_contract(plan.dry_run_result)
+        if (
+            existing_operation.status != OperationStatus.SUCCEEDED
+            or existing_payload.get("plan_id") != str(plan.id)
+            or stage_contract is None
+            or existing_payload.get("stage_contract_sha256") != stage_contract["contract_sha256"]
+        ):
+            raise _error(
+                409,
+                "PROVISION_DRY_RUN_IDEMPOTENCY_CONFLICT",
+                "Dry-run 幂等记录与当前 Attempt 不一致",
+            )
+        parent_operation_id = _ORCHESTRATION_OPERATION_ID.get()
+        if parent_operation_id is not None:
+            parent_operation = db.get(PortalOperation, parent_operation_id)
+            if parent_operation is None or parent_operation.status != OperationStatus.RUNNING:
+                raise _error(
+                    409,
+                    "PROVISION_ORCHESTRATION_STATE_INVALID",
+                    "顶层 Provision Operation 状态不完整",
+                )
+            parent_payload = dict(parent_operation.validated_payload)
+            parent_payload["canonical_execution_contract"] = stage_contract["contract_sha256"]
+            parent_operation.validated_payload = parent_payload
+            db.commit()
+        return {
+            "status": "READY_FOR_PROVISION",
+            "plan": _plan_view(plan, internal=True),
+            "idempotent_replay": True,
+        }
     now = utcnow()
     if ensure_utc(plan.reservation_expires_at) <= now:
         raise _error(409, "RESOURCE_RESERVATION_EXPIRED", "资源 reservation 已过期")
@@ -1987,6 +2925,18 @@ def dry_run_provision_plan(
     plan.dry_run_result = worker
     plan.dry_run_at = now
     plan.updated_at = now
+    parent_operation_id = _ORCHESTRATION_OPERATION_ID.get()
+    if parent_operation_id is not None:
+        parent_operation = db.get(PortalOperation, parent_operation_id)
+        if parent_operation is None or parent_operation.status != OperationStatus.RUNNING:
+            raise _error(
+                409,
+                "PROVISION_ORCHESTRATION_STATE_INVALID",
+                "顶层 Provision Operation 状态不完整",
+            )
+        parent_payload = dict(parent_operation.validated_payload)
+        parent_payload["canonical_execution_contract"] = stage_contract["contract_sha256"]
+        parent_operation.validated_payload = parent_payload
     operation = _operation(
         db,
         context=context,
@@ -2026,7 +2976,10 @@ def dry_run_provision_plan(
     return {"status": "READY_FOR_PROVISION", "plan": _plan_view(plan, internal=True)}
 
 
-@router.post("/admin/compute-resource-requests/{request_id}/provision")
+@router.post(
+    "/admin/compute-resource-requests/{request_id}/provision",
+    deprecated=True,
+)
 def provision_reserved_compute_environment(
     request_id: str,
     body: ComputeProvisionActionRequest,
@@ -2035,7 +2988,9 @@ def provision_reserved_compute_environment(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     require_session_csrf(request, context)
-    require_recent_reauthentication(context)
+    parent_operation_id = _ORCHESTRATION_OPERATION_ID.get()
+    if parent_operation_id is None:
+        require_recent_reauthentication(context)
     parsed_request_id = _request_id(request_id)
     item = _admin_request(db, parsed_request_id, lock=True)
     _deny_self_administration(item, context)
@@ -2095,6 +3050,25 @@ def provision_reserved_compute_environment(
             "PROVISION_DRY_RUN_CONTRACT_INCOMPLETE",
             "真实 Stage 需要完整且有效的 Dry-run Stage contract",
         )
+    if parent_operation_id is not None:
+        parent_operation = db.get(PortalOperation, parent_operation_id)
+        parent_payload = (
+            parent_operation.validated_payload
+            if parent_operation is not None and isinstance(parent_operation.validated_payload, dict)
+            else {}
+        )
+        if (
+            parent_operation is None
+            or parent_operation.status != OperationStatus.RUNNING
+            or parent_payload.get("deployment_version") != deployment_version()
+            or parent_payload.get("canonical_execution_contract")
+            != stage_contract["contract_sha256"]
+        ):
+            raise _error(
+                409,
+                "PROVISION_RUNTIME_CONTRACT_MISMATCH",
+                "Runtime 或 canonical execution contract 已变化；Stage 在写入前停止",
+            )
     if plan.request_id != item.id or plan.portal_account_id != item.portal_account_id:
         raise _error(409, "PROVISION_PLAN_BINDING_FAILED", "资源计划与申请归属不一致")
     account = db.get(PortalUser, item.portal_account_id)
@@ -2140,6 +3114,14 @@ def provision_reserved_compute_environment(
         "reservation_ids": reservation_ids,
         "execution_enabled": True,
     }
+    operation_payload = dict(payload)
+    if parent_operation_id is not None:
+        operation_payload.update(
+            {
+                "parent_operation_id": str(parent_operation_id),
+                "visibility": "INTERNAL_STEP",
+            }
+        )
     now = utcnow()
     operation = PortalOperation(
         id=operation_id,
@@ -2150,7 +3132,7 @@ def provision_reserved_compute_environment(
         owner_managed_user_id=None,
         approved_by=context.user.id,
         request_summary="Stage exact reserved compute environment after administrator reauthentication",
-        validated_payload=payload,
+        validated_payload=operation_payload,
         idempotency_key=f"compute.provision.stage:{body.idempotency_key}",
         risk_level=RiskLevel.CRITICAL,
         status=OperationStatus.RUNNING,
@@ -2288,12 +3270,36 @@ def provision_reserved_compute_environment(
         operation.error_code = str(error.get("code", "COMPUTE_STAGE_FAILED"))[:64]
         classification = str(worker.get("side_effect_classification", "PARTIAL_UNKNOWN"))
         rollback_status = str(worker.get("rollback_status", "REQUIRES_MANUAL_REVIEW"))
-        raw_retained = worker.get("retained_resources")
-        retained = (
-            sorted(str(value)[:128] for value in raw_retained)
-            if isinstance(raw_retained, list)
-            else ["UNKNOWN"]
+        verification = authoritative_zero_residue(
+            db,
+            item,
+            plan,
+            operation,
+            actor=context.user.normalized_login,
+            worker_call=call_worker,
         )
+        if verification.all_absent:
+            classification = (
+                "NO_SIDE_EFFECT" if classification == "NO_SIDE_EFFECT" else "PARTIAL_ROLLED_BACK"
+            )
+            rollback_status = (
+                "NOT_REQUIRED" if classification == "NO_SIDE_EFFECT" else "ROLLED_BACK"
+            )
+            retained: list[str] = []
+        else:
+            classification = (
+                "PARTIAL_UNKNOWN"
+                if verification.unknown_resource_state or verification.script_integrity != "PASS"
+                else "PARTIAL_ROLLBACK_FAILED"
+            )
+            rollback_status = "REQUIRES_MANUAL_REVIEW"
+            retained = sorted(
+                {
+                    *verification.portal_residue,
+                    *verification.host_residue,
+                    *verification.unknown_resource_state,
+                }
+            )
         raw_rollback_steps = worker.get("rollback_steps")
         rollback_steps = (
             {
@@ -2332,6 +3338,7 @@ def provision_reserved_compute_environment(
             "stage_failure_code": str(
                 worker.get("stage_failure_code", "FIXED_STAGE_SCRIPT_FAILED")
             )[:128],
+            "automatic_reconciliation": verification.evidence(),
         }
         for reservation in reservations:
             reservation.state = "FAILED_HOLD" if held else "RELEASED"

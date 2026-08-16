@@ -1450,6 +1450,45 @@ def admin_retry_lease_recycle(
     return response
 
 
+@router.get("/admin/restore-requests")
+def admin_restore_requests(
+    context: AuthContext = Depends(permission_dependency("users.read")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    rows = db.execute(
+        select(PortalResourceRestoreRequest, PortalManagedUser, PortalResourceRecycleItem)
+        .join(
+            PortalManagedUser,
+            PortalManagedUser.id == PortalResourceRestoreRequest.owner_managed_user_id,
+        )
+        .join(
+            PortalResourceRecycleItem,
+            PortalResourceRecycleItem.id == PortalResourceRestoreRequest.recycle_item_id,
+        )
+        .order_by(PortalResourceRestoreRequest.requested_at.desc())
+    ).all()
+    return {
+        "status": "OK",
+        "requests": [
+            {
+                "id": str(restore.id),
+                "username": managed.unix_username,
+                "resource_name": item.resource_name,
+                "state": restore.state,
+                "duration_seconds": restore.requested_duration_seconds,
+                "requested_at": ensure_utc(restore.requested_at).isoformat(),
+                "decided_at": (
+                    ensure_utc(restore.decided_at).isoformat()
+                    if restore.decided_at is not None
+                    else None
+                ),
+            }
+            for restore, managed, item in rows
+        ],
+        "count": len(rows),
+    }
+
+
 @router.post("/admin/restore-requests/{request_id}/decision")
 def admin_decide_restore(
     request_id: uuid.UUID,

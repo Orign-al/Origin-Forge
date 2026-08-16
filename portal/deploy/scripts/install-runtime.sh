@@ -47,6 +47,16 @@ rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
   --exclude=test-results \
   "$SOURCE_DIR/" "$RUNTIME_DIR/"
 
+deployment_version="$(
+  git -c safe.directory="$PLATFORM_DIR" \
+    -C "$PLATFORM_DIR" rev-parse --verify 'HEAD^{commit}'
+)"
+[[ $deployment_version =~ ^[0-9a-f]{40}$ ]] \
+  || { echo "deployment Git identity is invalid" >&2; exit 1; }
+printf '%s\n' "$deployment_version" >"$RUNTIME_DIR/DEPLOYMENT_VERSION"
+chown root:root "$RUNTIME_DIR/DEPLOYMENT_VERSION"
+chmod 0444 "$RUNTIME_DIR/DEPLOYMENT_VERSION"
+
 install -d -o root -g root -m 0755 \
   "$RUNTIME_DIR/apps/web/.next/standalone/apps/web/.next/static" \
   "$RUNTIME_DIR/scripts" \
@@ -94,7 +104,9 @@ for unit in \
   h100-portal-api.service \
   h100-portal-web.service \
   h100-portal-lease-expiry.service \
-  h100-portal-lease-expiry.timer; do
+  h100-portal-lease-expiry.timer \
+  h100-portal-provision-reconcile.service \
+  h100-portal-provision-reconcile.timer; do
   install -o root -g root -m 0644 "$SOURCE_DIR/deploy/systemd/$unit" "$UNIT_DIR/$unit"
 done
 

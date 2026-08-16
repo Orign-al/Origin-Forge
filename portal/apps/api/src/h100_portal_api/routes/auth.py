@@ -541,10 +541,22 @@ def setup_password(
 def me(
     context: AuthContext = Depends(auth_context), db: Session = Depends(get_db)
 ) -> dict[str, object]:
+    reauthenticated_at = context.session.reauthenticated_at
+    recent_auth_valid_until = (
+        ensure_utc(reauthenticated_at) + timedelta(minutes=get_settings().reauthentication_minutes)
+        if reauthenticated_at is not None
+        else None
+    )
     return {
         "user": serialize_user(context.user).model_dump(mode="json"),
         "role": highest_role_safe(context.user),
         "ssh_enrollment": ssh_enrollment_status(db, context.user),
+        "recent_auth_valid": bool(
+            recent_auth_valid_until is not None and recent_auth_valid_until > utcnow()
+        ),
+        "recent_auth_valid_until": (
+            recent_auth_valid_until.isoformat() if recent_auth_valid_until is not None else None
+        ),
     }
 
 

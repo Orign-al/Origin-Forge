@@ -6,6 +6,7 @@ type State = {
   requestStatus: string | null;
   reviewNote?: string | null;
   planState?: string | null;
+  recentAuthValid?: boolean;
   mutationCsrf: string[];
   submittedBody?: Record<string, unknown>;
   provisionCalls: number;
@@ -114,6 +115,14 @@ function computeRequest(state: State, internal = false) {
       : {}),
     username: "origin-pilot2",
     status: state.requestStatus,
+    lifecycle_state:
+      state.requestStatus === "REQUESTED"
+        ? "PENDING"
+        : state.requestStatus === "FAILED"
+          ? "FAILED"
+          : state.requestStatus === "KEY_ENROLLMENT_PENDING"
+            ? "STAGED"
+            : state.requestStatus,
     approval_state:
       state.requestStatus === "REQUESTED" ? "NOT_APPROVED" : "APPROVED",
     ...(state.requestStatus === "FAILED"
@@ -142,10 +151,10 @@ function computeRequest(state: State, internal = false) {
     plan: plan(state),
     ...(internal
       ? {
-          retry_authorization_available: state.requestStatus === "FAILED",
+          retry_available: state.requestStatus === "FAILED",
           retry_state:
             state.requestStatus === "FAILED"
-              ? "AWAITING_ADMINISTRATOR"
+              ? "RETRY_ELIGIBLE"
               : "NOT_REQUIRED",
           attempts: state.planState
             ? [
@@ -154,6 +163,31 @@ function computeRequest(state: State, internal = false) {
                   attempt_reason: "INITIAL",
                   plan: plan(state),
                   operations: [],
+                  provision_operation:
+                    state.requestStatus === "FAILED"
+                      ? {
+                          id: STAGE_OPERATION_ID,
+                          operation_type: "compute.provision",
+                          status: "FAILED",
+                          started_at: "2026-08-13T10:09:52Z",
+                          finished_at: "2026-08-13T10:09:53Z",
+                          error_code: "COMPUTE_STAGE_FAILED",
+                          rollback_status: "ROLLED_BACK",
+                          safe_summary:
+                            "Compute Stage failed; original request approval remains intact",
+                          safe_root_cause: "Container image validation failed",
+                          side_effect_classification: "PARTIAL_ROLLED_BACK",
+                          last_successful_step: "SLURM_ASSOCIATION",
+                          first_failed_step: "CONTAINER_IMAGE",
+                          failed_handler: "compute.provision.stage",
+                          workflow_steps: {
+                            PREPARING: "SUCCEEDED",
+                            VALIDATING: "SUCCEEDED",
+                            CREATING_ENVIRONMENT: "FAILED",
+                            FINALIZING: "SUCCEEDED",
+                          },
+                        }
+                      : null,
                   stage_operation:
                     state.requestStatus === "FAILED"
                       ? {
@@ -230,6 +264,9 @@ async function installApi(page: Page, state: State): Promise<void> {
           ssh_key_state: "NOT_APPLICABLE",
           setup_path: null,
         },
+        recent_auth_valid: state.recentAuthValid ?? true,
+        recent_auth_valid_until:
+          state.recentAuthValid === false ? null : "2026-08-11T12:15:00Z",
       });
       return;
     }
@@ -342,6 +379,55 @@ async function installApi(page: Page, state: State): Promise<void> {
       });
       return;
     }
+    if (
+      path ===
+      `/admin/compute-resource-requests/${REQUEST_ID}/approve-and-provision`
+    ) {
+      state.provisionCalls += 1;
+      state.requestStatus = "KEY_ENROLLMENT_PENDING";
+      state.planState = "STAGED";
+      await json(route, {
+        status: "KEY_ENROLLMENT_PENDING",
+        operation_id: "10000000-0000-4000-8000-000000000006",
+        operation: {
+          id: "10000000-0000-4000-8000-000000000006",
+          operation_type: "compute.provision",
+          status: "SUCCEEDED",
+          workflow_steps: {
+            PREPARING: "SUCCEEDED",
+            VALIDATING: "SUCCEEDED",
+            CREATING_ENVIRONMENT: "SUCCEEDED",
+            FINALIZING: "SUCCEEDED",
+          },
+        },
+        idempotent_replay: false,
+        request: computeRequest(state, true),
+      });
+      return;
+    }
+    if (path === `/admin/compute-resource-requests/${REQUEST_ID}/retry`) {
+      state.provisionCalls += 1;
+      state.requestStatus = "KEY_ENROLLMENT_PENDING";
+      state.planState = "STAGED";
+      await json(route, {
+        status: "KEY_ENROLLMENT_PENDING",
+        operation_id: "10000000-0000-4000-8000-000000000007",
+        operation: {
+          id: "10000000-0000-4000-8000-000000000007",
+          operation_type: "compute.provision.retry",
+          status: "SUCCEEDED",
+          workflow_steps: {
+            PREPARING: "SUCCEEDED",
+            VALIDATING: "SUCCEEDED",
+            CREATING_ENVIRONMENT: "SUCCEEDED",
+            FINALIZING: "SUCCEEDED",
+          },
+        },
+        idempotent_replay: false,
+        request: computeRequest(state, true),
+      });
+      return;
+    }
     if (path === `/admin/compute-resource-requests/${REQUEST_ID}/plan`) {
       state.requestStatus = "PROVISION_PLAN_READY";
       state.planState = "RESERVED";
@@ -449,9 +535,7 @@ test("进行中申请禁止重复且普通用户不能访问管理员审批对�
   await expect(page.getByText(/无权查看/)).toBeVisible();
 });
 
-test("管理员批准、reservation、dry-run 和 Stage 保持 Lease 未启动", async ({
-  page,
-}) => {
+test("管理员一次批准自动完成 Provision，Lease 仍未启动", async ({ page }) => {
   const state: State = {
     role: "platform_admin",
     requestStatus: "REQUESTED",
@@ -464,27 +548,26 @@ test("管理员批准、reservation、dry-run 和 Stage 保持 Lease 未启动",
     page.getByText("origin-pilot2", { exact: true }).first(),
   ).toBeVisible();
   await expect(page.locator("img")).toHaveCount(0);
-  await page.getByRole("button", { name: "批准" }).click();
   await expect(
-    page.getByRole("button", { name: "生成 Provision Plan" }),
-  ).toBeVisible();
-  await page.getByRole("button", { name: "生成 Provision Plan" }).click();
-  await expect(page.getByText("20002 / 20002")).toBeVisible();
-  await expect(page.getByText("30002", { exact: true })).toBeVisible();
+    page.getByText("本次 recent-auth 同时授权批准与完整 Provision", {
+      exact: false,
+    }),
+  ).toHaveCount(0);
+  await page.getByRole("button", { name: "批准" }).click();
   await expect(
     page.getByText("gpu-dev-origin-pilot2", { exact: true }),
   ).toBeVisible();
   await expect(page.getByText("NOT STARTED", { exact: false })).toBeVisible();
-  await page.getByRole("button", { name: "执行 Dry-run" }).click();
+  await expect(page.getByText("申请已批准，计算环境已自动创建")).toBeVisible();
   await expect(
-    page.getByText("READY_FOR_PROVISION", { exact: true }).first(),
-  ).toBeVisible();
+    page.getByRole("button", { name: "生成 Provision Plan" }),
+  ).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "执行 Dry-run" })).toHaveCount(
+    0,
+  );
   await expect(
     page.getByRole("button", { name: "正式创建计算环境（Stage）" }),
-  ).toBeDisabled();
-  await page.getByLabel("管理员密码（最近重新认证）").fill("fixture password");
-  await page.getByRole("button", { name: "正式创建计算环境（Stage）" }).click();
-  await expect(page.getByText(/真实 Stage 已完成/)).toBeVisible();
+  ).toHaveCount(0);
   expect(state.provisionCalls).toBe(1);
   expect(state.requestStatus).toBe("KEY_ENROLLMENT_PENDING");
   expect(state.planState).toBe("STAGED");
@@ -493,7 +576,7 @@ test("管理员批准、reservation、dry-run 和 Stage 保持 Lease 未启动",
   );
 });
 
-test("失败 Attempt 历史可审计且不会直接复活旧 Plan", async ({ page }) => {
+test("失败 Attempt 显示安全摘要并只提供一次 Retry", async ({ page }) => {
   const state: State = {
     role: "platform_admin",
     requestStatus: "FAILED",
@@ -504,21 +587,72 @@ test("失败 Attempt 历史可审计且不会直接复活旧 Plan", async ({ pag
   await installApi(page, state);
   await page.goto(`/compute-requests/${REQUEST_ID}`);
   await expect(
-    page.getByRole("heading", { name: "Provision Attempt #1 失败" }),
+    page.getByRole("heading", { name: "Provision 失败" }),
   ).toBeVisible();
-  await expect(page.getByText(STAGE_OPERATION_ID)).toBeVisible();
   await expect(page.getByText("ROLLED_BACK", { exact: true })).toBeVisible();
   await expect(
-    page.getByText("EXPLICIT_STAGE_CONFIRMATION_GATE", { exact: true }),
+    page.getByText("Container image validation failed", { exact: true }),
   ).toBeVisible();
   await expect(
-    page.getByText("固定 Stage 脚本确认参数解析失败；未创建计算资源"),
+    page.getByRole("button", { name: "重试 Provision" }),
   ).toBeVisible();
+  await page.getByRole("button", { name: "重试 Provision" }).click();
   await expect(
-    page.getByRole("button", { name: "授权创建新的 Provision 尝试" }),
-  ).toBeDisabled();
+    page.getByText("新的 Provision Attempt 已自动完成"),
+  ).toBeVisible();
+  expect(state.provisionCalls).toBe(1);
   await expect(
-    page.getByRole("button", { name: "验证回滚后重新生成 Plan" }),
+    page.getByRole("button", { name: "生成 Provision Plan" }),
+  ).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "执行 Dry-run" })).toHaveCount(
+    0,
+  );
+  await expect(
+    page.getByRole("button", { name: "正式创建计算环境（Stage）" }),
+  ).toHaveCount(0);
+});
+
+test("只有资源状态 UNKNOWN 时才显示人工处理", async ({ page }) => {
+  const state: State = {
+    role: "platform_admin",
+    requestStatus: "FAILED",
+    planState: "FAILED",
+    mutationCsrf: [],
+    provisionCalls: 0,
+  };
+  await installApi(page, state);
+  await page.route(
+    `**/api/v1/admin/compute-resource-requests/${REQUEST_ID}`,
+    async (route) => {
+      const base = computeRequest(state, true);
+      await json(route, {
+        status: "OK",
+        request: {
+          ...base,
+          retry_available: false,
+          retry_state: "MANUAL_REVIEW",
+          attempts: [
+            {
+              ...(base?.attempts?.[0] ?? {}),
+              provision_operation: {
+                id: STAGE_OPERATION_ID,
+                operation_type: "compute.provision",
+                status: "FAILED",
+                rollback_status: "REQUIRES_MANUAL_REVIEW",
+                unknown_resource_state: ["ROOT_WORKER:WORKER_UNAVAILABLE"],
+                first_failed_step: "CONTAINER_IMAGE",
+              },
+            },
+          ],
+        },
+      });
+    },
+  );
+  await page.goto(`/compute-requests/${REQUEST_ID}`);
+  await expect(page.getByTestId("manual-review")).toBeVisible();
+  await expect(page.getByText("ROOT_WORKER:WORKER_UNAVAILABLE")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "重试 Provision" }),
   ).toHaveCount(0);
 });
 

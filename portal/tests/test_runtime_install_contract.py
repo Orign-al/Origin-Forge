@@ -69,3 +69,21 @@ def test_portal3f_worker_can_write_only_the_guard_metrics_directory() -> None:
     assert "ReadWritePaths=/var/lib/node_exporter/textfile_collector" in unit
     ambient = [line for line in unit.splitlines() if line.startswith("AmbientCapabilities=")]
     assert ambient == ["AmbientCapabilities=CAP_SETUID"]
+
+
+def test_runtime_version_and_automatic_provision_reconciliation_are_system_bound() -> None:
+    installer = (PORTAL_ROOT / "deploy/scripts/install-runtime.sh").read_text()
+    service = (PORTAL_ROOT / "deploy/systemd/h100-portal-provision-reconcile.service").read_text()
+    timer = (PORTAL_ROOT / "deploy/systemd/h100-portal-provision-reconcile.timer").read_text()
+
+    assert 'git -c safe.directory="$PLATFORM_DIR"' in installer
+    assert "rev-parse --verify 'HEAD^{commit}'" in installer
+    assert "h100-portal-provision-reconcile.service" in installer
+    assert "h100-portal-provision-reconcile.timer" in installer
+    assert "User=h100-portal-api" in service
+    assert (
+        "ExecStart=/opt/h100-portal/venv/bin/h100-portal-provision-reconcile --pending" in service
+    )
+    assert "RestrictAddressFamilies=AF_UNIX" in service
+    assert "CapabilityBoundingSet=" in service
+    assert "OnUnitActiveSec=5min" in timer

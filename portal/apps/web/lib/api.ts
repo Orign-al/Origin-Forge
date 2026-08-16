@@ -351,6 +351,12 @@ export type SafeProvisionOperation = {
   last_successful_step: string | null;
   first_failed_step: string | null;
   failed_handler: string | null;
+  workflow_steps?: Record<string, string>;
+  deployment_version?: string | null;
+  canonical_execution_contract?: string | null;
+  reconciliation_status?: string | null;
+  resource_residue?: string[] | null;
+  unknown_resource_state?: string[] | null;
 };
 
 export type ProvisionAttempt = {
@@ -358,6 +364,7 @@ export type ProvisionAttempt = {
   attempt_reason: string;
   plan: ProvisionPlan;
   operations: Array<SafeProvisionOperation | null>;
+  provision_operation?: SafeProvisionOperation | null;
   stage_operation: SafeProvisionOperation | null;
   reservations: Record<string, { id: string; state: string }>;
 };
@@ -369,6 +376,7 @@ export type ComputeResourceRequest = {
   managed_user_id?: string | null;
   username: string;
   status: string;
+  lifecycle_state?: string;
   approval_state: string;
   user_status_message?: string;
   requested_gpu_max: 0 | 1;
@@ -388,6 +396,8 @@ export type ComputeResourceRequest = {
   updated_at: string;
   plan: ProvisionPlan | null;
   attempts?: ProvisionAttempt[];
+  retry_available?: boolean;
+  /** @deprecated Compatibility projection for the removed authorization ceremony. */
   retry_authorization_available?: boolean;
   retry_state?: string;
   portal_user?: {
@@ -458,10 +468,15 @@ export const setupPassword = (payload: {
     method: "POST",
     body: JSON.stringify(payload),
   });
-export const me = () =>
-  apiFetch<{ user: User; role: string; ssh_enrollment: SshEnrollment }>(
-    "/auth/me",
-  );
+export type CurrentSession = {
+  user: User;
+  role: string;
+  ssh_enrollment: SshEnrollment;
+  recent_auth_valid?: boolean;
+  recent_auth_valid_until?: string | null;
+};
+
+export const me = () => apiFetch<CurrentSession>("/auth/me");
 export const logout = () => apiFetch<void>("/auth/logout", { method: "POST" });
 export const overview = () => apiFetch<Overview>("/platform/overview");
 export const users = () =>
@@ -667,6 +682,33 @@ export const reviewComputeRequest = (
     `/admin/compute-resource-requests/${encodeURIComponent(id)}/review`,
     { method: "POST", body: JSON.stringify(payload) },
   );
+export type ProvisionWorkflowResult = {
+  status: "PROVISIONING" | "KEY_ENROLLMENT_PENDING" | "FAILED";
+  operation_id: string;
+  operation: SafeProvisionOperation;
+  idempotent_replay: boolean;
+  request: ComputeResourceRequest;
+};
+
+export const approveAndProvision = (
+  id: string,
+  payload: { review_note: string | null; idempotency_key: string },
+) =>
+  apiFetch<ProvisionWorkflowResult>(
+    `/admin/compute-resource-requests/${encodeURIComponent(id)}/approve-and-provision`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+
+export const retryProvision = (
+  id: string,
+  payload: { admin_note: string | null; idempotency_key: string },
+) =>
+  apiFetch<ProvisionWorkflowResult>(
+    `/admin/compute-resource-requests/${encodeURIComponent(id)}/retry`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+
+/** @deprecated Compatibility-only endpoint; the Portal no longer calls it. */
 export const authorizeProvisionRetry = (
   id: string,
   payload: {
@@ -716,6 +758,7 @@ export const reconcileFailedProvision = (
       body: JSON.stringify({ ...payload, idempotency_key: randomUuid() }),
     },
   );
+/** @deprecated Compatibility-only endpoint; orchestration creates plans internally. */
 export const createProvisionPlan = (id: string) =>
   apiFetch<{ status: string; plan: ProvisionPlan }>(
     `/admin/compute-resource-requests/${encodeURIComponent(id)}/plan`,
@@ -724,6 +767,7 @@ export const createProvisionPlan = (id: string) =>
       body: JSON.stringify({ idempotency_key: randomUuid() }),
     },
   );
+/** @deprecated Compatibility-only endpoint; orchestration runs dry-run internally. */
 export const dryRunProvisionPlan = (id: string) =>
   apiFetch<{ status: "READY_FOR_PROVISION"; plan: ProvisionPlan }>(
     `/admin/compute-resource-requests/${encodeURIComponent(id)}/dry-run`,
@@ -732,6 +776,7 @@ export const dryRunProvisionPlan = (id: string) =>
       body: JSON.stringify({ idempotency_key: randomUuid() }),
     },
   );
+/** @deprecated Compatibility-only endpoint; orchestration runs Stage internally. */
 export const provisionComputeEnvironment = (id: string) =>
   apiFetch<{
     status: "KEY_ENROLLMENT_PENDING";
@@ -902,6 +947,33 @@ export const requestRestore = (itemId: string, durationSeconds = 345600) =>
         duration_seconds: durationSeconds,
         idempotency_key: randomUuid(),
       }),
+    },
+  );
+export type AdminRestoreRequest = {
+  id: string;
+  username: string;
+  resource_name: string;
+  state: string;
+  duration_seconds: number;
+  requested_at: string;
+  decided_at: string | null;
+};
+
+export const adminRestoreRequests = () =>
+  apiFetch<{ status: "OK"; requests: AdminRestoreRequest[]; count: number }>(
+    "/admin/restore-requests",
+  );
+
+export const decideRestoreRequest = (
+  requestId: string,
+  decision: "APPROVE" | "REJECT",
+  comment: string | null,
+) =>
+  apiFetch<{ status: string; restore_request_id?: string; lease_id?: string }>(
+    `/admin/restore-requests/${encodeURIComponent(requestId)}/decision`,
+    {
+      method: "POST",
+      body: JSON.stringify({ decision, comment }),
     },
   );
 export const createOperation = (payload: Record<string, unknown>) =>

@@ -2093,11 +2093,21 @@ def list_operations(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     rows = db.scalars(
-        select(PortalOperation).order_by(PortalOperation.created_at.desc()).limit(200)
+        select(PortalOperation).order_by(PortalOperation.created_at.desc()).limit(500)
     ).all()
+    # Fixed lifecycle sub-operations remain durable diagnostic evidence, but
+    # the normal administrator surface presents one top-level Provision action.
+    visible_rows = [
+        row
+        for row in rows
+        if not (
+            isinstance(row.validated_payload, dict)
+            and row.validated_payload.get("visibility") == "INTERNAL_STEP"
+        )
+    ][:200]
     return {
         "status": "OK",
-        "operations": [operation_response(row).model_dump(mode="json") for row in rows],
+        "operations": [operation_response(row).model_dump(mode="json") for row in visible_rows],
     }
 
 

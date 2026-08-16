@@ -265,8 +265,8 @@ export default function ComputeRequestPage() {
               />
             </div>
             <div className="notice">
-              提交后进入管理员审批。批准和 dry-run
-              均不会立即创建服务器资源，也不会提前启动 Lease。
+              提交后进入管理员审批。管理员批准一次后，系统自动完成安全检查和环境创建；
+              Lease 仍只会在你登记 Container 公钥并 Activate 后开始。
             </div>
             {create.isError ? (
               <div className="error-box" role="alert">

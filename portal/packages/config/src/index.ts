@@ -10,6 +10,7 @@ export const navigation = [
   ["总览", "/"],
   ["用户", "/users"],
   ["资源申请", "/compute-requests"],
+  ["恢复申请", "/restore-requests"],
   ["连接", "/access"],
   ["容器", "/containers"],
   ["Slurm", "/slurm"],

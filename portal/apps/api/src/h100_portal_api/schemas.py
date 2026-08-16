@@ -120,6 +120,36 @@ class ComputeProvisionActionRequest(ApiModel):
     idempotency_key: uuid.UUID
 
 
+class ComputeProvisionApprovalRequest(ApiModel):
+    """One administrator decision that starts the complete initial workflow."""
+
+    review_note: str | None = Field(default=None, max_length=1000)
+    idempotency_key: uuid.UUID
+
+    @field_validator("review_note")
+    @classmethod
+    def normalize_review_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class ComputeProvisionRetryRequest(ApiModel):
+    """One target-derived retry action; diagnostic evidence is never user input."""
+
+    idempotency_key: uuid.UUID
+    admin_note: str | None = Field(default=None, max_length=500)
+
+    @field_validator("admin_note")
+    @classmethod
+    def normalize_admin_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.split())
+        return normalized or None
+
+
 class ComputeProvisionRetryAuthorizationRequest(ApiModel):
     """Administrator attestation required before a fresh Stage attempt."""
 

@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically converge failed H100 Portal Provision attempts
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=10s
+Persistent=true
+Unit=h100-portal-provision-reconcile.service
+
+[Install]
+WantedBy=timers.target
