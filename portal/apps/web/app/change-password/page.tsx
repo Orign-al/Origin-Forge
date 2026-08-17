@@ -1,5 +1,6 @@
 "use client";
 
+import { useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { type FormEvent, useEffect, useState } from "react";
 
@@ -8,6 +9,7 @@ import { changePassword, me } from "../../lib/api";
 
 export default function RequiredPasswordChangePage() {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmation, setConfirmation] = useState("");
@@ -35,6 +37,7 @@ export default function RequiredPasswordChangePage() {
         new_password: newPassword,
         confirmation,
       });
+      queryClient.clear();
       router.replace("/");
     } catch {
       setError(

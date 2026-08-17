@@ -1,5 +1,6 @@
 "use client";
 
+import { useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
@@ -46,6 +47,7 @@ function localTime(value: string) {
 
 export default function SetupPasswordPage() {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const [action, setAction] = useState<PasswordAction | null>(null);
   const [linkState, setLinkState] = useState<LinkState>("LOADING");
   const [error, setError] = useState<string | null>(null);
@@ -99,6 +101,7 @@ export default function SetupPasswordPage() {
     }
     try {
       const result = await setupPassword(parsed.data);
+      queryClient.clear();
       if (result.requires_login) {
         setResetComplete(true);
         return;

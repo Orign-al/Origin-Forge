@@ -1,5 +1,6 @@
 "use client";
 
+import { useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
@@ -17,6 +18,7 @@ type FormValues = z.infer<typeof schema>;
 
 export default function LoginPage() {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
   const {
@@ -38,6 +40,7 @@ export default function LoginPage() {
     }
     try {
       const result = await login(parsed.data);
+      queryClient.clear();
       router.replace(
         result.user.password_state === "RESET_REQUIRED"
           ? "/change-password"

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from h100_portal_api import expiry_service
 from h100_portal_api.enums import (
     AccountState,
@@ -23,6 +24,7 @@ from h100_portal_api.lease_service import (
     ensure_active_lease,
     request_renewal,
 )
+from h100_portal_api.main import app
 from h100_portal_api.models import (
     PortalAuditEvent,
     PortalComputeLease,
@@ -35,13 +37,14 @@ from h100_portal_api.models import (
     PortalResourceRecycleItem,
     PortalResourceRestoreRequest,
     PortalRole,
+    PortalSession,
     PortalSshKey,
     PortalStorageResource,
     PortalUser,
     ensure_utc,
     utcnow,
 )
-from h100_portal_api.security import hash_password
+from h100_portal_api.security import digest_secret, hash_password
 from h100_portal_api.terminal_service import TerminalServiceError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -719,6 +722,92 @@ def test_ordinary_user_self_routes_are_owner_scoped_and_admin_routes_are_denied(
         ).status_code
         == 403
     )
+
+
+def test_independent_cookie_jars_isolate_sessions_logout_relogin_and_self_resources(
+    database: Session, origin_headers: dict[str, str]
+) -> None:
+    first = _identity(database)
+    second = _identity(
+        database,
+        login="fixture-user-b",
+        username="fixture-user-b",
+        uid=20002,
+        port=22024,
+    )
+    first_job = _job(database, first, "first-session-job")
+    second_job = _job(database, second, "second-session-job")
+    database.commit()
+
+    with (
+        TestClient(app, base_url="http://127.0.0.1:18080") as context_a,
+        TestClient(app, base_url="http://127.0.0.1:18080") as context_b,
+    ):
+        headers_a = _login(context_a, origin_headers, first.user.normalized_login)
+        _login(context_b, origin_headers, second.user.normalized_login)
+        cookie_a = context_a.cookies["h100_session"]
+        cookie_b = context_b.cookies["h100_session"]
+        assert cookie_a != cookie_b
+
+        for _ in range(3):
+            me_a = context_a.get("/api/v1/auth/me")
+            me_b = context_b.get("/api/v1/auth/me")
+            assert me_a.status_code == me_b.status_code == 200
+            assert me_a.json()["user"]["id"] == str(first.user.id)
+            assert me_b.json()["user"]["id"] == str(second.user.id)
+
+            jobs_a = context_a.get("/api/v1/self/jobs").json()["jobs"]
+            jobs_b = context_b.get("/api/v1/self/jobs").json()["jobs"]
+            assert [row["id"] for row in jobs_a] == [str(first_job.id)]
+            assert [row["id"] for row in jobs_b] == [str(second_job.id)]
+
+            container_a = context_a.get("/api/v1/self/container").json()["container"]
+            container_b = context_b.get("/api/v1/self/container").json()["container"]
+            assert container_a["id"] == str(first.container.id)
+            assert container_b["id"] == str(second.container.id)
+
+            lease_a = context_a.get("/api/v1/self/lease").json()["lease"]
+            lease_b = context_b.get("/api/v1/self/lease").json()["lease"]
+            assert lease_a["id"] == str(first.lease.id)
+            assert lease_b["id"] == str(second.lease.id)
+
+            keys_a = context_a.get(f"/api/v1/users/{first.user.id}/ssh-keys")
+            keys_b = context_b.get(f"/api/v1/users/{second.user.id}/ssh-keys")
+            assert keys_a.status_code == keys_b.status_code == 200
+            assert [row["id"] for row in keys_a.json()["keys"]] == [str(first.key.id)]
+            assert [row["id"] for row in keys_b.json()["keys"]] == [str(second.key.id)]
+
+        assert context_a.get(f"/api/v1/self/jobs/{second_job.id}/logs").status_code == 404
+        assert context_b.get(f"/api/v1/self/jobs/{first_job.id}/logs").status_code == 404
+        assert context_a.get(f"/api/v1/users/{second.user.id}/ssh-keys").status_code == 403
+        assert context_b.get(f"/api/v1/users/{first.user.id}/ssh-keys").status_code == 403
+
+        logged_out = context_a.post("/api/v1/auth/logout", headers=headers_a)
+        assert logged_out.status_code == 204
+        assert context_a.get("/api/v1/auth/me").status_code == 401
+        assert context_b.get("/api/v1/auth/me").json()["user"]["id"] == str(second.user.id)
+        assert context_b.cookies["h100_session"] == cookie_b
+
+        headers_a = _login(context_a, origin_headers, first.user.normalized_login)
+        assert context_a.cookies["h100_session"] != cookie_a
+        assert context_a.get("/api/v1/auth/me").json()["user"]["id"] == str(first.user.id)
+        assert context_b.get("/api/v1/auth/me").json()["user"]["id"] == str(second.user.id)
+        assert context_a.post("/api/v1/auth/logout", headers=headers_a).status_code == 204
+
+    with TestClient(app, base_url="http://127.0.0.1:18080") as shared_context:
+        _login(shared_context, origin_headers, first.user.normalized_login)
+        first_shared_cookie = shared_context.cookies["h100_session"]
+        assert shared_context.get("/api/v1/auth/me").json()["user"]["id"] == str(first.user.id)
+
+        _login(shared_context, origin_headers, second.user.normalized_login)
+        assert shared_context.cookies["h100_session"] != first_shared_cookie
+        assert shared_context.get("/api/v1/auth/me").json()["user"]["id"] == str(second.user.id)
+
+    sessions = database.scalars(select(PortalSession)).all()
+    first_shared = next(
+        row for row in sessions if row.session_hash == digest_secret(first_shared_cookie)
+    )
+    assert first_shared.revoked_at is not None
 
 
 def test_job_and_container_operations_enforce_active_lease_gpu_and_time(
