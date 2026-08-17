@@ -49,6 +49,10 @@ OCI_MANIFEST_MEDIA_TYPES = {
     "application/vnd.oci.image.manifest.v1+json",
     "application/vnd.docker.distribution.manifest.v2+json",
 }
+OCI_INDEX_MEDIA_TYPES = {
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+}
 OCI_CONFIG_MEDIA_TYPES = {
     "application/vnd.oci.image.config.v1+json",
     "application/vnd.docker.container.image.v1+json",
@@ -165,6 +169,83 @@ def _blob(
     return path
 
 
+def _resolve_image_manifest_descriptor(
+    layout: Path,
+    descriptor: dict[str, Any],
+    *,
+    owner_uid: int,
+) -> dict[str, Any]:
+    """Resolve one approved linux/amd64 image from a local OCI descriptor.
+
+    Docker's containerd image store exports a top-level OCI index descriptor
+    whose referenced index contains the platform image plus a provenance
+    attestation.  The attestation is local metadata, not a second runnable
+    platform.  Accept exactly that shape while rejecting ambiguous platform
+    choices and all remote descriptors.
+    """
+    media_type = str(descriptor["mediaType"])
+    if media_type in OCI_MANIFEST_MEDIA_TYPES:
+        platform = descriptor.get("platform")
+        if platform is not None and (
+            not isinstance(platform, dict)
+            or platform.get("os") != "linux"
+            or platform.get("architecture") != "amd64"
+        ):
+            _raise("LOCAL_BASE_IMAGE_PLATFORM_MISMATCH")
+        return descriptor
+
+    index_path = _blob(layout, descriptor, owner_uid=owner_uid)
+    nested_index = _read_json(index_path, owner_uid=owner_uid)
+    nested_media_type = nested_index.get("mediaType")
+    raw_manifests = nested_index.get("manifests")
+    if (
+        nested_index.get("schemaVersion") != 2
+        or (nested_media_type is not None and nested_media_type not in OCI_INDEX_MEDIA_TYPES)
+        or not isinstance(raw_manifests, list)
+        or not raw_manifests
+    ):
+        _raise("LOCAL_BASE_IMAGE_MANIFEST_INVALID")
+
+    platform_images: list[dict[str, Any]] = []
+    attestations: list[dict[str, Any]] = []
+    for raw_descriptor in raw_manifests:
+        nested_descriptor = _descriptor(
+            raw_descriptor,
+            allowed_media_types=OCI_MANIFEST_MEDIA_TYPES,
+        )
+        # Every descriptor must resolve to a complete local blob even when it
+        # is non-runnable provenance metadata.
+        _blob(layout, nested_descriptor, owner_uid=owner_uid)
+        platform = nested_descriptor.get("platform")
+        if (
+            isinstance(platform, dict)
+            and platform.get("os") == "linux"
+            and platform.get("architecture") == "amd64"
+        ):
+            platform_images.append(nested_descriptor)
+            continue
+        annotations = nested_descriptor.get("annotations")
+        if (
+            isinstance(platform, dict)
+            and platform.get("os") == "unknown"
+            and platform.get("architecture") == "unknown"
+            and isinstance(annotations, dict)
+            and annotations.get("vnd.docker.reference.type") == "attestation-manifest"
+        ):
+            attestations.append(nested_descriptor)
+            continue
+        _raise("LOCAL_BASE_IMAGE_PLATFORM_MISMATCH")
+
+    if len(platform_images) != 1:
+        _raise("LOCAL_BASE_IMAGE_PLATFORM_MISMATCH")
+    image_descriptor = platform_images[0]
+    for attestation in attestations:
+        annotations = attestation["annotations"]
+        if annotations.get("vnd.docker.reference.digest") != image_descriptor["digest"]:
+            _raise("LOCAL_BASE_IMAGE_MANIFEST_INVALID")
+    return image_descriptor
+
+
 def _verify_layout(
     layout: Path,
     manifest_digest: str,
@@ -200,7 +281,10 @@ def _verify_layout(
     if index.get("schemaVersion") != 2 or not isinstance(manifests, list):
         _raise("LOCAL_BASE_IMAGE_MANIFEST_INVALID")
     matching = [
-        _descriptor(value, allowed_media_types=OCI_MANIFEST_MEDIA_TYPES)
+        _descriptor(
+            value,
+            allowed_media_types=OCI_MANIFEST_MEDIA_TYPES | OCI_INDEX_MEDIA_TYPES,
+        )
         for value in manifests
         if isinstance(value, dict) and value.get("digest") == manifest_digest
     ]
@@ -215,9 +299,14 @@ def _verify_layout(
     ):
         _raise("LOCAL_BASE_IMAGE_PLATFORM_MISMATCH")
 
-    image_manifest_path = _blob(
+    image_descriptor = _resolve_image_manifest_descriptor(
         expected_layout,
         index_descriptor,
+        owner_uid=owner_uid,
+    )
+    image_manifest_path = _blob(
+        expected_layout,
+        image_descriptor,
         owner_uid=owner_uid,
     )
     image_manifest = _read_json(image_manifest_path, owner_uid=owner_uid)

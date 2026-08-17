@@ -31,6 +31,9 @@ def _local_oci_fixture(
     configured_user: str | None = None,
     architecture: str = "amd64",
     layer_urls: list[str] | None = None,
+    nested_index: bool = False,
+    duplicate_platform: bool = False,
+    bad_attestation_reference: bool = False,
 ) -> dict[str, Any]:
     artifact_base = root / "controlled" / "artifacts" / "oci" / "standard-dev-base"
     config = {
@@ -63,23 +66,74 @@ def _local_oci_fixture(
         "layers": [layer_descriptor],
     }
     manifest_bytes = _json_bytes(image_manifest)
-    manifest_digest = _digest(manifest_bytes)
+    image_manifest_digest = _digest(manifest_bytes)
+    image_descriptor = {
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": image_manifest_digest,
+        "size": len(manifest_bytes),
+        "platform": {"os": "linux", "architecture": "amd64"},
+    }
+    extra_blobs: dict[str, bytes] = {}
+    if nested_index:
+        attestation_bytes = _json_bytes(
+            {
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "artifactType": "application/vnd.in-toto+json",
+            }
+        )
+        attestation_digest = _digest(attestation_bytes)
+        attestation_descriptor = {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": attestation_digest,
+            "size": len(attestation_bytes),
+            "annotations": {
+                "vnd.docker.reference.digest": (
+                    "sha256:" + "f" * 64 if bad_attestation_reference else image_manifest_digest
+                ),
+                "vnd.docker.reference.type": "attestation-manifest",
+            },
+            "platform": {"os": "unknown", "architecture": "unknown"},
+        }
+        nested_manifests = [image_descriptor, attestation_descriptor]
+        if duplicate_platform:
+            nested_manifests.append(dict(image_descriptor))
+        nested_index_bytes = _json_bytes(
+            {
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": nested_manifests,
+            }
+        )
+        manifest_digest = _digest(nested_index_bytes)
+        index_descriptor = {
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "digest": manifest_digest,
+            "size": len(nested_index_bytes),
+            "annotations": {"containerd.io/distribution.source.docker.io": "library/h100_base"},
+        }
+        extra_blobs[manifest_digest] = nested_index_bytes
+        extra_blobs[attestation_digest] = attestation_bytes
+    else:
+        manifest_digest = image_manifest_digest
+        index_descriptor = image_descriptor
     digest_hex = manifest_digest.removeprefix("sha256:")
     layout = artifact_base / digest_hex / "layout"
     index = {
         "schemaVersion": 2,
-        "manifests": [
-            {
-                "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "digest": manifest_digest,
-                "size": len(manifest_bytes),
-                "platform": {"os": "linux", "architecture": "amd64"},
-            }
-        ],
+        "manifests": [index_descriptor],
     }
     _write(layout / "oci-layout", _json_bytes({"imageLayoutVersion": "1.0.0"}))
     _write(layout / "index.json", _json_bytes(index))
-    _write(layout / "blobs" / "sha256" / digest_hex, manifest_bytes)
+    _write(
+        layout / "blobs" / "sha256" / image_manifest_digest.removeprefix("sha256:"),
+        manifest_bytes,
+    )
+    for blob_digest, blob_content in extra_blobs.items():
+        _write(
+            layout / "blobs" / "sha256" / blob_digest.removeprefix("sha256:"),
+            blob_content,
+        )
     _write(
         layout / "blobs" / "sha256" / config_digest.removeprefix("sha256:"),
         config_bytes,
@@ -134,6 +188,37 @@ def test_local_oci_accepts_null_config_user_as_effective_root(tmp_path: Path) ->
     observed = _verify(fixture)
     assert observed["effective_user"] == "root"
     assert observed["manifest_digest"] == fixture["canonical_manifest"]["manifest_digest"]
+
+
+def test_local_oci_accepts_containerd_nested_index_with_attestation(
+    tmp_path: Path,
+) -> None:
+    fixture = _local_oci_fixture(tmp_path, nested_index=True)
+    observed = _verify(fixture)
+    assert observed["effective_user"] == "root"
+    assert observed["manifest_digest"] == fixture["canonical_manifest"]["manifest_digest"]
+
+
+@pytest.mark.parametrize(
+    ("invalid_shape", "expected_code"),
+    [
+        ("duplicate-platform", "LOCAL_BASE_IMAGE_PLATFORM_MISMATCH"),
+        ("bad-attestation", "LOCAL_BASE_IMAGE_MANIFEST_INVALID"),
+    ],
+)
+def test_local_oci_rejects_ambiguous_nested_index(
+    tmp_path: Path,
+    invalid_shape: str,
+    expected_code: str,
+) -> None:
+    fixture = _local_oci_fixture(
+        tmp_path,
+        nested_index=True,
+        duplicate_platform=invalid_shape == "duplicate-platform",
+        bad_attestation_reference=invalid_shape == "bad-attestation",
+    )
+    with pytest.raises(local_image.LocalImageValidationError, match=expected_code):
+        _verify(fixture)
 
 
 def test_local_oci_rejects_missing_or_corrupt_blob(tmp_path: Path) -> None:
