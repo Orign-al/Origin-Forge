@@ -437,6 +437,31 @@ async function expectOwnerResources(
   ).not.toContain(other.username);
 }
 
+async function expectOwnerJobUi(
+  page: Page,
+  own: FixtureAccount,
+  other: FixtureAccount,
+): Promise<void> {
+  await page.goto("/jobs");
+  await expect(page.getByRole("heading", { name: "作业" })).toBeVisible();
+  const ownRow = page
+    .getByRole("row")
+    .filter({ hasText: `${own.username}-private-job` });
+  await expect(ownRow).toHaveCount(1);
+  await expect(page.getByText(`${other.username}-private-job`)).toHaveCount(0);
+
+  await ownRow.getByRole("button", { name: "日志" }).click();
+  await expect(
+    page.getByText(`${own.username}-private-job · 日志`, { exact: true }),
+  ).toBeVisible();
+  await expect(page.locator(".job-log").first()).toContainText(
+    `${own.username}-private-stdout`,
+  );
+  await expect(page.locator(".job-log").first()).not.toContainText(
+    other.username,
+  );
+}
+
 test("two browser.newContext cookie jars stay isolated across refresh, logout, and re-login", async ({
   browser,
 }) => {
@@ -530,5 +555,34 @@ test("two pages in one BrowserContext intentionally share the latest login cooki
     ]);
   } finally {
     await context.close();
+  }
+});
+
+test("two browser contexts render only their owner-bound Job UI and logs", async ({
+  browser,
+}) => {
+  const fixture = new PortalSessionFixture();
+  const contextA = await browser.newContext({ baseURL: ORIGIN });
+  const contextB = await browser.newContext({ baseURL: ORIGIN });
+  try {
+    const pageA = await contextA.newPage();
+    const pageB = await contextB.newPage();
+    await fixture.install(pageA, contextA);
+    await fixture.install(pageB, contextB);
+
+    await Promise.all([loginAs(pageA, accountA), loginAs(pageB, accountB)]);
+    await Promise.all([
+      expectOwnerJobUi(pageA, accountA, accountB),
+      expectOwnerJobUi(pageB, accountB, accountA),
+    ]);
+
+    expect((await api(pageA, `/self/jobs/${accountB.jobId}/logs`)).status).toBe(
+      404,
+    );
+    expect((await api(pageB, `/self/jobs/${accountA.jobId}/logs`)).status).toBe(
+      404,
+    );
+  } finally {
+    await Promise.all([contextA.close(), contextB.close()]);
   }
 });

@@ -1419,6 +1419,11 @@ def test_restore_request_is_idempotent_and_admin_restore_reactivates_all_resourc
     assert first.json()["restore_request_id"] == repeated.json()["restore_request_id"]
     assert conflict.status_code == 409
     assert conflict.json()["detail"]["code"] == "IDEMPOTENCY_CONFLICT"
+    requested_audits = database.scalars(
+        select(PortalAuditEvent).where(PortalAuditEvent.event_type == "RESOURCE_RESTORE_REQUESTED")
+    ).all()
+    assert [event.object_id for event in requested_audits] == [first.json()["restore_request_id"]]
+    assert requested_audits[0].actor == "origin-pilot"
 
     client.cookies.clear()
     admin_headers = _login(client, origin_headers, admin.normalized_login)

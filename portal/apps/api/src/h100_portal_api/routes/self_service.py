@@ -1141,6 +1141,7 @@ def create_restore_request(
         idempotency_key=str(body.idempotency_key),
     )
     db.add(restore)
+    db.flush()
     item.state = "RESTORE_PENDING"
     managed.compute_environment_state = "RESTORE_PENDING"
     _audit(
