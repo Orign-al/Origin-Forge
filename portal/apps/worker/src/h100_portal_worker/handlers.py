@@ -21,11 +21,11 @@ import urllib.request
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from h100_portal_worker.local_image import local_image_contract
+from h100_portal_worker.local_image import DEPLOYMENT_VERSION_PATH, local_image_contract
 from h100_portal_worker.schemas import (
     APPROVED_CLIENT_VALIDATION_PAYLOAD,
     APPROVED_PILOT_ACCEPTANCE_PAYLOAD,
@@ -222,6 +222,14 @@ ACTIVATE_REQUIRED_SCRIPTS = frozenset(
         "h100-container-start",
         "h100-container-stop",
         "h100-gpu-bypass-guard",
+    }
+)
+SELF_ACTIVATE_REQUIRED_SCRIPTS = frozenset(
+    {
+        "h100-platform-common",
+        "h100-user-gpu-isolation",
+        "h100-container-start",
+        "h100-container-stop",
     }
 )
 PORTAL3F_REQUIRED_SCRIPTS = ACTIVATE_REQUIRED_SCRIPTS | frozenset({"h100-origin-pilot-acceptance"})
@@ -1791,10 +1799,19 @@ def _read_approved_ssh_key_record(record_id: str) -> dict[str, Any]:
         raise LifecycleValidationError(
             "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key association metadata is invalid"
         ) from exc
+    username = metadata.get("username")
     if (
         metadata.get("scope") not in {"HOST", "CONTAINER", "BOTH"}
         or operation_id != metadata.get("operation_id")
         or managed_user_id != metadata.get("managed_user_id")
+        or (
+            username is not None
+            and (
+                not isinstance(username, str)
+                or re.fullmatch(r"[a-z][a-z0-9-]{0,31}", username) is None
+                or username in {"root", "origin-al", "codexops", "nobody"}
+            )
+        )
     ):
         raise LifecycleValidationError(
             "PUBLIC_KEY_VALIDATION_FAILED", "approved SSH key association metadata is invalid"
@@ -1807,6 +1824,7 @@ def _read_approved_ssh_key_record(record_id: str) -> dict[str, Any]:
         "scope": metadata["scope"],
         "operation_id": operation_id,
         "managed_user_id": managed_user_id,
+        "username": username,
         "size_bytes": len(content),
     }
 
@@ -1917,6 +1935,10 @@ def _prepare_ssh_key_record(request: WorkerRequest, payload: dict[str, Any]) -> 
                 if any(existing.get(key) != value for key, value in comparisons.items()):
                     raise LifecycleValidationError(
                         "SSH_KEY_STAGING_CONFLICT", "existing SSH key staging record differs"
+                    )
+                if existing.get("username") not in {None, payload["username"]}:
+                    raise LifecycleValidationError(
+                        "SSH_KEY_STAGING_CONFLICT", "existing SSH key owner differs"
                     )
                 return {
                     "status": "SUCCEEDED",
@@ -4833,7 +4855,16 @@ def _execute_origin_pilot_stage(request: WorkerRequest, payload: dict[str, Any])
     }
 
 
-def _read_active_pilot_state(username: str) -> dict[str, str]:
+def _read_managed_lifecycle_state(username: str) -> dict[str, str]:
+    if re.fullmatch(r"[a-z][a-z0-9-]{0,31}", username) is None or username in {
+        "root",
+        "origin-al",
+        "codexops",
+        "nobody",
+    }:
+        raise LifecycleValidationError(
+            "CONTAINER_START_STATE_REJECTED", "managed lifecycle username is invalid"
+        )
     path = PILOT_STATE_ROOT / f"{username}.state"
     try:
         before = path.lstat()
@@ -4895,6 +4926,11 @@ def _read_active_pilot_state(username: str) -> dict[str, str]:
                     "managed lifecycle state contains duplicate fields",
                 )
             values[key] = value[:256]
+    return values
+
+
+def _read_active_pilot_state(username: str) -> dict[str, str]:
+    values = _read_managed_lifecycle_state(username)
     if (
         values.get("STATUS") != "ACTIVE"
         or values.get("USERNAME") != username
@@ -5179,6 +5215,815 @@ def _execute_managed_container_start(
         }
     except LifecycleValidationError as exc:
         return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+
+
+def _activation_runtime_binding(payload: dict[str, Any]) -> None:
+    try:
+        installed = DEPLOYMENT_VERSION_PATH.read_text(encoding="ascii").strip()
+    except OSError:
+        installed = "SOURCE_WORKTREE"
+    if installed != payload["deployment_version"]:
+        raise LifecycleValidationError(
+            "ACTIVATION_RUNTIME_BINDING_REJECTED",
+            "API and Root Worker deployment versions differ",
+        )
+
+
+def _activation_lifecycle_common(payload: dict[str, Any]) -> dict[str, str]:
+    return {
+        "VERSION": "3",
+        "USERNAME": str(payload["username"]),
+        "UID": str(payload["uid"]),
+        "GID": str(payload["gid"]),
+        "PROJECT_ID": str(payload["project_id"]),
+        "SSH_PORT": str(payload["ssh_port"]),
+        "SLURM_ACCOUNT": str(payload["slurm_account"]),
+        "SLURM_QOS": str(payload["slurm_qos"]),
+        "MAX_GPUS": str(payload["gpu_max"]),
+        "REQUEST_ID": str(payload["request_id"]),
+        "PLAN_ID": str(payload["plan_id"]),
+        "DRY_RUN_OPERATION_ID": str(payload["dry_run_operation_id"]),
+    }
+
+
+def _validate_activation_lifecycle_common(
+    lifecycle: dict[str, str], payload: dict[str, Any]
+) -> None:
+    expected = _activation_lifecycle_common(payload)
+    mismatches = sorted(key for key, value in expected.items() if lifecycle.get(key) != value)
+    if mismatches:
+        raise LifecycleValidationError(
+            "ACTIVATION_LIFECYCLE_BINDING_REJECTED",
+            f"managed lifecycle differs from the owner-bound plan: {','.join(mismatches)}",
+        )
+
+
+def _activation_staged_lifecycle(payload: dict[str, Any]) -> dict[str, str]:
+    lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+    _validate_activation_lifecycle_common(lifecycle, payload)
+    expected = {
+        "STATUS": "STAGED",
+        "SSH_KEY_STATE": "REQUIRED_BEFORE_ACTIVATION",
+        "LEASE_STATE": "NOT_STARTED",
+        "LEASE_START": "",
+        "LEASE_EXPIRES": "",
+    }
+    mismatches = sorted(key for key, value in expected.items() if lifecycle.get(key) != value)
+    if mismatches:
+        raise LifecycleValidationError(
+            "ACTIVATION_STATE_REJECTED",
+            f"managed compute identity is not safely STAGED: {','.join(mismatches)}",
+        )
+    return lifecycle
+
+
+def _activation_in_progress_lifecycle(
+    payload: dict[str, Any], expected_fingerprints: list[str]
+) -> dict[str, str]:
+    lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+    _validate_activation_lifecycle_common(lifecycle, payload)
+    expected = {
+        "STATUS": "ACTIVATING",
+        "SSH_KEY_STATE": "INSTALLED",
+        "CONTAINER_KEY_FINGERPRINTS": ",".join(expected_fingerprints),
+        "ACTIVATION_OPERATION_ID": str(payload["activation_operation_id"]),
+        "LEASE_STATE": "NOT_STARTED",
+        "LEASE_START": "",
+        "LEASE_EXPIRES": "",
+    }
+    mismatches = sorted(key for key, value in expected.items() if lifecycle.get(key) != value)
+    if mismatches:
+        raise LifecycleValidationError(
+            "ACTIVATION_STATE_CONFLICT",
+            f"ACTIVATING lifecycle differs from this operation: {','.join(mismatches)}",
+        )
+    return lifecycle
+
+
+def _activation_timestamp(value: str, field: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise LifecycleValidationError(
+            "ACTIVATION_LEASE_STATE_REJECTED", f"managed lifecycle {field} is invalid"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise LifecycleValidationError(
+            "ACTIVATION_LEASE_STATE_REJECTED", f"managed lifecycle {field} lacks a timezone"
+        )
+    return parsed.astimezone(UTC)
+
+
+def _activation_active_lifecycle(
+    payload: dict[str, Any], expected_fingerprints: list[str]
+) -> tuple[dict[str, str], datetime, datetime]:
+    lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+    _validate_activation_lifecycle_common(lifecycle, payload)
+    expected = {
+        "STATUS": "ACTIVE",
+        "SSH_KEY_STATE": "INSTALLED",
+        "CONTAINER_KEY_FINGERPRINTS": ",".join(expected_fingerprints),
+        "ACTIVATION_OPERATION_ID": str(payload["activation_operation_id"]),
+        "LEASE_STATE": "ACTIVE",
+    }
+    mismatches = sorted(key for key, value in expected.items() if lifecycle.get(key) != value)
+    if mismatches:
+        raise LifecycleValidationError(
+            "ACTIVATION_STATE_CONFLICT",
+            f"ACTIVE lifecycle is bound to another operation or key set: {','.join(mismatches)}",
+        )
+    starts_at = _activation_timestamp(lifecycle.get("LEASE_START", ""), "Lease start")
+    expires_at = _activation_timestamp(lifecycle.get("LEASE_EXPIRES", ""), "Lease expiry")
+    if expires_at - starts_at != timedelta(
+        seconds=STANDARD_COMPUTE_LEASE_SECONDS
+    ) or expires_at <= datetime.now(UTC):
+        raise LifecycleValidationError(
+            "ACTIVATION_LEASE_STATE_REJECTED",
+            "managed lifecycle does not contain one current 96-hour Lease",
+        )
+    return lifecycle, starts_at, expires_at
+
+
+def _open_activation_state_directory() -> tuple[int, int]:
+    try:
+        group_gid = grp.getgrnam("gpu-platform-admin").gr_gid
+    except KeyError as exc:
+        raise LifecycleValidationError(
+            "ACTIVATION_STATE_WRITE_FAILED", "managed lifecycle group is unavailable"
+        ) from exc
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        directory = os.open(PILOT_STATE_ROOT, flags)
+        metadata = os.fstat(directory)
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "ACTIVATION_STATE_WRITE_FAILED", "managed lifecycle directory is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != group_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o750
+    ):
+        os.close(directory)
+        raise LifecycleValidationError(
+            "ACTIVATION_STATE_WRITE_FAILED", "managed lifecycle directory metadata is invalid"
+        )
+    return directory, group_gid
+
+
+def _write_activation_lifecycle_state(
+    payload: dict[str, Any],
+    *,
+    status: str,
+    fingerprints: list[str],
+    starts_at: datetime | None,
+    expires_at: datetime | None,
+) -> None:
+    has_lease = starts_at is not None and expires_at is not None
+    if (
+        status not in {"STAGED", "ACTIVATING", "ACTIVE"}
+        or (status == "ACTIVE") != has_lease
+        or (status != "ACTIVE" and has_lease)
+    ):
+        raise LifecycleValidationError(
+            "ACTIVATION_STATE_WRITE_FAILED", "managed lifecycle transition is invalid"
+        )
+    values = {"VERSION": "3", "STATUS": status, **_activation_lifecycle_common(payload)}
+    if status in {"ACTIVATING", "ACTIVE"}:
+        values.update(
+            {
+                "SSH_KEY_STATE": "INSTALLED",
+                "CONTAINER_KEY_FINGERPRINTS": ",".join(fingerprints),
+                "ACTIVATION_OPERATION_ID": str(payload["activation_operation_id"]),
+                "LEASE_STATE": "ACTIVE" if status == "ACTIVE" else "NOT_STARTED",
+                "LEASE_START": starts_at.astimezone(UTC).isoformat() if starts_at else "",
+                "LEASE_EXPIRES": expires_at.astimezone(UTC).isoformat() if expires_at else "",
+            }
+        )
+    else:
+        values.update(
+            {
+                "SSH_KEY_STATE": "REQUIRED_BEFORE_ACTIVATION",
+                "LEASE_STATE": "NOT_STARTED",
+                "LEASE_START": "",
+                "LEASE_EXPIRES": "",
+            }
+        )
+    content = "".join(f"{key}={value}\n" for key, value in values.items()).encode("ascii")
+    directory, group_gid = _open_activation_state_directory()
+    temporary = (
+        f".{payload['username']}.{payload['activation_operation_id']}.{secrets.token_hex(8)}.tmp"
+    )
+    descriptor: int | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o640, dir_fd=directory)
+        os.fchmod(descriptor, 0o640)
+        os.fchown(descriptor, 0, group_gid)
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError("short lifecycle state write")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary,
+            f"{payload['username']}.state",
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        os.fsync(directory)
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "ACTIVATION_STATE_WRITE_FAILED", "managed lifecycle state could not be committed"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        with suppress(FileNotFoundError, OSError):
+            os.unlink(temporary, dir_fd=directory)
+        os.close(directory)
+
+
+def _activation_account_preflight(payload: dict[str, Any]) -> pwd.struct_passwd:
+    account = _portal4a_account(payload)
+    username = str(payload["username"])
+    host_ssh = Path(account.pw_dir) / ".ssh"
+    host_keys = host_ssh / "authorized_keys"
+    if (
+        account.pw_dir != f"/home/{username}"
+        or account.pw_shell != "/usr/sbin/nologin"
+        or set(_group_names(username, account.pw_gid)) != {username}
+        or host_ssh.is_symlink()
+        or host_keys.exists()
+        or host_keys.is_symlink()
+    ):
+        raise LifecycleValidationError(
+            "HOST_SSH_POLICY_REJECTED",
+            "owner-bound activation requires nologin and absent Host authorized_keys",
+        )
+    return account
+
+
+def _open_container_ssh_directory(payload: dict[str, Any]) -> int:
+    uid = int(payload["uid"])
+    gid = int(payload["gid"])
+    root = PILOT_DATA_ROOT / str(payload["username"])
+    paths = (root, root / "home", root / "home/.ssh")
+    for path in paths:
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise LifecycleValidationError(
+                "CONTAINER_KEY_INSTALL_FAILED", "managed Container SSH directory is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != uid
+            or metadata.st_gid != gid
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise LifecycleValidationError(
+                "CONTAINER_KEY_INSTALL_FAILED",
+                "managed Container SSH directory metadata is invalid",
+            )
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        directory = os.open(paths[-1], flags)
+        opened = os.fstat(directory)
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "CONTAINER_KEY_INSTALL_FAILED", "managed Container SSH directory could not be opened"
+        ) from exc
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or opened.st_uid != uid
+        or opened.st_gid != gid
+        or stat.S_IMODE(opened.st_mode) != 0o700
+    ):
+        os.close(directory)
+        raise LifecycleValidationError(
+            "CONTAINER_KEY_INSTALL_FAILED", "managed Container SSH directory changed during open"
+        )
+    return directory
+
+
+def _activation_key_content(records: list[dict[str, Any]]) -> bytes:
+    content = b"".join(
+        _read_staging_component(f"{record['record_id']}.pub", MAX_SSH_KEY_FILE_BYTES)
+        for record in records
+    )
+    if not 0 < len(content) <= MAX_SSH_KEY_FILE_BYTES:
+        raise LifecycleValidationError(
+            "CONTAINER_KEY_INSTALL_FAILED", "Container authorized_keys content is invalid"
+        )
+    return content
+
+
+def _install_activation_keys(
+    payload: dict[str, Any], records: list[dict[str, Any]], fingerprints: list[str]
+) -> bool:
+    path = PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys"
+    if path.exists() or path.is_symlink():
+        installed = _installed_key_fingerprints(path, int(payload["uid"]), int(payload["gid"]))
+        if installed != fingerprints:
+            raise LifecycleValidationError(
+                "CONTAINER_KEY_CONFLICT", "Container authorized_keys differs from approved keys"
+            )
+        return False
+    content = _activation_key_content(records)
+    directory = _open_container_ssh_directory(payload)
+    temporary = f".authorized_keys.{payload['activation_operation_id']}.{secrets.token_hex(8)}.tmp"
+    descriptor: int | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=directory)
+        os.fchmod(descriptor, 0o600)
+        os.fchown(descriptor, int(payload["uid"]), int(payload["gid"]))
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError("short authorized_keys write")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        if _component_exists(directory, "authorized_keys"):
+            raise LifecycleValidationError(
+                "CONTAINER_KEY_CONFLICT", "Container authorized_keys appeared during activation"
+            )
+        os.replace(temporary, "authorized_keys", src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
+    except LifecycleValidationError:
+        raise
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "CONTAINER_KEY_INSTALL_FAILED", "Container authorized_keys could not be committed"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        with suppress(FileNotFoundError, OSError):
+            os.unlink(temporary, dir_fd=directory)
+        os.close(directory)
+    installed = _installed_key_fingerprints(path, int(payload["uid"]), int(payload["gid"]))
+    if installed != fingerprints:
+        raise LifecycleValidationError(
+            "CONTAINER_KEY_INSTALL_FAILED", "Container authorized_keys verification failed"
+        )
+    return True
+
+
+def _remove_activation_keys(payload: dict[str, Any], fingerprints: list[str]) -> bool:
+    path = PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys"
+    if not path.exists() and not path.is_symlink():
+        return False
+    if _installed_key_fingerprints(path, int(payload["uid"]), int(payload["gid"])) != fingerprints:
+        raise LifecycleValidationError(
+            "ACTIVATION_ROLLBACK_KEY_CONFLICT",
+            "Container authorized_keys changed; automatic removal was refused",
+        )
+    directory = _open_container_ssh_directory(payload)
+    try:
+        before = os.stat("authorized_keys", dir_fd=directory, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise LifecycleValidationError(
+                "ACTIVATION_ROLLBACK_KEY_CONFLICT",
+                "Container authorized_keys changed before rollback",
+            )
+        os.unlink("authorized_keys", dir_fd=directory)
+        os.fsync(directory)
+    except LifecycleValidationError:
+        raise
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "ACTIVATION_ROLLBACK_FAILED", "Container authorized_keys could not be removed"
+        ) from exc
+    finally:
+        os.close(directory)
+    if path.exists() or path.is_symlink():
+        raise LifecycleValidationError(
+            "ACTIVATION_ROLLBACK_FAILED", "Container authorized_keys remains after rollback"
+        )
+    return True
+
+
+def _activation_container_security(
+    payload: dict[str, Any],
+    *,
+    require_running: bool,
+    expected_fingerprints: list[str] | None,
+) -> dict[str, Any]:
+    _activation_account_preflight(payload)
+    inspected = containers_inspect({"name": str(payload["container_name"])})
+    raw = inspected.get("container", {})
+    container: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    state = container.get("state", {})
+    mounts = container.get("mounts", [])
+    username = str(payload["username"])
+    expected_mounts = {
+        (str(PILOT_DATA_ROOT / username / "home"), f"/home/{username}"),
+        (str(PILOT_DATA_ROOT / username / "workspace"), "/workspace"),
+        (str(PILOT_DATA_ROOT / username / "shared"), "/shared"),
+        (
+            f"/srv/gpu-platform/container-data/{username}/ssh-host-keys",
+            "/etc/ssh/persistent",
+        ),
+    }
+    observed_mounts = {
+        (str(item.get("Source", "")), str(item.get("Destination", "")))
+        for item in mounts
+        if isinstance(item, dict) and item.get("Type") == "bind" and item.get("RW") is True
+    }
+    health = state.get("Health", {}) if isinstance(state, dict) else {}
+    if not (
+        inspected.get("status") == "OK"
+        and str(container.get("name", "")).lstrip("/") == payload["container_name"]
+        and container.get("owner") == username
+        and container.get("cpu_limit") == 8.0
+        and container.get("memory_limit_bytes") == 32 * 1024**3
+        and container.get("pids_limit") == 4096
+        and container.get("ssh_port") == str(payload["ssh_port"])
+        and container.get("privileged") is False
+        and container.get("network_mode") != "host"
+        and container.get("pid_mode") != "host"
+        and container.get("ipc_mode") != "host"
+        and container.get("gpu") == "NONE"
+        and not container.get("docker_socket_mounted")
+        and isinstance(mounts, list)
+        and len(mounts) == len(expected_mounts)
+        and observed_mounts == expected_mounts
+        and not any(
+            "munge" in str(item.get("Destination", "")).casefold()
+            or str(item.get("Source", "")) in {"/", "/etc/munge", "/run/munge"}
+            for item in mounts
+            if isinstance(item, dict)
+        )
+        and isinstance(state, dict)
+        and state.get("Running") is require_running
+        and (
+            isinstance(health, dict) and health.get("Status") == "healthy"
+            if require_running
+            else state.get("Status") in {"created", "exited"}
+        )
+    ):
+        raise LifecycleValidationError(
+            "ACTIVATION_CONTAINER_SECURITY_REJECTED",
+            "development Container differs from the fixed GPU-less security contract",
+        )
+    if expected_fingerprints is not None:
+        installed = _installed_key_fingerprints(
+            PILOT_DATA_ROOT / username / "home/.ssh/authorized_keys",
+            int(payload["uid"]),
+            int(payload["gid"]),
+        )
+        if installed != expected_fingerprints:
+            raise LifecycleValidationError(
+                "ACTIVATION_CONTAINER_KEY_REJECTED",
+                "Container authorized_keys differs from owner-approved key records",
+            )
+    return container
+
+
+def _activation_records(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    records = validate_approved_ssh_key_records(list(payload["ssh_key_record_ids"]))
+    fingerprints = [str(record["fingerprint_sha256"]) for record in records]
+    if (
+        fingerprints != payload["ssh_key_fingerprints"]
+        or any(record["managed_user_id"] != payload["managed_user_id"] for record in records)
+        or any(record["username"] not in {None, payload["username"]} for record in records)
+        or any(record["scope"] != "CONTAINER" for record in records)
+    ):
+        raise LifecycleValidationError(
+            "ACTIVATION_KEY_BINDING_REJECTED",
+            "approved SSH key records are not Container-only records owned by the target",
+        )
+    return records, fingerprints
+
+
+def _activation_container_running(payload: dict[str, Any]) -> bool:
+    inspected = containers_inspect({"name": str(payload["container_name"])})
+    raw_container = inspected.get("container", {})
+    container = raw_container if isinstance(raw_container, dict) else {}
+    raw_state = container.get("state", {})
+    state = raw_state if isinstance(raw_state, dict) else {}
+    running = state.get("Running")
+    if (
+        inspected.get("status") != "OK"
+        or str(container.get("name", "")).lstrip("/") != payload["container_name"]
+        or container.get("owner") != payload["username"]
+        or not isinstance(running, bool)
+    ):
+        raise LifecycleValidationError(
+            "ACTIVATION_CONTAINER_STATE_UNKNOWN",
+            "development Container running state could not be authoritatively resolved",
+        )
+    return running
+
+
+def _activation_result(
+    request: WorkerRequest,
+    payload: dict[str, Any],
+    fingerprints: list[str],
+    starts_at: datetime,
+    expires_at: datetime,
+    *,
+    replay: bool,
+) -> dict[str, Any]:
+    return {
+        "status": "SUCCEEDED",
+        "handler": "compute.activate.self",
+        "activation_operation_id": payload["activation_operation_id"],
+        "managed_user_id": payload["managed_user_id"],
+        "compute_request_id": payload["request_id"],
+        "plan_id": payload["plan_id"],
+        "username": payload["username"],
+        "container_name": payload["container_name"],
+        "container_state": "RUNNING",
+        "container_gpu": "NONE",
+        "container_cpus": 8,
+        "container_memory_gb": 32,
+        "container_pids_limit": 4096,
+        "container_privileged": False,
+        "docker_socket": "ABSENT",
+        "munge": "ABSENT",
+        "host_namespaces": "DISABLED",
+        "container_key_fingerprints": fingerprints,
+        "host_authorized_keys": "ABSENT",
+        "host_shell": "/usr/sbin/nologin",
+        "host_password": "LOCKED",
+        "lease_starts_at": starts_at.isoformat(),
+        "lease_expires_at": expires_at.isoformat(),
+        "lease_duration_seconds": STANDARD_COMPUTE_LEASE_SECONDS,
+        "deployment_version": payload["deployment_version"],
+        "worker_request_id": request.request_id,
+        "idempotent_replay": replay,
+    }
+
+
+def _rollback_self_activation(payload: dict[str, Any], fingerprints: list[str]) -> bool:
+    lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+    _validate_activation_lifecycle_common(lifecycle, payload)
+    if lifecycle.get("STATUS") == "STAGED":
+        try:
+            _compute_stage_postconditions(payload)
+            return True
+        except LifecycleValidationError:
+            pass
+    elif lifecycle.get("STATUS") in {"ACTIVATING", "ACTIVE"}:
+        if lifecycle.get("ACTIVATION_OPERATION_ID") != payload[
+            "activation_operation_id"
+        ] or lifecycle.get("CONTAINER_KEY_FINGERPRINTS") != ",".join(fingerprints):
+            raise LifecycleValidationError(
+                "ACTIVATION_STATE_CONFLICT",
+                "automatic rollback refused an ACTIVE lifecycle owned by another operation",
+            )
+    else:
+        raise LifecycleValidationError(
+            "ACTIVATION_ROLLBACK_STATE_UNKNOWN",
+            "managed lifecycle is neither the bound STAGED, ACTIVATING, nor ACTIVE state",
+        )
+    inspected = containers_inspect({"name": str(payload["container_name"])})
+    raw_container = inspected.get("container", {})
+    container = raw_container if isinstance(raw_container, dict) else {}
+    raw_state = container.get("state", {})
+    state = raw_state if isinstance(raw_state, dict) else {}
+    if not (
+        inspected.get("status") == "OK"
+        and str(container.get("name", "")).lstrip("/") == payload["container_name"]
+        and container.get("owner") == payload["username"]
+        and isinstance(state.get("Running"), bool)
+    ):
+        raise LifecycleValidationError(
+            "ACTIVATION_ROLLBACK_CONTAINER_UNKNOWN",
+            "development Container state could not be authoritatively resolved",
+        )
+    if state["Running"] is True:
+        stopped = run_allowlisted_script(
+            [SCRIPT_ALLOWLIST["h100-container-stop"], str(payload["username"])], timeout=90
+        )
+        if not stopped.get("ok"):
+            raise LifecycleValidationError(
+                "ACTIVATION_ROLLBACK_CONTAINER_STOP_FAILED",
+                "development Container could not be stopped during activation rollback",
+            )
+    _remove_activation_keys(payload, fingerprints)
+    _write_activation_lifecycle_state(
+        payload,
+        status="STAGED",
+        fingerprints=[],
+        starts_at=None,
+        expires_at=None,
+    )
+    _compute_stage_postconditions(payload)
+    return False
+
+
+def _execute_self_compute_activation(
+    request: WorkerRequest, payload: dict[str, Any]
+) -> dict[str, Any]:
+    expected_key = f"compute-activate:{payload['activation_operation_id']}"
+    if (
+        request.requested_by != payload["owner_login"]
+        or request.approved_by != payload["owner_login"]
+        or request.idempotency_key != expected_key
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "ACTIVATION_OWNER_BINDING_REJECTED",
+                "message": "activation request is not bound to its authenticated owner",
+            },
+            "rollback_status": "NOT_REQUIRED",
+        }
+    integrity = script_integrity()
+    failed = sorted(
+        name
+        for name in SELF_ACTIVATE_REQUIRED_SCRIPTS
+        if not integrity.get(name, {}).get("integrity_ok", False)
+    )
+    if failed:
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "SCRIPT_INTEGRITY_FAILED",
+                "message": "fixed activation lifecycle integrity check failed",
+                "scripts": failed,
+            },
+            "rollback_status": "NOT_REQUIRED",
+        }
+    mutated = False
+    fingerprints: list[str] = list(payload["ssh_key_fingerprints"])
+    try:
+        _activation_runtime_binding(payload)
+        records, fingerprints = _activation_records(payload)
+        lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+        if lifecycle.get("STATUS") == "ACTIVE":
+            _lifecycle, starts_at, expires_at = _activation_active_lifecycle(payload, fingerprints)
+            _activation_container_security(
+                payload,
+                require_running=True,
+                expected_fingerprints=fingerprints,
+            )
+            return _activation_result(
+                request,
+                payload,
+                fingerprints,
+                starts_at,
+                expires_at,
+                replay=True,
+            )
+        if lifecycle.get("STATUS") == "ACTIVATING":
+            _activation_in_progress_lifecycle(payload, fingerprints)
+            mutated = True
+        else:
+            _activation_staged_lifecycle(payload)
+            _compute_stage_postconditions(payload)
+            mutated = True
+            _install_activation_keys(payload, records, fingerprints)
+            _write_activation_lifecycle_state(
+                payload,
+                status="ACTIVATING",
+                fingerprints=fingerprints,
+                starts_at=None,
+                expires_at=None,
+            )
+        running = _activation_container_running(payload)
+        _activation_container_security(
+            payload,
+            require_running=running,
+            expected_fingerprints=fingerprints,
+        )
+        if not running:
+            started = run_allowlisted_script(
+                [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])], timeout=150
+            )
+            if not started.get("ok"):
+                raise LifecycleValidationError(
+                    "CONTAINER_START_FAILED", "development Container failed to start"
+                )
+        _activation_container_security(
+            payload,
+            require_running=True,
+            expected_fingerprints=fingerprints,
+        )
+        isolation = run_allowlisted_script(
+            [SCRIPT_ALLOWLIST["h100-user-gpu-isolation"], "verify", str(payload["username"])],
+            timeout=60,
+        )
+        if not isolation.get("ok"):
+            raise LifecycleValidationError(
+                "GPU_ISOLATION_FAILED", "per-UID GPU isolation verification failed"
+            )
+        starts_at = datetime.now(UTC)
+        expires_at = starts_at + timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS)
+        _write_activation_lifecycle_state(
+            payload,
+            status="ACTIVE",
+            fingerprints=fingerprints,
+            starts_at=starts_at,
+            expires_at=expires_at,
+        )
+        _activation_active_lifecycle(payload, fingerprints)
+        return _activation_result(
+            request,
+            payload,
+            fingerprints,
+            starts_at,
+            expires_at,
+            replay=False,
+        )
+    except (LifecycleValidationError, OSError) as exc:
+        rollback_status = "NOT_REQUIRED"
+        if mutated:
+            try:
+                _rollback_self_activation(payload, fingerprints)
+                rollback_status = "ROLLED_BACK"
+            except LifecycleValidationError, OSError:
+                rollback_status = "REQUIRES_MANUAL_REVIEW"
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": getattr(exc, "code", "ACTIVATION_FAILED"),
+                "message": str(exc)[:512],
+            },
+            "rollback_status": rollback_status,
+        }
+
+
+def _execute_self_compute_activation_rollback(
+    request: WorkerRequest, payload: dict[str, Any]
+) -> dict[str, Any]:
+    expected_key = f"compute-activate-rollback:{payload['activation_operation_id']}"
+    if (
+        request.requested_by != payload["owner_login"]
+        or request.approved_by != payload["owner_login"]
+        or request.idempotency_key != expected_key
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "ACTIVATION_ROLLBACK_BINDING_REJECTED",
+                "message": "activation rollback is not bound to its owner and operation",
+            },
+            "rollback_status": "REQUIRES_MANUAL_REVIEW",
+        }
+    integrity = script_integrity()
+    if not all(
+        integrity.get(name, {}).get("integrity_ok", False)
+        for name in SELF_ACTIVATE_REQUIRED_SCRIPTS
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "SCRIPT_INTEGRITY_FAILED",
+                "message": "fixed activation rollback integrity check failed",
+            },
+            "rollback_status": "REQUIRES_MANUAL_REVIEW",
+        }
+    try:
+        _records, fingerprints = _activation_records(payload)
+        replay = _rollback_self_activation(payload, fingerprints)
+        return {
+            "status": "SUCCEEDED",
+            "handler": "compute.activate.self.rollback",
+            "activation_operation_id": payload["activation_operation_id"],
+            "managed_user_id": payload["managed_user_id"],
+            "username": payload["username"],
+            "container_state": "STOPPED",
+            "host_authorized_keys": "ABSENT",
+            "container_authorized_keys": "ABSENT",
+            "lease_state": "NOT_STARTED",
+            "rollback_status": "ROLLED_BACK",
+            "idempotent_replay": replay,
+        }
+    except (LifecycleValidationError, OSError) as exc:
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": getattr(exc, "code", "ACTIVATION_ROLLBACK_FAILED"),
+                "message": str(exc)[:512],
+            },
+            "rollback_status": "REQUIRES_MANUAL_REVIEW",
+        }
 
 
 def _activation_fingerprints(
@@ -7506,6 +8351,14 @@ def dry_run_plan(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, A
                 "message": "Stage consumes a separately recorded compute.provision.dry_run",
             },
         }
+    if request.operation_type in {"compute.activate.self", "compute.activate.self.rollback"}:
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "ACTIVATION_DRY_RUN_REJECTED",
+                "message": "owner activation preflight is internal to the one-click operation",
+            },
+        }
     if request.operation_type == "user.ssh_client_validation.record":
         return _portal3f_client_validation_plan(payload)
     if request.operation_type == "user.pilot.acceptance":
@@ -7599,6 +8452,10 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
         }
     if request.operation_type in KNOWN_WRITES:
         if not request.dry_run:
+            if request.operation_type == "compute.activate.self":
+                return _execute_self_compute_activation(request, payload)
+            if request.operation_type == "compute.activate.self.rollback":
+                return _execute_self_compute_activation_rollback(request, payload)
             if request.operation_type == "compute.provision.stage":
                 return _execute_compute_provision_stage(request, payload)
             if request.operation_type == "self.job.submit":

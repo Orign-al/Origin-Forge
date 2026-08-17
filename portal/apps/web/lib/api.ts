@@ -153,6 +153,32 @@ export type SshKeyList = {
   enrollment: SshEnrollment;
 };
 
+export type SelfComputeActivationResult =
+  | {
+      status: "ACTIVATING";
+      operation_id: string;
+      idempotent_replay: true;
+      environment_state: "STAGED";
+      container_state: "ACTIVATING";
+      ssh_state: "INSTALLING";
+      lease: null;
+    }
+  | {
+      status: "ACTIVE" | "ALREADY_ACTIVE";
+      operation_id?: string;
+      idempotent_replay: boolean;
+      environment_state: "ACTIVE";
+      container_state: "RUNNING";
+      ssh_state: "READY";
+      lease: {
+        id: string;
+        state: string;
+        starts_at: string;
+        expires_at: string;
+        duration_seconds: 345600;
+      };
+    };
+
 export type Overview = {
   status: string;
   platform: {
@@ -531,6 +557,11 @@ export const enrollSshKey = (
     private_key_received: false;
     authorized_keys_installed: false;
   }>(`/users/${encodeURIComponent(userId)}/ssh-keys`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+export const activateSelfCompute = (payload: { idempotency_key: string }) =>
+  apiFetch<SelfComputeActivationResult>("/self/compute/activate", {
     method: "POST",
     body: JSON.stringify(payload),
   });

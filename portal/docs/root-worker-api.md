@@ -55,6 +55,7 @@ Prometheus/Grafana。GPU minor 只按 UUID + PCI Bus ID 与 NVIDIA driver procfs
 - `slurm.drain`、`slurm.resume`、`job.cancel`、`quota.update`
 - `ssh_key.add`、`ssh_key.revoke`
 - `ssh_key.prepare`、`ssh_key.discard`
+- `compute.activate.self`、`compute.activate.self.rollback`
 
 Portal-3C 开放的宿主资源写路径是：`requested_by=approved_by=origin-al`、固定幂等键、固定
 审批引用和逐字段匹配既有计划的 `user.stage(origin-pilot)`。Worker 在执行前再次运行
@@ -87,6 +88,18 @@ authorized_keys、shell/password、Host/Container SSH effective policy、监听�
 fingerprint、GPU isolation、Guard、quota、Slurm DRAIN/空队列及容器安全。后置条件失败时
 调用内部 `user.activate.rollback`，恢复 STAGED/nologin/两处 key absent/容器 stopped；
 该回滚 operation 不对浏览器开放。
+
+多用户自助激活不复用上述 legacy `user.activate`。API 的
+`POST /api/v1/self/compute/activate` 只接受幂等键，并从认证会话与数据库生成完整闭合
+payload；Worker 要求 `requested_by=approved_by=owner_login` 且幂等键绑定顶层 Activation
+Operation。它只接受 owner 的 `CONTAINER` key records，验证 STAGED Request/Plan/Dry-run
+lineage、root-controlled lifecycle state、nologin/locked password、Host authorized_keys
+ABSENT、容器固定 mount/CPU/Memory/PIDs/GPU NONE/no host namespaces/no Docker socket/no
+MUNGE 以及 per-UID GPU policy。容器启动期间 lifecycle 为
+`ACTIVATING / Lease NOT_STARTED`；健康与安全后置条件全部通过后才写入 `ACTIVE` 和精确
+96 小时时间。API 数据库事务失败会调用固定 rollback handler，停止容器、移除本次容器
+key 并恢复 STAGED。该路径不接收 username、UID、container name、path、command 或 argv
+等浏览器字段，也不要求 `users.write`。
 
 Portal-3D-R 同时定义了一个与通用容器管理分离的自助启动闭合路径。API 端点
 `POST /api/v1/containers/{name}/start` 只允许当前会话所属的受管容器，并只接收服务端

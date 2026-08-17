@@ -333,6 +333,12 @@ class SelfContainerActionRequest(ApiModel):
     idempotency_key: uuid.UUID
 
 
+class SelfComputeActivateRequest(ApiModel):
+    """The browser selects no identity, container, key, or Lease coordinates."""
+
+    idempotency_key: uuid.UUID
+
+
 class SelfTerminalCreateRequest(ApiModel):
     idempotency_key: uuid.UUID
     cols: int = Field(default=120, ge=20, le=300)

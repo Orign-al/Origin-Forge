@@ -990,7 +990,6 @@ export function OrdinarySshKeys() {
           userId={current.data.user.id}
           username={current.data.user.normalized_login}
           computeState={current.data.ssh_enrollment.compute_state}
-          managedUserId={current.data.ssh_enrollment.managed_user_id}
           containerOnly
         />
       </SectionCard>

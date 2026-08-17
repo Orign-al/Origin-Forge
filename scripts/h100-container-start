@@ -27,7 +27,8 @@ pilot_state_value() {
 
 require_activated_pilot_access() {
   local state_file="/etc/h100-platform/users/${user_name}.state"
-  local state_uid state_gid expected_fingerprints authorized_keys metadata
+  local state_version state_status state_uid state_gid expected_fingerprints authorized_keys metadata
+  local host_authorized_keys lease_start lease_expires lease_start_epoch lease_expires_epoch now_epoch
   local key_line fingerprint
   local -a observed_fingerprints=()
   [[ -e "${state_file}" ]] || return 0
@@ -36,10 +37,17 @@ require_activated_pilot_access() {
   [[ "$(stat -c '%U:%G:%a' "${state_file}")" == \
     'root:gpu-platform-admin:640' ]] \
     || h100_fail 'managed Pilot lifecycle state ownership or mode is invalid'
-  [[ "$(pilot_state_value "${state_file}" VERSION)" == 2 ]] \
+  state_version="$(pilot_state_value "${state_file}" VERSION)"
+  [[ "${state_version}" == 2 || "${state_version}" == 3 ]] \
     || h100_fail 'managed Pilot lifecycle state version is invalid'
-  [[ "$(pilot_state_value "${state_file}" STATUS)" == ACTIVE ]] \
-    || h100_fail 'managed Pilot container requires ACTIVE compute identity'
+  state_status="$(pilot_state_value "${state_file}" STATUS)"
+  if [[ "${state_version}" == 3 ]]; then
+    [[ "${state_status}" == ACTIVATING || "${state_status}" == ACTIVE ]] \
+      || h100_fail 'multi-user Container start requires ACTIVATING or ACTIVE state'
+  else
+    [[ "${state_status}" == ACTIVE ]] \
+      || h100_fail 'managed Pilot container requires ACTIVE compute identity'
+  fi
   [[ "$(pilot_state_value "${state_file}" SSH_KEY_STATE)" == INSTALLED ]] \
     || h100_fail 'managed Pilot container requires INSTALLED SSH keys'
   [[ "$(pilot_state_value "${state_file}" USERNAME)" == "${user_name}" ]] \
@@ -49,10 +57,42 @@ require_activated_pilot_access() {
   [[ "$(id -u "${user_name}")" == "${state_uid}" \
     && "$(id -g "${user_name}")" == "${state_gid}" ]] \
     || h100_fail 'managed Pilot UID/GID is inconsistent'
-  case "$(getent passwd "${user_name}" | cut -d: -f7)" in
-    /bin/bash|/usr/sbin/nologin) ;;
-    *) h100_fail 'managed Pilot login shell is outside the approved policy' ;;
-  esac
+  if [[ "${state_version}" == 3 ]]; then
+    [[ "$(getent passwd "${user_name}" | cut -d: -f7)" == /usr/sbin/nologin ]] \
+      || h100_fail 'multi-user Container activation must keep Host shell nologin'
+    host_authorized_keys="/home/${user_name}/.ssh/authorized_keys"
+    [[ ! -e "${host_authorized_keys}" && ! -L "${host_authorized_keys}" ]] \
+      || h100_fail 'multi-user Container activation forbids Host authorized_keys'
+    if [[ "${state_status}" == ACTIVATING ]]; then
+      [[ "$(pilot_state_value "${state_file}" ACTIVATION_OPERATION_ID)" =~ \
+        ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] \
+        || h100_fail 'multi-user Container activation operation binding is invalid'
+      [[ "$(pilot_state_value "${state_file}" LEASE_STATE)" == NOT_STARTED ]] \
+        || h100_fail 'multi-user Container Lease must remain NOT_STARTED during activation'
+      [[ -z "$(pilot_state_value "${state_file}" LEASE_START)" \
+        && -z "$(pilot_state_value "${state_file}" LEASE_EXPIRES)" ]] \
+        || h100_fail 'multi-user Container Lease timestamps started before activation succeeded'
+    else
+      [[ "$(pilot_state_value "${state_file}" LEASE_STATE)" == ACTIVE ]] \
+        || h100_fail 'multi-user Container start requires an active Lease'
+      lease_start="$(pilot_state_value "${state_file}" LEASE_START)"
+      lease_expires="$(pilot_state_value "${state_file}" LEASE_EXPIRES)"
+      lease_start_epoch="$(date -u -d "${lease_start}" +%s 2>/dev/null)" \
+        || h100_fail 'multi-user Container Lease start is invalid'
+      lease_expires_epoch="$(date -u -d "${lease_expires}" +%s 2>/dev/null)" \
+        || h100_fail 'multi-user Container Lease expiry is invalid'
+      now_epoch="$(date -u +%s)"
+      ((lease_expires_epoch - lease_start_epoch == 345600)) \
+        || h100_fail 'multi-user Container Lease duration is not 96 hours'
+      ((lease_expires_epoch > now_epoch)) \
+        || h100_fail 'multi-user Container Lease has expired'
+    fi
+  else
+    case "$(getent passwd "${user_name}" | cut -d: -f7)" in
+      /bin/bash|/usr/sbin/nologin) ;;
+      *) h100_fail 'managed Pilot login shell is outside the approved policy' ;;
+    esac
+  fi
   [[ "$(passwd -S "${user_name}" | awk '{print $2}')" == L ]] \
     || h100_fail 'managed Pilot password must remain locked'
 

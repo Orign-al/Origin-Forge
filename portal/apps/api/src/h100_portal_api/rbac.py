@@ -81,6 +81,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "audit.read",
     },
     "user": {
+        "self.compute.activate",
         "self.environment.read",
         "self.lease.read",
         "self.lease.renew.request",

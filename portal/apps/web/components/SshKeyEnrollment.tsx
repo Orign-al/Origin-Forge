@@ -5,8 +5,8 @@ import { useRef, useState } from "react";
 
 import { Button, Input, StatusBadge } from "@h100-portal/ui";
 import {
+  activateSelfCompute,
   ApiError,
-  createOperation,
   enrollSshKey,
   sshKeys,
   type SshKeyRecord,
@@ -20,6 +20,7 @@ import {
   type GeneratedSshKey,
   type ParsedSshPublicKey,
 } from "../lib/ssh-key";
+import { randomUuid } from "../lib/random-uuid";
 
 type Scope = "HOST" | "CONTAINER" | "BOTH";
 type EnrollmentMode = "idle" | "generate" | "import";
@@ -110,16 +111,12 @@ export function SshKeyEnrollment({
   userId,
   username,
   computeState,
-  managedUserId,
-  activateDryRun,
   onClose,
   containerOnly = false,
 }: {
   userId: string;
   username: string;
   computeState: string;
-  managedUserId?: string | null;
-  activateDryRun?: Record<string, unknown> | null;
   onClose?: () => void;
   containerOnly?: boolean;
 }) {
@@ -137,12 +134,9 @@ export function SshKeyEnrollment({
   const [imported, setImported] = useState<ParsedSshPublicKey | null>(null);
   const [importConfirmed, setImportConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [activating, setActivating] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [localActivatePlan, setLocalActivatePlan] = useState<Record<
-    string,
-    unknown
-  > | null>(null);
   const keysQuery = useQuery({
     queryKey: ["ssh-keys", userId],
     queryFn: () => sshKeys(userId),
@@ -152,15 +146,9 @@ export function SshKeyEnrollment({
   const validKeys = keys.filter(
     (key) => key.state === "VALIDATED" || key.state === "INSTALLED",
   );
-  const effectiveManagedUserId =
-    managedUserId ?? keysQuery.data?.enrollment.managed_user_id;
-  const plan = localActivatePlan ?? activateDryRun;
-  const hostSshPolicy =
-    plan?.host_ssh_policy &&
-    typeof plan.host_ssh_policy === "object" &&
-    !Array.isArray(plan.host_ssh_policy)
-      ? (plan.host_ssh_policy as Record<string, unknown>)
-      : null;
+  const validContainerKeys = validKeys.filter(
+    (key) => key.scope === "CONTAINER",
+  );
 
   function resetFlow(nextMode: EnrollmentMode) {
     setMode(nextMode);
@@ -311,42 +299,50 @@ export function SshKeyEnrollment({
     }
   }
 
-  async function createActivateDryRun() {
-    if (!effectiveManagedUserId || !validKeys.length) return;
+  async function activateEnvironment() {
+    if (!containerOnly || !validContainerKeys.length) return;
     setBusy(true);
+    setActivating(true);
     setError(null);
     try {
-      const operation = await createOperation({
-        operation_type: "user.activate",
-        target_type: "compute_identity",
-        target_id: username,
-        request_summary: `${username} Activate 计划（仅 dry-run）`,
-        payload: {
-          managed_user_id: effectiveManagedUserId,
-          approved_ssh_key_record_ids: validKeys.map((key) => key.id),
-          expected_state: "STAGED",
-          approval_reference: "portal3d-r-self-service-v1",
-        },
-        idempotency_key: `portal3d-r-activate:${Date.now()}`,
+      const result = await activateSelfCompute({
+        idempotency_key: randomUuid(),
       });
-      const dryRun = operation.dry_run_result;
-      setLocalActivatePlan(
-        dryRun && typeof dryRun === "object"
-          ? (dryRun as Record<string, unknown>)
-          : null,
+      if (result.status === "ACTIVATING") {
+        setMessage("计算环境正在激活；Lease 尚未开始，请稍后刷新状态。");
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["me"] }),
+          queryClient.invalidateQueries({ queryKey: ["self-environment"] }),
+          queryClient.invalidateQueries({ queryKey: ["self-container"] }),
+          queryClient.invalidateQueries({ queryKey: ["self-lease"] }),
+        ]);
+        return;
+      }
+      setMessage(
+        `计算环境已激活；Lease 从 ${new Date(
+          result.lease.starts_at,
+        ).toLocaleString(
+          "zh-CN",
+        )} 开始，到 ${new Date(result.lease.expires_at).toLocaleString("zh-CN")} 到期。`,
       );
-      setMessage("Activate dry-run 已完成；真实 Activate 仍需管理员明确审批。");
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: ["user", userId] }),
-        queryClient.invalidateQueries({ queryKey: ["operations"] }),
+        queryClient.invalidateQueries({ queryKey: ["ssh-keys", userId] }),
+        queryClient.invalidateQueries({ queryKey: ["me"] }),
+        queryClient.invalidateQueries({ queryKey: ["self-environment"] }),
+        queryClient.invalidateQueries({ queryKey: ["self-container"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["self-container-connection"],
+        }),
+        queryClient.invalidateQueries({ queryKey: ["self-lease"] }),
       ]);
     } catch (caught) {
       setError(
         caught instanceof ApiError
           ? `${caught.code}：${caught.message}`
-          : "Activate dry-run 失败",
+          : "计算环境激活失败；Lease 未开始",
       );
     } finally {
+      setActivating(false);
       setBusy(false);
     }
   }
@@ -429,7 +425,9 @@ export function SshKeyEnrollment({
               <div className="muted">
                 {containerOnly && computeState === "ACTIVE"
                   ? "新增密钥仍只授权自己的开发容器，不会启用宿主访问。"
-                  : "尚未安装；计算身份仍需 Activate 审批。"}
+                  : containerOnly
+                    ? "公钥已就绪；激活成功后只会安装到自己的开发容器。"
+                    : "尚未安装。"}
               </div>
             </div>
           )}
@@ -690,92 +688,43 @@ export function SshKeyEnrollment({
         </section>
       ) : null}
 
-      {validKeys.length > 0 && computeState === "STAGED" ? (
-        <section className="activate-dry-run">
+      {containerOnly &&
+      validContainerKeys.length > 0 &&
+      computeState === "STAGED" ? (
+        <section className="activate-compute" data-testid="self-activation">
           <div>
-            <h3>Activate Dry-Run</h3>
+            <h3>激活计算环境</h3>
             <p className="muted">
-              重新验证 STAGED 资源和 Key Scope；不会安装 authorized_keys、修改
-              Shell 或启动容器。
+              后端将自动完成安全预检、安装容器公钥、启动并验证开发容器；Lease
+              只在全部成功后开始。
             </p>
+            <dl className="kv-grid">
+              <div className="kv">
+                <dt>SSH key</dt>
+                <dd>Ready</dd>
+              </div>
+              <div className="kv">
+                <dt>Environment</dt>
+                <dd>Staged</dd>
+              </div>
+              <div className="kv">
+                <dt>Lease</dt>
+                <dd>Starts after activation</dd>
+              </div>
+              <div className="kv">
+                <dt>Host SSH</dt>
+                <dd>Disabled</dd>
+              </div>
+            </dl>
           </div>
           <Button
             tone="primary"
             type="button"
             disabled={busy}
-            onClick={() => void createActivateDryRun()}
+            onClick={() => void activateEnvironment()}
           >
-            生成 Activate Dry-Run
+            {activating ? "正在激活…" : "激活计算环境"}
           </Button>
-        </section>
-      ) : null}
-
-      {plan ? (
-        <section className="activate-plan" data-testid="activate-dry-run-plan">
-          <div className="detail-section-heading">
-            <h3>Activate Dry-Run</h3>
-            <StatusBadge
-              value={String(plan.activate_status ?? plan.status ?? "UNKNOWN")}
-            />
-          </div>
-          <dl className="kv-grid">
-            <div className="kv">
-              <dt>Host authorized_keys</dt>
-              <dd>{String(plan.host_authorized_keys_install ?? "UNKNOWN")}</dd>
-            </div>
-            <div className="kv">
-              <dt>Container authorized_keys</dt>
-              <dd>
-                {String(plan.container_authorized_keys_install ?? "UNKNOWN")}
-              </dd>
-            </div>
-            <div className="kv">
-              <dt>执行</dt>
-              <dd>DISABLED — ADMINISTRATOR APPROVAL REQUIRED</dd>
-            </div>
-            <div className="kv">
-              <dt>当前 Shell</dt>
-              <dd>{String(plan.shell_current ?? "/usr/sbin/nologin")}</dd>
-            </div>
-            <div className="kv">
-              <dt>宿主 SSH 策略</dt>
-              <dd>{String(hostSshPolicy?.status ?? "UNKNOWN")}</dd>
-            </div>
-            <div className="kv">
-              <dt>Public Key Authentication</dt>
-              <dd>
-                {hostSshPolicy?.pubkey_authentication === true
-                  ? "ENABLED"
-                  : "DISABLED"}
-              </dd>
-            </div>
-            <div className="kv">
-              <dt>Password Authentication</dt>
-              <dd>
-                {hostSshPolicy?.password_authentication === false
-                  ? "DISABLED"
-                  : "ENABLED"}
-              </dd>
-            </div>
-            <div className="kv">
-              <dt>Keyboard Interactive</dt>
-              <dd>
-                {hostSshPolicy?.keyboard_interactive_authentication === false
-                  ? "DISABLED"
-                  : "ENABLED"}
-              </dd>
-            </div>
-            <div className="kv">
-              <dt>Required Authentication</dt>
-              <dd>
-                {Array.isArray(hostSshPolicy?.authentication_methods)
-                  ? hostSshPolicy.authentication_methods
-                      .map((item) => String(item).toUpperCase())
-                      .join(", ")
-                  : "UNKNOWN"}
-              </dd>
-            </div>
-          </dl>
         </section>
       ) : null}
     </div>

@@ -431,8 +431,8 @@ Host h100-${String(linux.unix_username)}-dev
         <div className="notice staged-waiting">
           SSH Key 已验证但尚未安装。宿主 authorized_keys 仍为 ABSENT，Shell 仍为
           /usr/sbin/nologin，容器保持 STOPPED。
-          <Link className="table-link" href={`/users/${user.id}?tab=ssh`}>
-            查看 Activate Dry-Run
+          <Link className="table-link" href="/ssh-keys">
+            前往激活计算环境
           </Link>
         </div>
       ) : null}
@@ -449,10 +449,6 @@ Host h100-${String(linux.unix_username)}-dev
               userId={user.id}
               username={String(linux.unix_username ?? "origin-pilot")}
               computeState={computeState}
-              managedUserId={String(linux.managed_user_id ?? "") || null}
-              activateDryRun={
-                user.compute_onboarding?.activate_dry_run?.plan ?? null
-              }
               onClose={() => setSetupOpen(false)}
             />
           </aside>

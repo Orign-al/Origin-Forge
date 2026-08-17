@@ -314,8 +314,6 @@ export default function UserDetailPage() {
     String(linux.onboarding_state ?? ""),
   );
   const sshKeyCount = Number(linux.ssh_key_count ?? 0);
-  const activatePlanReady =
-    asRecord(compute?.activate_dry_run?.plan).activate_status === "READY";
   async function createComputePlan() {
     setBusy(true);
     setMessage(null);
@@ -567,14 +565,12 @@ export default function UserDetailPage() {
                     >
                       设置 SSH 公钥
                     </Button>
-                    <Button disabled>Activate（未审批）</Button>
+                    <Button disabled>由用户本人激活</Button>
                   </div>
                   <div className="notice">
                     {sshKeyCount === 0
                       ? "SSH PUBLIC KEY REQUIRED。"
-                      : activatePlanReady
-                        ? "SSH 公钥已验证，Activate dry-run 已通过；仍需管理员明确审批。"
-                        : "SSH 公钥已验证，等待生成 Activate dry-run。"}
+                      : "SSH 公钥已验证；用户可在自己的 SSH 密钥页一次激活。"}
                     当前没有 authorized_keys，Shell 仍为
                     /usr/sbin/nologin，容器保持 STOPPED。
                   </div>
@@ -855,12 +851,6 @@ export default function UserDetailPage() {
               userId={user.id}
               username={String(linux.unix_username ?? "origin-pilot")}
               computeState={String(linux.onboarding_state ?? "UNKNOWN")}
-              managedUserId={String(linux.managed_user_id ?? "") || null}
-              activateDryRun={
-                compute?.activate_dry_run?.plan
-                  ? asRecord(compute.activate_dry_run.plan)
-                  : null
-              }
             />
           ) : (
             <EmptyState

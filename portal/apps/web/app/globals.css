@@ -857,8 +857,7 @@ button {
   padding-top: 14px;
 }
 .enrollment-form h3,
-.activate-dry-run h3,
-.activate-plan h3 {
+.activate-compute h3 {
   margin: 0;
   font-size: 14px;
 }
@@ -942,7 +941,7 @@ button {
 .local-passphrase-note {
   font-size: 12px;
 }
-.activate-dry-run {
+.activate-compute {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -951,15 +950,8 @@ button {
   margin-top: 18px;
   padding-top: 14px;
 }
-.activate-dry-run p {
+.activate-compute p {
   margin: 4px 0 0;
-}
-.activate-plan {
-  border: 1px solid var(--line);
-  border-left: 4px solid var(--accent);
-  border-radius: 5px;
-  margin-top: 14px;
-  padding: 13px;
 }
 .access-target-grid {
   display: grid;
@@ -1295,7 +1287,7 @@ button {
   }
   .onboarding-banner,
   .ssh-enrollment-empty,
-  .activate-dry-run {
+  .activate-compute {
     align-items: stretch;
     flex-direction: column;
   }

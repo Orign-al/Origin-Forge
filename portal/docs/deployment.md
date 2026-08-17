@@ -147,7 +147,7 @@ Web unit 的网络沙箱必须保留 `IPAddressDeny=any`，只额外允许 local
 `/opt/h100-portal/tests/worker_socket_smoke.py` 验证固定读取、dry-run 和拒绝路径。
 
 浏览器验收必须覆盖 1366×768 和 1920×1080 的 Key 空状态、生成、导入、fingerprint
-确认、一次性私钥下载确认、Key 列表、连接 Gate 与 Activate dry-run。测试 Key 只在测试
+确认、一次性私钥下载确认、Key 列表、连接 Gate 与单次 owner-bound Activate。测试 Key 只在测试
 内存/临时目录生成，测试结束删除，不安装到真实账号。部署后用源码/日志/数据库扫描确认
 没有 private-key 装甲；扫描输出不得反向打印任何疑似 secret 正文。
 

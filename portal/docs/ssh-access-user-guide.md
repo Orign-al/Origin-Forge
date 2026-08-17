@@ -10,7 +10,7 @@ STAGED 计算用户首次登录时，Portal 会显示“完成 SSH 密钥设置�
 
 ### 生成新密钥
 
-1. 选择“生成新密钥”，确认注释和 Scope；`BOTH` 同时用于宿主与开发容器。
+1. 选择“生成新密钥”，确认注释；普通用户的 Scope 固定为 `CONTAINER`。
 2. 浏览器本地生成 ED25519 key pair。先下载私钥，也可下载或复制 `.pub` 公钥。
 3. 安全保存私钥并勾选“我已经保存私钥”，再继续登记 public key。
 4. Portal 只显示类型、`SHA256:` fingerprint、注释、Scope 和 `VALIDATED — NOT INSTALLED`。
@@ -33,22 +33,23 @@ fingerprint、注释和 Scope，再确认登记。
 - Linux password `LOCKED`；
 - 宿主与容器 `authorized_keys` 均 `ABSENT`；
 - 开发容器 `STOPPED`、GPU `NONE`；
-- Slurm 节点 `DRAIN`。
+- Lease `NOT STARTED`。
 
-管理员完成 Activate dry-run、核对 fingerprint/Scope 并另行批准后，平台才会把同一 public
-key 分别安装到批准的 HOST/CONTAINER 目标。平台不会把宿主 `.ssh` 目录挂载到容器。
+用户点击一次“激活计算环境”后，后端自动完成 owner-bound preflight、把该用户有效的
+`CONTAINER` public key 安装到自己的开发容器、启动并验证容器；全部成功后才开始精确
+96 小时 Lease。没有独立 Activate dry-run 或第二次确认。宿主 `authorized_keys` 继续
+`ABSENT`，shell 继续 `/usr/sbin/nologin`，平台不会把宿主 `.ssh` 目录挂载到容器。
 
 ## 连接
 
-ACTIVE 后，“连接”页显示真实 Host、Port、Username 和 fingerprint。命令模板中的
+ACTIVE 后，“连接”页显示开发容器的真实 Host、Port、Username 和 fingerprint。命令模板中的
 `<你的私钥路径>` 是用户自己设备上的路径，Portal 不知道也不保存它。
 
 ```text
-ssh -i <你的私钥路径> origin-pilot@<APPROVED_HOST>
-ssh -i <你的私钥路径> -p 22023 origin-pilot@<APPROVED_HOST>
+ssh -i <你的私钥路径> -p <CONTAINER_PORT> <COMPUTE_USERNAME>@<APPROVED_HOST>
 ```
 
-VS Code Remote SSH 配置同样使用本地 `IdentityFile <你的私钥路径>`。宿主环境的 GPU 只
-能在 Slurm Job 内访问；长期开发容器是 GPU NONE。连接页的 SSH User Public Key
-fingerprint 用于用户认证，SSH Server/Container Host Key fingerprint 用于验证服务端
-身份，两者不可混淆。
+VS Code Remote SSH 配置同样使用本地 `IdentityFile <你的私钥路径>` 和容器端口。普通用户
+不能 SSH 登录 H100 Host；GPU 只能通过受控 Slurm Job 使用，长期开发容器是 GPU NONE。
+连接页的 SSH User Public Key fingerprint 用于用户认证，Container Host Key fingerprint
+用于验证服务端身份，两者不可混淆。

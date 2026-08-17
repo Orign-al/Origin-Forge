@@ -62,6 +62,25 @@ def test_container_stop_is_integrity_bound_and_installed() -> None:
     assert "/usr/local/sbin/h100-container-stop" in install_text
 
 
+def test_container_start_is_integrity_bound_and_supports_pre_lease_activation() -> None:
+    source = PLATFORM_ROOT / "scripts/h100-container-start"
+    installer = PORTAL_ROOT / "deploy/scripts/install-runtime.sh"
+    manifest = json.loads((PORTAL_ROOT / "deploy/worker-scripts.json").read_text())
+
+    assert source.is_file()
+    assert manifest["h100-container-start"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    source_text = source.read_text()
+    assert "ACTIVATING or ACTIVE state" in source_text
+    assert "Lease must remain NOT_STARTED during activation" in source_text
+    assert "Lease timestamps started before activation succeeded" in source_text
+    assert "lease_expires_epoch - lease_start_epoch == 345600" in source_text
+    assert "Host authorized_keys" in source_text
+    install_text = installer.read_text()
+    assert 'CONTAINER_START_SOURCE="${PLATFORM_DIR}/scripts/h100-container-start"' in install_text
+    assert '"$CONTAINER_START_SOURCE"' in install_text
+    assert "/usr/local/sbin/h100-container-start" in install_text
+
+
 def test_portal3f_worker_can_write_only_the_guard_metrics_directory() -> None:
     unit = (PORTAL_ROOT / "deploy/systemd/h100-portal-worker.service").read_text()
 

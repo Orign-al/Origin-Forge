@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { apiFetch } from "@h100-portal/api-client";
 import {
+  activateSelfCompute,
   closeSelfTerminal,
   enrollSshKey,
   failedProvisionReconciliationReadiness,
@@ -40,6 +41,63 @@ describe("API client", () => {
         body: JSON.stringify({}),
       }),
     ).resolves.toEqual({ ok: true });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("sends only an idempotency key for owner-bound self activation", async () => {
+    document.cookie = "h100_csrf=test-csrf-value; Path=/";
+    const idempotencyKey = "00000000-0000-4000-8000-000000000077";
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        expect(String(input)).toBe("/api/v1/self/compute/activate");
+        expect(init?.method).toBe("POST");
+        expect(new Headers(init?.headers).get("X-CSRF-Token")).toBe(
+          "test-csrf-value",
+        );
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        expect(body).toEqual({ idempotency_key: idempotencyKey });
+        for (const forbidden of [
+          "managed_user_id",
+          "username",
+          "uid",
+          "container_name",
+          "ssh_key_record_ids",
+          "lease_id",
+          "command",
+          "argv",
+        ]) {
+          expect(body).not.toHaveProperty(forbidden);
+        }
+        return new Response(
+          JSON.stringify({
+            status: "ACTIVE",
+            operation_id: "00000000-0000-4000-8000-000000000078",
+            idempotent_replay: false,
+            environment_state: "ACTIVE",
+            container_state: "RUNNING",
+            ssh_state: "READY",
+            lease: {
+              id: "00000000-0000-4000-8000-000000000079",
+              state: "ACTIVE",
+              starts_at: "2026-08-17T08:00:00Z",
+              expires_at: "2026-08-21T08:00:00Z",
+              duration_seconds: 345600,
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      activateSelfCompute({ idempotency_key: idempotencyKey }),
+    ).resolves.toEqual(
+      expect.objectContaining({
+        status: "ACTIVE",
+        container_state: "RUNNING",
+      }),
+    );
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 

@@ -30,6 +30,8 @@ KNOWN_READS = {
     "compute.provision.retry_verify",
 }
 KNOWN_WRITES = {
+    "compute.activate.self",
+    "compute.activate.self.rollback",
     "compute.provision.plan",
     "compute.provision.dry_run",
     "compute.provision.stage",
@@ -759,6 +761,162 @@ def _validate_user_activate(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _validate_compute_activate_self(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "activation_operation_id",
+        "managed_user_id",
+        "portal_account_id",
+        "owner_login",
+        "request_id",
+        "plan_id",
+        "stage_operation_id",
+        "dry_run_operation_id",
+        "username",
+        "uid",
+        "gid",
+        "project_id",
+        "ssh_port",
+        "container_name",
+        "slurm_account",
+        "slurm_qos",
+        "ssh_key_record_ids",
+        "ssh_key_fingerprints",
+        "gpu_max",
+        "lease_seconds",
+        "expected_compute_state",
+        "expected_container_state",
+        "expected_host_access",
+        "expected_shell",
+        "expected_password_state",
+        "expected_gpu",
+        "deployment_version",
+    }
+    if set(payload) != fields or set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+        raise PayloadValidationError(
+            "ACTIVATION_PAYLOAD_REJECTED",
+            "owner-bound activation fields are incomplete",
+        )
+    username = payload.get("username")
+    owner_login = payload.get("owner_login")
+    if (
+        not isinstance(username, str)
+        or SAFE_USERNAME.fullmatch(username) is None
+        or username in {"root", "origin-al", "codexops", "nobody"}
+        or not isinstance(owner_login, str)
+        or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", owner_login) is None
+    ):
+        raise PayloadValidationError(
+            "ACTIVATION_OWNER_REJECTED",
+            "activation owner identity is invalid",
+        )
+    uid = payload.get("uid")
+    gid = payload.get("gid")
+    project_id = payload.get("project_id")
+    ssh_port = payload.get("ssh_port")
+    if (
+        not isinstance(uid, int)
+        or isinstance(uid, bool)
+        or not PILOT_UID_MIN <= uid <= PILOT_UID_MAX
+        or not isinstance(gid, int)
+        or isinstance(gid, bool)
+        or not PILOT_UID_MIN <= gid <= PILOT_UID_MAX
+        or not isinstance(project_id, int)
+        or isinstance(project_id, bool)
+        or not PROJECT_ID_MIN <= project_id <= PROJECT_ID_MAX
+        or not isinstance(ssh_port, int)
+        or isinstance(ssh_port, bool)
+        or not PILOT_SSH_PORT_MIN <= ssh_port <= PILOT_SSH_PORT_MAX
+    ):
+        raise PayloadValidationError(
+            "ACTIVATION_RESOURCE_BINDING_REJECTED",
+            "activation resource coordinates are invalid",
+        )
+    if (
+        payload.get("container_name") != f"gpu-dev-{username}"
+        or payload.get("slurm_account") != "company"
+        or payload.get("slurm_qos") != "general"
+        or payload.get("gpu_max") not in {0, 1}
+        or payload.get("lease_seconds") != STANDARD_COMPUTE_LEASE_SECONDS
+        or payload.get("expected_compute_state") != "STAGED"
+        or payload.get("expected_container_state") != "STOPPED"
+        or payload.get("expected_host_access") != "DISABLED_BY_PLATFORM_POLICY"
+        or payload.get("expected_shell") != "/usr/sbin/nologin"
+        or payload.get("expected_password_state") != "LOCKED"
+        or payload.get("expected_gpu") != "NONE"
+    ):
+        raise PayloadValidationError(
+            "ACTIVATION_SECURITY_CONTRACT_REJECTED",
+            "activation security contract differs from the fixed policy",
+        )
+    record_ids = payload.get("ssh_key_record_ids")
+    fingerprints = payload.get("ssh_key_fingerprints")
+    if (
+        not isinstance(record_ids, list)
+        or not 1 <= len(record_ids) <= 5
+        or not isinstance(fingerprints, list)
+        or len(fingerprints) != len(record_ids)
+        or any(
+            not isinstance(item, str) or re.fullmatch(r"SHA256:[A-Za-z0-9+/]+", item) is None
+            for item in fingerprints
+        )
+    ):
+        raise PayloadValidationError(
+            "ACTIVATION_KEY_BINDING_REJECTED",
+            "activation SSH key bindings are invalid",
+        )
+    canonical_record_ids = [_canonical_uuid(item, "SSH key record ID") for item in record_ids]
+    if len(set(canonical_record_ids)) != len(canonical_record_ids) or len(set(fingerprints)) != len(
+        fingerprints
+    ):
+        raise PayloadValidationError(
+            "ACTIVATION_KEY_BINDING_REJECTED",
+            "activation SSH key bindings contain duplicates",
+        )
+    version = payload.get("deployment_version")
+    if not isinstance(version, str) or (
+        version != "SOURCE_WORKTREE" and re.fullmatch(r"[0-9a-f]{40}", version) is None
+    ):
+        raise PayloadValidationError(
+            "ACTIVATION_RUNTIME_BINDING_REJECTED",
+            "activation deployment version is invalid",
+        )
+    return {
+        "activation_operation_id": _canonical_uuid(
+            payload.get("activation_operation_id"), "activation operation ID"
+        ),
+        "managed_user_id": _canonical_uuid(payload.get("managed_user_id"), "managed user ID"),
+        "portal_account_id": _canonical_uuid(payload.get("portal_account_id"), "Portal account ID"),
+        "owner_login": owner_login,
+        "request_id": _canonical_uuid(payload.get("request_id"), "compute request ID"),
+        "plan_id": _canonical_uuid(payload.get("plan_id"), "provision plan ID"),
+        "stage_operation_id": _canonical_uuid(
+            payload.get("stage_operation_id"), "Stage operation ID"
+        ),
+        "dry_run_operation_id": _canonical_uuid(
+            payload.get("dry_run_operation_id"), "dry-run operation ID"
+        ),
+        "username": username,
+        "uid": uid,
+        "gid": gid,
+        "project_id": project_id,
+        "ssh_port": ssh_port,
+        "container_name": f"gpu-dev-{username}",
+        "slurm_account": "company",
+        "slurm_qos": "general",
+        "ssh_key_record_ids": canonical_record_ids,
+        "ssh_key_fingerprints": list(fingerprints),
+        "gpu_max": int(payload["gpu_max"]),
+        "lease_seconds": STANDARD_COMPUTE_LEASE_SECONDS,
+        "expected_compute_state": "STAGED",
+        "expected_container_state": "STOPPED",
+        "expected_host_access": "DISABLED_BY_PLATFORM_POLICY",
+        "expected_shell": "/usr/sbin/nologin",
+        "expected_password_state": "LOCKED",
+        "expected_gpu": "NONE",
+        "deployment_version": version,
+    }
+
+
 def _validate_ssh_key_prepare(payload: dict[str, Any]) -> dict[str, Any]:
     if set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
         raise PayloadValidationError(
@@ -1317,6 +1475,8 @@ def validate_payload(
         return _validate_compute_provision_retry_verify(payload)
     if operation_type == "compute.provision.stage":
         return _validate_compute_provision_stage(payload)
+    if operation_type in {"compute.activate.self", "compute.activate.self.rollback"}:
+        return _validate_compute_activate_self(payload)
     if operation_type == "containers.inspect":
         name = payload.get("name")
         if not isinstance(name, str) or not SAFE_IDENTIFIER.fullmatch(name):

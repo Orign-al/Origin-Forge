@@ -11,6 +11,14 @@
 只接收受控 key record ID，并在 root-owned staging 文件上使用 `O_NOFOLLOW`、owner/mode/
 inode/大小检查和 `ssh-keygen` fingerprint 校验。公钥验证失败不会部分激活用户。
 
+当前多用户产品路径使用 `POST /api/v1/self/compute/activate` 和 Worker 的
+`compute.activate.self`，旧 `user.activate` 仅保留历史兼容。浏览器只发送幂等键；API 从
+认证会话解析 owner，并绑定对应 Request、成功 Stage、Container、Storage 和该 owner 的
+有效 `CONTAINER` key。Worker 先写 root-controlled `ACTIVATING / Lease NOT_STARTED` 状态，
+安装容器公钥、启动并验证 GPU NONE 的容器，再写 `ACTIVE` 和精确 96 小时 Lease。任何失败
+都会停止容器、移除本次安装的容器公钥并恢复 STAGED；宿主 shell 始终 nologin，Host
+authorized_keys 始终 ABSENT。
+
 新 Key 可以在浏览器生成或由用户导入已有 `.pub`。浏览器生成使用固定依赖和 Web Crypto
 随机源；私钥只保留在页面内存及用户下载，不提交 API，也不使用 localStorage、
 sessionStorage、IndexedDB、Service Worker cache、analytics 或错误遥测。API 不提供

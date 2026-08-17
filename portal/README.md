@@ -22,13 +22,14 @@ ssh -L 18080:10.10.10.2:18080 h100-codex
 
 - API 非 root，不访问 Docker Socket、MUNGE key、shadow 或 SlurmDBD 密码。
 - 高权限宿主操作只能经由限权 Unix Socket Root Worker。
-- Portal-3C 已通过审批主体和参数均精确绑定的 Root Worker 链路 Stage `origin-pilot`；
-  `user.activate` 真实执行继续禁用，也不 RESUME Slurm。
+- 多用户 Provision 通过审批主体和参数均精确绑定的 Root Worker 链路自动完成 Stage；旧
+  `user.activate` 只保留给 `origin-pilot` 历史兼容路径，新产品 UI 不再调用。
 - Stage 创建锁定且使用 `/usr/sbin/nologin` 的独立计算身份，不读取或安装 SSH 公钥；
   公钥验证、普通 shell、容器启动和登录能力全部保留到后续 Activate 审批。
-- Portal-3D-R 提供浏览器本地生成 ED25519 或导入已有 `.pub`。服务器只保存 public key 和
-  metadata，绝不接收、生成或保存 private key。有效 Key 仍是 `VALIDATED — NOT INSTALLED`，
-  只能生成 Activate dry-run。
+- Portal 提供浏览器本地生成 ED25519 或导入已有 `.pub`。服务器只保存 public key 和
+  metadata，绝不接收、生成或保存 private key。普通用户登记有效 CONTAINER Key 后可一次
+  点击激活自己的 STAGED 环境；API 以会话身份绑定 owner，内部自动预检、安装容器 Key、
+  启动并验证容器，成功后才开始精确 96 小时 Lease。宿主 SSH 始终禁用。
 - Origin-al 网页密码与 Linux/SSH 密码完全分离。
 - 内部 HTTP 接受不阻断当前单节点 Pilot 的已批准 Stage，但不得据此扩大访问范围或绕过
   Portal Operation、审批、幂等键、脚本 hash 和 Root Worker 校验链路。

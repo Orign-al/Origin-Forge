@@ -890,21 +890,16 @@ for (const viewport of [
     });
 
     await openSshTab(page);
-    await page.getByRole("button", { name: "生成 Activate Dry-Run" }).click();
-    await expect(page.getByTestId("activate-dry-run-plan")).toContainText(
-      "PLANNED",
-    );
-    await expect(page.getByTestId("activate-dry-run-plan")).toContainText(
-      "DISABLED — ADMINISTRATOR APPROVAL REQUIRED",
-    );
-    await page.getByTestId("activate-dry-run-plan").scrollIntoViewIfNeeded();
+    await expect(
+      page.getByRole("button", { name: "生成 Activate Dry-Run" }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "激活计算环境" }),
+    ).toHaveCount(0);
     await assertVisualBoundary(page);
     await page.screenshot({
-      path: path.join(
-        OUTPUT_DIRECTORY,
-        `${viewport.label}-activate-dry-run.png`,
-      ),
+      path: path.join(OUTPUT_DIRECTORY, `${viewport.label}-key-ready.png`),
     });
-    expect(state.activateBodies).toHaveLength(1);
+    expect(state.activateBodies).toHaveLength(0);
   });
 }
