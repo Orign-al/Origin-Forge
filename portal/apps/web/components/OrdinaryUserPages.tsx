@@ -38,6 +38,11 @@ import {
 
 const APPROVED_IMAGE =
   "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a";
+const DEFAULT_JOB_SCRIPT = `set -eu
+
+echo "hello from Slurm"
+whoami
+id`;
 
 function localTime(value?: string) {
   if (!value) return "—";
@@ -66,6 +71,18 @@ function bytes(value: number | null | undefined) {
     unit += 1;
   }
   return `${next.toFixed(unit > 2 ? 1 : 0)} ${units[unit]}`;
+}
+
+function jobErrorMessage(error: unknown) {
+  if (
+    error instanceof ApiError &&
+    ["RESOURCE_OWNERSHIP_REJECTED", "SELF_COMPUTE_CONTEXT_INVALID"].includes(
+      error.code,
+    )
+  ) {
+    return "无法确认当前计算环境，请联系管理员。";
+  }
+  return error instanceof ApiError ? error.message : "作业提交失败";
 }
 
 export function OrdinaryUnprovisionedDashboard({ user }: { user: User }) {
@@ -680,8 +697,7 @@ export function OrdinaryJobs() {
     refetchInterval: 10_000,
   });
   const [name, setName] = useState("training-job");
-  const [script, setScript] = useState("workspace/job.sh");
-  const [workdir, setWorkdir] = useState("workspace");
+  const [script, setScript] = useState(DEFAULT_JOB_SCRIPT);
   const [cpus, setCpus] = useState(2);
   const [memory, setMemory] = useState(4096);
   const [gpu, setGpu] = useState<0 | 1>(0);
@@ -701,8 +717,7 @@ export function OrdinaryJobs() {
     mutationFn: () =>
       submitSelfJob({
         name,
-        script_path: script,
-        workdir,
+        script,
         cpus,
         memory_mb: memory,
         gpu_count: gpu,
@@ -731,22 +746,23 @@ export function OrdinaryJobs() {
       />
       <SectionCard
         title="新建作业"
-        subtitle="脚本和工作目录必须位于自己的工作区"
+        subtitle="脚本由Portal保存为自己的不可变作业快照，并以当前Linux用户提交"
       >
         <form className="job-form-grid" onSubmit={onSubmit}>
           <label>
             作业名称
             <Input value={name} onChange={(e) => setName(e.target.value)} />
           </label>
-          <label>
-            脚本路径
-            <Input value={script} onChange={(e) => setScript(e.target.value)} />
-          </label>
-          <label>
-            工作目录
-            <Input
-              value={workdir}
-              onChange={(e) => setWorkdir(e.target.value)}
+          <label className="job-script-field">
+            执行脚本
+            <textarea
+              className="ui-textarea mono"
+              value={script}
+              onChange={(event) => setScript(event.target.value)}
+              rows={14}
+              maxLength={8192}
+              required
+              spellCheck={false}
             />
           </label>
           <label>
@@ -802,17 +818,17 @@ export function OrdinaryJobs() {
             </select>
           </label>
           <div className="job-submit-row">
-            <Button tone="primary" type="submit" disabled={submit.isPending}>
+            <Button
+              tone="primary"
+              type="submit"
+              disabled={submit.isPending || script.length === 0}
+            >
               提交作业
             </Button>
           </div>
         </form>
         {submit.isError ? (
-          <div className="error-box">
-            {submit.error instanceof ApiError
-              ? `${submit.error.code}：${submit.error.message}`
-              : "作业提交失败"}
-          </div>
+          <div className="error-box">{jobErrorMessage(submit.error)}</div>
         ) : null}
       </SectionCard>
       <SectionCard title="我的作业" subtitle="只显示当前账号提交的作业">

@@ -1,6 +1,6 @@
+import hashlib
 import uuid
 from datetime import datetime
-from pathlib import PurePosixPath
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -55,6 +55,10 @@ from h100_portal_api.schemas import (
     SelfTerminalInputRequest,
     SelfTerminalResizeRequest,
 )
+from h100_portal_api.self_resources import (
+    SelfResourceContext,
+    resolve_self_compute_context,
+)
 from h100_portal_api.terminal_service import (
     TerminalRecord,
     TerminalServiceError,
@@ -73,16 +77,6 @@ APPROVED_IMAGE_REFS = {
 
 def _error(status_code: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message})
-
-
-def _relative_path(value: str, field: str) -> str:
-    path = PurePosixPath(value)
-    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
-        raise _error(422, "PATH_OUTSIDE_WORKSPACE", f"{field}必须位于用户工作区")
-    normalized = str(path)
-    if "\x00" in normalized or normalized.startswith("/"):
-        raise _error(422, "PATH_OUTSIDE_WORKSPACE", f"{field}必须位于用户工作区")
-    return normalized
 
 
 def _audit(
@@ -492,20 +486,23 @@ def _owned_terminal(
         raise _terminal_error(exc) from exc
     if require_active:
         try:
-            entitlement(db, managed.id)
+            resources = resolve_self_compute_context(
+                db,
+                context.user,
+                require_running_container=True,
+            )
         except HTTPException as exc:
             record.worker.request_close()
-            raise _error(
-                409, "TERMINAL_DENIED_LEASE_INACTIVE", "租约失效时不能使用网页终端"
-            ) from exc
-        container = _container_for_owner(db, managed.id)
-        if (
-            managed.compute_environment_state != "ACTIVE"
-            or managed.host_access_state != "DISABLED_BY_PLATFORM_POLICY"
-            or managed.shell != "/usr/sbin/nologin"
-            or container.id != record.container_id
-            or container.observed_state != "RUNNING"
-        ):
+            raw_detail: Any = getattr(exc, "detail", None)
+            detail = raw_detail if isinstance(raw_detail, dict) else {}
+            if detail.get("code") == "LEASE_INACTIVE":
+                raise _error(
+                    409,
+                    "TERMINAL_DENIED_LEASE_INACTIVE",
+                    "租约失效时不能使用网页终端",
+                ) from exc
+            raise _error(409, "TERMINAL_SECURITY_GATE_FAILED", "网页终端安全状态已改变") from exc
+        if resources.container.id != record.container_id:
             record.worker.request_close()
             raise _error(409, "TERMINAL_SECURITY_GATE_FAILED", "网页终端安全状态已改变")
     return managed, record
@@ -519,16 +516,14 @@ def create_self_terminal(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     require_session_csrf(request, context)
-    managed = managed_identity_for_user(db, context.user, lock=True)
-    active_lease, terminal_lease = entitlement(db, managed.id, lock=True)
-    container = _container_for_owner(db, managed.id, lock=True)
-    if (
-        managed.compute_environment_state != "ACTIVE"
-        or managed.host_access_state != "DISABLED_BY_PLATFORM_POLICY"
-        or managed.shell != "/usr/sbin/nologin"
-        or container.observed_state != "RUNNING"
-    ):
-        raise _error(409, "TERMINAL_SECURITY_GATE_FAILED", "开发容器终端当前不可用")
+    resources = resolve_self_compute_context(
+        db,
+        context.user,
+        lock=True,
+        require_running_container=True,
+    )
+    managed = resources.managed
+    container = resources.container
     keys = db.scalars(
         select(PortalSshKey).where(
             PortalSshKey.owner_managed_user_id == managed.id,
@@ -555,8 +550,8 @@ def create_self_terminal(
         "uid": managed.uid,
         "gid": managed.gid,
         "name": container.name,
-        "lease_id": str(active_lease.id),
-        "lease_expires_at": ensure_utc(terminal_lease.expires_at).isoformat(),
+        "lease_id": str(resources.active_lease.id),
+        "lease_expires_at": ensure_utc(resources.terminal_lease.expires_at).isoformat(),
         "expected_gpu": "NONE",
         "host_access": "DISABLED_BY_PLATFORM_POLICY",
         "expected_key_fingerprints": fingerprints,
@@ -734,9 +729,10 @@ def _job_view(job: PortalJob) -> dict[str, Any]:
     }
 
 
-def _refresh_job(context: AuthContext, managed: Any, job: PortalJob) -> None:
+def _refresh_job(context: AuthContext, resources: SelfResourceContext, job: PortalJob) -> None:
     if job.slurm_job_id is None:
         return
+    managed = resources.managed
     try:
         result = call_worker(
             "self.job.status.read",
@@ -769,15 +765,15 @@ def self_jobs(
     context: AuthContext = Depends(permission_dependency("self.jobs.read")),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    managed = managed_identity_for_user(db, context.user)
+    resources = resolve_self_compute_context(db, context.user)
     rows = db.scalars(
         select(PortalJob)
-        .where(PortalJob.owner_managed_user_id == managed.id)
+        .where(PortalJob.owner_managed_user_id == resources.managed.id)
         .order_by(PortalJob.created_at.desc())
         .limit(200)
     ).all()
     for row in rows[:50]:
-        _refresh_job(context, managed, row)
+        _refresh_job(context, resources, row)
     db.commit()
     return {"status": "OK", "jobs": [_job_view(row) for row in rows], "count": len(rows)}
 
@@ -792,15 +788,15 @@ def submit_self_job(
     require_session_csrf(request, context)
     if body.image_ref is not None and body.image_ref not in APPROVED_IMAGE_REFS:
         raise _error(422, "IMAGE_NOT_APPROVED", "镜像不在管理员批准清单中")
-    script_path = _relative_path(body.script_path, "Job Script")
-    workdir = _relative_path(body.workdir, "Workdir")
-    managed = managed_identity_for_user(db, context.user, lock=True)
-    active, terminal = entitlement(db, managed.id, lock=True)
+    resources = resolve_self_compute_context(db, context.user, lock=True)
+    managed = resources.managed
+    active = resources.active_lease
+    terminal = resources.terminal_lease
     now = utcnow()
     remaining = int((ensure_utc(terminal.expires_at) - now).total_seconds())
     if body.time_limit_seconds > remaining:
         raise _error(422, "JOB_EXCEEDS_LEASE", "作业时限不能超过租约剩余时间")
-    if body.gpu_count > min(1, active.gpu_count):
+    if body.gpu_count > resources.max_gpu:
         raise _error(422, "GPU_LIMIT_EXCEEDED", "当前用户最多申请1张GPU")
     operation_key = f"self-job-submit:{managed.id}:{body.idempotency_key}"
     existing = db.scalar(
@@ -815,17 +811,25 @@ def submit_self_job(
             raise _error(409, "IDEMPOTENCY_CONFLICT", "幂等操作缺少作业记录")
         return {"status": existing.status, "job": _job_view(job)}
     job_id = uuid.uuid4()
+    script_content = body.script
+    if not script_content.startswith("#!"):
+        script_content = f"#!/bin/bash\n{script_content}"
+    script_bytes = script_content.encode("utf-8")
+    if len(script_bytes) > 8 * 1024:
+        raise _error(422, "JOB_SCRIPT_REJECTED", "执行脚本不能超过8 KiB")
+    script_sha256 = hashlib.sha256(script_bytes).hexdigest()
+    script_path = f"workspace/.portal/job-scripts/{job_id}.sh"
+    workdir = "workspace"
     stdout = f"workspace/.portal/jobs/{job_id}.out"
     stderr = f"workspace/.portal/jobs/{job_id}.err"
     payload = {
+        **resources.worker_identity(),
         "portal_job_id": str(job_id),
-        "managed_user_id": str(managed.id),
         "lease_id": str(active.id),
-        "username": managed.unix_username,
-        "uid": managed.uid,
-        "gid": managed.gid,
         "name": body.name,
         "script_relative_path": script_path,
+        "script_content": script_content,
+        "script_sha256": script_sha256,
         "workdir_relative_path": workdir,
         "stdout_relative_path": stdout,
         "stderr_relative_path": stderr,
@@ -834,8 +838,13 @@ def submit_self_job(
         "gpu_count": body.gpu_count,
         "time_limit_seconds": body.time_limit_seconds,
         "lease_deadline_at": ensure_utc(terminal.expires_at).isoformat(),
+        "slurm_account": managed.slurm_account,
+        "slurm_qos": managed.slurm_qos,
+        "max_gpu": resources.max_gpu,
         "image_ref": body.image_ref,
     }
+    operation_payload = {key: value for key, value in payload.items() if key != "script_content"}
+    operation_payload["script_bytes"] = len(script_bytes)
     operation = _new_operation(
         db,
         context,
@@ -844,7 +853,7 @@ def submit_self_job(
         target_type="slurm_job",
         target_id=str(job_id),
         summary="用户通过Portal提交自己的Slurm作业",
-        payload=payload,
+        payload=operation_payload,
         idempotency_key=operation_key,
     )
     job = PortalJob(
@@ -921,18 +930,18 @@ def submit_self_job(
 
 def _owned_job(
     db: Session, context: AuthContext, job_id: uuid.UUID, *, lock: bool = False
-) -> tuple[Any, PortalJob]:
-    managed = managed_identity_for_user(db, context.user)
+) -> tuple[SelfResourceContext, PortalJob]:
+    resources = resolve_self_compute_context(db, context.user, lock=lock)
     query = select(PortalJob).where(
         PortalJob.id == job_id,
-        PortalJob.owner_managed_user_id == managed.id,
+        PortalJob.owner_managed_user_id == resources.managed.id,
     )
     if lock:
         query = query.with_for_update()
     job = db.scalar(query)
     if job is None:
         raise _error(404, "JOB_NOT_FOUND", "作业不存在")
-    return managed, job
+    return resources, job
 
 
 @router.get("/self/jobs/{job_id}")
@@ -941,8 +950,8 @@ def self_job_detail(
     context: AuthContext = Depends(permission_dependency("self.jobs.read")),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    managed, job = _owned_job(db, context, job_id)
-    _refresh_job(context, managed, job)
+    resources, job = _owned_job(db, context, job_id)
+    _refresh_job(context, resources, job)
     db.commit()
     return {"status": "OK", "job": _job_view(job)}
 
@@ -953,7 +962,8 @@ def self_job_logs(
     context: AuthContext = Depends(permission_dependency("self.jobs.read")),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    managed, job = _owned_job(db, context, job_id)
+    resources, job = _owned_job(db, context, job_id)
+    managed = resources.managed
     result = _worker(
         "self.job.logs.read",
         payload={
@@ -980,7 +990,8 @@ def cancel_self_job(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     require_session_csrf(request, context)
-    managed, job = _owned_job(db, context, job_id, lock=True)
+    resources, job = _owned_job(db, context, job_id, lock=True)
+    managed = resources.managed
     if job.slurm_job_id is None:
         raise _error(409, "JOB_NOT_SUBMITTED", "作业尚未提交到Slurm")
     key = f"self-job-cancel:{job.id}:{body.idempotency_key}"

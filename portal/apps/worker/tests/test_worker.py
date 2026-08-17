@@ -33,6 +33,7 @@ def request(
     payload: dict | None = None,  # type: ignore[type-arg]
     dry_run: bool = False,
     *,
+    requested_by: str = "origin-al",
     approved_by: str | None = None,
     idempotency_key: str = "worker-test-0001",
 ) -> WorkerRequest:
@@ -41,7 +42,7 @@ def request(
         request_id=str(uuid.uuid4()),
         operation_type=operation,
         payload=payload or {},
-        requested_by="origin-al",
+        requested_by=requested_by,
         approved_by=approved_by,
         idempotency_key=idempotency_key,
         dry_run=dry_run,
@@ -2140,17 +2141,20 @@ def test_live_image_inventory_requires_digest_and_uses_whitelisted_fields(
     assert result["images"][0]["architecture"] == "amd64"
 
 
-def portal4a_job_payload() -> dict[str, object]:
+def managed_job_payload(*, username: str = "origin-pilot", uid: int = 20001) -> dict[str, object]:
     portal_job_id = str(uuid.uuid4())
+    script = "#!/bin/bash\nset -eu\nwhoami\nid\n"
     return {
         "portal_job_id": portal_job_id,
         "managed_user_id": "3b95b4f0-95d9-444a-8f0b-46288195a807",
         "lease_id": str(uuid.uuid4()),
-        "username": "origin-pilot",
-        "uid": 20001,
-        "gid": 20001,
+        "username": username,
+        "uid": uid,
+        "gid": uid,
         "name": "portal-job",
-        "script_relative_path": "workspace/job.sh",
+        "script_relative_path": f"workspace/.portal/job-scripts/{portal_job_id}.sh",
+        "script_content": script,
+        "script_sha256": hashlib.sha256(script.encode()).hexdigest(),
         "workdir_relative_path": "workspace",
         "stdout_relative_path": f"workspace/.portal/jobs/{portal_job_id}.out",
         "stderr_relative_path": f"workspace/.portal/jobs/{portal_job_id}.err",
@@ -2159,17 +2163,22 @@ def portal4a_job_payload() -> dict[str, object]:
         "gpu_count": 1,
         "time_limit_seconds": 600,
         "lease_deadline_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+        "slurm_account": "company",
+        "slurm_qos": "general",
+        "max_gpu": 1,
         "image_ref": None,
     }
 
 
-def portal4a_terminal_payload() -> dict[str, object]:
+def managed_terminal_payload(
+    *, username: str = "origin-pilot", uid: int = 20001
+) -> dict[str, object]:
     return {
         "managed_user_id": "3b95b4f0-95d9-444a-8f0b-46288195a807",
-        "username": "origin-pilot",
-        "uid": 20001,
-        "gid": 20001,
-        "name": "gpu-dev-origin-pilot",
+        "username": username,
+        "uid": uid,
+        "gid": uid,
+        "name": f"gpu-dev-{username}",
         "lease_id": str(uuid.uuid4()),
         "lease_expires_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
         "expected_gpu": "NONE",
@@ -2181,7 +2190,7 @@ def portal4a_terminal_payload() -> dict[str, object]:
 
 
 def test_portal4a_worker_schema_fixes_job_outputs_and_gpu_limit() -> None:
-    payload = portal4a_job_payload()
+    payload = managed_job_payload()
     validated = validate_payload("self.job.submit", payload)
     assert validated["stdout_relative_path"] == payload["stdout_relative_path"]
     with pytest.raises(ValueError, match="output path"):
@@ -2191,10 +2200,42 @@ def test_portal4a_worker_schema_fixes_job_outputs_and_gpu_limit() -> None:
         )
     with pytest.raises(ValueError, match="GPU"):
         validate_payload("self.job.submit", {**payload, "gpu_count": 2})
+    for changed in (
+        {"script_sha256": "0" * 64},
+        {"script_relative_path": "workspace/user-selected.sh"},
+        {"workdir_relative_path": "workspace/other"},
+        {"slurm_account": "platform-admin"},
+        {"username": "root", "uid": 0, "gid": 0},
+    ):
+        with pytest.raises(ValueError):
+            validate_payload("self.job.submit", {**payload, **changed})
+
+
+def test_multi_user_worker_schema_accepts_origin_pilot2_owner_binding() -> None:
+    job = validate_payload(
+        "self.job.submit",
+        managed_job_payload(username="origin-pilot2", uid=20002),
+    )
+    terminal = validate_payload(
+        "self.container.terminal",
+        managed_terminal_payload(username="origin-pilot2", uid=20002),
+    )
+
+    assert job["username"] == terminal["username"] == "origin-pilot2"
+    assert job["uid"] == job["gid"] == 20002
+    assert terminal["name"] == "gpu-dev-origin-pilot2"
+    assert terminal["uid"] == terminal["gid"] == 20002
+    argv = worker_terminal._terminal_argv(
+        terminal,
+        "h100-portal-terminal-00000000-0000-4000-8000-000000000099",
+    )
+    assert argv[argv.index("--user") + 1] == "20002:20002"
+    assert "gpu-dev-origin-pilot2" in argv
+    assert argv[0] == "/usr/bin/docker"
 
 
 def test_web_terminal_schema_binds_owned_container_without_command_fields() -> None:
-    payload = portal4a_terminal_payload()
+    payload = managed_terminal_payload()
     validated = validate_payload("self.container.terminal", payload)
     request_id = "00000000-0000-4000-8000-000000000099"
     marker = "h100-portal-terminal-00000000-0000-4000-8000-000000000099"
@@ -2251,18 +2292,24 @@ def test_web_terminal_process_discovery_matches_only_fixed_markers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     marker = "h100-portal-terminal-00000000-0000-4000-8000-000000000099"
-    top = SimpleNamespace(
-        returncode=0,
-        stdout="\n".join(
-            [
-                "PID PPID USER COMMAND",
-                "100 10 origin-pilot " + marker + " --login",
-                "101 10 origin-pilot user-process --login",
-                "102 10 root /usr/sbin/sshd -D",
-            ]
-        ),
-    )
-    monkeypatch.setattr(worker_terminal.subprocess, "run", lambda *_args, **_kwargs: top)
+
+    def docker(argv, **_kwargs):  # type: ignore[no-untyped-def]
+        if argv[1] == "ps":
+            return SimpleNamespace(
+                returncode=0,
+                stdout="gpu-dev-origin-pilot\ngpu-dev-origin-pilot2\nunmanaged\n",
+            )
+        username = argv[2].removeprefix("gpu-dev-")
+        lines = [
+            "PID PPID USER COMMAND",
+            f"101 10 {username} user-process --login",
+            "102 10 root /usr/sbin/sshd -D",
+        ]
+        if username == "origin-pilot2":
+            lines.append(f"100 10 {username} {marker} --login")
+        return SimpleNamespace(returncode=0, stdout="\n".join(lines))
+
+    monkeypatch.setattr(worker_terminal.subprocess, "run", docker)
     assert worker_terminal._marked_host_processes(marker) == [(100, marker)]
     assert worker_terminal._marked_host_processes() == [(100, marker)]
 
@@ -2270,17 +2317,17 @@ def test_web_terminal_process_discovery_matches_only_fixed_markers(
 def test_web_terminal_preflight_requires_nologin_and_absent_host_key(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    payload = validate_payload("self.container.terminal", portal4a_terminal_payload())
+    payload = validate_payload("self.container.terminal", managed_terminal_payload())
     host_home = tmp_path / "host-home"
     host_home.mkdir()
     monkeypatch.setattr(
         worker_terminal,
-        "_portal4a_account",
+        "_managed_account",
         lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin", pw_dir=str(host_home)),
     )
     monkeypatch.setattr(
         worker_terminal,
-        "_portal4a_container_security",
+        "_managed_container_security",
         lambda *_args, **_kwargs: {"state": {"Running": True, "Health": {"Status": "healthy"}}},
     )
     monkeypatch.setattr(
@@ -2337,7 +2384,7 @@ def test_worker_routes_terminal_to_stream_handler_without_general_handle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("H100_PORTAL_WORKER_TESTING", "1")
-    payload = portal4a_terminal_payload()
+    payload = managed_terminal_payload()
     envelope = {
         "protocol_version": 1,
         "request_id": str(uuid.uuid4()),
@@ -2378,7 +2425,7 @@ def test_worker_routes_terminal_to_stream_handler_without_general_handle(
 
 
 def test_portal4a_worker_rejects_spoofed_self_actor_and_container_actor() -> None:
-    self_request = request("self.job.submit", portal4a_job_payload())
+    self_request = request("self.job.submit", managed_job_payload())
     denied = handle(self_request)
     assert denied["error"]["code"] == "RESOURCE_OWNERSHIP_REJECTED"
 
@@ -2396,6 +2443,32 @@ def test_portal4a_worker_rejects_spoofed_self_actor_and_container_actor() -> Non
     assert denied["error"]["code"] == "RESOURCE_OWNERSHIP_REJECTED"
 
 
+def test_worker_routes_origin_pilot2_self_job_for_matching_actor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = managed_job_payload(username="origin-pilot2", uid=20002)
+    monkeypatch.setattr(
+        handlers,
+        "_execute_self_job_submit",
+        lambda _request, validated: {
+            "status": "SUCCEEDED",
+            "username": validated["username"],
+            "uid": validated["uid"],
+        },
+    )
+
+    result = handle(
+        request(
+            "self.job.submit",
+            payload,
+            requested_by="origin-pilot2",
+            approved_by="origin-pilot2",
+        )
+    )
+
+    assert result == {"status": "SUCCEEDED", "username": "origin-pilot2", "uid": 20002}
+
+
 def test_portal4a_component_open_rejects_symlink_and_pins_staged_inode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2410,12 +2483,23 @@ def test_portal4a_component_open_rejects_symlink_and_pins_staged_inode(
     monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", tmp_path / "users")
 
     with pytest.raises(handlers.LifecycleValidationError) as escaped:
-        handlers._read_user_script("workspace/escape/passwd", uid, gid)
+        handlers._managed_user_path(
+            "origin-pilot",
+            "workspace/escape/passwd",
+            directory=False,
+            uid=uid,
+            gid=gid,
+        )
     assert escaped.value.code == "SYMLINK_ESCAPE_REJECTED"
 
     portal_job_id = str(uuid.uuid4())
     staged, descriptor = handlers._stage_user_job_script(
-        {"portal_job_id": portal_job_id, "uid": uid, "gid": gid},
+        {
+            "portal_job_id": portal_job_id,
+            "username": "origin-pilot",
+            "uid": uid,
+            "gid": gid,
+        },
         script.read_bytes(),
     )
     try:
@@ -2466,10 +2550,67 @@ def test_portal4a_setpriv_uses_fixed_argv_and_never_shell(
     assert captured["pass_fds"] == (9,)
 
 
+def test_job_script_is_staged_then_only_fixed_sbatch_runs_as_target_user(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = validate_payload(
+        "self.job.submit",
+        managed_job_payload(username="origin-pilot2", uid=20002),
+    )
+    users_root = tmp_path / "users"
+    output_parent = users_root / "origin-pilot2/workspace/.portal/jobs"
+    output_parent.mkdir(parents=True)
+    workdir = users_root / "origin-pilot2/workspace"
+    staged = tmp_path / "staged-job.sh"
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", users_root)
+    monkeypatch.setattr(handlers, "_managed_slurm_security_preflight", lambda _payload: None)
+    monkeypatch.setattr(
+        handlers,
+        "_managed_user_path",
+        lambda *_args, **_kwargs: workdir,
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_ensure_managed_owned_directory",
+        lambda *_args, **_kwargs: output_parent,
+    )
+
+    def stage(_payload, content):  # type: ignore[no-untyped-def]
+        captured["content"] = content
+        staged.write_bytes(content)
+        return staged, os.open(staged, os.O_RDONLY)
+
+    def run_as_user(bound_payload, command, timeout, *, pass_fds=()):  # type: ignore[no-untyped-def]
+        captured["payload"] = bound_payload
+        captured["command"] = command
+        captured["timeout"] = timeout
+        captured["pass_fds"] = pass_fds
+        return {"ok": True, "stdout": "42\n", "stderr": "", "exit_code": 0}
+
+    monkeypatch.setattr(handlers, "_stage_user_job_script", stage)
+    monkeypatch.setattr(handlers, "_run_as_managed_user", run_as_user)
+    monkeypatch.setattr(handlers, "_slurm_job_owner", lambda _job_id: "origin-pilot2")
+
+    result = handlers._execute_self_job_submit(
+        request("self.job.submit", approved_by="origin-pilot2"), payload
+    )
+
+    assert result["status"] == "SUCCEEDED"
+    assert captured["content"] == payload["script_content"].encode()
+    assert captured["payload"]["uid"] == captured["payload"]["gid"] == 20002
+    command = captured["command"]
+    assert command[0] == "/usr/bin/sbatch"
+    assert command[-1].startswith("/proc/self/fd/")
+    assert payload["script_content"] not in command
+    assert not any(item in {"bash", "sh", "sudo"} for item in command)
+
+
 def test_portal4a_gpu_job_mounts_only_owned_root_and_disables_host_home(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    payload = portal4a_job_payload()
+    payload = managed_job_payload()
     payload["image_ref"] = (
         "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
         "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
@@ -2477,7 +2618,7 @@ def test_portal4a_gpu_job_mounts_only_owned_root_and_disables_host_home(
     payload["lease_deadline_at"] = "2026-08-14T05:24:55.083442+00:00"
     users_root = tmp_path / "users"
     monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", users_root)
-    argv = handlers._portal4a_sbatch_argv(
+    argv = handlers._managed_sbatch_argv(
         payload,
         workdir=users_root / "origin-pilot/workspace",
         stdout=users_root / "origin-pilot/workspace/.portal/jobs/job.out",
@@ -2514,7 +2655,7 @@ def test_portal4a_host_revoke_rolls_back_shell_and_key_on_postcondition_failure(
     shell = {"value": "/bin/bash"}
     monkeypatch.setattr(
         handlers,
-        "_portal4a_account",
+        "_managed_account",
         lambda _payload: SimpleNamespace(pw_shell=shell["value"]),
     )
     monkeypatch.setattr(
@@ -2598,7 +2739,7 @@ def test_portal4a_restore_is_idempotent_after_worker_success(
     monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
     monkeypatch.setattr(
         handlers,
-        "_portal4a_account",
+        "_managed_account",
         lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
     )
     monkeypatch.setattr(
@@ -2608,7 +2749,7 @@ def test_portal4a_restore_is_idempotent_after_worker_success(
     )
     monkeypatch.setattr(
         handlers,
-        "_portal4a_container_security",
+        "_managed_container_security",
         lambda *_args, **_kwargs: {"state": {"Running": True}},
     )
     monkeypatch.setattr(
@@ -2634,7 +2775,7 @@ def test_portal4a_restore_rolls_back_container_and_key_after_postcondition_failu
     monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
     monkeypatch.setattr(
         handlers,
-        "_portal4a_account",
+        "_managed_account",
         lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
     )
     monkeypatch.setattr(
@@ -2653,7 +2794,7 @@ def test_portal4a_restore_rolls_back_container_and_key_after_postcondition_failu
             "CONTAINER_SECURITY_REJECTED", "fixture postcondition failure"
         )
 
-    monkeypatch.setattr(handlers, "_portal4a_container_security", security)
+    monkeypatch.setattr(handlers, "_managed_container_security", security)
     monkeypatch.setattr(
         handlers,
         "script_integrity",
@@ -2693,7 +2834,7 @@ def test_portal4a_restore_stops_partial_start_before_resuspending_key(
     monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
     monkeypatch.setattr(
         handlers,
-        "_portal4a_account",
+        "_managed_account",
         lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
     )
     monkeypatch.setattr(
@@ -2703,7 +2844,7 @@ def test_portal4a_restore_stops_partial_start_before_resuspending_key(
     )
     monkeypatch.setattr(
         handlers,
-        "_portal4a_container_security",
+        "_managed_container_security",
         lambda *_args, **_kwargs: {"state": {"Running": False}},
     )
     monkeypatch.setattr(
@@ -2744,7 +2885,7 @@ def test_portal4a_recycle_rejects_unapproved_key_before_runtime_changes(
     monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
     monkeypatch.setattr(
         handlers,
-        "_portal4a_account",
+        "_managed_account",
         lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
     )
     monkeypatch.setattr(
@@ -2759,7 +2900,7 @@ def test_portal4a_recycle_rejects_unapproved_key_before_runtime_changes(
     )
     monkeypatch.setattr(
         handlers,
-        "_portal4a_container_security",
+        "_managed_container_security",
         lambda *_args, **_kwargs: pytest.fail(
             "key binding must be checked before container changes"
         ),
@@ -2782,7 +2923,7 @@ def test_recycle_suspends_new_ssh_access_before_container_stop_failure(
     monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
     monkeypatch.setattr(
         handlers,
-        "_portal4a_account",
+        "_managed_account",
         lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
     )
     monkeypatch.setattr(
@@ -2793,7 +2934,7 @@ def test_recycle_suspends_new_ssh_access_before_container_stop_failure(
     monkeypatch.setattr(handlers, "_active_user_slurm_jobs", lambda _username: [])
     monkeypatch.setattr(
         handlers,
-        "_portal4a_container_security",
+        "_managed_container_security",
         lambda *_args, **_kwargs: {"state": {"Running": True}},
     )
     monkeypatch.setattr(
@@ -2838,7 +2979,7 @@ def test_recycle_retry_after_stop_failure_is_idempotent_and_preserves_data(
     monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
     monkeypatch.setattr(
         handlers,
-        "_portal4a_account",
+        "_managed_account",
         lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
     )
     monkeypatch.setattr(
@@ -2854,7 +2995,7 @@ def test_recycle_retry_after_stop_failure_is_idempotent_and_preserves_data(
             assert running["value"] is False
         return {"state": {"Running": running["value"]}}
 
-    monkeypatch.setattr(handlers, "_portal4a_container_security", security)
+    monkeypatch.setattr(handlers, "_managed_container_security", security)
     monkeypatch.setattr(
         handlers,
         "script_integrity",
@@ -2893,7 +3034,7 @@ def test_recycle_running_job_uses_controlled_cancel_and_preserves_history_bindin
     monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
     monkeypatch.setattr(
         handlers,
-        "_portal4a_account",
+        "_managed_account",
         lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
     )
     monkeypatch.setattr(
@@ -2919,7 +3060,7 @@ def test_recycle_running_job_uses_controlled_cancel_and_preserves_history_bindin
     monkeypatch.setattr(handlers, "run_fixed", fixed)
     monkeypatch.setattr(
         handlers,
-        "_portal4a_container_security",
+        "_managed_container_security",
         lambda *_args, **_kwargs: {"state": {"Running": False}},
     )
 

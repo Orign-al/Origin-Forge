@@ -42,7 +42,15 @@ function decodeBase64(value: string) {
 }
 
 function safeMessage(error: unknown) {
-  if (error instanceof ApiError) return `${error.code}：${error.message}`;
+  if (
+    error instanceof ApiError &&
+    ["RESOURCE_OWNERSHIP_REJECTED", "SELF_COMPUTE_CONTEXT_INVALID"].includes(
+      error.code,
+    )
+  ) {
+    return "无法确认当前计算环境，请联系管理员。";
+  }
+  if (error instanceof ApiError) return error.message;
   return "网页终端连接失败";
 }
 

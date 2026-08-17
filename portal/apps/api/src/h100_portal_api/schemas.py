@@ -356,14 +356,21 @@ class SelfTerminalResizeRequest(ApiModel):
 
 class SelfJobSubmitRequest(ApiModel):
     name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-    script_path: str = Field(min_length=1, max_length=255)
-    workdir: str = Field(default="workspace", min_length=1, max_length=255)
+    script: str = Field(min_length=1, max_length=8192)
     cpus: int = Field(ge=1, le=8)
     memory_mb: int = Field(ge=256, le=32768)
     gpu_count: Literal[0, 1]
     time_limit_seconds: int = Field(ge=60, le=345600)
     image_ref: str | None = Field(default=None, max_length=512)
     idempotency_key: uuid.UUID
+
+    @field_validator("script")
+    @classmethod
+    def valid_job_script(cls, value: str) -> str:
+        encoded = value.encode("utf-8")
+        if not encoded or len(encoded) > 8 * 1024 or b"\x00" in encoded:
+            raise ValueError("job script must be non-empty UTF-8 text up to 8 KiB")
+        return value
 
 
 class LeaseRenewalCreateRequest(ApiModel):

@@ -156,8 +156,9 @@ function submittedJob(body: Record<string, unknown>) {
     memory_mb: body.memory_mb,
     gpu_count: body.gpu_count,
     time_limit_seconds: body.time_limit_seconds,
-    script_path: body.script_path,
-    workdir: body.workdir,
+    script_path:
+      "workspace/.portal/job-scripts/00000000-0000-4000-8000-000000000047.sh",
+    workdir: "workspace",
     stdout_path:
       "/srv/gpu-platform/users/origin-pilot/portal-jobs/00000000-0000-4000-8000-000000000047.stdout",
     stderr_path:
@@ -468,6 +469,10 @@ for (const viewport of [
     await capture(page, viewport.label, "07-container-only-connection");
 
     await page.goto("/jobs");
+    await expect(page.getByLabel("执行脚本")).toBeVisible();
+    await page
+      .getByLabel("执行脚本")
+      .fill('set -eu\necho "portal script"\nwhoami\nid');
     await page.getByLabel("GPU").selectOption("1");
     await page.getByLabel("运行环境").selectOption("approved");
     await expect(page.getByRole("button", { name: "提交作业" })).toBeEnabled();
@@ -480,6 +485,9 @@ for (const viewport of [
     await capture(page, viewport.label, "09-my-jobs");
     expect(state.jobBodies).toHaveLength(1);
     expect(state.jobBodies[0]?.gpu_count).toBe(1);
+    expect(state.jobBodies[0]?.script).toContain("portal script");
+    expect(state.jobBodies[0]).not.toHaveProperty("script_path");
+    expect(state.jobBodies[0]).not.toHaveProperty("workdir");
 
     await page.goto("/containers");
     await expect(

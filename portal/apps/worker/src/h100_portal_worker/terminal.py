@@ -27,8 +27,8 @@ from h100_portal_worker.handlers import (
     PILOT_DATA_ROOT,
     LifecycleValidationError,
     _installed_key_fingerprints,
-    _portal4a_account,
-    _portal4a_container_security,
+    _managed_account,
+    _managed_container_security,
 )
 from h100_portal_worker.protocol import MAX_FRAME, encode_frame
 from h100_portal_worker.schemas import WorkerRequest, validate_payload
@@ -80,7 +80,7 @@ def _window_size(descriptor: int, cols: int, rows: int) -> None:
 
 
 def _terminal_preflight(payload: dict[str, Any]) -> None:
-    account = _portal4a_account(payload)
+    account = _managed_account(payload)
     if account.pw_shell != "/usr/sbin/nologin":
         raise LifecycleValidationError(
             "HOST_ACCESS_POLICY_REJECTED",
@@ -92,7 +92,7 @@ def _terminal_preflight(payload: dict[str, Any]) -> None:
             "HOST_ACCESS_POLICY_REJECTED",
             "web terminal refuses a managed user with host SSH authorization",
         )
-    container = _portal4a_container_security(payload, require_running=True)
+    container = _managed_container_security(payload, require_running=True)
     state = container.get("state", {})
     health = state.get("Health", {}) if isinstance(state, dict) else {}
     if isinstance(health, dict) and health and health.get("Status") != "healthy":
@@ -143,15 +143,14 @@ def _terminal_argv(payload: dict[str, Any], marker: str) -> list[str]:
     ]
 
 
-def _marked_host_processes(marker: str | None = None) -> list[tuple[int, str]]:
+def _running_managed_containers() -> list[str]:
     try:
         result = subprocess.run(
             [
                 BINARIES["docker"],
-                "top",
-                "gpu-dev-origin-pilot",
-                "-eo",
-                "pid,ppid,user,args",
+                "ps",
+                "--format",
+                "{{.Names}}",
             ],
             cwd="/",
             env=FIXED_ENV,
@@ -161,19 +160,48 @@ def _marked_host_processes(marker: str | None = None) -> list[tuple[int, str]]:
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise OSError("container terminal process discovery failed") from exc
+        raise OSError("managed container discovery failed") from exc
     if result.returncode != 0:
-        raise OSError("container terminal process discovery was rejected")
+        raise OSError("managed container discovery was rejected")
+    return sorted(
+        name
+        for name in result.stdout.splitlines()
+        if re.fullmatch(r"gpu-dev-[a-z][a-z0-9-]{0,31}", name) is not None
+    )
+
+
+def _marked_host_processes(marker: str | None = None) -> list[tuple[int, str]]:
     processes: list[tuple[int, str]] = []
-    for line in result.stdout.splitlines()[1:]:
-        fields = line.split(maxsplit=3)
-        if len(fields) != 4 or not fields[0].isdigit():
+    for container_name in _running_managed_containers():
+        try:
+            result = subprocess.run(
+                [
+                    BINARIES["docker"],
+                    "top",
+                    container_name,
+                    "-eo",
+                    "pid,ppid,user,args",
+                ],
+                cwd="/",
+                env=FIXED_ENV,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise OSError("container terminal process discovery failed") from exc
+        if result.returncode != 0:
             continue
-        argv0 = fields[3].split(maxsplit=1)[0]
-        if (marker is not None and argv0 == marker) or (
-            marker is None and TERMINAL_PROCESS_PATTERN.fullmatch(argv0) is not None
-        ):
-            processes.append((int(fields[0]), argv0))
+        for line in result.stdout.splitlines()[1:]:
+            fields = line.split(maxsplit=3)
+            if len(fields) != 4 or not fields[0].isdigit():
+                continue
+            argv0 = fields[3].split(maxsplit=1)[0]
+            if (marker is not None and argv0 == marker) or (
+                marker is None and TERMINAL_PROCESS_PATTERN.fullmatch(argv0) is not None
+            ):
+                processes.append((int(fields[0]), argv0))
     return processes
 
 

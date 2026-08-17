@@ -5456,7 +5456,7 @@ def _write_activation_lifecycle_state(
 
 
 def _activation_account_preflight(payload: dict[str, Any]) -> pwd.struct_passwd:
-    account = _portal4a_account(payload)
+    account = _managed_account(payload)
     username = str(payload["username"])
     host_ssh = Path(account.pw_dir) / ".ssh"
     host_keys = host_ssh / "authorized_keys"
@@ -7200,7 +7200,7 @@ def _user_activate_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _portal4a_account(payload: dict[str, Any]) -> pwd.struct_passwd:
+def _managed_account(payload: dict[str, Any]) -> pwd.struct_passwd:
     username = str(payload["username"])
     try:
         account = pwd.getpwnam(username)
@@ -7230,8 +7230,16 @@ def _portal4a_account(payload: dict[str, Any]) -> pwd.struct_passwd:
     return account
 
 
-def _portal4a_slurm_security_preflight(payload: dict[str, Any]) -> None:
-    _portal4a_account(payload)
+def _managed_slurm_security_preflight(payload: dict[str, Any]) -> None:
+    account = _managed_account(payload)
+    if account.pw_shell != "/usr/sbin/nologin":
+        raise LifecycleValidationError(
+            "HOST_ACCESS_POLICY_REJECTED",
+            "self-service jobs require managed-user host login to remain disabled",
+        )
+    username = str(payload["username"])
+    slurm_account = str(payload["slurm_account"])
+    slurm_qos = str(payload["slurm_qos"])
     integrity = script_integrity()
     isolation_tool = "h100-user-gpu-isolation"
     if not integrity.get(isolation_tool, {}).get("integrity_ok", False):
@@ -7239,7 +7247,7 @@ def _portal4a_slurm_security_preflight(payload: dict[str, Any]) -> None:
             "SCRIPT_INTEGRITY_FAILED", "GPU isolation verifier integrity failed"
         )
     isolation = run_allowlisted_script(
-        [SCRIPT_ALLOWLIST[isolation_tool], "verify", str(payload["username"])], timeout=60
+        [SCRIPT_ALLOWLIST[isolation_tool], "verify", username], timeout=60
     )
     if not isolation.get("ok"):
         raise LifecycleValidationError(
@@ -7253,32 +7261,34 @@ def _portal4a_slurm_security_preflight(payload: dict[str, Any]) -> None:
             "show",
             "assoc",
             "where",
-            f"User={payload['username']}",
-            "Account=company",
+            f"User={username}",
+            f"Account={slurm_account}",
             "format=User,Account,QOS,DefaultQOS",
         ],
         timeout=20,
     )
     if not association.get("ok") or not any(
-        values[:2] == [payload["username"], "company"] and "general" in values[2:]
+        len(values) >= 4
+        and values[:2] == [username, slurm_account]
+        and (slurm_qos in values[2].split(",") or values[3] == slurm_qos)
         for values in (line.split("|") for line in str(association.get("stdout", "")).splitlines())
     ):
         raise LifecycleValidationError(
-            "SLURM_ASSOCIATION_REJECTED", "Slurm association is not company/general"
+            "SLURM_ASSOCIATION_REJECTED", "Slurm association differs from the owned context"
         )
     qos = run_fixed(
         "sacctmgr",
-        ["-n", "-P", "show", "qos", "general", "format=Name,MaxTRESPerUser"],
+        ["-n", "-P", "show", "qos", slurm_qos, "format=Name,MaxTRESPerUser"],
         timeout=20,
     )
     if not qos.get("ok") or not any(
-        line.startswith("general|") and "gres/gpu=1" in line
+        line.startswith(f"{slurm_qos}|") and "gres/gpu=1" in line
         for line in str(qos.get("stdout", "")).splitlines()
     ):
         raise LifecycleValidationError("GPU_LIMIT_REJECTED", "Slurm GPU limit is not one")
 
 
-def _portal4a_relative_parts(relative: str) -> tuple[str, ...]:
+def _managed_relative_parts(relative: str) -> tuple[str, ...]:
     path = PurePosixPath(relative)
     if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
         raise LifecycleValidationError(
@@ -7300,11 +7310,11 @@ def _validate_owned_descriptor(
 
 
 @contextmanager
-def _open_portal4a_user_path(
-    relative: str, *, directory: bool, uid: int, gid: int
+def _open_managed_user_path(
+    username: str, relative: str, *, directory: bool, uid: int, gid: int
 ) -> Iterator[tuple[Path, int, os.stat_result]]:
-    parts = _portal4a_relative_parts(relative)
-    root = PILOT_DATA_ROOT / PILOT_USERNAME
+    parts = _managed_relative_parts(relative)
+    root = PILOT_DATA_ROOT / username
     descriptors: list[int] = []
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -7338,8 +7348,10 @@ def _open_portal4a_user_path(
                 os.close(descriptor)
 
 
-def _portal4a_user_path(relative: str, *, directory: bool, uid: int, gid: int) -> Path:
-    with _open_portal4a_user_path(relative, directory=directory, uid=uid, gid=gid) as (
+def _managed_user_path(
+    username: str, relative: str, *, directory: bool, uid: int, gid: int
+) -> Path:
+    with _open_managed_user_path(username, relative, directory=directory, uid=uid, gid=gid) as (
         path,
         _descriptor,
         _metadata,
@@ -7362,18 +7374,9 @@ def _read_regular_descriptor(descriptor: int, metadata: os.stat_result) -> bytes
     return bytes(content)
 
 
-def _read_user_script(relative: str, uid: int, gid: int) -> bytes:
-    with _open_portal4a_user_path(relative, directory=False, uid=uid, gid=gid) as (
-        _path,
-        descriptor,
-        metadata,
-    ):
-        return _read_regular_descriptor(descriptor, metadata)
-
-
-def _ensure_portal4a_owned_directory(relative: str, uid: int, gid: int) -> Path:
-    parts = _portal4a_relative_parts(relative)
-    root = PILOT_DATA_ROOT / PILOT_USERNAME
+def _ensure_managed_owned_directory(username: str, relative: str, uid: int, gid: int) -> Path:
+    parts = _managed_relative_parts(relative)
+    root = PILOT_DATA_ROOT / username
     descriptors: list[int] = []
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -7418,12 +7421,13 @@ def _ensure_portal4a_owned_directory(relative: str, uid: int, gid: int) -> Path:
 def _stage_user_job_script(payload: dict[str, Any], content: bytes) -> tuple[Path, int]:
     uid = int(payload["uid"])
     gid = int(payload["gid"])
+    username = str(payload["username"])
     script_relative = "workspace/.portal/job-scripts"
-    _ensure_portal4a_owned_directory(script_relative, uid, gid)
-    _ensure_portal4a_owned_directory("workspace/.portal/jobs", uid, gid)
+    _ensure_managed_owned_directory(username, script_relative, uid, gid)
+    _ensure_managed_owned_directory(username, "workspace/.portal/jobs", uid, gid)
     filename = f"{payload['portal_job_id']}.sh"
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    with _open_portal4a_user_path(script_relative, directory=True, uid=uid, gid=gid) as (
+    with _open_managed_user_path(username, script_relative, directory=True, uid=uid, gid=gid) as (
         script_dir,
         directory_descriptor,
         _metadata,
@@ -7447,7 +7451,14 @@ def _stage_user_job_script(payload: dict[str, Any], content: bytes) -> tuple[Pat
             if created:
                 os.fchown(descriptor, uid, gid)
                 os.fchmod(descriptor, 0o700)
-                os.write(descriptor, content)
+                written = 0
+                while written < len(content):
+                    count = os.write(descriptor, content[written:])
+                    if count <= 0:
+                        raise LifecycleValidationError(
+                            "JOB_STAGING_REJECTED", "staged job script write made no progress"
+                        )
+                    written += count
                 os.fsync(descriptor)
             metadata = _validate_owned_descriptor(descriptor, directory=False, uid=uid, gid=gid)
             if created:
@@ -7540,7 +7551,7 @@ def _run_as_managed_user(
     }
 
 
-def _portal4a_sbatch_argv(
+def _managed_sbatch_argv(
     payload: dict[str, Any],
     *,
     workdir: Path,
@@ -7557,8 +7568,8 @@ def _portal4a_sbatch_argv(
     argv = [
         BINARIES["sbatch"],
         "--parsable",
-        "--account=company",
-        "--qos=general",
+        f"--account={payload['slurm_account']}",
+        f"--qos={payload['slurm_qos']}",
         f"--job-name={payload['name']}",
         f"--cpus-per-task={payload['cpus']}",
         f"--mem={payload['memory_mb']}M",
@@ -7571,7 +7582,7 @@ def _portal4a_sbatch_argv(
     if int(payload["gpu_count"]) == 1:
         argv.append("--gres=gpu:1")
     if payload.get("image_ref"):
-        owned_root = PILOT_DATA_ROOT / PILOT_USERNAME
+        owned_root = PILOT_DATA_ROOT / str(payload["username"])
         argv.extend(
             [
                 f"--container-image={payload['image_ref']}",
@@ -7586,23 +7597,30 @@ def _portal4a_sbatch_argv(
 def _execute_self_job_submit(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
     staged_descriptor: int | None = None
     try:
-        _portal4a_slurm_security_preflight(payload)
+        _managed_slurm_security_preflight(payload)
         uid = int(payload["uid"])
         gid = int(payload["gid"])
-        content = _read_user_script(str(payload["script_relative_path"]), uid, gid)
-        workdir = _portal4a_user_path(
-            str(payload["workdir_relative_path"]), directory=True, uid=uid, gid=gid
+        username = str(payload["username"])
+        content = str(payload["script_content"]).encode("utf-8")
+        workdir = _managed_user_path(
+            username,
+            str(payload["workdir_relative_path"]),
+            directory=True,
+            uid=uid,
+            gid=gid,
         )
         _staged, staged_descriptor = _stage_user_job_script(payload, content)
-        root = PILOT_DATA_ROOT / PILOT_USERNAME
+        root = PILOT_DATA_ROOT / username
         stdout = root / str(payload["stdout_relative_path"])
         stderr = root / str(payload["stderr_relative_path"])
-        output_parent = _ensure_portal4a_owned_directory("workspace/.portal/jobs", uid, gid)
+        output_parent = _ensure_managed_owned_directory(
+            username, "workspace/.portal/jobs", uid, gid
+        )
         if stdout.parent != output_parent or stderr.parent != output_parent:
             raise LifecycleValidationError(
                 "JOB_OUTPUT_REJECTED", "job output directories are inconsistent"
             )
-        argv = _portal4a_sbatch_argv(
+        argv = _managed_sbatch_argv(
             payload,
             workdir=workdir,
             stdout=stdout,
@@ -7652,7 +7670,7 @@ def _execute_self_job_submit(request: WorkerRequest, payload: dict[str, Any]) ->
 
 def _execute_self_job_cancel(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
     try:
-        _portal4a_account(payload)
+        _managed_account(payload)
         job_id = int(payload["slurm_job_id"])
         if _slurm_job_owner(job_id) != payload["username"]:
             raise LifecycleValidationError(
@@ -7673,9 +7691,9 @@ def _execute_self_job_cancel(request: WorkerRequest, payload: dict[str, Any]) ->
         return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
 
 
-def _read_job_log(relative: str, uid: int, gid: int) -> str:
+def _read_job_log(username: str, relative: str, uid: int, gid: int) -> str:
     try:
-        with _open_portal4a_user_path(relative, directory=False, uid=uid, gid=gid) as (
+        with _open_managed_user_path(username, relative, directory=False, uid=uid, gid=gid) as (
             _path,
             descriptor,
             metadata,
@@ -7692,14 +7710,15 @@ def _read_job_log(relative: str, uid: int, gid: int) -> str:
 
 def _self_job_logs(payload: dict[str, Any]) -> dict[str, Any]:
     try:
-        _portal4a_account(payload)
+        _managed_account(payload)
+        username = str(payload["username"])
         uid = int(payload["uid"])
         gid = int(payload["gid"])
         return {
             "status": "OK",
             "handler": "self.job.logs.read",
-            "stdout": _read_job_log(str(payload["stdout_relative_path"]), uid, gid),
-            "stderr": _read_job_log(str(payload["stderr_relative_path"]), uid, gid),
+            "stdout": _read_job_log(username, str(payload["stdout_relative_path"]), uid, gid),
+            "stderr": _read_job_log(username, str(payload["stderr_relative_path"]), uid, gid),
         }
     except LifecycleValidationError as exc:
         return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
@@ -7707,7 +7726,7 @@ def _self_job_logs(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _self_job_status(payload: dict[str, Any]) -> dict[str, Any]:
     try:
-        _portal4a_account(payload)
+        _managed_account(payload)
         job_id = int(payload["slurm_job_id"])
         if _slurm_job_owner(job_id) != payload["username"]:
             raise LifecycleValidationError(
@@ -7768,7 +7787,7 @@ def _self_job_status(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _self_storage(payload: dict[str, Any]) -> dict[str, Any]:
     try:
-        account = _portal4a_account(payload)
+        account = _managed_account(payload)
         root = PILOT_DATA_ROOT / str(payload["username"])
         resolved = root.resolve(strict=True)
         metadata = resolved.lstat()
@@ -7803,10 +7822,10 @@ def _self_storage(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
 
-def _portal4a_container_security(
+def _managed_container_security(
     payload: dict[str, Any], *, require_running: bool | None
 ) -> dict[str, Any]:
-    _portal4a_account(payload)
+    _managed_account(payload)
     inspected = containers_inspect({"name": str(payload["name"])})
     raw_container = inspected.get("container", {})
     container: dict[str, Any] = raw_container if isinstance(raw_container, dict) else {}
@@ -7848,7 +7867,7 @@ def _portal4a_container_security(
     return container
 
 
-def _execute_portal4a_container_lifecycle(
+def _execute_managed_container_lifecycle(
     request: WorkerRequest, payload: dict[str, Any]
 ) -> dict[str, Any]:
     try:
@@ -7862,7 +7881,7 @@ def _execute_portal4a_container_lifecycle(
             raise LifecycleValidationError(
                 "CONTAINER_OPERATION_DENIED_LEASE_INACTIVE", "active lease binding is required"
             )
-        before = _portal4a_container_security(
+        before = _managed_container_security(
             payload, require_running=False if action == "start" else None
         )
         required_scripts = {"h100-container-stop"}
@@ -7886,7 +7905,7 @@ def _execute_portal4a_container_lifecycle(
             if not started.get("ok"):
                 raise LifecycleValidationError("CONTAINER_START_FAILED", "container start failed")
         expected_running = action != "stop"
-        _portal4a_container_security(payload, require_running=expected_running)
+        _managed_container_security(payload, require_running=expected_running)
         return {
             "status": "SUCCEEDED",
             "handler": request.operation_type,
@@ -7905,7 +7924,7 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
     suspended = active.with_name("authorized_keys.portal-recycle")
     started_by_restore = False
     try:
-        account = _portal4a_account(payload)
+        account = _managed_account(payload)
         if account.pw_shell != "/usr/sbin/nologin":
             raise LifecycleValidationError(
                 "HOST_ACCESS_POLICY_REJECTED", "restore requires host login to remain disabled"
@@ -7938,7 +7957,7 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
             "lease_id": payload["restore_request_id"],
             "lease_expires_at": "restored-by-approved-request",
         }
-        container = _portal4a_container_security(lifecycle_payload, require_running=None)
+        container = _managed_container_security(lifecycle_payload, require_running=None)
         running = bool(container.get("state", {}).get("Running"))
         if running:
             if not active.exists():
@@ -7975,7 +7994,7 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
             raise LifecycleValidationError(
                 "CONTAINER_START_FAILED", "restored container failed to start"
             )
-        _portal4a_container_security(lifecycle_payload, require_running=True)
+        _managed_container_security(lifecycle_payload, require_running=True)
         return {
             "status": "SUCCEEDED",
             "handler": "resource.restore",
@@ -8052,7 +8071,7 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
     failed_step = "RECYCLE_PREFLIGHT"
     try:
         failed_step = "ACCOUNT_SECURITY_GATE"
-        account = _portal4a_account(payload)
+        account = _managed_account(payload)
         if account.pw_shell != "/usr/sbin/nologin":
             raise LifecycleValidationError(
                 "HOST_ACCESS_POLICY_REJECTED", "lease recycle requires host shell to be disabled"
@@ -8132,7 +8151,7 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
             "name": payload["container_name"],
         }
         failed_step = "CONTAINER_SECURITY_PREFLIGHT"
-        container = _portal4a_container_security(lifecycle_payload, require_running=None)
+        container = _managed_container_security(lifecycle_payload, require_running=None)
         if bool(container.get("state", {}).get("Running")):
             failed_step = "CONTAINER_STOP"
             integrity = script_integrity()
@@ -8146,7 +8165,7 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
             if not stopped.get("ok"):
                 raise LifecycleValidationError("CONTAINER_STOP_FAILED", "container stop failed")
         failed_step = "RECYCLE_POSTCONDITION"
-        _portal4a_container_security(lifecycle_payload, require_running=False)
+        _managed_container_security(lifecycle_payload, require_running=False)
         if (
             active.exists()
             or not suspended.exists()
@@ -8230,7 +8249,7 @@ def _execute_host_access_revoke(request: WorkerRequest, payload: dict[str, Any])
     original_shell: str | None = None
     migration_started = False
     try:
-        account = _portal4a_account(payload)
+        account = _managed_account(payload)
         original_shell = account.pw_shell
         if account.pw_shell not in {"/bin/bash", "/usr/sbin/nologin"}:
             raise LifecycleValidationError(
@@ -8288,7 +8307,7 @@ def _execute_host_access_revoke(request: WorkerRequest, payload: dict[str, Any])
             )
         for username, before in management_before.items():
             validate_ssh_policy_no_regression(username, before, _sshd_effective_config(username))
-        _portal4a_account(payload)
+        _managed_account(payload)
         if migration_started:
             removed.unlink()
         return {
@@ -8466,7 +8485,7 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
                 request.operation_type in {"container.start", "container.stop", "container.restart"}
                 and "uid" in payload
             ):
-                return _execute_portal4a_container_lifecycle(request, payload)
+                return _execute_managed_container_lifecycle(request, payload)
             if request.operation_type == "resource.restore":
                 return _execute_resource_restore(request, payload)
             if request.operation_type in {"lease.expire", "resource.recycle"}:

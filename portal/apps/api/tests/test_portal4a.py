@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import uuid
 from datetime import timedelta
@@ -686,6 +687,7 @@ def test_ordinary_user_self_routes_are_owner_scoped_and_admin_routes_are_denied(
     assert own.status_code == 200
     assert [row["id"] for row in own.json()["jobs"]] == [str(first_job.id)]
     assert client.get(f"/api/v1/self/jobs/{second_job.id}").status_code == 404
+    assert client.get(f"/api/v1/self/jobs/{second_job.id}/logs").status_code == 404
     assert (
         client.post(
             f"/api/v1/self/jobs/{second_job.id}/cancel",
@@ -725,8 +727,15 @@ def test_job_and_container_operations_enforce_active_lease_gpu_and_time(
     origin_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # type: ignore[no-untyped-def]
-    identity = _identity(database, remaining_hours=2)
-    headers = _login(client, origin_headers, "origin-pilot")
+    identity = _identity(
+        database,
+        login="origin-pilot2",
+        username="origin-pilot2",
+        uid=20002,
+        port=22024,
+        remaining_hours=2,
+    )
+    headers = _login(client, origin_headers, "origin-pilot2")
     calls: list[dict[str, object]] = []
 
     def worker(operation_type: str, **kwargs):  # type: ignore[no-untyped-def]
@@ -735,14 +744,13 @@ def test_job_and_container_operations_enforce_active_lease_gpu_and_time(
             "status": "SUCCEEDED",
             "request_id": str(uuid.uuid4()),
             "slurm_job_id": 101,
-            "slurm_user": "origin-pilot",
+            "slurm_user": "origin-pilot2",
         }
 
     monkeypatch.setattr("h100_portal_api.routes.self_service.call_worker", worker)
     base = {
         "name": "portal-job",
-        "script_path": "workspace/job.sh",
-        "workdir": "workspace",
+        "script": "set -eu\nwhoami\nid\n",
         "cpus": 1,
         "memory_mb": 1024,
         "gpu_count": 1,
@@ -758,10 +766,31 @@ def test_job_and_container_operations_enforce_active_lease_gpu_and_time(
         json={**base, "time_limit_seconds": 3 * 3600},
     )
     assert too_long.status_code == 422
+    spoofed_owner = client.post(
+        "/api/v1/self/jobs",
+        headers=headers,
+        json={**base, "username": "fixture-user-b", "uid": 20003},
+    )
+    assert spoofed_owner.status_code == 422
+    assert calls == []
     submitted = client.post("/api/v1/self/jobs", headers=headers, json=base)
     assert submitted.status_code == 200
     assert submitted.json()["job"]["gpu_count"] == 1
-    assert calls[-1]["requested_by"] == "origin-pilot"
+    assert calls[-1]["requested_by"] == "origin-pilot2"
+    worker_payload = calls[-1]["payload"]
+    assert worker_payload["managed_user_id"] == str(identity.managed.id)
+    assert worker_payload["username"] == "origin-pilot2"
+    assert worker_payload["uid"] == worker_payload["gid"] == 20002
+    assert worker_payload["slurm_account"] == "company"
+    assert worker_payload["slurm_qos"] == "general"
+    assert worker_payload["max_gpu"] == 1
+    assert worker_payload["workdir_relative_path"] == "workspace"
+    assert worker_payload["script_relative_path"].startswith("workspace/.portal/job-scripts/")
+    assert worker_payload["script_content"].startswith("#!/bin/bash\nset -eu")
+    assert (
+        worker_payload["script_sha256"]
+        == hashlib.sha256(worker_payload["script_content"].encode()).hexdigest()
+    )
 
     identity.lease.state = "EXPIRED"
     identity.lease.expired_at = utcnow()
@@ -790,6 +819,7 @@ def test_expired_timestamp_denies_new_access_even_when_database_state_is_active(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # type: ignore[no-untyped-def]
     identity = _identity(database)
+    owned_job = _job(database, identity, "expired-log-denied")
     identity.lease.expires_at = utcnow() - timedelta(seconds=1)
     identity.lease.starts_at = identity.lease.expires_at - timedelta(
         seconds=MAX_LEASE_DURATION_SECONDS
@@ -819,8 +849,7 @@ def test_expired_timestamp_denies_new_access_even_when_database_state_is_active(
         headers=headers,
         json={
             "name": "expired-denied",
-            "script_path": "workspace/job.sh",
-            "workdir": "workspace",
+            "script": "set -eu\nwhoami\n",
             "cpus": 1,
             "memory_mb": 1024,
             "gpu_count": 0,
@@ -847,6 +876,10 @@ def test_expired_timestamp_denies_new_access_even_when_database_state_is_active(
     assert container_start.json()["detail"]["code"] == "CONTAINER_OPERATION_DENIED_LEASE_INACTIVE"
     assert job.status_code == 409
     assert job.json()["detail"]["code"] == "LEASE_INACTIVE"
+    jobs = client.get("/api/v1/self/jobs")
+    logs = client.get(f"/api/v1/self/jobs/{owned_job.id}/logs")
+    assert jobs.status_code == logs.status_code == 409
+    assert logs.json()["detail"]["code"] == "LEASE_INACTIVE"
     assert renewal.status_code == 409
     assert renewal.json()["detail"]["code"] == "LEASE_EXPIRED_RESTORE_REQUIRED"
 
@@ -1056,15 +1089,21 @@ def test_web_terminal_is_owner_scoped_lease_gated_and_does_not_audit_input(
     origin_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # type: ignore[no-untyped-def]
-    first = _identity(database)
+    first = _identity(
+        database,
+        login="origin-pilot2",
+        username="origin-pilot2",
+        uid=20002,
+        port=22024,
+    )
     _identity(
         database,
         login="fixture-user-b",
         username="fixture-user-b",
-        uid=20002,
-        port=22024,
+        uid=20003,
+        port=22025,
     )
-    headers = _login(client, origin_headers, "origin-pilot")
+    headers = _login(client, origin_headers, "origin-pilot2")
 
     class FakeWorker:
         def __init__(self) -> None:
@@ -1138,10 +1177,10 @@ def test_web_terminal_is_owner_scoped_lease_gated_and_does_not_audit_input(
     terminal_id = opened.json()["terminal"]["id"]
     assert registry.open_payload == {
         "managed_user_id": str(first.managed.id),
-        "username": "origin-pilot",
-        "uid": 20001,
-        "gid": 20001,
-        "name": "gpu-dev-origin-pilot",
+        "username": "origin-pilot2",
+        "uid": 20002,
+        "gid": 20002,
+        "name": "gpu-dev-origin-pilot2",
         "lease_id": str(first.lease.id),
         "lease_expires_at": ensure_utc(first.lease.expires_at).isoformat(),
         "expected_gpu": "NONE",
@@ -1178,7 +1217,7 @@ def test_web_terminal_is_owner_scoped_lease_gated_and_does_not_audit_input(
     assert denied.json()["detail"]["code"] == "TERMINAL_NOT_FOUND"
 
     client.cookies.clear()
-    headers = _login(client, origin_headers, "origin-pilot")
+    headers = _login(client, origin_headers, "origin-pilot2")
     # A different Portal login session cannot attach to an existing terminal,
     # even when it belongs to the same managed user.
     rebound = client.get(f"/api/v1/self/container/terminal/sessions/{terminal_id}/output?cursor=0")
@@ -1199,7 +1238,7 @@ def test_web_terminal_refuses_host_access_regression_and_expired_lease(
         json={"idempotency_key": str(uuid.uuid4()), "cols": 120, "rows": 32},
     )
     assert host_regression.status_code == 409
-    assert host_regression.json()["detail"]["code"] == "TERMINAL_SECURITY_GATE_FAILED"
+    assert host_regression.json()["detail"]["code"] == "SELF_COMPUTE_CONTEXT_INVALID"
 
     identity.managed.host_access_state = "DISABLED_BY_PLATFORM_POLICY"
     identity.managed.shell = "/usr/sbin/nologin"

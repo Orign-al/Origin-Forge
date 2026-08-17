@@ -1056,8 +1056,12 @@ button {
   font-weight: 600;
 }
 .job-form-grid label .ui-input,
-.job-form-grid label select {
+.job-form-grid label select,
+.job-form-grid label textarea {
   margin-top: 5px;
+}
+.job-form-grid .job-script-field {
+  grid-column: 1 / -1;
 }
 .job-submit-row {
   display: flex;

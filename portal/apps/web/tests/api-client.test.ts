@@ -12,6 +12,7 @@ import {
   sendSelfTerminalInput,
   startManagedContainer,
   startSelfTerminal,
+  submitSelfJob,
 } from "../lib/api";
 
 afterEach(() => {
@@ -351,6 +352,46 @@ describe("API client", () => {
         expect.objectContaining({ command: expect.anything() }),
       );
     }
+  });
+
+  it("submits script text without browser-selected owner or host paths", async () => {
+    document.cookie = "h100_csrf=test-csrf-value; Path=/";
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        expect(String(input)).toBe("/api/v1/self/jobs");
+        expect(init?.method).toBe("POST");
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        expect(body.script).toBe("set -eu\nwhoami\nid\n");
+        for (const forbidden of [
+          "script_path",
+          "workdir",
+          "username",
+          "uid",
+          "container_name",
+          "account",
+          "qos",
+        ]) {
+          expect(body).not.toHaveProperty(forbidden);
+        }
+        return new Response(JSON.stringify({ status: "SUBMITTED", job: {} }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await submitSelfJob({
+      name: "owner-job",
+      script: "set -eu\nwhoami\nid\n",
+      cpus: 2,
+      memory_mb: 4096,
+      gpu_count: 1,
+      time_limit_seconds: 300,
+      image_ref: null,
+      idempotency_key: "00000000-0000-4000-8000-000000000093",
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it("binds Lease recovery to CSRF and the typed Lease ID without browser secrets", async () => {

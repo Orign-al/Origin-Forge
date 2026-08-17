@@ -917,8 +917,7 @@ export const selfJobs = () =>
   apiFetch<{ status: string; jobs: SelfJob[]; count: number }>("/self/jobs");
 export const submitSelfJob = (payload: {
   name: string;
-  script_path: string;
-  workdir: string;
+  script: string;
   cpus: number;
   memory_mb: number;
   gpu_count: 0 | 1;
