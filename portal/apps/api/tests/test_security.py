@@ -17,11 +17,12 @@ from sqlalchemy.exc import IntegrityError
 def test_approved_origins_are_parsed_without_exposing_api(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     origins = (
         "http://127.0.0.1:18080,http://10.10.10.220:18080,"
-        "http://20.10.10.3,https://20.10.10.3"
+        "http://20.10.10.3:18080,http://20.10.10.3,https://20.10.10.3"
     )
     assert Settings.parse_origins(origins) == (
         "http://127.0.0.1:18080",
         "http://10.10.10.220:18080",
+        "http://20.10.10.3:18080",
         "http://20.10.10.3",
         "https://20.10.10.3",
     )

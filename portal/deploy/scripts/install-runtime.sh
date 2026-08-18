@@ -117,6 +117,7 @@ for unit in \
   h100-portal-worker.service \
   h100-portal-api.service \
   h100-portal-web.service \
+  h100-portal-web-tun1.service \
   h100-portal-lease-expiry.service \
   h100-portal-lease-expiry.timer \
   h100-portal-provision-reconcile.service \

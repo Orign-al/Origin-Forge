@@ -92,11 +92,18 @@ def test_portal3f_worker_can_write_only_the_guard_metrics_directory() -> None:
 
 def test_web_binds_to_current_tunnel_service_address() -> None:
     service = (PORTAL_ROOT / "deploy/systemd/h100-portal-web.service").read_text()
+    tun1_service = (PORTAL_ROOT / "deploy/systemd/h100-portal-web-tun1.service").read_text()
     environment = (PORTAL_ROOT / "deploy/portal.env.example").read_text()
+    installer = (PORTAL_ROOT / "deploy/scripts/install-runtime.sh").read_text()
 
     assert "Environment=HOSTNAME=10.10.10.220" in service.splitlines()
     assert "Environment=HOSTNAME=10.10.10.2" not in service.splitlines()
+    assert "Environment=HOSTNAME=20.10.10.3" in tun1_service.splitlines()
+    assert "Environment=HOSTNAME=0.0.0.0" not in service + tun1_service
+    assert "IPAddressAllow=20.10.10.0/24" in tun1_service
+    assert "h100-portal-web-tun1.service" in installer
     assert "http://10.10.10.220:18080" in environment
+    assert "http://20.10.10.3:18080" in environment
     assert "http://20.10.10.3" in environment
     assert "https://20.10.10.3" in environment
     assert "http://10.10.10.2:18080" not in environment
