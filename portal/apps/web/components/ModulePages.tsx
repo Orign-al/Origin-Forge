@@ -732,7 +732,7 @@ export function MonitoringModule() {
               <dd>
                 <a
                   className="table-link"
-                  href="http://10.10.10.2:3000"
+                  href="http://10.10.10.220:3000"
                   target="_blank"
                   rel="noreferrer"
                 >
@@ -1009,7 +1009,7 @@ export function SystemModule() {
           <dl className="kv-grid">
             <div className="kv">
               <dt>Web</dt>
-              <dd className="mono">10.10.10.2:18080</dd>
+              <dd className="mono">10.10.10.220:18080</dd>
             </div>
             <div className="kv">
               <dt>API</dt>

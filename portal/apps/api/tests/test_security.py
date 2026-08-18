@@ -14,13 +14,21 @@ from h100_portal_api.security import (
 from sqlalchemy.exc import IntegrityError
 
 
-def test_private_and_loopback_origins_are_parsed_without_exposing_api() -> None:
-    assert Settings.parse_origins("http://127.0.0.1:18080,http://10.10.10.2:18080") == (
-        "http://127.0.0.1:18080",
-        "http://10.10.10.2:18080",
+def test_approved_origins_are_parsed_without_exposing_api(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    origins = (
+        "http://127.0.0.1:18080,http://10.10.10.220:18080,"
+        "http://20.10.10.3,https://20.10.10.3"
     )
+    assert Settings.parse_origins(origins) == (
+        "http://127.0.0.1:18080",
+        "http://10.10.10.220:18080",
+        "http://20.10.10.3",
+        "https://20.10.10.3",
+    )
+    monkeypatch.delenv("PORTAL_ALLOWED_ORIGINS")
+    assert Settings().allowed_origins == Settings.parse_origins(origins)
     with pytest.raises(ValueError, match="loopback"):
-        Settings(api_host="10.10.10.2")
+        Settings(api_host="10.10.10.220")
 
 
 def test_login_normalization_is_case_insensitive() -> None:

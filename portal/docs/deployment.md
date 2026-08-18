@@ -8,7 +8,7 @@
 - 配置：`/etc/h100-portal`
 - 数据和日志：`/var/lib/h100-portal`、`/var/log/h100-portal`
 - Runtime socket：`/run/h100-portal/worker.sock`
-- Web：`10.10.10.2:18080`（精确绑定 `tun0`）
+- Web：`10.10.10.220:18080`（精确绑定 `tun0`）
 - API：`127.0.0.1:18081`（继续仅限 loopback）
 - PostgreSQL：本机 Unix Socket，不监听 Portal TCP 端口
 
@@ -135,12 +135,12 @@ policy、管理账号 diff、reload、服务状态或第二连接任一失败，
 ```bash
 curl -fsS http://127.0.0.1:18081/health/live
 curl -fsS http://127.0.0.1:18081/health/ready
-curl -fsS http://10.10.10.2:18080/login >/dev/null
+curl -fsS http://10.10.10.220:18080/login >/dev/null
 ss -lntup
 systemctl --failed
 ```
 
-ready 必须同时报告数据库和 Worker 可用。确认 Web 只有 `10.10.10.2:18080`，API 只有
+ready 必须同时报告数据库和 Worker 可用。确认 Web 只有 `10.10.10.220:18080`，API 只有
 `127.0.0.1:18081`，且不存在 `0.0.0.0:18080/18081` 或全局 IPv6 Portal 监听。
 Web unit 的网络沙箱必须保留 `IPAddressDeny=any`，只额外允许 localhost 和
 `10.10.10.0/24`；API unit 仍只允许 localhost。以 API UID 运行
@@ -151,10 +151,10 @@ Web unit 的网络沙箱必须保留 `IPAddressDeny=any`，只额外允许 local
 内存/临时目录生成，测试结束删除，不安装到真实账号。部署后用源码/日志/数据库扫描确认
 没有 private-key 装甲；扫描输出不得反向打印任何疑似 secret 正文。
 
-批准的虚拟网络客户端直接打开 `http://10.10.10.2:18080`。如需可选 SSH Tunnel 回退：
+批准的虚拟网络客户端直接打开 `http://10.10.10.220:18080`。如需可选 SSH Tunnel 回退：
 
 ```bash
-ssh -L 18080:10.10.10.2:18080 h100-codex
+ssh -L 18080:10.10.10.220:18080 h100-codex
 ```
 
 浏览器打开 `http://127.0.0.1:18080`。两种入口都在精确 CSRF Origin allowlist 中；不得

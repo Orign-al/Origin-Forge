@@ -14,7 +14,9 @@ class Settings(BaseSettings):
     worker_socket: str = "/run/h100-portal/worker.sock"
     allowed_origins: Annotated[tuple[str, ...], NoDecode] = (
         "http://127.0.0.1:18080",
-        "http://10.10.10.2:18080",
+        "http://10.10.10.220:18080",
+        "http://20.10.10.3",
+        "https://20.10.10.3",
     )
     cookie_secure: bool = False
     cookie_name: str = "h100_session"

@@ -11,7 +11,7 @@ Group=h100-portal-web
 WorkingDirectory=/opt/h100-portal/apps/web/.next/standalone/apps/web
 Environment=NODE_ENV=production
 Environment=NEXT_TELEMETRY_DISABLED=1
-Environment=HOSTNAME=10.10.10.2
+Environment=HOSTNAME=10.10.10.220
 Environment=PORT=18080
 ExecStart=/opt/node-v24.19.0/bin/node /opt/h100-portal/apps/web/.next/standalone/apps/web/server.js
 SuccessExitStatus=143

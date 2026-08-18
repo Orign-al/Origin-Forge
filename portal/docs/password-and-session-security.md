@@ -60,8 +60,9 @@ challenge；最终密码提交不再携带原始 token。Setup 页面只加载�
 3. 登录前 token 的 HMAC 或登录后 session 中保存的 CSRF digest 有效。
 
 SameSite Cookie 不能替代上述校验。API 不信任代理头，当前服务启动使用
-`--no-proxy-headers`。生产 allowlist 只包含 `http://10.10.10.2:18080` 和作为回退的
-`http://127.0.0.1:18080`，不得添加通配 Origin。
+`--no-proxy-headers`。生产 allowlist 只包含 `http://10.10.10.220:18080`、批准代理的
+`http://20.10.10.3`/`https://20.10.10.3` 和作为回退的 `http://127.0.0.1:18080`，
+不得添加通配 Origin。
 
 若访问范围扩展到其他网络、VPN 用户、办公网或公网，必须重新进行 transport 威胁评估，
 优先启用 HTTPS，并将 Cookie `Secure` 属性切换为 `true`。不得在 TLS 启用前声称当前入口

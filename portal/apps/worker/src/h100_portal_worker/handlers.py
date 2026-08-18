@@ -1172,7 +1172,7 @@ def monitoring_summary() -> dict[str, Any]:
         "docker": {"status": containers.get("status"), "count": containers.get("count")},
         "slurm": {"status": slurm.get("status"), "node": slurm},
         "storage": {"status": storage.get("status"), "mounts": storage.get("mounts", [])},
-        "grafana": grafana | {"url": "http://10.10.10.2:3000"},
+        "grafana": grafana | {"url": "http://10.10.10.220:3000"},
     }
 
 
