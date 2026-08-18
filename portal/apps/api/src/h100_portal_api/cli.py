@@ -14,6 +14,13 @@ from sqlalchemy.orm import Session
 from h100_portal_api.audit import record_audit
 from h100_portal_api.config import get_settings
 from h100_portal_api.database import SessionLocal
+from h100_portal_api.delegated_auth import (
+    DELEGATED_TEST_MAX_TTL_SECONDS,
+    DELEGATED_TEST_MIN_TTL_SECONDS,
+    DELEGATED_TEST_SCOPES,
+    DelegatedTestAuthError,
+    issue_delegated_test_session,
+)
 from h100_portal_api.enums import (
     AccountState,
     OnboardingState,
@@ -2703,6 +2710,57 @@ def portal4a_revoke_origin_pilot_host_access(approval_text: str) -> int:
     return 0
 
 
+def create_delegated_test_session(target_login: str, scopes: list[str], ttl_seconds: int) -> int:
+    """Issue one credential from the local privileged acceptance control plane."""
+
+    try:
+        normalized_target = normalize_login(target_login)
+        with SessionLocal() as db:
+            owners = (
+                db.scalars(
+                    select(PortalUser)
+                    .join(PortalUser.roles)
+                    .where(
+                        PortalRole.name == "platform_owner",
+                        PortalUser.account_state == AccountState.ACTIVE,
+                    )
+                )
+                .unique()
+                .all()
+            )
+            if len(owners) != 1:
+                raise DelegatedTestAuthError(
+                    "DELEGATED_TEST_ACTOR_DENIED",
+                    "the local control plane requires exactly one active platform_owner",
+                )
+            effective_user = db.scalar(
+                select(PortalUser).where(PortalUser.normalized_login == normalized_target)
+            )
+            if effective_user is None:
+                raise DelegatedTestAuthError(
+                    "DELEGATED_TEST_TARGET_DENIED", "effective user does not exist"
+                )
+            issued = issue_delegated_test_session(
+                db,
+                actor=owners[0],
+                effective_user=effective_user,
+                scopes=scopes,
+                ttl_seconds=ttl_seconds,
+                source_ip="local-console",
+                user_agent="h100-portal-admin-delegated-test",
+            )
+            db.commit()
+            # The raw bearer is returned exactly once and is intended to be
+            # captured directly by the acceptance runner.  Only its hash was
+            # persisted; no target password or ordinary session was touched.
+            print(issued.credential)
+            return 0
+    except (DelegatedTestAuthError, SQLAlchemyError, ValueError) as exc:
+        code = getattr(exc, "code", exc.__class__.__name__)
+        print(f"DELEGATED TEST SESSION BLOCKED — {code}", file=sys.stderr)
+        return 2
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="H100 Portal administrator bootstrap")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2729,6 +2787,17 @@ def main() -> int:
     portal4a_credential.add_argument("--base-url", default="http://10.10.10.2:18080")
     portal4a_revoke = subparsers.add_parser("portal4a-revoke-origin-pilot-host-access")
     portal4a_revoke.add_argument("--approval-text", required=True)
+    delegated = subparsers.add_parser("create-delegated-test-session")
+    delegated.add_argument("--target", required=True)
+    delegated.add_argument(
+        "--scope", action="append", required=True, choices=sorted(DELEGATED_TEST_SCOPES)
+    )
+    delegated.add_argument(
+        "--ttl-seconds",
+        type=int,
+        default=DELEGATED_TEST_MAX_TTL_SECONDS,
+        choices=range(DELEGATED_TEST_MIN_TTL_SECONDS, DELEGATED_TEST_MAX_TTL_SECONDS + 1),
+    )
     args = parser.parse_args()
     if args.command == "prepare-origin-al":
         return prepare_origin_al()
@@ -2758,6 +2827,8 @@ def main() -> int:
         return portal4a_issue_origin_pilot_test_login(args.base_url)
     if args.command == "portal4a-revoke-origin-pilot-host-access":
         return portal4a_revoke_origin_pilot_host_access(args.approval_text)
+    if args.command == "create-delegated-test-session":
+        return create_delegated_test_session(args.target, args.scope, args.ttl_seconds)
     return 2
 
 

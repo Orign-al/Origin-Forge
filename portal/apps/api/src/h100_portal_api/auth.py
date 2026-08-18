@@ -9,8 +9,13 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from h100_portal_api.config import get_settings
+from h100_portal_api.delegated_auth import (
+    DELEGATED_CREDENTIAL_PREFIX,
+    DELEGATED_TEST_SCOPES,
+)
 from h100_portal_api.enums import PasswordActionTokenState, PasswordState
 from h100_portal_api.models import (
+    PortalDelegatedTestSession,
     PortalManagedUser,
     PortalPasswordSetupToken,
     PortalSession,
@@ -18,6 +23,7 @@ from h100_portal_api.models import (
     ensure_utc,
     utcnow,
 )
+from h100_portal_api.rbac import highest_role, role_names
 from h100_portal_api.schemas import RoleResponse, SessionResponse, UserResponse
 from h100_portal_api.security import (
     digest_secret,
@@ -31,9 +37,25 @@ AUTH_ERROR = {"code": "AUTHENTICATION_FAILED", "message": "用户名或密码不
 
 
 class AuthContext(NamedTuple):
+    # ``user`` is always the effective user used for ordinary RBAC and /self
+    # owner binding.  For a normal cookie session the actor is the same user.
     user: PortalUser
-    session: PortalSession
+    session: PortalSession | None
     session_raw: str
+    actor_user: PortalUser | None = None
+    delegation: PortalDelegatedTestSession | None = None
+
+    @property
+    def actor(self) -> PortalUser:
+        return self.actor_user or self.user
+
+    @property
+    def delegated_scopes(self) -> frozenset[str]:
+        return frozenset(self.delegation.scopes) if self.delegation is not None else frozenset()
+
+    @property
+    def is_delegated(self) -> bool:
+        return self.delegation is not None
 
 
 class SlidingRateLimiter:
@@ -100,6 +122,18 @@ def require_preauth_csrf(request: Request) -> None:
 
 
 def require_session_csrf(request: Request, context: AuthContext) -> None:
+    if context.is_delegated:
+        # A delegated bearer is an explicit proof-of-possession credential, not
+        # an ambient browser cookie.  Scope enforcement has already run in the
+        # permission dependency; still bind this write to the exact header that
+        # produced the context.
+        authorization = request.headers.get("authorization", "")
+        if not secrets.compare_digest(authorization, f"Bearer {context.session_raw}"):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "DELEGATED_CREDENTIAL_REJECTED", "message": "委托凭据无效"},
+            )
+        return
     ensure_allowed_origin(request)
     cookie = request.cookies.get(get_settings().csrf_cookie_name)
     header = request.headers.get("x-csrf-token")
@@ -107,7 +141,9 @@ def require_session_csrf(request: Request, context: AuthContext) -> None:
         raise HTTPException(
             status_code=403, detail={"code": "CSRF_REJECTED", "message": "CSRF 校验失败"}
         )
-    if not secrets.compare_digest(digest_secret(header), context.session.csrf_hash):
+    if context.session is None or not secrets.compare_digest(
+        digest_secret(header), context.session.csrf_hash
+    ):
         raise HTTPException(
             status_code=403, detail={"code": "CSRF_REJECTED", "message": "CSRF 校验失败"}
         )
@@ -243,7 +279,79 @@ def load_context(db: Session, request: Request) -> AuthContext:
     return AuthContext(user=user, session=session, session_raw=raw)
 
 
+def load_delegated_context(db: Session, request: Request) -> AuthContext:
+    authorization = request.headers.get("authorization", "")
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        raise HTTPException(
+            status_code=401, detail={"code": "AUTH_REQUIRED", "message": "请先登录"}
+        )
+    credential = authorization[len(prefix) :]
+    expected_length = len(DELEGATED_CREDENTIAL_PREFIX) + 64
+    if len(credential) != expected_length or not credential.startswith(DELEGATED_CREDENTIAL_PREFIX):
+        raise HTTPException(
+            status_code=401, detail={"code": "AUTH_REQUIRED", "message": "请先登录"}
+        )
+    delegated = db.scalar(
+        select(PortalDelegatedTestSession).where(
+            PortalDelegatedTestSession.token_hash == digest_secret(credential)
+        )
+    )
+    now = utcnow()
+    if delegated is None or delegated.revoked_at is not None:
+        raise HTTPException(
+            status_code=401, detail={"code": "AUTH_REQUIRED", "message": "请先登录"}
+        )
+    if ensure_utc(delegated.expires_at) <= now:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "DELEGATED_TEST_SESSION_EXPIRED", "message": "委托测试会话已过期"},
+        )
+    actor = db.get(PortalUser, delegated.actor_user_id)
+    effective_user = db.get(PortalUser, delegated.effective_user_id)
+    scopes = delegated.scopes
+    valid = (
+        actor is not None
+        and actor.account_state == "ACTIVE"
+        and highest_role(actor) == "platform_owner"
+        and effective_user is not None
+        and effective_user.account_state == "ACTIVE"
+        and role_names(effective_user) == ["user"]
+        and isinstance(scopes, list)
+        and bool(scopes)
+        and all(isinstance(scope, str) for scope in scopes)
+        and set(scopes).issubset(DELEGATED_TEST_SCOPES)
+    )
+    if not valid or actor is None or effective_user is None:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "DELEGATED_TEST_SESSION_INVALID", "message": "委托测试会话无效"},
+        )
+    delegated.last_seen_at = now
+    request.state.delegated_audit = {
+        "delegation_id": str(delegated.id),
+        "actor_user": actor.normalized_login,
+        "effective_user": effective_user.normalized_login,
+        "scopes": sorted(scopes),
+        "created_at": ensure_utc(delegated.created_at).isoformat(),
+        "expires_at": ensure_utc(delegated.expires_at).isoformat(),
+    }
+    db.commit()
+    return AuthContext(
+        user=effective_user,
+        session=None,
+        session_raw=credential,
+        actor_user=actor,
+        delegation=delegated,
+    )
+
+
 def require_recent_reauthentication(context: AuthContext) -> None:
+    if context.is_delegated or context.session is None:
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail={"code": "REAUTH_REQUIRED", "message": "高风险操作需要最近重新认证"},
+        )
     timestamp = context.session.reauthenticated_at
     if (
         timestamp is None

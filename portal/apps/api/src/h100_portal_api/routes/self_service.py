@@ -17,7 +17,7 @@ from h100_portal_api.auth import (
     user_agent,
 )
 from h100_portal_api.database import get_db
-from h100_portal_api.dependencies import permission_dependency
+from h100_portal_api.dependencies import permission_dependency, require_delegated_scope
 from h100_portal_api.enums import OperationStatus, RiskLevel
 from h100_portal_api.lease_service import (
     RenewalLeaseExpiredError,
@@ -90,17 +90,28 @@ def _audit(
     result: str = "SUCCESS",
     metadata: dict[str, Any] | None = None,
 ) -> None:
+    actor = context.actor
+    safe_metadata = dict(metadata or {})
+    if context.delegation is not None:
+        safe_metadata.update(
+            {
+                "delegation_id": str(context.delegation.id),
+                "actor_user": actor.normalized_login,
+                "effective_user": context.user.normalized_login,
+                "delegated_scopes": sorted(context.delegated_scopes),
+            }
+        )
     record_audit(
         db,
         event_type=event_type,
-        actor=context.user.normalized_login,
-        actor_role=highest_role(context.user),
+        actor=actor.normalized_login,
+        actor_role=highest_role(actor),
         source_ip=client_ip(request),
         user_agent=user_agent(request),
         object_type=object_type,
         object_id=object_id,
         result=result,
-        metadata=metadata,
+        metadata=safe_metadata,
     )
 
 
@@ -145,15 +156,24 @@ def _new_operation(
     idempotency_key: str,
     risk_level: RiskLevel = RiskLevel.MEDIUM,
 ) -> PortalOperation:
+    actor = context.actor
+    validated_payload = dict(payload)
+    if context.delegation is not None:
+        validated_payload["delegated_test_context"] = {
+            "delegation_id": str(context.delegation.id),
+            "actor_user": actor.normalized_login,
+            "effective_user": context.user.normalized_login,
+            "scopes": sorted(context.delegated_scopes),
+        }
     operation = PortalOperation(
         operation_type=operation_type,
         target_type=target_type,
         target_id=target_id,
-        requested_by=context.user.id,
+        requested_by=actor.id,
         owner_managed_user_id=owner_id,
-        approved_by=context.user.id,
+        approved_by=actor.id,
         request_summary=summary,
-        validated_payload=payload,
+        validated_payload=validated_payload,
         idempotency_key=idempotency_key,
         risk_level=risk_level,
         status=OperationStatus.RUNNING,
@@ -471,6 +491,8 @@ def _owned_terminal(
     *,
     require_active: bool,
 ) -> tuple[Any, TerminalRecord]:
+    if context.session is None:
+        raise _error(403, "DELEGATED_SCOPE_DENIED", "委托测试会话不能使用网页终端")
     managed = managed_identity_for_user(db, context.user)
     try:
         parsed = uuid.UUID(terminal_id)
@@ -515,6 +537,8 @@ def create_self_terminal(
     context: AuthContext = Depends(permission_dependency("self.container.terminal")),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    if context.session is None:
+        raise _error(403, "DELEGATED_SCOPE_DENIED", "委托测试会话不能使用网页终端")
     require_session_csrf(request, context)
     resources = resolve_self_compute_context(
         db,
@@ -753,7 +777,18 @@ def _refresh_job(context: AuthContext, resources: SelfResourceContext, job: Port
         return
     if result.get("status") != "OK" or result.get("slurm_user") != managed.unix_username:
         return
-    job.state = str(result.get("job_state", job.state)).split("+", 1)[0]
+    projected_state = str(result.get("job_state", job.state)).split("+", 1)[0].split(None, 1)[0]
+    if projected_state in {
+        "PENDING",
+        "RUNNING",
+        "COMPLETING",
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+        "TIMEOUT",
+        "OUT_OF_MEMORY",
+    }:
+        job.state = projected_state
     exit_code = result.get("exit_code")
     job.exit_code = str(exit_code)[:32] if exit_code else job.exit_code
     if job.state in {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY"}:
@@ -801,7 +836,7 @@ def submit_self_job(
     operation_key = f"self-job-submit:{managed.id}:{body.idempotency_key}"
     existing = db.scalar(
         select(PortalOperation).where(
-            PortalOperation.requested_by == context.user.id,
+            PortalOperation.requested_by == context.actor.id,
             PortalOperation.idempotency_key == operation_key,
         )
     )
@@ -962,7 +997,10 @@ def self_job_logs(
     context: AuthContext = Depends(permission_dependency("self.jobs.read")),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    require_delegated_scope(context, "self.jobs.logs.read")
     resources, job = _owned_job(db, context, job_id)
+    _refresh_job(context, resources, job)
+    db.commit()
     managed = resources.managed
     result = _worker(
         "self.job.logs.read",
@@ -992,6 +1030,21 @@ def cancel_self_job(
     require_session_csrf(request, context)
     resources, job = _owned_job(db, context, job_id, lock=True)
     managed = resources.managed
+    if context.delegation is not None:
+        operation = db.get(PortalOperation, job.operation_id)
+        delegated_context = (
+            operation.validated_payload.get("delegated_test_context")
+            if operation is not None and isinstance(operation.validated_payload, dict)
+            else None
+        )
+        if not isinstance(delegated_context, dict) or delegated_context.get("delegation_id") != str(
+            context.delegation.id
+        ):
+            raise _error(
+                403,
+                "DELEGATED_JOB_CANCEL_DENIED",
+                "委托测试会话只能取消自己创建的作业",
+            )
     if job.slurm_job_id is None:
         raise _error(409, "JOB_NOT_SUBMITTED", "作业尚未提交到Slurm")
     key = f"self-job-cancel:{job.id}:{body.idempotency_key}"

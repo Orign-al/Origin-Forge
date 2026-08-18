@@ -8,8 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from h100_portal_api.audit import record_audit
+from h100_portal_api.auth import client_ip, user_agent
 from h100_portal_api.config import get_settings
-from h100_portal_api.database import engine
+from h100_portal_api.database import SessionLocal, engine
 from h100_portal_api.routes import (
     activation,
     audit,
@@ -50,6 +52,31 @@ app.add_middleware(
 @app.middleware("http")
 async def security_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
     response = await call_next(request)
+    delegated = getattr(request.state, "delegated_audit", None)
+    if isinstance(delegated, dict):
+        try:
+            with SessionLocal() as db:
+                status_code = int(response.status_code)
+                record_audit(
+                    db,
+                    event_type="DELEGATED_TEST_REQUEST",
+                    actor=str(delegated["actor_user"]),
+                    actor_role="platform_owner",
+                    source_ip=client_ip(request),
+                    user_agent=user_agent(request),
+                    object_type="delegated_request",
+                    object_id=request.url.path,
+                    result="SUCCESS" if status_code < 400 else "DENIED",
+                    metadata={
+                        **delegated,
+                        "action": f"{request.method} {request.url.path}",
+                        "target": request.url.path,
+                        "status_code": status_code,
+                    },
+                )
+                db.commit()
+        except Exception:
+            LOG.exception("failed to persist delegated request audit")
     response.headers.setdefault("Cache-Control", "no-store")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")

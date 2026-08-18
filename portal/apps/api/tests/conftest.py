@@ -12,6 +12,7 @@ os.environ["PORTAL_SECRET_KEY"] = "test-secret-key-that-is-long-enough-for-hmac-
 os.environ["PORTAL_ALLOWED_ORIGINS"] = "http://127.0.0.1:18080"
 os.environ["PORTAL_ENVIRONMENT"] = "test"
 
+from h100_portal_api import main as main_module
 from h100_portal_api.auth import SlidingRateLimiter
 from h100_portal_api.database import Base, get_db
 from h100_portal_api.main import app
@@ -38,6 +39,7 @@ app.dependency_overrides[get_db] = override_db
 @pytest.fixture(autouse=True)
 def database(monkeypatch: pytest.MonkeyPatch) -> Generator[Session]:
     monkeypatch.setattr(auth_routes, "rate_limiter", SlidingRateLimiter())
+    monkeypatch.setattr(main_module, "SessionLocal", TestingSession)
     Base.metadata.drop_all(TEST_ENGINE)
     Base.metadata.create_all(TEST_ENGINE)
     with TestingSession() as session:

@@ -541,6 +541,7 @@ def setup_password(
 def me(
     context: AuthContext = Depends(auth_context), db: Session = Depends(get_db)
 ) -> dict[str, object]:
+    assert context.session is not None
     reauthenticated_at = context.session.reauthenticated_at
     recent_auth_valid_until = (
         ensure_utc(reauthenticated_at) + timedelta(minutes=get_settings().reauthentication_minutes)
@@ -582,6 +583,7 @@ def logout(
     db: Session = Depends(get_db),
     context: AuthContext = Depends(auth_context),
 ) -> None:
+    assert context.session is not None
     require_session_csrf(request, context)
     revoke_session(db, context.session)
     terminal_registry.close_for_portal_session(context.session.id)
@@ -606,6 +608,7 @@ def reauthenticate(
     db: Session = Depends(get_db),
     context: AuthContext = Depends(auth_context),
 ) -> dict[str, bool]:
+    assert context.session is not None
     require_session_csrf(request, context)
     credential = db.scalar(
         select(PortalPasswordCredential).where(PortalPasswordCredential.user_id == context.user.id)
@@ -694,6 +697,7 @@ def revoke_other_session(
     db: Session = Depends(get_db),
     context: AuthContext = Depends(auth_context),
 ) -> None:
+    assert context.session is not None
     require_session_csrf(request, context)
     try:
         import uuid
@@ -739,6 +743,7 @@ def revoke_other_sessions(
     db: Session = Depends(get_db),
     context: AuthContext = Depends(auth_context),
 ) -> dict[str, int]:
+    assert context.session is not None
     require_session_csrf(request, context)
     revoked = revoke_user_sessions(db, context.user.id, except_id=context.session.id)
     terminal_registry.close_for_user(context.user.id, except_session_id=context.session.id)

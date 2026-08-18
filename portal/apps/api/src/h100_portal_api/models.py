@@ -164,6 +164,35 @@ class PortalSession(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class PortalDelegatedTestSession(Base):
+    """Short-lived, scope-limited bearer delegation for controlled acceptance tests."""
+
+    __tablename__ = "portal_delegated_test_sessions"
+    __table_args__ = (
+        CheckConstraint(
+            "actor_user_id <> effective_user_id", name="ck_delegated_test_distinct_users"
+        ),
+        CheckConstraint("ttl_seconds BETWEEN 600 AND 900", name="ck_delegated_test_ttl"),
+        CheckConstraint("expires_at > created_at", name="ck_delegated_test_expiry_order"),
+        Index("ix_delegated_test_expiry", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    actor_user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("portal_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    effective_user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("portal_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    scopes: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    ttl_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class PortalOperation(Base):
     __tablename__ = "portal_operations"
     __table_args__ = (UniqueConstraint("requested_by", "idempotency_key"),)
