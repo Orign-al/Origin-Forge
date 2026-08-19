@@ -6,10 +6,12 @@ import { type FormEvent, useEffect, useState } from "react";
 
 import { Button, Card, Input } from "@h100-portal/ui";
 import { changePassword, me } from "../../lib/api";
+import { LanguageSwitcher, useI18n } from "../../lib/i18n";
 
 export default function RequiredPasswordChangePage() {
   const router = useRouter();
   const queryClient = useQueryClient();
+  const { t } = useI18n();
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmation, setConfirmation] = useState("");
@@ -50,13 +52,16 @@ export default function RequiredPasswordChangePage() {
   return (
     <div className="auth-page">
       <Card className="auth-panel">
+        <div className="auth-language-row">
+          <LanguageSwitcher />
+        </div>
         <div className="auth-brand">
-          <h1>首次登录修改密码</h1>
-          <p>设置自己的Portal密码后才能进入计算环境。</p>
+          <h1>{t("首次登录修改密码")}</h1>
+          <p>{t("设置自己的Portal密码后才能进入计算环境。")}</p>
         </div>
         <form onSubmit={submit}>
           <div className="form-field">
-            <label htmlFor="temporary-password">临时密码</label>
+            <label htmlFor="temporary-password">{t("临时密码")}</label>
             <Input
               id="temporary-password"
               type="password"
@@ -66,7 +71,7 @@ export default function RequiredPasswordChangePage() {
             />
           </div>
           <div className="form-field">
-            <label htmlFor="new-password">新Portal密码</label>
+            <label htmlFor="new-password">{t("新Portal密码")}</label>
             <Input
               id="new-password"
               type="password"
@@ -76,7 +81,7 @@ export default function RequiredPasswordChangePage() {
             />
           </div>
           <div className="form-field">
-            <label htmlFor="confirmation">再次输入</label>
+            <label htmlFor="confirmation">{t("再次输入")}</label>
             <Input
               id="confirmation"
               type="password"
@@ -87,17 +92,17 @@ export default function RequiredPasswordChangePage() {
           </div>
           {error ? (
             <div className="error-box" role="alert">
-              {error}
+              {t(error)}
             </div>
           ) : null}
           <div className="form-actions">
             <Button tone="primary" type="submit" disabled={busy}>
-              保存并进入我的环境
+              {t("保存并进入我的环境")}
             </Button>
           </div>
         </form>
         <div className="auth-foot">
-          此操作只修改Portal密码，不设置或解锁Linux密码。
+          {t("此操作只修改Portal密码，不设置或解锁Linux密码。")}
         </div>
       </Card>
     </div>

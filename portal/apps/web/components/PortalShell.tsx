@@ -12,6 +12,7 @@ import {
 } from "@h100-portal/config";
 import { Badge, Button } from "@h100-portal/ui";
 import { alerts, logout, me, recordPageAccess } from "../lib/api";
+import { LanguageSwitcher, useI18n } from "../lib/i18n";
 
 const ROLE_LABELS: Record<string, string> = {
   platform_owner: "平台所有者",
@@ -70,6 +71,7 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
   const queryClient = useQueryClient();
+  const { t } = useI18n();
   const [search, setSearch] = useState("");
   const current = useQuery({ queryKey: ["me"], queryFn: me, retry: false });
   const alertQuery = useQuery({
@@ -115,13 +117,13 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
   if (current.isPending)
     return (
       <div className="auth-page">
-        <div className="muted">正在验证会话…</div>
+        <div className="muted">{t("正在验证会话…")}</div>
       </div>
     );
   if (current.isError) {
     return (
       <div className="auth-page">
-        <div className="muted">正在跳转登录页…</div>
+        <div className="muted">{t("正在跳转登录页…")}</div>
       </div>
     );
   }
@@ -140,7 +142,7 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
     typeof alertData?.count === "number" ? alertData.count : "—";
   const searchResults = search.trim()
     ? activeNavigation.filter(([label]) =>
-        label.toLowerCase().includes(search.trim().toLowerCase()),
+        t(label).toLowerCase().includes(search.trim().toLowerCase()),
       )
     : [];
   async function signOut() {
@@ -155,13 +157,13 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
           <div className="brand-title">{PORTAL_TITLE}</div>
           <div className="brand-subtitle">
             {role === "user"
-              ? "个人计算环境 · Portal-5A-1B"
-              : "单机控制面 · Portal-5A-1B"}
+              ? t("个人计算环境 · Portal-5A-1B")
+              : t("单机控制面 · Portal-5A-1B")}
           </div>
         </div>
-        <nav className="nav-group" aria-label="主导航">
+        <nav className="nav-group" aria-label={t("主导航")}>
           <div className="nav-label">
-            {role === "user" ? "我的资源" : "平台"}
+            {role === "user" ? t("我的资源") : t("平台")}
           </div>
           {activeNavigation.map(([label, href]) => (
             <Link
@@ -169,7 +171,7 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
               href={href}
               className={`nav-link ${pathname === href ? "nav-link-active" : ""}`}
             >
-              {label}
+              {t(label)}
             </Link>
           ))}
         </nav>
@@ -177,22 +179,22 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
           {role === "user" ? (
             <>
               {user.resource_onboarding_state === "NOT_ENROLLED"
-                ? "计算资源未配置"
+                ? t("计算资源未配置")
                 : user.resource_onboarding_state === "STAGED"
-                  ? "等待 Container SSH 密钥"
-                  : "Host SSH 已禁用"}
+                  ? t("等待 Container SSH 密钥")
+                  : t("Host SSH 已禁用")}
               <br />
               {user.resource_onboarding_state === "NOT_ENROLLED"
-                ? "Portal Identity Only"
+                ? t("Portal Identity Only")
                 : user.resource_onboarding_state === "STAGED"
-                  ? "Container STOPPED · Lease 未开始"
-                  : "GPU 上限 1 · 租约受控"}
+                  ? t("Container STOPPED · Lease 未开始")
+                  : t("GPU 上限 1 · 租约受控")}
             </>
           ) : (
             <>
-              Production Pilot ACTIVE
+              {t("Production Pilot ACTIVE")}
               <br />
-              单节点 · 单受管用户
+              {t("单节点 · 单受管用户")}
             </>
           )}
         </div>
@@ -200,26 +202,26 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
       <div className="portal-main">
         <header className="topbar">
           <div className="topbar-left">
-            <span className="env-label">H100 单节点环境</span>
+            <span className="env-label">{t("H100 单节点环境")}</span>
             <span className="local-mode">{ACCESS_MODE_LABEL}</span>
           </div>
           <div className="topbar-search">
             <label htmlFor="global-search" className="sr-only">
-              全局模块搜索
+              {t("全局模块搜索")}
             </label>
             <input
               id="global-search"
               className="topbar-search-input"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder="搜索模块"
+              placeholder={t("搜索模块")}
               autoComplete="off"
             />
             {searchResults.length ? (
               <div className="topbar-search-results">
                 {searchResults.map(([label, href]) => (
                   <Link key={href} href={href} onClick={() => setSearch("")}>
-                    {label}
+                    {t(label)}
                   </Link>
                 ))}
               </div>
@@ -227,22 +229,25 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
           </div>
           <div className="topbar-right">
             {role !== "user" ? (
-              <span className="muted">节点：sagsh100server</span>
+              <span className="muted">
+                {t("节点：{node}", { node: "sagsh100server" })}
+              </span>
             ) : null}
             {role !== "user" ? (
               <span
                 className="alert-count"
-                aria-label={`当前告警 ${alertCount} 个`}
+                aria-label={t("当前告警 {count} 个", { count: alertCount })}
               >
-                告警 {alertCount}
+                {t("告警 {count}", { count: alertCount })}
               </span>
             ) : null}
+            <LanguageSwitcher compact />
             <Link className="user-chip" href="/account/security">
               <span className="avatar">O</span>
               {user.display_name}
-              <span className="muted">{ROLE_LABELS[role] ?? role}</span>
+              <span className="muted">{t(ROLE_LABELS[role] ?? role)}</span>
             </Link>
-            <Button onClick={signOut}>退出</Button>
+            <Button onClick={signOut}>{t("退出")}</Button>
           </div>
         </header>
         <main className="content">
@@ -251,15 +256,15 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
             <div className="onboarding-banner" role="status">
               <div>
                 <strong>
-                  完成 Container SSH 密钥设置后即可申请激活计算环境。
+                  {t("完成 Container SSH 密钥设置后即可申请激活计算环境。")}
                 </strong>
-                <span>Host SSH、容器访问与 Lease 仍保持关闭。</span>
+                <span>{t("Host SSH、容器访问与 Lease 仍保持关闭。")}</span>
               </div>
               <Link
                 className="ui-button ui-button-primary"
                 href={current.data.ssh_enrollment.setup_path}
               >
-                设置 SSH 密钥
+                {t("设置 SSH 密钥")}
               </Link>
             </div>
           ) : null}
@@ -279,13 +284,16 @@ export function PageHeading({
   description?: string;
   action?: React.ReactNode;
 }) {
+  const { t } = useI18n();
   return (
     <div className="page-heading">
       <div>
-        <div className="breadcrumb">平台 / {title}</div>
-        <h1>{title}</h1>
+        <div className="breadcrumb">
+          {t("平台")} / {t(title)}
+        </div>
+        <h1>{t(title)}</h1>
         {description ? (
-          <div className="page-description">{description}</div>
+          <div className="page-description">{t(description)}</div>
         ) : null}
       </div>
       {action ? <div className="heading-actions">{action}</div> : null}
@@ -294,9 +302,10 @@ export function PageHeading({
 }
 
 export function LoadingBlock() {
+  const { t } = useI18n();
   return (
     <div className="ui-card">
-      <div className="ui-empty">正在读取平台数据…</div>
+      <div className="ui-empty">{t("正在读取平台数据…")}</div>
     </div>
   );
 }
@@ -305,15 +314,18 @@ export function ErrorBlock({
 }: {
   message?: string;
 }) {
-  return <div className="error-box">{message}</div>;
+  const { t } = useI18n();
+  return <div className="error-box">{t(message)}</div>;
 }
 export function UnauthorizedBlock() {
-  return <div className="error-box">当前账号无权查看此模块。</div>;
+  const { t } = useI18n();
+  return <div className="error-box">{t("当前账号无权查看此模块。")}</div>;
 }
 export function StaleNotice() {
+  const { t } = useI18n();
   return (
     <div className="notice">
-      数据来自最近一次成功采样；当前 Worker 或数据源可能暂时不可用。
+      {t("数据来自最近一次成功采样；当前 Worker 或数据源可能暂时不可用。")}
     </div>
   );
 }
@@ -329,13 +341,14 @@ export function SectionCard({
   children: React.ReactNode;
   action?: React.ReactNode;
 }) {
+  const { t } = useI18n();
   return (
     <section className="ui-card section-card">
       <div className="section-card-header">
         <div>
-          <div className="section-card-title">{title}</div>
+          <div className="section-card-title">{t(title)}</div>
           {subtitle ? (
-            <div className="section-card-subtitle">{subtitle}</div>
+            <div className="section-card-subtitle">{t(subtitle)}</div>
           ) : null}
         </div>
         {action}
@@ -346,7 +359,11 @@ export function SectionCard({
 }
 
 export function RoleBadge({ role }: { role: string }) {
+  const { t } = useI18n();
   return (
-    <Badge label={role} tone={role === "platform_owner" ? "info" : "neutral"} />
+    <Badge
+      label={t(ROLE_LABELS[role] ?? role)}
+      tone={role === "platform_owner" ? "info" : "neutral"}
+    />
   );
 }

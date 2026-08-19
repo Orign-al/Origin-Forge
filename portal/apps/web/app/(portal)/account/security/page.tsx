@@ -16,9 +16,11 @@ import {
   revokeSession,
   sessions,
 } from "../../../../lib/api";
+import { useI18n } from "../../../../lib/i18n";
 
 export default function AccountSecurityPage() {
   const queryClient = useQueryClient();
+  const { t } = useI18n();
   const current = useQuery({ queryKey: ["me"], queryFn: me });
   const sessionQuery = useQuery({ queryKey: ["sessions"], queryFn: sessions });
   const [currentPassword, setCurrentPassword] = useState("");
@@ -45,7 +47,7 @@ export default function AccountSecurityPage() {
     event.preventDefault();
     setMessage(null);
     if (newPassword.length < 14 || newPassword !== confirmation) {
-      setMessage("新密码至少 14 个字符，且两次输入必须一致。");
+      setMessage(t("新密码至少 14 个字符，且两次输入必须一致。"));
       return;
     }
     setBusy(true);
@@ -58,10 +60,10 @@ export default function AccountSecurityPage() {
       setCurrentPassword("");
       setNewPassword("");
       setConfirmation("");
-      setMessage("网页密码已修改，其他会话已撤销，当前会话已旋转。");
+      setMessage(t("网页密码已修改，其他会话已撤销，当前会话已旋转。"));
       await queryClient.invalidateQueries({ queryKey: ["sessions"] });
     } catch {
-      setMessage("密码修改失败；未修改 Linux 或 SSH 密码。");
+      setMessage(t("密码修改失败；未修改 Linux 或 SSH 密码。"));
     } finally {
       setBusy(false);
     }
@@ -75,24 +77,24 @@ export default function AccountSecurityPage() {
       />
       <div className="section-grid">
         <Card className="detail-panel">
-          <h2>当前网页身份</h2>
+          <h2>{t("当前网页身份")}</h2>
           <dl className="kv-grid">
             <div className="kv">
-              <dt>登录名</dt>
+              <dt>{t("登录名")}</dt>
               <dd>{current.data.user.login_name}</dd>
             </div>
             <div className="kv">
-              <dt>角色</dt>
+              <dt>{t("角色")}</dt>
               <dd>{current.data.role}</dd>
             </div>
             <div className="kv">
-              <dt>账号</dt>
+              <dt>{t("账号")}</dt>
               <dd>
                 <StatusBadge value={current.data.user.account_state} />
               </dd>
             </div>
             <div className="kv">
-              <dt>计算身份</dt>
+              <dt>{t("计算身份")}</dt>
               <dd>
                 <StatusBadge
                   value={current.data.user.resource_onboarding_state}
@@ -101,14 +103,16 @@ export default function AccountSecurityPage() {
             </div>
           </dl>
           <div className="notice">
-            网页密码与 Linux shadow、SSH 密码和 authorized_keys 完全分离。
+            {t(
+              "网页密码与 Linux shadow、SSH 密码和 authorized_keys 完全分离。",
+            )}
           </div>
         </Card>
         <Card className="detail-panel">
-          <h2>修改网页密码</h2>
+          <h2>{t("修改网页密码")}</h2>
           <form onSubmit={submit}>
             <div className="form-field">
-              <label htmlFor="current-password">当前网页密码</label>
+              <label htmlFor="current-password">{t("当前网页密码")}</label>
               <Input
                 id="current-password"
                 type="password"
@@ -118,7 +122,7 @@ export default function AccountSecurityPage() {
               />
             </div>
             <div className="form-field">
-              <label htmlFor="new-password">新网页密码</label>
+              <label htmlFor="new-password">{t("新网页密码")}</label>
               <Input
                 id="new-password"
                 type="password"
@@ -128,7 +132,7 @@ export default function AccountSecurityPage() {
               />
             </div>
             <div className="form-field">
-              <label htmlFor="confirm-password">再次输入</label>
+              <label htmlFor="confirm-password">{t("再次输入")}</label>
               <Input
                 id="confirm-password"
                 type="password"
@@ -138,7 +142,7 @@ export default function AccountSecurityPage() {
               />
             </div>
             <Button tone="primary" type="submit" disabled={busy}>
-              保存网页密码
+              {t("保存网页密码")}
             </Button>
             {message ? (
               <div className="notice" role="status">
@@ -151,29 +155,31 @@ export default function AccountSecurityPage() {
       <Card className="detail-panel">
         <div className="section-card-header">
           <div>
-            <h2>活动会话</h2>
-            <div className="muted">空闲 30 分钟，绝对 12 小时</div>
+            <h2>{t("活动会话")}</h2>
+            <div className="muted">{t("空闲 30 分钟，绝对 12 小时")}</div>
           </div>
           <Button
             onClick={async () => {
               const result = await revokeOtherSessions();
-              setMessage(`已撤销 ${result.revoked} 个其他会话。`);
+              setMessage(
+                t("已撤销 {count} 个其他会话。", { count: result.revoked }),
+              );
               await queryClient.invalidateQueries({ queryKey: ["sessions"] });
             }}
           >
-            撤销其他会话
+            {t("撤销其他会话")}
           </Button>
         </div>
         <div className="ui-table-wrap">
           <table className="ui-table">
             <thead>
               <tr>
-                <th>创建时间</th>
-                <th>最近活动</th>
-                <th>来源</th>
-                <th>绝对到期</th>
-                <th>状态</th>
-                <th>操作</th>
+                <th>{t("创建时间")}</th>
+                <th>{t("最近活动")}</th>
+                <th>{t("来源")}</th>
+                <th>{t("绝对到期")}</th>
+                <th>{t("状态")}</th>
+                <th>{t("操作")}</th>
               </tr>
             </thead>
             <tbody>
@@ -198,7 +204,7 @@ export default function AccountSecurityPage() {
                         });
                       }}
                     >
-                      撤销
+                      {t("撤销")}
                     </Button>
                   </td>
                 </tr>

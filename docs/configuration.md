@@ -58,6 +58,22 @@ PORTAL_ALLOWED_ORIGINS=http://127.0.0.1:18080,http://10.10.10.220:18080,http://2
 `h100-portal-web.service` 的 `HOSTNAME=0.0.0.0` 配置；systemd `IPAddressAllow` 继续限制
 到批准的 EasyTier/VPN/管理网段。
 
+## Portal 界面语言
+
+Portal 支持 `zh-CN` 和 `en-US`。登录页及登录后的顶栏均提供语言选择器，默认语言为中文。
+浏览器选择后写入以下非敏感偏好 Cookie：
+
+```text
+origin_forge_locale=zh-CN | en-US
+```
+
+Cookie 固定为 `Path=/; Max-Age=31536000; SameSite=Lax`。当前内网 HTTP 部署不能设置
+`Secure`；该 Cookie 必须保持非 `HttpOnly`，因为客户端切换器需要更新它。它不包含账号、
+Session、token 或 CSRF 数据，服务端只接受上述两个固定值，其他值一律回退到 `zh-CN`。
+
+语言 Cookie 按访问主机隔离，因此 `10.10.10.220` 与 `20.10.10.3` 会分别记忆偏好。这不会
+影响两个入口的登录、Session 安全边界或同源 `/api/v1/*` 代理。
+
 ## 生成生产随机值
 
 在受控管理员终端生成随机值，并直接写入 root-owned 配置。以下命令只用于生成候选值，

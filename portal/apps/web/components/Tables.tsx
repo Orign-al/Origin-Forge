@@ -3,6 +3,7 @@
 import { tableFeatures, useTable, type ColumnDef } from "@tanstack/react-table";
 
 import { DataTable, EmptyState, StatusBadge } from "@h100-portal/ui";
+import { useI18n } from "../lib/i18n";
 
 export type SimpleRow = Record<string, unknown> & { id?: string };
 const SIMPLE_TABLE_FEATURES = tableFeatures({});
@@ -20,13 +21,14 @@ export function ObjectTable({
   columns: SimpleColumnDef[];
   empty?: string;
 }) {
+  const { t } = useI18n();
   const table = useTable({
     data: rows,
     columns,
     features: SIMPLE_TABLE_FEATURES,
   });
   if (rows.length === 0)
-    return <EmptyState title={empty} detail="数据源没有返回记录" />;
+    return <EmptyState title={t(empty)} detail={t("数据源没有返回记录")} />;
   return (
     <DataTable>
       <thead>
@@ -34,7 +36,10 @@ export function ObjectTable({
           <tr key={group.id}>
             {group.headers.map((header) => (
               <th key={header.id}>
-                {header.isPlaceholder ? null : (
+                {header.isPlaceholder ? null : typeof header.column.columnDef
+                    .header === "string" ? (
+                  t(header.column.columnDef.header)
+                ) : (
                   <table.FlexRender header={header} />
                 )}
               </th>

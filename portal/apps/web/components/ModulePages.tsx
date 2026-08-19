@@ -36,6 +36,7 @@ import {
   StaleNotice,
   UnauthorizedBlock,
 } from "./PortalShell";
+import { useI18n } from "../lib/i18n";
 
 type Row = Record<string, unknown>;
 
@@ -84,11 +85,12 @@ function Table({
   columns: Array<[string, string]>;
   empty?: string;
 }) {
+  const { t } = useI18n();
   if (!rows.length) {
     return (
       <EmptyState
-        title={empty}
-        detail="数据源没有返回记录；UNKNOWN 不会被折叠为正常"
+        title={t(empty)}
+        detail={t("数据源没有返回记录；UNKNOWN 不会被折叠为正常")}
       />
     );
   }
@@ -98,7 +100,7 @@ function Table({
         <thead>
           <tr>
             {columns.map(([key, label]) => (
-              <th key={key}>{label}</th>
+              <th key={key}>{t(label)}</th>
             ))}
           </tr>
         </thead>

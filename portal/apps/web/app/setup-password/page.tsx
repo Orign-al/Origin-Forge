@@ -13,6 +13,7 @@ import {
   getCsrf,
   setupPassword,
 } from "../../lib/api";
+import { LanguageSwitcher, useI18n, type Locale } from "../../lib/i18n";
 
 const schema = z
   .object({
@@ -37,8 +38,8 @@ type PasswordAction = {
 
 type LinkState = "LOADING" | "READY" | "EXPIRED" | "USED" | "INVALID";
 
-function localTime(value: string) {
-  return new Intl.DateTimeFormat("zh-CN", {
+function localTime(value: string, locale: Locale) {
+  return new Intl.DateTimeFormat(locale, {
     timeZone: "Asia/Shanghai",
     dateStyle: "medium",
     timeStyle: "short",
@@ -48,6 +49,7 @@ function localTime(value: string) {
 export default function SetupPasswordPage() {
   const router = useRouter();
   const queryClient = useQueryClient();
+  const { locale, t } = useI18n();
   const [action, setAction] = useState<PasswordAction | null>(null);
   const [linkState, setLinkState] = useState<LinkState>("LOADING");
   const [error, setError] = useState<string | null>(null);
@@ -120,39 +122,42 @@ export default function SetupPasswordPage() {
   return (
     <div className="auth-page">
       <Card className="auth-panel">
+        <div className="auth-language-row">
+          <LanguageSwitcher />
+        </div>
         {linkState === "LOADING" ? (
-          <div className="ui-empty">正在验证一次性链接…</div>
+          <div className="ui-empty">{t("正在验证一次性链接…")}</div>
         ) : linkState !== "READY" ? (
           <div className="auth-brand">
-            <span className="local-mode">一次性密码链接</span>
+            <span className="local-mode">{t("一次性密码链接")}</span>
             <h1>
               {linkState === "EXPIRED"
-                ? "链接已过期"
+                ? t("链接已过期")
                 : linkState === "USED"
-                  ? "链接已使用"
-                  : "链接无效"}
+                  ? t("链接已使用")
+                  : t("链接无效")}
             </h1>
-            <p>请联系管理员生成新的密码设置或重置链接。</p>
+            <p>{t("请联系管理员生成新的密码设置或重置链接。")}</p>
           </div>
         ) : resetComplete ? (
           <>
             <div className="auth-brand">
-              <span className="local-mode">密码重置完成</span>
-              <h1>使用新密码登录</h1>
-              <p>该账号的旧 Portal 会话已全部撤销，计算资源没有变化。</p>
+              <span className="local-mode">{t("密码重置完成")}</span>
+              <h1>{t("使用新密码登录")}</h1>
+              <p>{t("该账号的旧 Portal 会话已全部撤销，计算资源没有变化。")}</p>
             </div>
             <Button tone="primary" onClick={() => router.replace("/login")}>
-              返回登录
+              {t("返回登录")}
             </Button>
           </>
         ) : (
           <>
             <div className="auth-brand">
               <span className="local-mode">
-                {isReset ? "密码重置" : "账号邀请"}
+                {isReset ? t("密码重置") : t("账号邀请")}
               </span>
-              <h1>{isReset ? "重置你的登录密码" : "设置你的登录密码"}</h1>
-              <p>此链接只能使用一次。</p>
+              <h1>{isReset ? t("重置你的登录密码") : t("设置你的登录密码")}</h1>
+              <p>{t("此链接只能使用一次。")}</p>
             </div>
             <dl className="kv-grid compact-action-identity">
               <div className="kv">
@@ -160,13 +165,13 @@ export default function SetupPasswordPage() {
                 <dd>{action?.username}</dd>
               </div>
               <div className="kv">
-                <dt>有效至</dt>
-                <dd>{action ? localTime(action.expires_at) : "—"}</dd>
+                <dt>{t("有效至")}</dt>
+                <dd>{action ? localTime(action.expires_at, locale) : "—"}</dd>
               </div>
             </dl>
             <form onSubmit={handleSubmit(submit)} noValidate>
               <div className="form-field">
-                <label htmlFor="password">新密码</label>
+                <label htmlFor="password">{t("新密码")}</label>
                 <Input
                   id="password"
                   type="password"
@@ -174,14 +179,16 @@ export default function SetupPasswordPage() {
                   {...register("password")}
                 />
                 <div className="muted compact-help">
-                  14–128 个字符，可使用中文和 Unicode。
+                  {t("14–128 个字符，可使用中文和 Unicode。")}
                 </div>
                 {errors.password ? (
-                  <div className="form-error">{errors.password.message}</div>
+                  <div className="form-error">
+                    {t(errors.password.message ?? "密码不符合要求")}
+                  </div>
                 ) : null}
               </div>
               <div className="form-field">
-                <label htmlFor="confirmation">确认新密码</label>
+                <label htmlFor="confirmation">{t("确认新密码")}</label>
                 <Input
                   id="confirmation"
                   type="password"
@@ -190,24 +197,25 @@ export default function SetupPasswordPage() {
                 />
                 {errors.confirmation ? (
                   <div className="form-error">
-                    {errors.confirmation.message}
+                    {t(errors.confirmation.message ?? "两次输入的密码不一致")}
                   </div>
                 ) : null}
               </div>
               {error ? (
                 <div className="error-box" role="alert">
-                  {error}
+                  {t(error)}
                 </div>
               ) : null}
               <div className="form-actions">
                 <Button tone="primary" type="submit" disabled={isSubmitting}>
-                  {isSubmitting ? "保存中…" : "设置密码并继续"}
+                  {isSubmitting ? t("保存中…") : t("设置密码并继续")}
                 </Button>
               </div>
             </form>
             <div className="auth-foot">
-              该操作只修改 Portal 身份密码，不修改 Linux、SSH、Container、Lease
-              或其他计算资源。
+              {t(
+                "该操作只修改 Portal 身份密码，不修改 Linux、SSH、Container、Lease 或其他计算资源。",
+              )}
             </div>
           </>
         )}

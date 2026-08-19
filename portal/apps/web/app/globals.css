@@ -331,6 +331,29 @@ button {
   font-weight: 700;
   letter-spacing: 0.05em;
 }
+.language-switcher select {
+  min-height: 32px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: #fff;
+  color: var(--ink);
+  padding: 4px 26px 4px 9px;
+  font-size: 12px;
+}
+.language-switcher select:focus {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent-soft);
+}
+.language-switcher-compact select {
+  min-height: 28px;
+  background: #f9fafb;
+  padding-block: 2px;
+}
+.auth-language-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 14px;
+}
 .topbar-right {
   display: flex;
   align-items: center;

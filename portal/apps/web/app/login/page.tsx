@@ -9,6 +9,7 @@ import { z } from "zod";
 import { ACCESS_MODE_LABEL, PORTAL_TITLE } from "@h100-portal/config";
 import { Button, Card, Input } from "@h100-portal/ui";
 import { getCsrf, login } from "../../lib/api";
+import { LanguageSwitcher, useI18n } from "../../lib/i18n";
 
 const schema = z.object({
   username: z.string().min(1, "请输入登录名"),
@@ -19,6 +20,7 @@ type FormValues = z.infer<typeof schema>;
 export default function LoginPage() {
   const router = useRouter();
   const queryClient = useQueryClient();
+  const { t } = useI18n();
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
   const {
@@ -55,26 +57,29 @@ export default function LoginPage() {
   return (
     <div className="auth-page">
       <Card className="auth-panel">
+        <div className="auth-language-row">
+          <LanguageSwitcher />
+        </div>
         <div className="auth-brand">
           <span className="local-mode">{ACCESS_MODE_LABEL}</span>
           <h1>{PORTAL_TITLE}</h1>
-          <p>私有管理入口 · 请使用网页账号登录</p>
+          <p>{t("私有管理入口 · 请使用网页账号登录")}</p>
         </div>
         <form onSubmit={handleSubmit(submit)} noValidate>
           <div className="form-field">
-            <label htmlFor="username">登录名</label>
+            <label htmlFor="username">{t("登录名")}</label>
             <Input
               id="username"
               autoComplete="username"
-              placeholder="请输入登录名"
+              placeholder={t("请输入登录名")}
               {...register("username")}
             />
             {errors.username ? (
-              <div className="form-error">{errors.username.message}</div>
+              <div className="form-error">{t("请输入登录名")}</div>
             ) : null}
           </div>
           <div className="form-field">
-            <label htmlFor="password">网页密码</label>
+            <label htmlFor="password">{t("网页密码")}</label>
             <Input
               id="password"
               type="password"
@@ -82,12 +87,12 @@ export default function LoginPage() {
               {...register("password")}
             />
             {errors.password ? (
-              <div className="form-error">{errors.password.message}</div>
+              <div className="form-error">{t("请输入密码")}</div>
             ) : null}
           </div>
           {error ? (
             <div className="error-box" role="alert">
-              {error}
+              {t(error)}
             </div>
           ) : null}
           <div className="form-actions">
@@ -96,16 +101,16 @@ export default function LoginPage() {
               type="submit"
               disabled={!ready || isSubmitting}
             >
-              {isSubmitting ? "登录中…" : "登录"}
+              {isSubmitting ? t("登录中…") : t("登录")}
             </Button>
           </div>
         </form>
         <div className="auth-foot">
-          网页密码与 Linux/SSH
-          密码分离。当前入口仅绑定已批准的虚拟网络地址；Pilot
-          阶段由管理员接受内部 HTTP，未启用 TLS。
+          {t(
+            "网页密码与 Linux/SSH 密码分离。当前入口仅绑定已批准的虚拟网络地址；Pilot 阶段由管理员接受内部 HTTP，未启用 TLS。",
+          )}
           <br />
-          如已收到一次性设置或重置链接，请直接打开管理员交付的完整链接。
+          {t("如已收到一次性设置或重置链接，请直接打开管理员交付的完整链接。")}
         </div>
       </Card>
     </div>

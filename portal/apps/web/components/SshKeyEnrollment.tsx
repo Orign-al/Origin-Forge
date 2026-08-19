@@ -21,6 +21,7 @@ import {
   type ParsedSshPublicKey,
 } from "../lib/ssh-key";
 import { randomUuid } from "../lib/random-uuid";
+import { useI18n } from "../lib/i18n";
 
 type Scope = "HOST" | "CONTAINER" | "BOTH";
 type EnrollmentMode = "idle" | "generate" | "import";
@@ -45,6 +46,7 @@ function ScopeControl({
   onChange: (scope: Scope) => void;
   containerOnly?: boolean;
 }) {
+  const { t } = useI18n();
   const scopes: Scope[] = containerOnly
     ? ["CONTAINER"]
     : (Object.keys(SCOPE_LABELS) as Scope[]);
@@ -52,7 +54,7 @@ function ScopeControl({
     <div
       className="segmented-control"
       role="radiogroup"
-      aria-label="SSH Key 用途"
+      aria-label={t("SSH Key 用途")}
     >
       {scopes.map((scope) => (
         <label
@@ -66,7 +68,7 @@ function ScopeControl({
             checked={value === scope}
             onChange={() => onChange(scope)}
           />
-          {SCOPE_LABELS[scope]}
+          {t(SCOPE_LABELS[scope])}
         </label>
       ))}
     </div>
@@ -74,18 +76,19 @@ function ScopeControl({
 }
 
 function KeyTable({ keys }: { keys: SshKeyRecord[] }) {
+  const { locale, t } = useI18n();
   if (!keys.length) return null;
   return (
     <div className="ui-table-wrap ssh-key-table">
       <table className="ui-table">
         <thead>
           <tr>
-            <th>类型</th>
+            <th>{t("类型")}</th>
             <th>Fingerprint</th>
-            <th>注释</th>
-            <th>用途</th>
-            <th>状态</th>
-            <th>添加时间</th>
+            <th>{t("注释")}</th>
+            <th>{t("用途")}</th>
+            <th>{t("状态")}</th>
+            <th>{t("添加时间")}</th>
           </tr>
         </thead>
         <tbody>
@@ -94,11 +97,11 @@ function KeyTable({ keys }: { keys: SshKeyRecord[] }) {
               <td>{key.key_type.replace("ssh-", "").toUpperCase()}</td>
               <td className="mono">{key.fingerprint_sha256}</td>
               <td>{key.comment || "—"}</td>
-              <td>{SCOPE_LABELS[key.scope]}</td>
+              <td>{t(SCOPE_LABELS[key.scope])}</td>
               <td>
                 <StatusBadge value={keyStateLabel(key)} />
               </td>
-              <td>{new Date(key.created_at).toLocaleString("zh-CN")}</td>
+              <td>{new Date(key.created_at).toLocaleString(locale)}</td>
             </tr>
           ))}
         </tbody>
@@ -121,6 +124,7 @@ export function SshKeyEnrollment({
   containerOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
+  const { locale, t } = useI18n();
   const fileInput = useRef<HTMLInputElement>(null);
   const [mode, setMode] = useState<EnrollmentMode>("idle");
   const [scope, setScope] = useState<Scope>(
@@ -171,7 +175,9 @@ export function SshKeyEnrollment({
       setPrivateSaved(false);
     } catch (caught) {
       setError(
-        caught instanceof Error ? caught.message : "浏览器无法生成 SSH Key",
+        caught instanceof Error
+          ? t(caught.message)
+          : t("浏览器无法生成 SSH Key"),
       );
     }
   }
@@ -188,12 +194,12 @@ export function SshKeyEnrollment({
     setImportConfirmed(false);
     if (containsPrivateKeyMaterial(value)) {
       setImportText("");
-      setError("检测到私钥内容，已阻止导入。Portal 只接受 .pub 公钥。");
+      setError(t("检测到私钥内容，已阻止导入。Portal 只接受 .pub 公钥。"));
       return;
     }
     if (new TextEncoder().encode(value).length > 16 * 1024) {
       setImportText("");
-      setError("SSH 公钥内容超过 16KB 限制，已阻止导入。");
+      setError(t("SSH 公钥内容超过 16KB 限制，已阻止导入。"));
       return;
     }
     setImportText(value);
@@ -202,12 +208,12 @@ export function SshKeyEnrollment({
   async function uploadPublicFile(file: File | undefined) {
     if (!file) return;
     if (!file.name.toLowerCase().endsWith(".pub")) {
-      setError("仅支持 .pub 公钥文件；不要选择私钥文件。");
+      setError(t("仅支持 .pub 公钥文件；不要选择私钥文件。"));
       if (fileInput.current) fileInput.current.value = "";
       return;
     }
     if (file.size <= 0 || file.size > 16 * 1024) {
-      setError("公钥文件为空或超过 16KB 限制。");
+      setError(t("公钥文件为空或超过 16KB 限制。"));
       return;
     }
     acceptImportText(await file.text());
@@ -219,7 +225,9 @@ export function SshKeyEnrollment({
       setImported(parseOpenSshPublicKey(importText));
     } catch (caught) {
       setImported(null);
-      setError(caught instanceof Error ? caught.message : "SSH 公钥格式无效");
+      setError(
+        caught instanceof Error ? t(caught.message) : t("SSH 公钥格式无效"),
+      );
     }
   }
 
@@ -251,14 +259,14 @@ export function SshKeyEnrollment({
       setPrivateDownloaded(false);
       setMode("idle");
       setMessage(
-        "SSH 公钥已验证；私钥未发送到服务器，authorized_keys 尚未安装。",
+        t("SSH 公钥已验证；私钥未发送到服务器，authorized_keys 尚未安装。"),
       );
       await refreshAfterEnrollment();
     } catch (caught) {
       setError(
         caught instanceof ApiError
-          ? `${caught.code}：${caught.message}`
-          : "SSH 公钥登记失败",
+          ? `${caught.code}: ${t(caught.message)}`
+          : t("SSH 公钥登记失败"),
       );
     } finally {
       setBusy(false);
@@ -285,14 +293,14 @@ export function SshKeyEnrollment({
       setImportConfirmed(false);
       setMode("idle");
       setMessage(
-        "SSH 公钥已验证；平台没有接收私钥，authorized_keys 尚未安装。",
+        t("SSH 公钥已验证；平台没有接收私钥，authorized_keys 尚未安装。"),
       );
       await refreshAfterEnrollment();
     } catch (caught) {
       setError(
         caught instanceof ApiError
-          ? `${caught.code}：${caught.message}`
-          : "SSH 公钥登记失败",
+          ? `${caught.code}: ${t(caught.message)}`
+          : t("SSH 公钥登记失败"),
       );
     } finally {
       setBusy(false);
@@ -309,7 +317,7 @@ export function SshKeyEnrollment({
         idempotency_key: randomUuid(),
       });
       if (result.status === "ACTIVATING") {
-        setMessage("计算环境正在激活；Lease 尚未开始，请稍后刷新状态。");
+        setMessage(t("计算环境正在激活；Lease 尚未开始，请稍后刷新状态。"));
         await Promise.all([
           queryClient.invalidateQueries({ queryKey: ["me"] }),
           queryClient.invalidateQueries({ queryKey: ["self-environment"] }),
@@ -319,11 +327,10 @@ export function SshKeyEnrollment({
         return;
       }
       setMessage(
-        `计算环境已激活；Lease 从 ${new Date(
-          result.lease.starts_at,
-        ).toLocaleString(
-          "zh-CN",
-        )} 开始，到 ${new Date(result.lease.expires_at).toLocaleString("zh-CN")} 到期。`,
+        t("计算环境已激活；Lease 从 {starts} 开始，到 {expires} 到期。", {
+          starts: new Date(result.lease.starts_at).toLocaleString(locale),
+          expires: new Date(result.lease.expires_at).toLocaleString(locale),
+        }),
       );
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["ssh-keys", userId] }),
@@ -338,8 +345,8 @@ export function SshKeyEnrollment({
     } catch (caught) {
       setError(
         caught instanceof ApiError
-          ? `${caught.code}：${caught.message}`
-          : "计算环境激活失败；Lease 未开始",
+          ? `${caught.code}: ${t(caught.message)}`
+          : t("计算环境激活失败；Lease 未开始"),
       );
     } finally {
       setActivating(false);
@@ -351,43 +358,44 @@ export function SshKeyEnrollment({
     <div className="ssh-enrollment" data-testid="ssh-key-enrollment">
       <div className="detail-section-heading">
         <div>
-          <h2>SSH 密钥设置</h2>
+          <h2>{t("SSH 密钥设置")}</h2>
           <p className="muted">
-            服务器保存你的公钥。连接 SSH 时，请使用与该公钥匹配的私钥。
+            {t("服务器保存你的公钥。连接 SSH 时，请使用与该公钥匹配的私钥。")}
           </p>
         </div>
         {onClose ? (
           <Button
             type="button"
             onClick={onClose}
-            aria-label="关闭 SSH 密钥设置"
+            aria-label={t("关闭 SSH 密钥设置")}
           >
-            取消
+            {t("取消")}
           </Button>
         ) : null}
       </div>
 
       {containerOnly ? (
         <div className="security-strip">
-          <span>用途：仅开发容器</span>
-          <span>宿主 SSH：未启用</span>
-          <span>认证：SSH Public Key</span>
+          <span>{t("用途：仅开发容器")}</span>
+          <span>{t("宿主 SSH：未启用")}</span>
+          <span>{t("认证：SSH Public Key")}</span>
         </div>
       ) : (
-        <ol className="setup-stepper" aria-label="计算环境启用步骤">
+        <ol className="setup-stepper" aria-label={t("计算环境启用步骤")}>
           <li className={validKeys.length ? "step-complete" : "step-current"}>
-            1. SSH 密钥
+            {t("1. SSH 密钥")}
           </li>
-          <li>2. 确认资源</li>
-          <li>3. 等待激活</li>
-          <li>4. 连接环境</li>
+          <li>{t("2. 确认资源")}</li>
+          <li>{t("3. 等待激活")}</li>
+          <li>{t("4. 连接环境")}</li>
         </ol>
       )}
 
       {computeState === "STAGED" ? (
         <div className="notice staged-key-boundary">
-          当前 authorized_keys 为 ABSENT，Shell 为 /usr/sbin/nologin，开发容器为
-          STOPPED。 登记公钥不会自动 Activate。
+          {t(
+            "当前 authorized_keys 为 ABSENT，Shell 为 /usr/sbin/nologin，开发容器为 STOPPED。 登记公钥不会自动 Activate。",
+          )}
         </div>
       ) : null}
 
@@ -399,10 +407,10 @@ export function SshKeyEnrollment({
       ) : null}
 
       {keysQuery.isPending ? (
-        <div className="muted">正在读取 SSH Key 记录…</div>
+        <div className="muted">{t("正在读取 SSH Key 记录…")}</div>
       ) : null}
       {keysQuery.isError ? (
-        <div className="error-box">SSH Key 记录暂时不可用。</div>
+        <div className="error-box">{t("SSH Key 记录暂时不可用。")}</div>
       ) : null}
       <KeyTable keys={keys} />
 
@@ -410,24 +418,26 @@ export function SshKeyEnrollment({
         <div className="ssh-enrollment-empty">
           {!validKeys.length ? (
             <div>
-              <strong>使用 GPU 平台前，需要配置 SSH 密钥。</strong>
+              <strong>{t("使用 GPU 平台前，需要配置 SSH 密钥。")}</strong>
               <div className="muted">
-                你可以生成新的密钥，也可以导入已有公钥。
+                {t("你可以生成新的密钥，也可以导入已有公钥。")}
               </div>
             </div>
           ) : (
             <div>
               <strong>
                 {containerOnly && computeState === "ACTIVE"
-                  ? `${validKeys.length} 把公钥可用于开发容器`
-                  : `${validKeys.length} 把公钥已验证`}
+                  ? t("{count} 把公钥可用于开发容器", {
+                      count: validKeys.length,
+                    })
+                  : t("{count} 把公钥已验证", { count: validKeys.length })}
               </strong>
               <div className="muted">
                 {containerOnly && computeState === "ACTIVE"
-                  ? "新增密钥仍只授权自己的开发容器，不会启用宿主访问。"
+                  ? t("新增密钥仍只授权自己的开发容器，不会启用宿主访问。")
                   : containerOnly
-                    ? "公钥已就绪；激活成功后只会安装到自己的开发容器。"
-                    : "尚未安装。"}
+                    ? t("公钥已就绪；激活成功后只会安装到自己的开发容器。")
+                    : t("尚未安装。")}
               </div>
             </div>
           )}
@@ -437,20 +447,20 @@ export function SshKeyEnrollment({
               type="button"
               onClick={() => resetFlow("generate")}
             >
-              生成新密钥
+              {t("生成新密钥")}
             </Button>
             <Button type="button" onClick={() => resetFlow("import")}>
-              导入已有公钥
+              {t("导入已有公钥")}
             </Button>
           </div>
         </div>
       ) : null}
 
       {mode === "generate" ? (
-        <section className="enrollment-form" aria-label="生成新密钥">
-          <h3>生成新密钥</h3>
+        <section className="enrollment-form" aria-label={t("生成新密钥")}>
+          <h3>{t("生成新密钥")}</h3>
           <div className="form-field">
-            <label htmlFor="generated-key-comment">注释</label>
+            <label htmlFor="generated-key-comment">{t("注释")}</label>
             <Input
               id="generated-key-comment"
               value={comment}
@@ -459,7 +469,7 @@ export function SshKeyEnrollment({
             />
           </div>
           <div className="form-field">
-            <span className="field-label">用途</span>
+            <span className="field-label">{t("用途")}</span>
             <ScopeControl
               value={scope}
               onChange={setScope}
@@ -469,17 +479,17 @@ export function SshKeyEnrollment({
           {!generated ? (
             <div className="button-row">
               <Button tone="primary" type="button" onClick={generateKey}>
-                生成 ED25519 密钥
+                {t("生成 ED25519 密钥")}
               </Button>
               <Button type="button" onClick={() => resetFlow("idle")}>
-                取消
+                {t("取消")}
               </Button>
             </div>
           ) : (
             <div className="generated-key-confirmation">
               <dl className="kv-grid">
                 <div className="kv">
-                  <dt>类型</dt>
+                  <dt>{t("类型")}</dt>
                   <dd>ED25519</dd>
                 </div>
                 <div className="kv">
@@ -489,17 +499,18 @@ export function SshKeyEnrollment({
                   </dd>
                 </div>
                 <div className="kv">
-                  <dt>用途</dt>
-                  <dd>{SCOPE_LABELS[scope]}</dd>
+                  <dt>{t("用途")}</dt>
+                  <dd>{t(SCOPE_LABELS[scope])}</dd>
                 </div>
                 <div className="kv">
-                  <dt>私钥存储</dt>
-                  <dd>仅浏览器内存</dd>
+                  <dt>{t("私钥存储")}</dt>
+                  <dd>{t("仅浏览器内存")}</dd>
                 </div>
               </dl>
               <div className="notice">
-                私钥只在本次设置流程中提供下载。平台不会保存你的私钥；如果丢失，需要重新添加新的
-                SSH Key。
+                {t(
+                  "私钥只在本次设置流程中提供下载。平台不会保存你的私钥；如果丢失，需要重新添加新的 SSH Key。",
+                )}
               </div>
               <div className="button-row">
                 <Button
@@ -507,7 +518,7 @@ export function SshKeyEnrollment({
                   type="button"
                   onClick={downloadPrivateKey}
                 >
-                  下载私钥
+                  {t("下载私钥")}
                 </Button>
                 <Button
                   type="button"
@@ -519,19 +530,19 @@ export function SshKeyEnrollment({
                     )
                   }
                 >
-                  下载公钥
+                  {t("下载公钥")}
                 </Button>
                 <Button
                   type="button"
                   onClick={() => void copyText(generated.publicKey)}
                 >
-                  复制公钥
+                  {t("复制公钥")}
                 </Button>
                 <Button
                   type="button"
                   onClick={() => void copyText(generated.fingerprintSha256)}
                 >
-                  复制 Fingerprint
+                  {t("复制 Fingerprint")}
                 </Button>
               </div>
               <label className="confirmation-check">
@@ -541,16 +552,16 @@ export function SshKeyEnrollment({
                   disabled={!privateDownloaded}
                   onChange={(event) => setPrivateSaved(event.target.checked)}
                 />
-                我已经保存私钥
+                {t("我已经保存私钥")}
               </label>
               {!privateDownloaded ? (
-                <div className="muted">请先下载私钥，之后才能继续。</div>
+                <div className="muted">{t("请先下载私钥，之后才能继续。")}</div>
               ) : null}
               <div className="notice local-passphrase-note">
-                当前版本生成标准 OpenSSH 未加密私钥。保存后可在本机运行
-                ssh-keygen -p -f
-                {` ${generated.privateFileName}`}{" "}
-                添加本地保护密码；密码不会发送到 Portal。
+                {t(
+                  "当前版本生成标准 OpenSSH 未加密私钥。保存后可在本机运行 ssh-keygen -p -f {file} 添加本地保护密码；密码不会发送到 Portal。",
+                  { file: generated.privateFileName },
+                )}
               </div>
               <div className="button-row">
                 <Button
@@ -559,14 +570,14 @@ export function SshKeyEnrollment({
                   disabled={!privateSaved || busy}
                   onClick={() => void enrollGenerated()}
                 >
-                  继续
+                  {t("继续")}
                 </Button>
                 <Button
                   type="button"
                   disabled={busy}
                   onClick={() => resetFlow("idle")}
                 >
-                  取消
+                  {t("取消")}
                 </Button>
               </div>
             </div>
@@ -575,13 +586,13 @@ export function SshKeyEnrollment({
       ) : null}
 
       {mode === "import" ? (
-        <section className="enrollment-form" aria-label="导入已有公钥">
-          <h3>导入已有公钥</h3>
+        <section className="enrollment-form" aria-label={t("导入已有公钥")}>
+          <h3>{t("导入已有公钥")}</h3>
           <div className="notice">
-            仅支持 SSH 公钥（.pub）。不要上传没有 .pub 后缀的私钥文件。
+            {t("仅支持 SSH 公钥（.pub）。不要上传没有 .pub 后缀的私钥文件。")}
           </div>
           <div className="form-field">
-            <label htmlFor="public-key-upload">上传 .pub 文件</label>
+            <label htmlFor="public-key-upload">{t("上传 .pub 文件")}</label>
             <input
               ref={fileInput}
               id="public-key-upload"
@@ -594,7 +605,7 @@ export function SshKeyEnrollment({
             />
           </div>
           <div className="form-field">
-            <label htmlFor="public-key-paste">或粘贴 .pub 内容</label>
+            <label htmlFor="public-key-paste">{t("或粘贴 .pub 内容")}</label>
             <textarea
               id="public-key-paste"
               className="ui-textarea mono"
@@ -606,7 +617,7 @@ export function SshKeyEnrollment({
             />
           </div>
           <div className="form-field">
-            <label htmlFor="imported-key-comment">注释</label>
+            <label htmlFor="imported-key-comment">{t("注释")}</label>
             <Input
               id="imported-key-comment"
               value={comment}
@@ -615,7 +626,7 @@ export function SshKeyEnrollment({
             />
           </div>
           <div className="form-field">
-            <span className="field-label">用途</span>
+            <span className="field-label">{t("用途")}</span>
             <ScopeControl
               value={scope}
               onChange={setScope}
@@ -630,17 +641,17 @@ export function SshKeyEnrollment({
                 onClick={previewImport}
                 disabled={!importText}
               >
-                校验公钥
+                {t("校验公钥")}
               </Button>
               <Button type="button" onClick={() => resetFlow("idle")}>
-                取消
+                {t("取消")}
               </Button>
             </div>
           ) : (
             <div className="generated-key-confirmation">
               <dl className="kv-grid">
                 <div className="kv">
-                  <dt>类型</dt>
+                  <dt>{t("类型")}</dt>
                   <dd>{imported.keyType}</dd>
                 </div>
                 <div className="kv">
@@ -650,12 +661,12 @@ export function SshKeyEnrollment({
                   </dd>
                 </div>
                 <div className="kv">
-                  <dt>用途</dt>
-                  <dd>{SCOPE_LABELS[scope]}</dd>
+                  <dt>{t("用途")}</dt>
+                  <dd>{t(SCOPE_LABELS[scope])}</dd>
                 </div>
                 <div className="kv">
-                  <dt>私钥</dt>
-                  <dd>未接收</dd>
+                  <dt>{t("私钥")}</dt>
+                  <dd>{t("未接收")}</dd>
                 </div>
               </dl>
               <label className="confirmation-check">
@@ -664,7 +675,7 @@ export function SshKeyEnrollment({
                   checked={importConfirmed}
                   onChange={(event) => setImportConfirmed(event.target.checked)}
                 />
-                我确认这是与我持有的私钥匹配的 SSH 公钥
+                {t("我确认这是与我持有的私钥匹配的 SSH 公钥")}
               </label>
               <div className="button-row">
                 <Button
@@ -673,14 +684,14 @@ export function SshKeyEnrollment({
                   disabled={!importConfirmed || busy}
                   onClick={() => void enrollImported()}
                 >
-                  继续
+                  {t("继续")}
                 </Button>
                 <Button
                   type="button"
                   disabled={busy}
                   onClick={() => resetFlow("idle")}
                 >
-                  取消
+                  {t("取消")}
                 </Button>
               </div>
             </div>
@@ -693,10 +704,11 @@ export function SshKeyEnrollment({
       computeState === "STAGED" ? (
         <section className="activate-compute" data-testid="self-activation">
           <div>
-            <h3>激活计算环境</h3>
+            <h3>{t("激活计算环境")}</h3>
             <p className="muted">
-              后端将自动完成安全预检、安装容器公钥、启动并验证开发容器；Lease
-              只在全部成功后开始。
+              {t(
+                "后端将自动完成安全预检、安装容器公钥、启动并验证开发容器；Lease 只在全部成功后开始。",
+              )}
             </p>
             <dl className="kv-grid">
               <div className="kv">
@@ -723,7 +735,7 @@ export function SshKeyEnrollment({
             disabled={busy}
             onClick={() => void activateEnvironment()}
           >
-            {activating ? "正在激活…" : "激活计算环境"}
+            {activating ? t("正在激活…") : t("激活计算环境")}
           </Button>
         </section>
       ) : null}

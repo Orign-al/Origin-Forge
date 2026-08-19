@@ -28,6 +28,7 @@ import {
 } from "../lib/api";
 import { copyText } from "../lib/ssh-key";
 import { randomUuid } from "../lib/random-uuid";
+import { useI18n, type Locale } from "../lib/i18n";
 import { SshKeyEnrollment } from "./SshKeyEnrollment";
 import {
   ErrorBlock,
@@ -44,25 +45,29 @@ echo "hello from Slurm"
 whoami
 id`;
 
-function localTime(value?: string) {
+type Translate = ReturnType<typeof useI18n>["t"];
+
+function localTime(value: string | undefined, locale: Locale) {
   if (!value) return "—";
-  return new Intl.DateTimeFormat("zh-CN", {
+  return new Intl.DateTimeFormat(locale, {
     timeZone: "Asia/Shanghai",
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(value));
 }
 
-function remaining(value = 0) {
-  if (value <= 0) return "已到期";
+function remaining(value: number | undefined, t: Translate) {
+  if (!value || value <= 0) return t("已到期");
   const days = Math.floor(value / 86400);
   const hours = Math.floor((value % 86400) / 3600);
   const minutes = Math.floor((value % 3600) / 60);
-  return days ? `${days}天 ${hours}小时` : `${hours}小时 ${minutes}分`;
+  return days
+    ? t("{days}天 {hours}小时", { days, hours })
+    : t("{hours}小时 {minutes}分", { hours, minutes });
 }
 
-function bytes(value: number | null | undefined) {
-  if (value === null || value === undefined) return "正在计算";
+function bytes(value: number | null | undefined, t: Translate) {
+  if (value === null || value === undefined) return t("正在计算");
   const units = ["B", "KB", "MB", "GB", "TB"];
   let next = value;
   let unit = 0;
@@ -73,20 +78,21 @@ function bytes(value: number | null | undefined) {
   return `${next.toFixed(unit > 2 ? 1 : 0)} ${units[unit]}`;
 }
 
-function jobErrorMessage(error: unknown) {
+function jobErrorMessage(error: unknown, t: Translate) {
   if (
     error instanceof ApiError &&
     ["RESOURCE_OWNERSHIP_REJECTED", "SELF_COMPUTE_CONTEXT_INVALID"].includes(
       error.code,
     )
   ) {
-    return "无法确认当前计算环境，请联系管理员。";
+    return t("无法确认当前计算环境，请联系管理员。");
   }
-  return error instanceof ApiError ? error.message : "作业提交失败";
+  return error instanceof ApiError ? t(error.message) : t("作业提交失败");
 }
 
 export function OrdinaryUnprovisionedDashboard({ user }: { user: User }) {
   const queryClient = useQueryClient();
+  const { t } = useI18n();
   const query = useQuery({
     queryKey: ["self-compute-request"],
     queryFn: selfComputeRequest,
@@ -113,29 +119,31 @@ export function OrdinaryUnprovisionedDashboard({ user }: { user: User }) {
   const provisioning = computeRequest?.status === "PROVISIONING";
   const failed = computeRequest?.status === "FAILED";
   const environmentLabel = pending
-    ? "审批中"
+    ? t("审批中")
     : approved
-      ? "已批准，等待创建"
+      ? t("已批准，等待创建")
       : failed
-        ? "创建失败，管理员处理中"
-        : "尚未申请";
+        ? t("创建失败，管理员处理中")
+        : t("尚未申请");
   return (
     <>
       <PageHeading
         title="我的环境"
-        description={`Portal 账号已激活，计算环境${environmentLabel}`}
+        description={t("Portal 账号已激活，计算环境{state}", {
+          state: environmentLabel,
+        })}
         action={<StatusBadge value="NOT PROVISIONED" />}
       />
       <div className="grid-compact ordinary-stats">
         <Card className="stat-panel">
-          <div className="stat-label">账号</div>
+          <div className="stat-label">{t("账号")}</div>
           <div className="stat-value compact-stat">
             <StatusBadge value={user.account_state} />
           </div>
-          <div className="stat-detail">Portal 登录身份已建立</div>
+          <div className="stat-detail">{t("Portal 登录身份已建立")}</div>
         </Card>
         <Card className="stat-panel">
-          <div className="stat-label">计算环境</div>
+          <div className="stat-label">{t("计算环境")}</div>
           <div className="stat-value compact-stat">
             <StatusBadge
               value={
@@ -152,18 +160,20 @@ export function OrdinaryUnprovisionedDashboard({ user }: { user: User }) {
           <div className="stat-detail">
             {approved
               ? provisioning
-                ? "管理员正在执行受控 Stage；Lease 尚未开始"
-                : "资源尚未执行 Provision，Lease 尚未开始"
+                ? t("管理员正在执行受控 Stage；Lease 尚未开始")
+                : t("资源尚未执行 Provision，Lease 尚未开始")
               : pending
-                ? "等待管理员审批，尚未创建任何资源"
+                ? t("等待管理员审批，尚未创建任何资源")
                 : failed
-                  ? "创建失败；原申请保留，Lease 未启动"
-                  : "尚未创建 Linux、Container 或 Lease"}
+                  ? t("创建失败；原申请保留，Lease 未启动")
+                  : t("尚未创建 Linux、Container 或 Lease")}
           </div>
         </Card>
       </div>
       {query.isError ? (
-        <ErrorBlock message="计算资源申请状态暂时不可用；未将其显示为未申请。" />
+        <ErrorBlock
+          message={t("计算资源申请状态暂时不可用；未将其显示为未申请。")}
+        />
       ) : null}
       <div className="section-grid">
         <SectionCard
@@ -173,22 +183,26 @@ export function OrdinaryUnprovisionedDashboard({ user }: { user: User }) {
           {pending && computeRequest ? (
             <>
               <p>
-                状态：等待管理员审批 · GPU {computeRequest.requested_gpu_max} ·
-                Storage 300GB · Lease 4天
+                {t(
+                  "状态：等待管理员审批 · GPU {gpu} · Storage 300GB · Lease 4天",
+                  {
+                    gpu: computeRequest.requested_gpu_max,
+                  },
+                )}
               </p>
               <div className="button-row">
                 <Link
                   className="ui-button ui-button-primary"
                   href="/compute-request"
                 >
-                  查看申请
+                  {t("查看申请")}
                 </Link>
                 {computeRequest.status === "REQUESTED" ? (
                   <Button
                     disabled={cancel.isPending}
                     onClick={() => cancel.mutate(computeRequest.id)}
                   >
-                    撤回申请
+                    {t("撤回申请")}
                   </Button>
                 ) : null}
               </div>
@@ -197,72 +211,79 @@ export function OrdinaryUnprovisionedDashboard({ user }: { user: User }) {
             <>
               <div className="notice">
                 {computeRequest.user_status_message ??
-                  "计算环境创建失败，平台管理员正在处理。你的申请仍被保留，无需重新提交。"}
+                  t(
+                    "计算环境创建失败，平台管理员正在处理。你的申请仍被保留，无需重新提交。",
+                  )}
               </div>
               <Link
                 className="ui-button ui-button-primary"
                 href="/compute-request"
               >
-                查看处理状态
+                {t("查看处理状态")}
               </Link>
             </>
           ) : approved && computeRequest ? (
             <>
               <p>
                 {provisioning
-                  ? "申请已批准，受控 Stage 正在进行。Lease 仍未启动。"
-                  : "申请已批准，正在等待创建。当前仍没有 Container、Quota、Slurm Association 或 Lease。"}
+                  ? t("申请已批准，受控 Stage 正在进行。Lease 仍未启动。")
+                  : t(
+                      "申请已批准，正在等待创建。当前仍没有 Container、Quota、Slurm Association 或 Lease。",
+                    )}
               </p>
               <Link
                 className="ui-button ui-button-primary"
                 href="/compute-request"
               >
-                查看批准状态
+                {t("查看批准状态")}
               </Link>
             </>
           ) : (
             <>
               {computeRequest?.status === "REJECTED" ? (
                 <div className="notice">
-                  上次申请未通过：{computeRequest.review_note ?? "未提供原因"}
+                  {t("上次申请未通过：{reason}", {
+                    reason: computeRequest.review_note ?? t("未提供原因"),
+                  })}
                 </div>
               ) : null}
               <p>
-                申请标准开发环境；提交申请不会自动创建服务器资源，也不会开始
-                Lease。
+                {t(
+                  "申请标准开发环境；提交申请不会自动创建服务器资源，也不会开始 Lease。",
+                )}
               </p>
               <Link
                 className="ui-button ui-button-primary"
                 href="/compute-request"
               >
-                申请计算资源
+                {t("申请计算资源")}
               </Link>
             </>
           )}
           {cancel.isError ? (
             <div className="form-error">
               {cancel.error instanceof ApiError
-                ? cancel.error.message
-                : "申请未能撤回"}
+                ? t(cancel.error.message)
+                : t("申请未能撤回")}
             </div>
           ) : null}
         </SectionCard>
         <SectionCard title="设置SSH密钥" subtitle="用于未来自己的开发容器">
-          <p>计算身份获批后，可登记 SSH 公钥；平台不会要求上传私钥。</p>
+          <p>{t("计算身份获批后，可登记 SSH 公钥；平台不会要求上传私钥。")}</p>
           <Link className="ui-button" href="/ssh-keys">
-            设置SSH密钥
+            {t("设置SSH密钥")}
           </Link>
         </SectionCard>
       </div>
       <div className="section-grid">
         <SectionCard title="账号与安全">
           <Link className="table-link" href="/account/security">
-            修改 Portal 密码与管理会话
+            {t("修改 Portal 密码与管理会话")}
           </Link>
         </SectionCard>
         <SectionCard title="帮助">
           <Link className="table-link" href="/help">
-            查看开户与资源申请说明
+            {t("查看开户与资源申请说明")}
           </Link>
         </SectionCard>
       </div>
@@ -271,6 +292,7 @@ export function OrdinaryUnprovisionedDashboard({ user }: { user: User }) {
 }
 
 export function OrdinaryStagedDashboard({ user }: { user: User }) {
+  const { t } = useI18n();
   return (
     <>
       <PageHeading
@@ -280,25 +302,25 @@ export function OrdinaryStagedDashboard({ user }: { user: User }) {
       />
       <div className="grid-compact ordinary-stats">
         <Card className="stat-panel">
-          <div className="stat-label">Portal 账号</div>
+          <div className="stat-label">{t("Portal 账号")}</div>
           <div className="stat-value compact-stat">
             <StatusBadge value={user.account_state} />
           </div>
-          <div className="stat-detail">登录身份保持 ACTIVE</div>
+          <div className="stat-detail">{t("登录身份保持 ACTIVE")}</div>
         </Card>
         <Card className="stat-panel">
-          <div className="stat-label">计算环境</div>
+          <div className="stat-label">{t("计算环境")}</div>
           <div className="stat-value compact-stat">
             <StatusBadge value="STAGED" />
           </div>
-          <div className="stat-detail">Container 已创建但保持停止</div>
+          <div className="stat-detail">{t("Container 已创建但保持停止")}</div>
         </Card>
         <Card className="stat-panel">
           <div className="stat-label">Lease</div>
           <div className="stat-value compact-stat">
             <StatusBadge value="NOT STARTED" />
           </div>
-          <div className="stat-detail">96小时倒计时尚未启动</div>
+          <div className="stat-detail">{t("96小时倒计时尚未启动")}</div>
         </Card>
       </div>
       <SectionCard
@@ -306,15 +328,16 @@ export function OrdinaryStagedDashboard({ user }: { user: User }) {
         subtitle="Scope 固定为 CONTAINER；私钥只保存在你的电脑"
       >
         <p>
-          计算资源已经安全 Stage。登记你自己的 ED25519
-          公钥后，管理员才能在下一阶段激活环境。
+          {t(
+            "计算资源已经安全 Stage。登记你自己的 ED25519 公钥后，管理员才能在下一阶段激活环境。",
+          )}
         </p>
         <Link className="ui-button ui-button-primary" href="/ssh-keys">
-          设置 SSH 密钥
+          {t("设置 SSH 密钥")}
         </Link>
       </SectionCard>
       <div className="notice">
-        当前不能启动容器、打开网页终端或提交作业；Host SSH 始终禁用。
+        {t("当前不能启动容器、打开网页终端或提交作业；Host SSH 始终禁用。")}
       </div>
     </>
   );
@@ -322,6 +345,7 @@ export function OrdinaryStagedDashboard({ user }: { user: User }) {
 
 function LeaseAction({ lease }: { lease: ComputeLease }) {
   const queryClient = useQueryClient();
+  const { t } = useI18n();
   const mutation = useMutation({
     mutationFn: () =>
       requestLeaseRenewal({
@@ -335,12 +359,12 @@ function LeaseAction({ lease }: { lease: ComputeLease }) {
   if (!lease.active) {
     return (
       <Link className="ui-button ui-button-primary" href="/recycle-bin">
-        申请恢复
+        {t("申请恢复")}
       </Link>
     );
   }
   if (lease.pending_renewal_id) {
-    return <StatusBadge value="续期申请待审批" />;
+    return <StatusBadge value={t("续期申请待审批")} />;
   }
   return (
     <div>
@@ -349,16 +373,18 @@ function LeaseAction({ lease }: { lease: ComputeLease }) {
         disabled={!lease.renewal_available || mutation.isPending}
         onClick={() => mutation.mutate()}
       >
-        申请续期
+        {t("申请续期")}
       </Button>
       {!lease.renewal_available ? (
-        <div className="muted compact-help">将在到期前24小时开放续期</div>
+        <div className="muted compact-help">
+          {t("将在到期前24小时开放续期")}
+        </div>
       ) : null}
       {mutation.isError ? (
         <div className="form-error">
           {mutation.error instanceof ApiError
-            ? mutation.error.message
-            : "续期申请未提交"}
+            ? t(mutation.error.message)
+            : t("续期申请未提交")}
         </div>
       ) : null}
     </div>
@@ -366,6 +392,7 @@ function LeaseAction({ lease }: { lease: ComputeLease }) {
 }
 
 export function OrdinaryDashboard() {
+  const { locale, t } = useI18n();
   const query = useQuery({
     queryKey: ["self-environment"],
     queryFn: selfEnvironment,
@@ -377,7 +404,8 @@ export function OrdinaryDashboard() {
     refetchInterval: 60_000,
   });
   if (query.isPending) return <LoadingBlock />;
-  if (query.isError) return <ErrorBlock message="计算环境状态暂时不可用。" />;
+  if (query.isError)
+    return <ErrorBlock message={t("计算环境状态暂时不可用。")} />;
   const environment = query.data.environment;
   const lease = environment.lease;
   const warning = lease.active && (lease.remaining_seconds ?? 0) <= 86400;
@@ -397,59 +425,71 @@ export function OrdinaryDashboard() {
       <section className={leaseClass}>
         <div>
           <div className="stat-label">
-            {lease.active ? "当前计算资源有效至" : "计算资源已于以下时间到期"}
+            {lease.active
+              ? t("当前计算资源有效至")
+              : t("计算资源已于以下时间到期")}
           </div>
-          <div className="lease-expiry">{localTime(lease.expires_at)}</div>
+          <div className="lease-expiry">
+            {localTime(lease.expires_at, locale)}
+          </div>
           <div className="muted">
-            剩余 {remaining(lease.remaining_seconds)} · 每次最多续期4天
+            {t("剩余 {remaining} · 每次最多续期4天", {
+              remaining: remaining(lease.remaining_seconds, t),
+            })}
           </div>
         </div>
         <LeaseAction lease={lease} />
       </section>
       <div className="grid-compact ordinary-stats">
         <Card className="stat-panel">
-          <div className="stat-label">计算环境</div>
+          <div className="stat-label">{t("计算环境")}</div>
           <div className="stat-value compact-stat">
             <StatusBadge value={environment.state} />
           </div>
-          <div className="stat-detail">Host SSH 已按普通用户策略关闭</div>
+          <div className="stat-detail">
+            {t("Host SSH 已按普通用户策略关闭")}
+          </div>
         </Card>
         <Card className="stat-panel">
-          <div className="stat-label">开发容器</div>
+          <div className="stat-label">{t("开发容器")}</div>
           <div className="stat-value compact-stat">
             <StatusBadge value={environment.container.state} />
           </div>
-          <div className="stat-detail">用于开发，不直接提供GPU</div>
+          <div className="stat-detail">{t("用于开发，不直接提供GPU")}</div>
         </Card>
         <Card className="stat-panel">
-          <div className="stat-label">GPU任务上限</div>
+          <div className="stat-label">{t("GPU任务上限")}</div>
           <div className="stat-value">{environment.gpu_max}</div>
-          <div className="stat-detail">通过作业页面提交</div>
+          <div className="stat-detail">{t("通过作业页面提交")}</div>
         </Card>
         <Card className="stat-panel">
-          <div className="stat-label">可用空间</div>
-          <div className="stat-value small-value">{bytes(available)}</div>
+          <div className="stat-label">{t("可用空间")}</div>
+          <div className="stat-value small-value">{bytes(available, t)}</div>
           <div className="stat-detail">
-            总配额 {bytes(environment.storage.quota_bytes)}
+            {t("总配额 {quota}", {
+              quota: bytes(environment.storage.quota_bytes, t),
+            })}
           </div>
         </Card>
       </div>
       <div className="section-grid">
         <SectionCard title="开始开发" subtitle="进入自己的长期开发容器">
-          <p>在开发容器中编写代码、编译和准备数据。容器不直接分配GPU。</p>
+          <p>
+            {t("在开发容器中编写代码、编译和准备数据。容器不直接分配GPU。")}
+          </p>
           <div className="button-row">
             <Link className="ui-button ui-button-primary" href="/terminal">
-              打开网页终端
+              {t("打开网页终端")}
             </Link>
             <Link className="ui-button" href="/access">
-              查看SSH连接
+              {t("查看SSH连接")}
             </Link>
           </div>
         </SectionCard>
         <SectionCard title="提交计算任务" subtitle="CPU 或最多1张GPU">
-          <p>选择工作区中的脚本，通过Portal提交到Slurm。</p>
+          <p>{t("选择工作区中的脚本，通过Portal提交到Slurm。")}</p>
           <Link className="ui-button ui-button-primary" href="/jobs">
-            新建作业
+            {t("新建作业")}
           </Link>
         </SectionCard>
       </div>
@@ -458,6 +498,7 @@ export function OrdinaryDashboard() {
 }
 
 export function OrdinaryConnection() {
+  const { t } = useI18n();
   const query = useQuery({
     queryKey: ["self-container-connection"],
     queryFn: selfContainerConnection,
@@ -466,7 +507,7 @@ export function OrdinaryConnection() {
   const [message, setMessage] = useState<string | null>(null);
   if (query.isPending) return <LoadingBlock />;
   if (query.isError)
-    return <ErrorBlock message="开发容器连接信息暂时不可用。" />;
+    return <ErrorBlock message={t("开发容器连接信息暂时不可用。")} />;
   const connection = query.data.connection;
   return (
     <>
@@ -497,7 +538,7 @@ export function OrdinaryConnection() {
             <dd>{connection.username}</dd>
           </div>
           <div className="kv">
-            <dt>认证</dt>
+            <dt>{t("认证")}</dt>
             <dd>SSH Public Key</dd>
           </div>
           <div className="kv">
@@ -505,43 +546,43 @@ export function OrdinaryConnection() {
             <dd>NONE</dd>
           </div>
           <div className="kv">
-            <dt>状态</dt>
+            <dt>{t("状态")}</dt>
             <dd>{connection.available ? "AVAILABLE" : "DISABLED"}</dd>
           </div>
           <div className="kv access-key-row">
-            <dt>用户密钥 Fingerprint</dt>
+            <dt>{t("用户密钥 Fingerprint")}</dt>
             <dd className="mono ssh-fingerprint-value">
-              {connection.key_fingerprint ?? "未安装"}
+              {connection.key_fingerprint ?? t("未安装")}
             </dd>
           </div>
         </dl>
         {connection.command ? (
           <div className="connection-output">
-            <div className="field-label">SSH 命令</div>
+            <div className="field-label">{t("SSH 命令")}</div>
             <pre className="connection-command">{connection.command}</pre>
             <div className="button-row">
               <Button
                 onClick={() =>
                   void copyText(connection.command ?? "").then(() =>
-                    setMessage("SSH命令已复制"),
+                    setMessage(t("SSH命令已复制")),
                   )
                 }
               >
-                复制命令
+                {t("复制命令")}
               </Button>
               <Button
                 onClick={() =>
                   void copyText(connection.vscode ?? "").then(() =>
-                    setMessage("VS Code配置已复制"),
+                    setMessage(t("VS Code配置已复制")),
                   )
                 }
               >
-                复制 VS Code 配置
+                {t("复制 VS Code 配置")}
               </Button>
             </div>
           </div>
         ) : (
-          <div className="notice">租约、容器或SSH公钥当前不可用。</div>
+          <div className="notice">{t("租约、容器或SSH公钥当前不可用。")}</div>
         )}
         {message ? (
           <div className="notice success-notice">{message}</div>
@@ -553,6 +594,7 @@ export function OrdinaryConnection() {
 
 export function OrdinaryContainer() {
   const queryClient = useQueryClient();
+  const { t } = useI18n();
   const query = useQuery({
     queryKey: ["self-container"],
     queryFn: selfContainer,
@@ -571,7 +613,8 @@ export function OrdinaryContainer() {
     },
   });
   if (query.isPending) return <LoadingBlock />;
-  if (query.isError) return <ErrorBlock message="开发容器状态暂时不可用。" />;
+  if (query.isError)
+    return <ErrorBlock message={t("开发容器状态暂时不可用。")} />;
   const container = query.data.container;
   return (
     <>
@@ -599,8 +642,8 @@ export function OrdinaryContainer() {
             <dd>NONE</dd>
           </div>
           <div className="kv">
-            <dt>用途</dt>
-            <dd>开发与数据准备</dd>
+            <dt>{t("用途")}</dt>
+            <dd>{t("开发与数据准备")}</dd>
           </div>
         </dl>
         <div className="button-row access-actions">
@@ -609,32 +652,32 @@ export function OrdinaryContainer() {
             href={container.state === "RUNNING" ? "/terminal" : "#"}
             aria-disabled={container.state !== "RUNNING"}
           >
-            网页终端
+            {t("网页终端")}
           </Link>
           <Button
             disabled={container.state === "RUNNING" || mutation.isPending}
             onClick={() => mutation.mutate("start")}
           >
-            启动
+            {t("启动")}
           </Button>
           <Button
             disabled={container.state !== "RUNNING" || mutation.isPending}
             onClick={() => mutation.mutate("restart")}
           >
-            重启
+            {t("重启")}
           </Button>
           <Button
             disabled={container.state !== "RUNNING" || mutation.isPending}
             onClick={() => mutation.mutate("stop")}
           >
-            停止
+            {t("停止")}
           </Button>
         </div>
         {mutation.isError ? (
           <div className="error-box">
             {mutation.error instanceof Error
               ? mutation.error.message
-              : "容器操作被拒绝"}
+              : t("容器操作被拒绝")}
           </div>
         ) : null}
       </SectionCard>
@@ -649,9 +692,13 @@ function JobRows({
   jobs: SelfJob[];
   onSelect: (job: SelfJob) => void;
 }) {
+  const { t } = useI18n();
   if (!jobs.length)
     return (
-      <EmptyState title="还没有Portal作业" detail="从上方创建CPU或单GPU作业" />
+      <EmptyState
+        title={t("还没有Portal作业")}
+        detail={t("从上方创建CPU或单GPU作业")}
+      />
     );
   return (
     <div className="ui-table-wrap">
@@ -659,27 +706,31 @@ function JobRows({
         <thead>
           <tr>
             <th>Job</th>
-            <th>名称</th>
-            <th>状态</th>
+            <th>{t("名称")}</th>
+            <th>{t("状态")}</th>
             <th>GPU</th>
-            <th>时限</th>
+            <th>{t("时限")}</th>
             <th>ExitCode</th>
-            <th>操作</th>
+            <th>{t("操作")}</th>
           </tr>
         </thead>
         <tbody>
           {jobs.map((job) => (
             <tr key={job.id}>
-              <td>{job.slurm_job_id ?? "提交中"}</td>
+              <td>{job.slurm_job_id ?? t("提交中")}</td>
               <td>{job.name}</td>
               <td>
                 <StatusBadge value={job.state} />
               </td>
               <td>{job.gpu_count}</td>
-              <td>{Math.ceil(job.time_limit_seconds / 60)} 分钟</td>
+              <td>
+                {t("{minutes} 分钟", {
+                  minutes: Math.ceil(job.time_limit_seconds / 60),
+                })}
+              </td>
               <td>{job.exit_code ?? "—"}</td>
               <td>
-                <Button onClick={() => onSelect(job)}>日志</Button>
+                <Button onClick={() => onSelect(job)}>{t("日志")}</Button>
               </td>
             </tr>
           ))}
@@ -691,6 +742,7 @@ function JobRows({
 
 export function OrdinaryJobs() {
   const queryClient = useQueryClient();
+  const { t } = useI18n();
   const query = useQuery({
     queryKey: ["self-jobs"],
     queryFn: selfJobs,
@@ -750,11 +802,11 @@ export function OrdinaryJobs() {
       >
         <form className="job-form-grid" onSubmit={onSubmit}>
           <label>
-            作业名称
+            {t("作业名称")}
             <Input value={name} onChange={(e) => setName(e.target.value)} />
           </label>
           <label className="job-script-field">
-            执行脚本
+            {t("执行脚本")}
             <textarea
               className="ui-textarea mono"
               value={script}
@@ -776,7 +828,7 @@ export function OrdinaryJobs() {
             />
           </label>
           <label>
-            内存 MB
+            {t("内存 MB")}
             <Input
               type="number"
               min={256}
@@ -797,7 +849,7 @@ export function OrdinaryJobs() {
             </select>
           </label>
           <label>
-            最长运行（分钟）
+            {t("最长运行（分钟）")}
             <Input
               type="number"
               min={1}
@@ -807,14 +859,14 @@ export function OrdinaryJobs() {
             />
           </label>
           <label>
-            运行环境
+            {t("运行环境")}
             <select
               className="ui-input"
               value={containerized ? "approved" : "host"}
               onChange={(e) => setContainerized(e.target.value === "approved")}
             >
-              <option value="host">标准 Slurm</option>
-              <option value="approved">已批准 CUDA 容器</option>
+              <option value="host">{t("标准 Slurm")}</option>
+              <option value="approved">{t("已批准 CUDA 容器")}</option>
             </select>
           </label>
           <div className="job-submit-row">
@@ -823,12 +875,12 @@ export function OrdinaryJobs() {
               type="submit"
               disabled={submit.isPending || script.length === 0}
             >
-              提交作业
+              {t("提交作业")}
             </Button>
           </div>
         </form>
         {submit.isError ? (
-          <div className="error-box">{jobErrorMessage(submit.error)}</div>
+          <div className="error-box">{jobErrorMessage(submit.error, t)}</div>
         ) : null}
       </SectionCard>
       <SectionCard title="我的作业" subtitle="只显示当前账号提交的作业">
@@ -842,8 +894,10 @@ export function OrdinaryJobs() {
       </SectionCard>
       {selected ? (
         <SectionCard
-          title={`${selected.name} · 日志`}
-          action={<Button onClick={() => setSelected(null)}>关闭</Button>}
+          title={t("{name} · 日志", { name: selected.name })}
+          action={
+            <Button onClick={() => setSelected(null)}>{t("关闭")}</Button>
+          }
         >
           <div className="button-row">
             <StatusBadge value={selected.state} />
@@ -853,14 +907,16 @@ export function OrdinaryJobs() {
                 disabled={cancel.isPending}
                 onClick={() => cancel.mutate(selected.id)}
               >
-                取消作业
+                {t("取消作业")}
               </Button>
             ) : null}
           </div>
           <h3>stdout</h3>
-          <pre className="job-log">{logs.data?.stdout || "暂无输出"}</pre>
+          <pre className="job-log">{logs.data?.stdout || t("暂无输出")}</pre>
           <h3>stderr</h3>
-          <pre className="job-log">{logs.data?.stderr || "暂无错误输出"}</pre>
+          <pre className="job-log">
+            {logs.data?.stderr || t("暂无错误输出")}
+          </pre>
         </SectionCard>
       ) : null}
     </>
@@ -868,13 +924,14 @@ export function OrdinaryJobs() {
 }
 
 export function OrdinaryStorage() {
+  const { t } = useI18n();
   const query = useQuery({
     queryKey: ["self-storage"],
     queryFn: selfStorage,
     refetchInterval: 60_000,
   });
   if (query.isPending) return <LoadingBlock />;
-  if (query.isError) return <ErrorBlock message="存储状态暂时不可用。" />;
+  if (query.isError) return <ErrorBlock message={t("存储状态暂时不可用。")} />;
   const storage = query.data.storage;
   return (
     <>
@@ -886,24 +943,26 @@ export function OrdinaryStorage() {
       <SectionCard title="工作区配额">
         <dl className="kv-grid">
           <div className="kv">
-            <dt>总配额</dt>
-            <dd>{bytes(storage.quota_bytes)}</dd>
+            <dt>{t("总配额")}</dt>
+            <dd>{bytes(storage.quota_bytes, t)}</dd>
           </div>
           <div className="kv">
-            <dt>已使用</dt>
-            <dd>{bytes(storage.used_bytes)}</dd>
+            <dt>{t("已使用")}</dt>
+            <dd>{bytes(storage.used_bytes, t)}</dd>
           </div>
           <div className="kv">
-            <dt>可用</dt>
-            <dd>{bytes(storage.available_bytes)}</dd>
+            <dt>{t("可用")}</dt>
+            <dd>{bytes(storage.available_bytes, t)}</dd>
           </div>
           <div className="kv">
-            <dt>隔离</dt>
+            <dt>{t("隔离")}</dt>
             <dd>PRIVATE</dd>
           </div>
         </dl>
         <div className="notice">
-          其他普通用户不能读取、列出或写入此目录。共享数据使用单独批准的数据集。
+          {t(
+            "其他普通用户不能读取、列出或写入此目录。共享数据使用单独批准的数据集。",
+          )}
         </div>
       </SectionCard>
     </>
@@ -912,6 +971,7 @@ export function OrdinaryStorage() {
 
 export function OrdinaryRecycleBin() {
   const queryClient = useQueryClient();
+  const { locale, t } = useI18n();
   const query = useQuery({
     queryKey: ["self-recycle-bin"],
     queryFn: selfRecycleBin,
@@ -922,7 +982,7 @@ export function OrdinaryRecycleBin() {
       queryClient.invalidateQueries({ queryKey: ["self-recycle-bin"] }),
   });
   if (query.isPending) return <LoadingBlock />;
-  if (query.isError) return <ErrorBlock message="回收站暂时不可用。" />;
+  if (query.isError) return <ErrorBlock message={t("回收站暂时不可用。")} />;
   return (
     <>
       <PageHeading
@@ -931,7 +991,10 @@ export function OrdinaryRecycleBin() {
       />
       {!query.data.items.length ? (
         <Card>
-          <EmptyState title="回收站为空" detail="当前没有过期的计算资源" />
+          <EmptyState
+            title={t("回收站为空")}
+            detail={t("当前没有过期的计算资源")}
+          />
         </Card>
       ) : (
         query.data.items.map((item) => (
@@ -941,27 +1004,29 @@ export function OrdinaryRecycleBin() {
             action={
               <StatusBadge
                 value={
-                  item.state === "RESTORE_PENDING" ? "恢复申请待审批" : "已过期"
+                  item.state === "RESTORE_PENDING"
+                    ? t("恢复申请待审批")
+                    : t("已过期")
                 }
               />
             }
           >
             <dl className="kv-grid">
               <div className="kv">
-                <dt>租约到期</dt>
-                <dd>{localTime(item.expires_at)}</dd>
+                <dt>{t("租约到期")}</dt>
+                <dd>{localTime(item.expires_at, locale)}</dd>
               </div>
               <div className="kv">
-                <dt>进入回收站</dt>
-                <dd>{localTime(item.recycled_at)}</dd>
+                <dt>{t("进入回收站")}</dt>
+                <dd>{localTime(item.recycled_at, locale)}</dd>
               </div>
               <div className="kv">
-                <dt>开发容器</dt>
-                <dd>已停止</dd>
+                <dt>{t("开发容器")}</dt>
+                <dd>{t("已停止")}</dd>
               </div>
               <div className="kv">
-                <dt>数据</dt>
-                <dd>已保留</dd>
+                <dt>{t("数据")}</dt>
+                <dd>{t("已保留")}</dd>
               </div>
             </dl>
             <div className="button-row access-actions">
@@ -970,7 +1035,7 @@ export function OrdinaryRecycleBin() {
                 disabled={restore.isPending || item.state !== "RECYCLE_BIN"}
                 onClick={() => restore.mutate(item.id)}
               >
-                申请恢复
+                {t("申请恢复")}
               </Button>
             </div>
           </SectionCard>
@@ -981,6 +1046,7 @@ export function OrdinaryRecycleBin() {
 }
 
 export function OrdinarySshKeys() {
+  const { t } = useI18n();
   const current = useQuery({ queryKey: ["me"], queryFn: me });
   if (current.isPending) return <LoadingBlock />;
   if (current.isError) return <ErrorBlock />;
@@ -990,10 +1056,11 @@ export function OrdinarySshKeys() {
         <PageHeading title="SSH密钥" description="用于未来自己的开发容器" />
         <SectionCard title="尚未建立计算身份">
           <p>
-            SSH
-            公钥登记将在计算资源申请获批后开放。平台只接收公钥，绝不会要求上传私钥。
+            {t(
+              "SSH 公钥登记将在计算资源申请获批后开放。平台只接收公钥，绝不会要求上传私钥。",
+            )}
           </p>
-          <Button disabled>设置SSH密钥</Button>
+          <Button disabled>{t("设置SSH密钥")}</Button>
         </SectionCard>
       </>
     );
@@ -1014,6 +1081,7 @@ export function OrdinarySshKeys() {
 }
 
 export function OrdinaryHelp() {
+  const { t } = useI18n();
   const current = useQuery({ queryKey: ["me"], queryFn: me });
   if (current.isPending) return <LoadingBlock />;
   if (current.isError) return <ErrorBlock />;
@@ -1024,12 +1092,15 @@ export function OrdinaryHelp() {
         <div className="section-grid">
           <SectionCard title="当前状态">
             <p>
-              Portal 账号已激活，但尚未创建 Linux 用户、开发容器、配额、Slurm 或
-              Lease。
+              {t(
+                "Portal 账号已激活，但尚未创建 Linux 用户、开发容器、配额、Slurm 或 Lease。",
+              )}
             </p>
           </SectionCard>
           <SectionCard title="下一步">
-            <p>下一阶段通过资源申请与管理员审批进入 Compute Provisioning。</p>
+            <p>
+              {t("下一阶段通过资源申请与管理员审批进入 Compute Provisioning。")}
+            </p>
           </SectionCard>
         </div>
       </>
@@ -1042,14 +1113,15 @@ export function OrdinaryHelp() {
         <div className="section-grid">
           <SectionCard title="当前状态">
             <p>
-              计算身份、私有存储、Slurm association 与无 GPU 开发容器已经安全
-              Stage；Container 保持停止，Lease 尚未启动。
+              {t(
+                "计算身份、私有存储、Slurm association 与无 GPU 开发容器已经安全 Stage；Container 保持停止，Lease 尚未启动。",
+              )}
             </p>
           </SectionCard>
           <SectionCard title="下一步">
-            <p>只登记你自己的 ED25519 公钥，Scope 固定为 CONTAINER。</p>
+            <p>{t("只登记你自己的 ED25519 公钥，Scope 固定为 CONTAINER。")}</p>
             <Link className="table-link" href="/ssh-keys">
-              设置 SSH 密钥
+              {t("设置 SSH 密钥")}
             </Link>
           </SectionCard>
         </div>
@@ -1061,21 +1133,23 @@ export function OrdinaryHelp() {
       <PageHeading title="帮助" description="普通用户计算流程" />
       <div className="section-grid">
         <SectionCard title="开发容器">
-          <p>用于编写代码和开发，不直接提供GPU。</p>
+          <p>{t("用于编写代码和开发，不直接提供GPU。")}</p>
           <Link className="table-link" href="/access">
-            查看连接信息
+            {t("查看连接信息")}
           </Link>
         </SectionCard>
         <SectionCard title="GPU任务">
-          <p>通过作业页面提交，当前最多使用1张GPU。</p>
+          <p>{t("通过作业页面提交，当前最多使用1张GPU。")}</p>
           <Link className="table-link" href="/jobs">
-            进入作业页面
+            {t("进入作业页面")}
           </Link>
         </SectionCard>
       </div>
       <SectionCard title="租约与恢复">
         <p>
-          到期前24小时可申请续期，每次最多4天。资源到期后开发容器会停止并进入回收站，数据不会立即删除；批准恢复后可继续使用。
+          {t(
+            "到期前24小时可申请续期，每次最多4天。资源到期后开发容器会停止并进入回收站，数据不会立即删除；批准恢复后可继续使用。",
+          )}
         </p>
       </SectionCard>
     </>
