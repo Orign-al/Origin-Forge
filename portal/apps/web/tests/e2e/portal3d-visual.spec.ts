@@ -139,7 +139,7 @@ function stagedUser(state: Portal3dState) {
       container_memory_gb: 32,
       container_pids_limit: 4096,
       container_image_digest: `sha256:${"a".repeat(64)}`,
-      approved_host: "10.82.36.1",
+      approved_host: "20.10.10.3",
       host_ssh_port: 22,
       host_ssh_server:
         computeState === "ACTIVE" ? "READY_FOR_CLIENT_VALIDATION" : "NOT_READY",
@@ -698,7 +698,7 @@ test("ACTIVE 且 Key 已安装后才显示 SSH 与 VS Code 配置", async ({ pag
   await page.goto("/access");
   await page.getByRole("button", { name: "连接宿主机" }).click();
   await expect(page.locator(".connection-command")).toContainText(
-    "ssh -i <你的私钥路径> origin-pilot@10.82.36.1",
+    "ssh -i <你的私钥路径> origin-pilot@20.10.10.3",
   );
   await page.getByRole("button", { name: "关闭" }).click();
   await page.getByRole("button", { name: "VS Code Remote SSH" }).click();
@@ -816,7 +816,7 @@ test("ACTIVE + STOPPED 仅显示受控容器启动入口并在成功后开放连
   );
   await page.getByRole("button", { name: "连接开发容器" }).click();
   await expect(page.locator(".connection-command")).toContainText(
-    "ssh -i <你的私钥路径> -p 22023 origin-pilot@10.82.36.1",
+    "ssh -i <你的私钥路径> -p 22023 origin-pilot@20.10.10.3",
   );
 });
 

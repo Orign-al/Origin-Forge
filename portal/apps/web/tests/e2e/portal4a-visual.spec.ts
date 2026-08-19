@@ -253,17 +253,17 @@ async function installPortal4aApi(
         status: "OK",
         connection: {
           available: active,
-          host: "10.82.36.1",
+          host: "20.10.10.3",
           port: 22023,
           username: "origin-pilot",
           authentication: "SSH_PUBLIC_KEY",
           gpu: "NONE",
           key_fingerprint: key.fingerprint_sha256,
           command: active
-            ? "ssh -i <你的私钥路径> -p 22023 origin-pilot@10.82.36.1"
+            ? "ssh -i <你的私钥路径> -p 22023 origin-pilot@20.10.10.3"
             : null,
           vscode: active
-            ? "Host h100-origin-pilot-dev\n    HostName 10.82.36.1\n    Port 22023\n    User origin-pilot\n    IdentityFile <你的私钥路径>"
+            ? "Host h100-origin-pilot-dev\n    HostName 20.10.10.3\n    Port 22023\n    User origin-pilot\n    IdentityFile <你的私钥路径>"
             : null,
         },
       });

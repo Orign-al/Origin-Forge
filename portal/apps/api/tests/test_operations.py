@@ -246,7 +246,7 @@ def portal3e_execution_result(record: PortalSshKey) -> dict[str, object]:
                 "service_state": "ACTIVE",
                 "internal_port": 22,
                 "status": "READY_FOR_CLIENT_VALIDATION",
-                "bind": {"address": "10.82.36.1", "port": 22023, "status": "LISTENING"},
+                "bind": {"address": "20.10.10.3", "port": 22023, "status": "LISTENING"},
             },
             "host_server_fingerprint": "SHA256:test-host-server-fingerprint",
             "container_server_fingerprint": "SHA256:test-container-server-fingerprint",
@@ -273,7 +273,7 @@ def portal3e_execution_result(record: PortalSshKey) -> dict[str, object]:
                 "cpus": 8,
                 "memory_gb": 32,
                 "pids_limit": 4096,
-                "ssh_address": "10.82.36.1",
+                "ssh_address": "20.10.10.3",
                 "ssh_port": 22023,
             },
             "guard": {

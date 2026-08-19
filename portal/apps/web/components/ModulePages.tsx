@@ -1009,7 +1009,7 @@ export function SystemModule() {
           <dl className="kv-grid">
             <div className="kv">
               <dt>Web</dt>
-              <dd className="mono">10.10.10.220 / 20.10.10.3 :18080</dd>
+              <dd className="mono">20.10.10.3:18080</dd>
             </div>
             <div className="kv">
               <dt>API</dt>

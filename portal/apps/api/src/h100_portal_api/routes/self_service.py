@@ -16,6 +16,7 @@ from h100_portal_api.auth import (
     require_session_csrf,
     user_agent,
 )
+from h100_portal_api.config import get_settings
 from h100_portal_api.database import get_db
 from h100_portal_api.dependencies import permission_dependency, require_delegated_scope
 from h100_portal_api.enums import OperationStatus, RiskLevel
@@ -68,7 +69,6 @@ from h100_portal_api.worker_client import WorkerClientError, call_worker
 
 router = APIRouter(tags=["self-service"])
 
-APPROVED_HOST = "10.82.36.1"
 APPROVED_IMAGE_REFS = {
     "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
     "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
@@ -302,6 +302,7 @@ def self_container_connection(
     context: AuthContext = Depends(permission_dependency("self.connection.read")),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    public_access_host = get_settings().public_access_host
     managed = managed_identity_for_user(db, context.user)
     lease = lease_view(db, managed.id)
     container = _container_for_owner(db, managed.id)
@@ -323,7 +324,7 @@ def self_container_connection(
         "status": "OK",
         "connection": {
             "available": available,
-            "host": APPROVED_HOST,
+            "host": public_access_host,
             "port": container.ssh_port,
             "username": managed.unix_username,
             "authentication": "SSH_PUBLIC_KEY",
@@ -331,13 +332,13 @@ def self_container_connection(
             "key_fingerprint": key.fingerprint_sha256 if key else None,
             "command": (
                 f"ssh -i <你的私钥路径> -p {container.ssh_port} "
-                f"{managed.unix_username}@{APPROVED_HOST}"
+                f"{managed.unix_username}@{public_access_host}"
             )
             if available
             else None,
             "vscode": (
                 f"Host h100-{managed.unix_username}-dev\n"
-                f"    HostName {APPROVED_HOST}\n"
+                f"    HostName {public_access_host}\n"
                 f"    Port {container.ssh_port}\n"
                 f"    User {managed.unix_username}\n"
                 "    IdentityFile <你的私钥路径>"

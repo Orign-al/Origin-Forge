@@ -14,18 +14,13 @@
 
 ## 登录入口
 
-管理员会分别提供宿主提交入口和个人开发容器端口。只使用自己的 SSH 私钥；不得共享账号、私钥或 SSH agent。
-
-宿主提交入口（仅在管理员确认 Gate 通过后启用）：
-
-```bash
-ssh USERNAME@10.82.36.1
-```
+管理员会提供个人开发容器端口。普通用户 Host SSH 始终禁用；只使用自己的 SSH 私钥，
+不得共享账号、私钥或 SSH agent。
 
 长期个人 Docker：
 
 ```bash
-ssh -p ASSIGNED_PORT USERNAME@10.82.36.1
+ssh -p ASSIGNED_PORT USERNAME@20.10.10.3
 ```
 
 首次连接前，从管理员提供的独立渠道核对 SSH host-key 指纹。禁止使用 `StrictHostKeyChecking=no`。
@@ -34,7 +29,7 @@ VS Code Remote SSH 示例：
 
 ```sshconfig
 Host h100-pilot-container
-    HostName 10.82.36.1
+    HostName 20.10.10.3
     User USERNAME
     Port ASSIGNED_PORT
     IdentityFile /path/to/your/private_key

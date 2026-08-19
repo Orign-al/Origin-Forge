@@ -239,7 +239,7 @@ def resource_view(
         "container_memory_gb": safe_spec.get("memory_gb"),
         "container_pids_limit": safe_spec.get("pids_limit"),
         "container_image_digest": container.image_digest if container is not None else None,
-        "approved_host": safe_spec.get("approved_host"),
+        "approved_host": get_settings().public_access_host,
         "host_ssh_port": safe_spec.get("host_ssh_port"),
         "host_server_fingerprint": safe_spec.get("host_server_fingerprint"),
         "container_server_fingerprint": safe_spec.get("container_server_fingerprint"),

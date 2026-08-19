@@ -958,6 +958,7 @@ def test_expired_timestamp_denies_new_access_even_when_database_state_is_active(
     assert environment.json()["environment"]["lease"]["active"] is False
     assert connection.status_code == 200
     assert connection.json()["connection"]["available"] is False
+    assert connection.json()["connection"]["host"] == "20.10.10.3"
     assert connection.json()["connection"]["command"] is None
     assert terminal.status_code == 409
     assert terminal.json()["detail"]["code"] == "LEASE_INACTIVE"

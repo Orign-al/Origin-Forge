@@ -17,6 +17,7 @@ readonly PROJECT_MIN=30000
 readonly PROJECT_MAX=39999
 readonly PORT_MIN=22023
 readonly PORT_MAX=22999
+readonly CONTAINER_PUBLISH_HOST=0.0.0.0
 
 created_group=0
 created_user=0
@@ -576,7 +577,7 @@ services:
     ports:
       - target: 22
         published: "${ssh_port}"
-        host_ip: ${H100_MANAGEMENT_IP}
+        host_ip: ${CONTAINER_PUBLISH_HOST}
         protocol: tcp
     volumes:
       - {type: bind, source: ${user_root}/home, target: /home/${username}, bind: {propagation: rprivate}}
@@ -599,6 +600,7 @@ created_container=1
 [[ "$(docker inspect --format '{{.State.Status}}' "${container_name}")" == created ]] \
   || fail 'container is not staged in created state'
 docker inspect "${container_name}" | jq -e \
+  --arg host_ip "${CONTAINER_PUBLISH_HOST}" \
   --arg port "${ssh_port}" \
   '.[0].HostConfig.Privileged == false
    and .[0].HostConfig.NetworkMode != "host"
@@ -611,6 +613,7 @@ docker inspect "${container_name}" | jq -e \
    and .[0].HostConfig.NanoCpus == 8000000000
    and .[0].HostConfig.Memory == 34359738368
    and .[0].HostConfig.PidsLimit == 4096
+   and .[0].HostConfig.PortBindings["22/tcp"][0].HostIp == $host_ip
    and .[0].HostConfig.PortBindings["22/tcp"][0].HostPort == $port
    and ((.[0].Mounts // []) | map(.Destination) | index("/var/run/docker.sock") | not)
    and ((.[0].Mounts // []) | map(.Destination) | index("/run/munge") | not)

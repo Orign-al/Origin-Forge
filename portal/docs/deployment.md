@@ -8,15 +8,15 @@
 - 配置：`/etc/h100-portal`
 - 数据和日志：`/var/lib/h100-portal`、`/var/log/h100-portal`
 - Runtime socket：`/run/h100-portal/worker.sock`
-- Web：`10.10.10.220:18080`（精确绑定 `tun0`）
-- Web：`20.10.10.3:18080`（独立进程精确绑定 `tun1`）
+- Web listener：`0.0.0.0:18080`（systemd 仅允许批准的 VPN、EasyTier 与管理 LAN 网段）
+- 用户正式地址：`http://20.10.10.3:18080/`
 - API：`127.0.0.1:18081`（继续仅限 loopback）
 - PostgreSQL：本机 Unix Socket，不监听 Portal TCP 端口
 
-管理员已接受当前 Pilot 经 `10.10.10.0/24` 受控虚拟网络使用内部明文 HTTP 直接访问
-Web；Transport TLS 未启用且当前范围不要求启用。SSH Tunnel 仅保留为可选回退。Web 不
-监听 `0.0.0.0`，API 不监听管理网地址。本变更不修改防火墙或公网监听。Slurm 必须在整个
-部署过程保持 `IDLE+DRAIN` 且队列为空。若访问范围扩大，必须重新评估并优先启用 HTTPS。
+管理员已接受当前 Pilot 经受控虚拟网络使用内部明文 HTTP 直接访问 Web；Transport TLS
+未启用且当前范围不要求启用。SSH Tunnel 仅保留为可选回退。Web 的通配 IPv4 listener
+不等于用户地址；Portal UI 和用户文档只显示 `20.10.10.3`。API 不监听管理网或 EasyTier
+地址。本变更不提供公网入口。若访问范围扩大，必须重新评估并优先启用 HTTPS。
 
 ## 前置检查
 
@@ -90,15 +90,19 @@ record，并增加 Scope、状态、生成方式、创建者和 enrollment Opera
 sudo /srv/gpu-platform/platform/portal/deploy/scripts/install-runtime.sh
 sudo systemd-analyze verify \
   /etc/systemd/system/h100-portal-web.service \
-  /etc/systemd/system/h100-portal-web-tun1.service \
   /etc/systemd/system/h100-portal-api.service \
   /etc/systemd/system/h100-portal-worker.socket \
   /etc/systemd/system/h100-portal-worker.service
 sudo systemctl enable --now h100-portal-worker.socket
 sudo systemctl enable --now h100-portal-api.service
-sudo systemctl enable --now h100-portal-web.service
-sudo systemctl enable --now h100-portal-web-tun1.service
+sudo systemctl disable --now h100-portal-web-tun1.service
+sudo systemctl enable h100-portal-web.service
+sudo systemctl restart h100-portal-web.service
 ```
+
+`h100-portal-web-tun1.service` 是旧的逐接口兼容 unit。升级时先安装新 runtime，再停止并
+禁用该旧 unit，最后重启唯一的 `h100-portal-web.service`；否则旧进程会占用
+`20.10.10.3:18080`，阻止通配 IPv4 listener 启动。
 
 Socket unit 以 `DirectoryMode=0755` 创建 `/run/h100-portal`；socket 本身必须为
 `root:h100-portal-api 0660`。父目录必须允许 API UID 遍历，但不得放宽 socket。
@@ -138,17 +142,16 @@ policy、管理账号 diff、reload、服务状态或第二连接任一失败，
 ```bash
 curl -fsS http://127.0.0.1:18081/health/live
 curl -fsS http://127.0.0.1:18081/health/ready
-curl -fsS http://10.10.10.220:18080/login >/dev/null
 curl -fsS http://20.10.10.3:18080/login >/dev/null
+curl -fsS http://10.82.36.1:18080/login >/dev/null
 ss -lntup
 systemctl --failed
 ```
 
-ready 必须同时报告数据库和 Worker 可用。确认 Web 只有 `10.10.10.220:18080` 和
-`20.10.10.3:18080` 两个精确监听，API 只有
-`127.0.0.1:18081`，且不存在 `0.0.0.0:18080/18081` 或全局 IPv6 Portal 监听。
-Web unit 的网络沙箱必须保留 `IPAddressDeny=any`，只额外允许 localhost 和
-`10.10.10.0/24`；API unit 仍只允许 localhost。以 API UID 运行
+ready 必须同时报告数据库和 Worker 可用。确认 Web 只有 `0.0.0.0:18080` IPv4 listener，
+API 只有 `127.0.0.1:18081`，且不存在 `0.0.0.0:18081` 或全局 IPv6 Portal listener。
+Web unit 的网络沙箱必须保留 `IPAddressDeny=any`，只允许 localhost、`10.10.10.0/24`、
+`20.10.10.0/24` 与 `10.82.36.0/24`；API unit 仍只允许 localhost。以 API UID 运行
 `/opt/h100-portal/tests/worker_socket_smoke.py` 验证固定读取、dry-run 和拒绝路径。
 
 浏览器验收必须覆盖 1366×768 和 1920×1080 的 Key 空状态、生成、导入、fingerprint
@@ -156,11 +159,10 @@ Web unit 的网络沙箱必须保留 `IPAddressDeny=any`，只额外允许 local
 内存/临时目录生成，测试结束删除，不安装到真实账号。部署后用源码/日志/数据库扫描确认
 没有 private-key 装甲；扫描输出不得反向打印任何疑似 secret 正文。
 
-批准的虚拟网络客户端直接打开 `http://10.10.10.220:18080` 或
-`http://20.10.10.3:18080`。如需可选 SSH Tunnel 回退：
+批准的 EasyTier 客户端直接打开 `http://20.10.10.3:18080`。如需可选 SSH Tunnel 回退：
 
 ```bash
-ssh -L 18080:10.10.10.220:18080 h100-codex
+ssh -L 18080:20.10.10.3:18080 h100-codex
 ```
 
 浏览器打开 `http://127.0.0.1:18080`。两种入口都在精确 CSRF Origin allowlist 中；不得

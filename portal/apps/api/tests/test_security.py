@@ -28,8 +28,13 @@ def test_approved_origins_are_parsed_without_exposing_api(monkeypatch) -> None: 
     )
     monkeypatch.delenv("PORTAL_ALLOWED_ORIGINS")
     assert Settings().allowed_origins == Settings.parse_origins(origins)
+    assert Settings().public_access_host == "20.10.10.3"
     with pytest.raises(ValueError, match="loopback"):
         Settings(api_host="10.10.10.220")
+    with pytest.raises(ValueError, match="concrete non-loopback"):
+        Settings(public_access_host="0.0.0.0")  # noqa: S104 -- rejected sentinel under test
+    with pytest.raises(ValueError, match="one IPv4 address"):
+        Settings(public_access_host="portal.internal")
 
 
 def test_login_normalization_is_case_insensitive() -> None:

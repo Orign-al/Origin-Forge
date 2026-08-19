@@ -95,6 +95,7 @@ PORTAL3E_FINAL_KEY_FINGERPRINT = "SHA256:nek6vyEb3GT+UJAcY5y/8PgY4achF2ouNy+8C2J
 PORTAL3E_FINAL_IDEMPOTENCY_KEY = "portal3e-final-origin-pilot-activate-v1"
 PORTAL3E_FINAL_ROLLBACK_IDEMPOTENCY_KEY = "portal3e-final-origin-pilot-rollback-v1"
 PORTAL3E_FINAL_APPROVED_HOST = "10.82.36.1"
+PORTAL3E_FINAL_PUBLIC_ACCESS_HOST = "20.10.10.3"
 PORTAL3F_APPROVAL_TEXT = (
     "允许进入 Portal-3F，记录 SSH Client Validation PASS 并执行首个 Slurm/GPU Pilot 验收。"
 )
@@ -388,7 +389,7 @@ def validate_activate_execution_result(
         and container_server.get("internal_port") == 22
         and container_server.get("status") == "READY_FOR_CLIENT_VALIDATION"
         and isinstance(container_server.get("bind"), dict)
-        and container_server["bind"].get("address") == PORTAL3E_FINAL_APPROVED_HOST
+        and container_server["bind"].get("address") == PORTAL3E_FINAL_PUBLIC_ACCESS_HOST
         and container_server["bind"].get("port") == 22023
         and container_server["bind"].get("status") == "LISTENING"
         and all(
@@ -421,7 +422,7 @@ def validate_activate_execution_result(
         and container.get("cpus") == 8
         and container.get("memory_gb") == 32
         and container.get("pids_limit") == 4096
-        and container.get("ssh_address") == PORTAL3E_FINAL_APPROVED_HOST
+        and container.get("ssh_address") == PORTAL3E_FINAL_PUBLIC_ACCESS_HOST
         and container.get("ssh_port") == 22023
         and isinstance(guard, dict)
         and guard.get("status") == "PASSING"
@@ -519,7 +520,7 @@ def _validate_portal3f_server_snapshot(
         and isinstance(container_server, dict)
         and container_server.get("status") == "READY_FOR_CLIENT_VALIDATION"
         and isinstance(container_server.get("bind"), dict)
-        and container_server["bind"].get("address") == PORTAL3E_FINAL_APPROVED_HOST
+        and container_server["bind"].get("address") == PORTAL3E_FINAL_PUBLIC_ACCESS_HOST
         and container_server["bind"].get("port") == 22023
         and isinstance(management_policy, dict)
         and management_policy.get("origin-al") == "UNCHANGED"
@@ -1525,10 +1526,10 @@ def persist_portal3e_activated_identity(
         "user_key_fingerprints": [record.fingerprint_sha256 for record in records],
         "host_server_fingerprint": host_server_fingerprint,
         "container_server_fingerprint": container_server_fingerprint,
-        "approved_host": PORTAL3E_FINAL_APPROVED_HOST,
+        "approved_host": PORTAL3E_FINAL_PUBLIC_ACCESS_HOST,
         "host_ssh_port": 22,
         "container_ssh_port": 22023,
-        "container_ssh_bind": f"{PORTAL3E_FINAL_APPROVED_HOST}:22023",
+        "container_ssh_bind": f"{PORTAL3E_FINAL_PUBLIC_ACCESS_HOST}:22023",
         "host_ssh_server": "READY_FOR_CLIENT_VALIDATION",
         "container_ssh_server": "READY_FOR_CLIENT_VALIDATION",
         "host_ssh_client_validation": "PENDING",
@@ -1575,7 +1576,7 @@ def persist_portal3e_activated_identity(
         (
             "user.activate.container_start",
             "container",
-            {"state": "RUNNING", "gpu": "NONE", "bind": "10.82.36.1:22023"},
+            {"state": "RUNNING", "gpu": "NONE", "bind": "20.10.10.3:22023"},
         ),
         (
             "user.activate.host_ssh_server",

@@ -24,7 +24,7 @@ import { randomUuid } from "../../../lib/random-uuid";
 
 type ConnectionView = "host" | "container" | "vscode" | null;
 
-const APPROVED_HOST = "10.82.36.1";
+const APPROVED_HOST = "20.10.10.3";
 
 export default function AccessPage() {
   const current = useQuery({ queryKey: ["me"], queryFn: me, retry: false });

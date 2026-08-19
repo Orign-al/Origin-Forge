@@ -90,18 +90,20 @@ def test_portal3f_worker_can_write_only_the_guard_metrics_directory() -> None:
     assert ambient == ["AmbientCapabilities=CAP_SETUID"]
 
 
-def test_web_binds_to_current_tunnel_service_address() -> None:
+def test_web_binds_user_ingress_without_exposing_internal_services() -> None:
     service = (PORTAL_ROOT / "deploy/systemd/h100-portal-web.service").read_text()
-    tun1_service = (PORTAL_ROOT / "deploy/systemd/h100-portal-web-tun1.service").read_text()
     environment = (PORTAL_ROOT / "deploy/portal.env.example").read_text()
     installer = (PORTAL_ROOT / "deploy/scripts/install-runtime.sh").read_text()
 
-    assert "Environment=HOSTNAME=10.10.10.220" in service.splitlines()
-    assert "Environment=HOSTNAME=10.10.10.2" not in service.splitlines()
-    assert "Environment=HOSTNAME=20.10.10.3" in tun1_service.splitlines()
-    assert "Environment=HOSTNAME=0.0.0.0" not in service + tun1_service
-    assert "IPAddressAllow=20.10.10.0/24" in tun1_service
-    assert "h100-portal-web-tun1.service" in installer
+    assert "Environment=HOSTNAME=0.0.0.0" in service.splitlines()
+    assert "IPAddressDeny=any" in service.splitlines()
+    assert "IPAddressAllow=localhost" in service.splitlines()
+    assert "IPAddressAllow=10.10.10.0/24" in service.splitlines()
+    assert "IPAddressAllow=20.10.10.0/24" in service.splitlines()
+    assert "IPAddressAllow=10.82.36.0/24" in service.splitlines()
+    assert "h100-portal-web-tun1.service" not in installer
+    assert not (PORTAL_ROOT / "deploy/systemd/h100-portal-web-tun1.service").exists()
+    assert "PORTAL_PUBLIC_ACCESS_HOST=20.10.10.3" in environment
     assert "http://10.10.10.220:18080" in environment
     assert "http://20.10.10.3:18080" in environment
     assert "http://20.10.10.3" in environment
@@ -135,3 +137,19 @@ def test_runtime_publishes_local_oci_base_before_installing_stage_handler() -> N
     assert publish in installer
     assert '--deployment-version "$deployment_version"' in installer
     assert installer.index(publish) < installer.index(stage_install)
+
+
+def test_compute_stage_publishes_ssh_on_ipv4_ingress_and_keeps_public_address_separate() -> None:
+    source = PLATFORM_ROOT / "scripts/h100-provision-stage"
+    worker = PORTAL_ROOT / "apps/worker/src/h100_portal_worker/handlers.py"
+    manifest = json.loads((PORTAL_ROOT / "deploy/worker-scripts.json").read_text())
+    source_text = source.read_text()
+    worker_text = worker.read_text()
+
+    assert manifest["h100-provision-stage"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert "readonly CONTAINER_PUBLISH_HOST=0.0.0.0" in source_text
+    assert "host_ip: ${CONTAINER_PUBLISH_HOST}" in source_text
+    assert '.HostConfig.PortBindings["22/tcp"][0].HostIp == $host_ip' in source_text
+    assert 'CONTAINER_PUBLISH_HOST = "0.0.0.0"' in worker_text
+    assert 'PUBLIC_ACCESS_HOST = "20.10.10.3"' in worker_text
+    assert 'container.get("ssh_host_ip") == CONTAINER_PUBLISH_HOST' in worker_text

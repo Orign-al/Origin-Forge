@@ -42,11 +42,11 @@ fingerprint、注释和 Scope，再确认登记。
 
 ## 连接
 
-ACTIVE 后，“连接”页显示开发容器的真实 Host、Port、Username 和 fingerprint。命令模板中的
+ACTIVE 后，“连接”页显示开发容器的正式入口 `20.10.10.3`、Port、Username 和 fingerprint。命令模板中的
 `<你的私钥路径>` 是用户自己设备上的路径，Portal 不知道也不保存它。
 
 ```text
-ssh -i <你的私钥路径> -p <CONTAINER_PORT> <COMPUTE_USERNAME>@<APPROVED_HOST>
+ssh -i <你的私钥路径> -p <CONTAINER_PORT> <COMPUTE_USERNAME>@20.10.10.3
 ```
 
 VS Code Remote SSH 配置同样使用本地 `IdentityFile <你的私钥路径>` 和容器端口。普通用户

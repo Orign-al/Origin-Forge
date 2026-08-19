@@ -134,6 +134,8 @@ PILOT_SSH_PORT_FIRST = 22023
 PILOT_USERNAME = "origin-pilot"
 MANAGEMENT_USERNAME = "origin-al"
 MANAGEMENT_IP = "10.82.36.1"
+CONTAINER_PUBLISH_HOST = "0.0.0.0"  # noqa: S104 -- approved user-ingress publish target
+PUBLIC_ACCESS_HOST = "20.10.10.3"
 SSH_REPRESENTATIVE_CLIENT_IP = "10.20.18.10"
 SSH_REPRESENTATIVE_HOST = "sagsh100server"
 GPU_DROPIN_NAME = "50-h100-gpu-isolation.conf"
@@ -2418,7 +2420,7 @@ def _candidate_ssh_port(excluded: set[int] | None = None) -> tuple[int | None, d
             return value, {
                 "range": f"{PILOT_SSH_PORT_MIN}-{PILOT_SSH_PORT_MAX}",
                 "reservation": "PROPOSED — NOT RESERVED",
-                "bind_address": MANAGEMENT_IP,
+                "bind_address": PUBLIC_ACCESS_HOST,
                 "source": "ss/docker/platform state",
             }
     return None, {
@@ -3355,6 +3357,7 @@ def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
         and container.get("memory_limit_bytes") == 32 * 1024**3
         and container.get("pids_limit") == 4096
         and container.get("ssh_port") == str(payload["ssh_port"])
+        and container.get("ssh_host_ip") == CONTAINER_PUBLISH_HOST
         and container.get("privileged") is False
         and container.get("network_mode") != "host"
         and container.get("pid_mode") != "host"
@@ -4009,7 +4012,7 @@ def _user_plan(requested_username: str) -> dict[str, Any]:
             {
                 "check": "ssh_port_candidate",
                 "status": "PASS" if ssh_port is not None else "FAIL",
-                "detail": f"候选端口={ssh_port}，未来绑定 {MANAGEMENT_IP}，只提出不开放"
+                "detail": f"候选端口={ssh_port}，用户入口 {PUBLIC_ACCESS_HOST}，只提出不开放"
                 if ssh_port is not None
                 else "候选端口不可用",
             },
@@ -4154,7 +4157,7 @@ def _user_plan(requested_username: str) -> dict[str, Any]:
             "memory_gb": 32,
             "pids_limit": 4096,
             "gpu": "none",
-            "network_bind": MANAGEMENT_IP,
+            "network_bind": PUBLIC_ACCESS_HOST,
         },
         "proposed_gpu_policy": {
             "method": "systemd-user-uid-slice",
@@ -4584,6 +4587,7 @@ def _stage_postcondition_summary(payload: dict[str, Any]) -> dict[str, Any]:
         and container.get("memory_limit_bytes") == payload["memory_gb"] * 1024**3
         and container.get("pids_limit") == payload["pids_limit"]
         and container.get("ssh_port") == str(payload["ssh_port"])
+        and container.get("ssh_host_ip") == CONTAINER_PUBLISH_HOST
         and container.get("privileged") is False
         and container.get("network_mode") != "host"
         and container.get("pid_mode") != "host"
@@ -5097,6 +5101,7 @@ def _verify_managed_container_start_preconditions(payload: dict[str, Any]) -> di
         and container.get("memory_limit_bytes") == APPROVED_STAGE_PAYLOAD["memory_gb"] * 1024**3
         and container.get("pids_limit") == APPROVED_STAGE_PAYLOAD["pids_limit"]
         and container.get("ssh_port") == str(APPROVED_STAGE_PAYLOAD["ssh_port"])
+        and container.get("ssh_host_ip") == CONTAINER_PUBLISH_HOST
         and container.get("privileged") is False
         and container.get("network_mode") != "host"
         and container.get("pid_mode") != "host"
@@ -5662,6 +5667,7 @@ def _activation_container_security(
         and container.get("memory_limit_bytes") == 32 * 1024**3
         and container.get("pids_limit") == 4096
         and container.get("ssh_port") == str(payload["ssh_port"])
+        and container.get("ssh_host_ip") == CONTAINER_PUBLISH_HOST
         and container.get("privileged") is False
         and container.get("network_mode") != "host"
         and container.get("pid_mode") != "host"
@@ -6151,13 +6157,13 @@ def _approved_container_listener() -> dict[str, Any]:
     )
     lines = [line.split() for line in str(result.get("stdout", "")).splitlines() if line.strip()]
     local_endpoints = [fields[3] for fields in lines if len(fields) >= 5]
-    expected = f"{MANAGEMENT_IP}:{APPROVED_STAGE_PAYLOAD['ssh_port']}"
+    expected = f"{CONTAINER_PUBLISH_HOST}:{APPROVED_STAGE_PAYLOAD['ssh_port']}"
     if not result.get("ok") or local_endpoints != [expected]:
         raise LifecycleValidationError(
             "CONTAINER_SSH_LISTENER_FAILED", "container SSH listener differs from approval"
         )
     return {
-        "address": MANAGEMENT_IP,
+        "address": PUBLIC_ACCESS_HOST,
         "port": APPROVED_STAGE_PAYLOAD["ssh_port"],
         "status": "LISTENING",
     }
@@ -6382,7 +6388,7 @@ def _activate_postcondition_summary(
         and container.get("memory_limit_bytes") == APPROVED_STAGE_PAYLOAD["memory_gb"] * 1024**3
         and container.get("pids_limit") == APPROVED_STAGE_PAYLOAD["pids_limit"]
         and container.get("ssh_port") == str(APPROVED_STAGE_PAYLOAD["ssh_port"])
-        and container.get("ssh_host_ip") == MANAGEMENT_IP
+        and container.get("ssh_host_ip") == CONTAINER_PUBLISH_HOST
         and container.get("privileged") is False
         and container.get("network_mode") != "host"
         and container.get("pid_mode") != "host"
@@ -6458,7 +6464,7 @@ def _activate_postcondition_summary(
             "cpus": APPROVED_STAGE_PAYLOAD["cpus"],
             "memory_gb": APPROVED_STAGE_PAYLOAD["memory_gb"],
             "pids_limit": APPROVED_STAGE_PAYLOAD["pids_limit"],
-            "ssh_address": MANAGEMENT_IP,
+            "ssh_address": PUBLIC_ACCESS_HOST,
             "ssh_port": APPROVED_STAGE_PAYLOAD["ssh_port"],
         },
         "guard": guard,

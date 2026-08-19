@@ -1,4 +1,5 @@
 from functools import lru_cache
+from ipaddress import AddressValueError, IPv4Address
 from typing import Annotated
 
 from pydantic import Field, field_validator
@@ -12,6 +13,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+pysqlite:////tmp/h100-portal-dev.db"
     secret_key: str = Field(default="development-only-change-me-000000000000", min_length=32)
     worker_socket: str = "/run/h100-portal/worker.sock"
+    public_access_host: str = "20.10.10.3"
     allowed_origins: Annotated[tuple[str, ...], NoDecode] = (
         "http://127.0.0.1:18080",
         "http://10.10.10.220:18080",
@@ -47,6 +49,17 @@ class Settings(BaseSettings):
         if value not in {"127.0.0.1", "::1"}:
             raise ValueError("Portal API must listen on loopback")
         return value
+
+    @field_validator("public_access_host")
+    @classmethod
+    def concrete_public_access_host(cls, value: str) -> str:
+        try:
+            address = IPv4Address(value)
+        except AddressValueError as exc:
+            raise ValueError("Portal public access host must be one IPv4 address") from exc
+        if address.is_unspecified or address.is_loopback or address.is_multicast:
+            raise ValueError("Portal public access host must be a concrete non-loopback address")
+        return str(address)
 
 
 @lru_cache

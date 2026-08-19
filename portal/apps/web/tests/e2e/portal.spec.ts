@@ -99,7 +99,7 @@ const originPilotPlan = {
     memory_gb: 32,
     pids_limit: 4096,
     gpu: "none",
-    network_bind: "10.82.36.1",
+    network_bind: "20.10.10.3",
   },
   proposed_gpu_policy: {
     method: "systemd-user-uid-slice",
