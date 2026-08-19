@@ -1,0 +1,14 @@
+[Unit]
+Description=H100 Portal legacy EasyTier HTTP ingress
+Documentation=file:/opt/h100-portal/docs/deployment.md
+Requires=easytier@home.service h100-portal-web.service
+After=easytier@home.service h100-portal-web.service
+
+[Socket]
+ListenStream=10.10.10.2:80
+FreeBind=yes
+NoDelay=true
+Accept=no
+
+[Install]
+WantedBy=sockets.target

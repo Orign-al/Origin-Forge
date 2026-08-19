@@ -104,11 +104,29 @@ def test_web_binds_user_ingress_without_exposing_internal_services() -> None:
     assert "h100-portal-web-tun1.service" not in installer
     assert not (PORTAL_ROOT / "deploy/systemd/h100-portal-web-tun1.service").exists()
     assert "PORTAL_PUBLIC_ACCESS_HOST=20.10.10.3" in environment
+    assert ",http://10.10.10.2," in environment
+    assert "http://10.10.10.2:18080" in environment
     assert "http://10.10.10.220:18080" in environment
     assert "http://20.10.10.3:18080" in environment
     assert "http://20.10.10.3" in environment
     assert "https://20.10.10.3" in environment
-    assert "http://10.10.10.2:18080" not in environment
+
+
+def test_legacy_http_entry_is_specific_and_proxies_only_to_portal_web() -> None:
+    socket = (PORTAL_ROOT / "deploy/systemd/h100-portal-legacy-http.socket").read_text()
+    service = (PORTAL_ROOT / "deploy/systemd/h100-portal-legacy-http.service").read_text()
+    installer = (PORTAL_ROOT / "deploy/scripts/install-runtime.sh").read_text()
+
+    assert "ListenStream=10.10.10.2:80" in socket.splitlines()
+    assert "ListenStream=0.0.0.0:80" not in socket.splitlines()
+    assert "FreeBind=yes" in socket.splitlines()
+    assert "systemd-socket-proxyd 127.0.0.1:18080" in service
+    assert "127.0.0.1:18081" not in service
+    assert "IPAddressDeny=any" in service.splitlines()
+    assert "IPAddressAllow=localhost" in service.splitlines()
+    assert "IPAddressAllow=10.10.10.0/24" in service.splitlines()
+    assert "h100-portal-legacy-http.socket" in installer
+    assert "h100-portal-legacy-http.service" in installer
 
 
 def test_runtime_version_and_automatic_provision_reconciliation_are_system_bound() -> None:
