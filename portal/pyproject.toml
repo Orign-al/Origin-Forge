@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "h100-portal"
 version = "0.1.0"
-description = "Local-only management portal for the single-node H100 platform"
+description = "Origin Forge control plane for the single-node multi-user H100 platform"
 requires-python = ">=3.14,<3.15"
 dependencies = [
   "alembic==1.19.0",

@@ -1,5 +1,5 @@
 [Unit]
-Description=H100 Portal fixed-operation root worker
+Description=Origin Forge fixed-operation root worker
 Documentation=file:/opt/h100-portal/docs/root-worker-api.md
 Requires=h100-portal-worker.socket
 After=h100-portal-worker.socket docker.service slurmd.service

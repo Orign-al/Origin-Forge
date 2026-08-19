@@ -1,5 +1,5 @@
 [Unit]
-Description=H100 Portal controlled root worker socket
+Description=Origin Forge controlled root worker socket
 
 [Socket]
 ListenStream=/run/h100-portal/worker.sock

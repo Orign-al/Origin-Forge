@@ -1,5 +1,5 @@
 [Unit]
-Description=H100 Portal management API
+Description=Origin Forge management API
 Documentation=file:/opt/h100-portal/docs/architecture.md
 Requires=h100-portal-worker.socket
 Wants=postgresql.service

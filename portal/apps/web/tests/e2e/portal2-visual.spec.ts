@@ -77,7 +77,7 @@ async function assertVisualBoundary(page: Page): Promise<void> {
 }
 
 const visualPages = [
-  { name: "login", url: "/login", heading: "H100 管理平台" },
+  { name: "login", url: "/login", heading: "Origin Forge" },
   { name: "overview", url: "/", heading: "总览" },
   { name: "gpu", url: "/gpus", heading: "GPU" },
   { name: "slurm", url: "/slurm", heading: "Slurm" },

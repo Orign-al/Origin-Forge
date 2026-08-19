@@ -1,12 +1,15 @@
-# H100 网页管理平台
+# Origin Forge Portal
 
-Portal-2 是 H100 单机平台的私有管理控制面。Web 用户入口监听所有 IPv4 接口，但 systemd
+Origin Forge 是 H100 单机多用户 GPU 平台的私有管理控制面。Web 用户入口监听所有 IPv4 接口，但 systemd
 网络策略仅允许批准的 VPN、EasyTier 和管理 LAN 网段；API 仍仅监听 `127.0.0.1:18081`。
-用户通过 EasyTier 正式地址访问：
+用户通过 EasyTier 主地址访问：
 
 ```text
 http://20.10.10.3:18080
 ```
+
+旧 EasyTier 网络入口 `http://10.10.10.220:18080` 同时保留。品牌名称只影响用户界面与
+文档；`h100-*` unit、命令和包名作为稳定部署接口继续保留。
 
 SSH Tunnel 仍可作为可选回退，但不是当前访问要求：
 
@@ -35,5 +38,7 @@ ssh -L 18080:20.10.10.3:18080 h100-codex
 - 内部 HTTP 接受不阻断当前单节点 Pilot 的已批准 Stage，但不得据此扩大访问范围或绕过
   Portal Operation、审批、幂等键、脚本 hash 和 Root Worker 校验链路。
 
-用户操作见 [`docs/ssh-access-user-guide.md`](docs/ssh-access-user-guide.md)，完整部署与安全
-说明见 [`docs/`](docs/)。
+仓库总览见 [`../README.md`](../README.md)，配置见
+[`../docs/configuration.md`](../docs/configuration.md)，用户操作见
+[`docs/ssh-access-user-guide.md`](docs/ssh-access-user-guide.md)，完整部署与安全说明见
+[`docs/`](docs/)。

@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 
-import { ACCESS_MODE_LABEL } from "@h100-portal/config";
+import { ACCESS_MODE_LABEL, PORTAL_TITLE } from "@h100-portal/config";
 import { Button, Card, Input } from "@h100-portal/ui";
 import { getCsrf, login } from "../../lib/api";
 
@@ -57,7 +57,7 @@ export default function LoginPage() {
       <Card className="auth-panel">
         <div className="auth-brand">
           <span className="local-mode">{ACCESS_MODE_LABEL}</span>
-          <h1>H100 管理平台</h1>
+          <h1>{PORTAL_TITLE}</h1>
           <p>私有管理入口 · 请使用网页账号登录</p>
         </div>
         <form onSubmit={handleSubmit(submit)} noValidate>

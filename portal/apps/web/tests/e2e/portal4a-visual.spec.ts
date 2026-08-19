@@ -420,7 +420,7 @@ for (const viewport of [
 
     await page.goto("/login");
     await expect(
-      page.getByRole("heading", { name: "H100 管理平台" }),
+      page.getByRole("heading", { name: "Origin Forge" }),
     ).toBeVisible();
     await capture(page, viewport.label, "01-login");
 

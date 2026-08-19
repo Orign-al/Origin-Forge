@@ -5,7 +5,11 @@ import { usePathname, useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 
-import { ACCESS_MODE_LABEL, navigation } from "@h100-portal/config";
+import {
+  ACCESS_MODE_LABEL,
+  navigation,
+  PORTAL_TITLE,
+} from "@h100-portal/config";
 import { Badge, Button } from "@h100-portal/ui";
 import { alerts, logout, me, recordPageAccess } from "../lib/api";
 
@@ -148,7 +152,7 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
     <div className="portal-frame">
       <aside className="portal-sidebar">
         <div className="brand">
-          <div className="brand-title">H100 管理平台</div>
+          <div className="brand-title">{PORTAL_TITLE}</div>
           <div className="brand-subtitle">
             {role === "user"
               ? "个人计算环境 · Portal-5A-1B"

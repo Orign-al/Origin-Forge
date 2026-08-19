@@ -1,10 +1,11 @@
 import type { Metadata } from "next";
+import { PORTAL_TITLE } from "@h100-portal/config";
 import "./globals.css";
 import { Providers } from "./providers";
 
 export const metadata: Metadata = {
-  title: "H100 管理平台",
-  description: "H100 私有隧道网络管理入口",
+  title: PORTAL_TITLE,
+  description: "Origin Forge H100 多用户 GPU 计算平台",
 };
 
 export default function RootLayout({

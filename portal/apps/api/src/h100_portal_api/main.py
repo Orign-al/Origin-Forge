@@ -37,7 +37,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="H100 管理平台 API", version="0.1.0", docs_url=None, redoc_url=None, lifespan=lifespan
+    title="Origin Forge API", version="0.1.0", docs_url=None, redoc_url=None, lifespan=lifespan
 )
 settings = get_settings()
 app.add_middleware(

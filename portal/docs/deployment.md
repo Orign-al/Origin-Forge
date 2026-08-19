@@ -1,4 +1,4 @@
-# Portal 部署手册
+# Origin Forge Portal 部署手册
 
 ## 当前部署形态
 
@@ -10,6 +10,7 @@
 - Runtime socket：`/run/h100-portal/worker.sock`
 - Web listener：`0.0.0.0:18080`（systemd 仅允许批准的 VPN、EasyTier 与管理 LAN 网段）
 - 用户正式地址：`http://20.10.10.3:18080/`
+- 旧 EasyTier 兼容地址：`http://10.10.10.220:18080/`
 - API：`127.0.0.1:18081`（继续仅限 loopback）
 - PostgreSQL：本机 Unix Socket，不监听 Portal TCP 端口
 
@@ -142,6 +143,7 @@ policy、管理账号 diff、reload、服务状态或第二连接任一失败，
 ```bash
 curl -fsS http://127.0.0.1:18081/health/live
 curl -fsS http://127.0.0.1:18081/health/ready
+curl -fsS http://10.10.10.220:18080/login >/dev/null
 curl -fsS http://20.10.10.3:18080/login >/dev/null
 curl -fsS http://10.82.36.1:18080/login >/dev/null
 ss -lntup

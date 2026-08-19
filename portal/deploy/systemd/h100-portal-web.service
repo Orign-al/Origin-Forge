@@ -1,5 +1,5 @@
 [Unit]
-Description=H100 Portal user ingress web console
+Description=Origin Forge user ingress web console
 Documentation=file:/opt/h100-portal/docs/deployment.md
 Wants=h100-portal-api.service
 After=network.target h100-portal-api.service
