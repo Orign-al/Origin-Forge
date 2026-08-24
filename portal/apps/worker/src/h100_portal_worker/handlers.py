@@ -25,6 +25,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from h100_portal_contracts.workspace import (
+    WORKSPACE_QUOTA_BYTES,
+    WORKSPACE_REQUIRED_DIRECTORIES,
+    WorkspaceBinding,
+    workspace_binding,
+)
+
 from h100_portal_worker.local_image import DEPLOYMENT_VERSION_PATH, local_image_contract
 from h100_portal_worker.schemas import (
     APPROVED_CLIENT_VALIDATION_PAYLOAD,
@@ -66,6 +73,7 @@ BINARIES = {
     "xfs_quota": "/usr/sbin/xfs_quota",
     "du": "/usr/bin/du",
     "find": "/usr/bin/find",
+    "findmnt": "/usr/bin/findmnt",
     "hostname": "/usr/bin/hostname",
     "ss": "/usr/bin/ss",
     "ssh-keygen": "/usr/bin/ssh-keygen",
@@ -79,6 +87,7 @@ BINARIES = {
 }
 SCRIPT_ALLOWLIST = {
     "h100-provision-stage": "/usr/local/sbin/h100-provision-stage",
+    "h100-workspace-alias": "/usr/local/sbin/h100-workspace-alias",
     "h100-user-create": "/usr/local/sbin/h100-user-create",
     "h100-user-gpu-isolation": "/usr/local/sbin/h100-user-gpu-isolation",
     "h100-container-create": "/usr/local/sbin/h100-container-create",
@@ -196,6 +205,7 @@ COMPUTE_STAGE_REQUIRED_SCRIPTS = frozenset(
     {
         "h100-provision-stage",
         "h100-platform-common",
+        "h100-workspace-alias",
         "h100-user-gpu-isolation",
         "h100-gpu-bypass-guard",
     }
@@ -7303,6 +7313,67 @@ def _managed_relative_parts(relative: str) -> tuple[str, ...]:
     return path.parts
 
 
+def _workspace_binding_for_payload(
+    payload: dict[str, Any], *, require_alias: bool
+) -> WorkspaceBinding:
+    try:
+        binding = workspace_binding(
+            str(payload["username"]),
+            int(payload["uid"]),
+            int(payload["gid"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LifecycleValidationError(
+            "WORKSPACE_BINDING_REJECTED", "managed workspace coordinates are invalid"
+        ) from exc
+    if payload.get("workspace_path") != str(binding.canonical_workspace) or payload.get(
+        "quota_root"
+    ) != str(binding.quota_root):
+        raise LifecycleValidationError(
+            "WORKSPACE_BINDING_REJECTED", "workspace is not derived from the managed owner"
+        )
+    try:
+        quota_metadata = Path(binding.quota_root).lstat()
+        backing_metadata = Path(binding.backing_workspace).lstat()
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "WORKSPACE_BINDING_REJECTED", "authoritative workspace backing is unavailable"
+        ) from exc
+    for metadata in (quota_metadata, backing_metadata):
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != binding.uid
+            or metadata.st_gid != binding.gid
+            or stat.S_IMODE(metadata.st_mode) & 0o007
+        ):
+            raise LifecycleValidationError(
+                "WORKSPACE_BINDING_REJECTED",
+                "authoritative workspace ownership or mode is invalid",
+            )
+    if require_alias:
+        try:
+            canonical_metadata = Path(binding.canonical_workspace).lstat()
+        except OSError as exc:
+            raise LifecycleValidationError(
+                "WORKSPACE_BINDING_REJECTED", "canonical workspace alias is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISDIR(canonical_metadata.st_mode)
+            or stat.S_ISLNK(canonical_metadata.st_mode)
+            or canonical_metadata.st_uid != binding.uid
+            or canonical_metadata.st_gid != binding.gid
+            or stat.S_IMODE(canonical_metadata.st_mode) & 0o007
+            or (canonical_metadata.st_dev, canonical_metadata.st_ino)
+            != (backing_metadata.st_dev, backing_metadata.st_ino)
+        ):
+            raise LifecycleValidationError(
+                "WORKSPACE_BINDING_REJECTED",
+                "canonical workspace is not the owner-bound backing alias",
+            )
+    return binding
+
+
 def _validate_owned_descriptor(
     descriptor: int, *, directory: bool, uid: int, gid: int
 ) -> os.stat_result:
@@ -7348,6 +7419,42 @@ def _open_managed_user_path(
             else "USER_PATH_NOT_FOUND"
         )
         raise LifecycleValidationError(code, "requested user path cannot be opened safely") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            with suppress(OSError):
+                os.close(descriptor)
+
+
+@contextmanager
+def _open_workspace_directory(
+    root: Path, relative: str, *, uid: int, gid: int
+) -> Iterator[tuple[Path, int, os.stat_result]]:
+    parts = _managed_relative_parts(relative)
+    descriptors: list[int] = []
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow)
+        descriptors.append(descriptor)
+        _validate_owned_descriptor(descriptor, directory=True, uid=uid, gid=gid)
+        metadata = os.fstat(descriptor)
+        for part in parts:
+            descriptor = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow,
+                dir_fd=descriptors[-1],
+            )
+            descriptors.append(descriptor)
+            metadata = _validate_owned_descriptor(descriptor, directory=True, uid=uid, gid=gid)
+        yield root.joinpath(*parts), descriptors[-1], metadata
+    except LifecycleValidationError:
+        raise
+    except OSError as exc:
+        code = (
+            "SYMLINK_ESCAPE_REJECTED"
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}
+            else "WORKSPACE_DIRECTORY_REJECTED"
+        )
+        raise LifecycleValidationError(code, "workspace path cannot be opened safely") from exc
     finally:
         for descriptor in reversed(descriptors):
             with suppress(OSError):
@@ -7823,6 +7930,113 @@ def _self_storage(payload: dict[str, Any]) -> dict[str, Any]:
             "status": "ERROR",
             "error": {
                 "code": getattr(exc, "code", "STORAGE_READ_FAILED"),
+                "message": str(exc),
+            },
+        }
+
+
+def _self_workspace_check(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        _managed_account(payload)
+        binding = _workspace_binding_for_payload(payload, require_alias=True)
+        root = Path(binding.canonical_workspace)
+        root_metadata = root.lstat()
+        writable = bool(
+            root_metadata.st_mode & stat.S_IWUSR and root_metadata.st_mode & stat.S_IXUSR
+        )
+        if not writable:
+            raise LifecycleValidationError(
+                "WORKSPACE_PERMISSION_REJECTED", "workspace is not owner-writable"
+            )
+        for relative in WORKSPACE_REQUIRED_DIRECTORIES:
+            with _open_workspace_directory(
+                root,
+                relative.as_posix(),
+                uid=binding.uid,
+                gid=binding.gid,
+            ) as (_path, _descriptor, metadata):
+                if stat.S_IMODE(metadata.st_mode) != 0o700:
+                    raise LifecycleValidationError(
+                        "WORKSPACE_DIRECTORY_REJECTED",
+                        "required workspace directory mode is invalid",
+                    )
+
+        mount_target = run_fixed(
+            "findmnt",
+            [
+                "--noheadings",
+                "--output",
+                "TARGET",
+                "--mountpoint",
+                str(binding.canonical_workspace),
+            ],
+            timeout=10,
+        )
+        mount_options = run_fixed(
+            "findmnt",
+            [
+                "--noheadings",
+                "--output",
+                "OPTIONS",
+                "--mountpoint",
+                str(binding.canonical_workspace),
+            ],
+            timeout=10,
+        )
+        options = {
+            option for option in str(mount_options.get("stdout", "")).strip().split(",") if option
+        }
+        if (
+            not mount_target.get("ok")
+            or str(mount_target.get("stdout", "")).strip() != str(binding.canonical_workspace)
+            or not mount_options.get("ok")
+            or not {"rw", "nosuid", "nodev"} <= options
+        ):
+            raise LifecycleValidationError(
+                "WORKSPACE_MOUNT_REJECTED", "canonical workspace bind mount is invalid"
+            )
+
+        project_id = int(payload["project_id"])
+        quota_bytes = int(payload["quota_bytes"])
+        if (
+            quota_bytes != WORKSPACE_QUOTA_BYTES
+            or f"{project_id}:{binding.quota_root}" not in _safe_file_lines(PROJECTS_FILE)
+            or f"h100_{binding.username}:{project_id}" not in _safe_file_lines(PROJID_FILE)
+        ):
+            raise LifecycleValidationError(
+                "WORKSPACE_QUOTA_REJECTED", "workspace XFS project mapping is invalid"
+            )
+        try:
+            quota = _verified_project_quota(project_id, quota_bytes // 1024**3)
+        except LifecycleValidationError as exc:
+            raise LifecycleValidationError(
+                "WORKSPACE_QUOTA_REJECTED", "workspace XFS quota is not enforced"
+            ) from exc
+        if quota.get("enforcement") != "ON":
+            raise LifecycleValidationError(
+                "WORKSPACE_QUOTA_REJECTED", "workspace XFS quota is not enforced"
+            )
+        return {
+            "status": "OK",
+            "handler": "self.workspace.check",
+            "username": binding.username,
+            "uid": binding.uid,
+            "gid": binding.gid,
+            "ownership_verified": True,
+            "writable": True,
+            "same_inode": True,
+            "quota_mapping_valid": True,
+            "quota_enforced": True,
+            "required_directories_ready": True,
+            "mount_status": "PASS",
+            "permission_status": "PASS",
+            "storage_status": "PASS",
+        }
+    except (LifecycleValidationError, OSError) as exc:
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": getattr(exc, "code", "WORKSPACE_CHECK_FAILED"),
                 "message": str(exc),
             },
         }
@@ -8582,6 +8796,8 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
             return _self_job_status(payload)
         if request.operation_type == "self.storage.read":
             return _self_storage(payload)
+        if request.operation_type == "self.workspace.check":
+            return _self_workspace_check(payload)
     except Exception as exc:
         return {
             "status": "UNKNOWN",

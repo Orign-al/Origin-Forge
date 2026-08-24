@@ -65,6 +65,9 @@ if [[ "${delete_data}" == no ]]; then
 fi
 
 user_root="${H100_DATA_ROOT}/users/${user_name}"
+user_uid="$(id -u "${user_name}")"
+workspace_root="${H100_WORKSPACE_ROOT}/${user_uid}"
+workspace_alias_tool=/usr/local/sbin/h100-workspace-alias
 host_key_root="${H100_DATA_ROOT}/container-data/${user_name}"
 [[ ! -L "${user_root}" && "$(realpath -e "${user_root}")" == "${user_root}" ]] \
   || h100_fail 'user data path validation failed'
@@ -80,6 +83,15 @@ project_id="$(awk -F: -v name="${project_name}" '$1 == name {print $2}' /etc/pro
 [[ "${project_id}" =~ ^[0-9]+$ ]] || h100_fail 'project ID mapping is invalid'
 grep -Fxq "${project_id}:${user_root}" /etc/projects \
   || h100_fail 'project path mapping is invalid'
+
+if findmnt --noheadings --mountpoint "${workspace_root}" >/dev/null 2>&1; then
+  [[ -x "${workspace_alias_tool}" && ! -L "${workspace_alias_tool}" ]] \
+    || h100_fail 'workspace alias removal handler is unavailable'
+  "${workspace_alias_tool}" remove "${user_name}" "${user_uid}" "$(id -g "${user_name}")" \
+    --confirm-remove "${user_name}"
+elif [[ -e "${workspace_root}" || -L "${workspace_root}" ]]; then
+  h100_fail 'unmounted canonical workspace collision requires review'
+fi
 
 stamp="$(date +%Y%m%d-%H%M%S-%N)"
 backup_dir="${H100_PLATFORM_ROOT}/backups/container-delete-${user_name}-${stamp}"

@@ -10,6 +10,7 @@ readonly PROJID_FILE=/etc/projid
 readonly COMPOSE_ROOT=/srv/gpu-platform/platform/config/dev-containers
 readonly CONTAINER_DATA_ROOT=/srv/gpu-platform/container-data
 readonly LOCAL_IMAGE_TOOL=/opt/h100-portal/venv/bin/h100-portal-local-image
+readonly WORKSPACE_ALIAS_TOOL=/usr/local/sbin/h100-workspace-alias
 readonly GUARD_SERVICE=h100-gpu-bypass-guard.service
 readonly UID_MIN=20000
 readonly UID_MAX=60000
@@ -29,6 +30,7 @@ created_association=0
 created_container=0
 created_compose=0
 created_image=0
+created_workspace_alias=0
 committed=0
 transaction_started=0
 backup_dir=
@@ -46,6 +48,8 @@ plan_id=
 dry_run_operation_id=
 project_name=
 user_root=
+backing_workspace=
+workspace_root=
 container_name=
 compose_dir=
 compose_file=
@@ -167,6 +171,19 @@ rollback() {
     fi
   else
     rollback_mark CONTAINER_DEFINITION NOT_REQUIRED
+  fi
+  if ((created_workspace_alias == 1)) \
+    || { [[ -n "${workspace_root}" ]] \
+      && findmnt --noheadings --mountpoint "${workspace_root}" >/dev/null 2>&1; }; then
+    if "${WORKSPACE_ALIAS_TOOL}" remove "${username}" "${uid}" "${gid}" \
+      --confirm-remove "${username}" >/dev/null 2>&1; then
+      rollback_mark WORKSPACE_ALIAS SUCCEEDED
+    else
+      rollback_mark WORKSPACE_ALIAS FAILED
+      manual_review=1
+    fi
+  else
+    rollback_mark WORKSPACE_ALIAS NOT_REQUIRED
   fi
   if ((created_image == 1)); then
     if docker image rm "${derived_image}" >/dev/null 2>&1; then
@@ -363,6 +380,8 @@ h100_acquire_lock
   || fail 'forbidden wildcard user-.slice GPU policy exists'
 project_name="h100_${username}"
 user_root="${H100_DATA_ROOT}/users/${username}"
+backing_workspace="${user_root}/workspace"
+workspace_root="${H100_WORKSPACE_ROOT}/${uid}"
 container_name="gpu-dev-${username}"
 derived_image="h100-local/dev-container:ubuntu24.04-${username}-${plan_id}"
 compose_dir="${COMPOSE_ROOT}/${username}"
@@ -373,7 +392,8 @@ getent passwd "${username}" >/dev/null && fail 'Linux user already exists'
 getent group "${username}" >/dev/null && fail 'Linux group already exists'
 getent passwd "${uid}" >/dev/null && fail 'UID already exists'
 getent group "${gid}" >/dev/null && fail 'GID already exists'
-[[ ! -e "${user_root}" && ! -e "${CONTAINER_DATA_ROOT}/${username}" ]] \
+[[ ! -e "${user_root}" && ! -e "${workspace_root}" \
+  && ! -e "${CONTAINER_DATA_ROOT}/${username}" ]] \
   || fail 'target storage already exists'
 [[ ! -e "${state_file}" && ! -e "${compose_dir}" ]] || fail 'target lifecycle state exists'
 docker container inspect "${container_name}" >/dev/null 2>&1 && fail 'container already exists'
@@ -489,7 +509,25 @@ current_step=PRIVATE_STORAGE
 install -d -o "${uid}" -g "${gid}" -m 0700 "${user_root}"
 created_data=1
 install -d -o "${uid}" -g "${gid}" -m 0700 \
-  "${user_root}/home" "${user_root}/home/.ssh" "${user_root}/workspace" "${user_root}/shared"
+  "${user_root}/home" \
+  "${user_root}/home/.ssh" \
+  "${backing_workspace}" \
+  "${backing_workspace}/projects" \
+  "${backing_workspace}/datasets" \
+  "${backing_workspace}/outputs" \
+  "${backing_workspace}/.portal" \
+  "${backing_workspace}/.portal/job-scripts" \
+  "${backing_workspace}/.portal/jobs" \
+  "${backing_workspace}/.portal/templates" \
+  "${backing_workspace}/.portal/logs" \
+  "${backing_workspace}/.portal/runtime" \
+  "${user_root}/shared"
+"${WORKSPACE_ALIAS_TOOL}" prepare "${username}" "${uid}" "${gid}"
+created_workspace_alias=1
+"${WORKSPACE_ALIAS_TOOL}" verify "${username}" "${uid}" "${gid}"
+[[ "$(stat -c '%d:%i' "${backing_workspace}")" == \
+  "$(stat -c '%d:%i' "${workspace_root}")" ]] \
+  || fail 'canonical workspace alias differs from the authoritative backing'
 install -d -o root -g root -m 0700 \
   "${CONTAINER_DATA_ROOT}/${username}" \
   "${CONTAINER_DATA_ROOT}/${username}/ssh-host-keys"
@@ -507,7 +545,7 @@ origin_root="${H100_DATA_ROOT}/users/origin-pilot"
   || fail 'origin-pilot identity baseline differs from production policy'
 [[ -d "${origin_root}/workspace" ]] || fail 'origin-pilot private workspace is unavailable'
 isolation_marker_one="${origin_root}/workspace/.portal-stage-isolation-${plan_id}"
-isolation_marker_two="${user_root}/workspace/.portal-stage-isolation-${plan_id}"
+isolation_marker_two="${workspace_root}/.portal-stage-isolation-${plan_id}"
 [[ ! -e "${isolation_marker_one}" && ! -e "${isolation_marker_two}" ]] \
   || fail 'isolation marker collision'
 install -o "${origin_uid}" -g "${origin_gid}" -m 0600 /dev/null "${isolation_marker_one}"
@@ -581,7 +619,7 @@ services:
         protocol: tcp
     volumes:
       - {type: bind, source: ${user_root}/home, target: /home/${username}, bind: {propagation: rprivate}}
-      - {type: bind, source: ${user_root}/workspace, target: /workspace, bind: {propagation: rprivate}}
+      - {type: bind, source: ${workspace_root}, target: /workspace, bind: {propagation: rprivate}}
       - {type: bind, source: ${user_root}/shared, target: /shared, bind: {propagation: rprivate}}
       - {type: bind, source: ${CONTAINER_DATA_ROOT}/${username}/ssh-host-keys, target: /etc/ssh/persistent, bind: {propagation: rprivate}}
     environment:
@@ -602,6 +640,7 @@ created_container=1
 docker inspect "${container_name}" | jq -e \
   --arg host_ip "${CONTAINER_PUBLISH_HOST}" \
   --arg port "${ssh_port}" \
+  --arg workspace "${workspace_root}" \
   '.[0].HostConfig.Privileged == false
    and .[0].HostConfig.NetworkMode != "host"
    and .[0].HostConfig.PidMode != "host"
@@ -618,7 +657,7 @@ docker inspect "${container_name}" | jq -e \
    and ((.[0].Mounts // []) | map(.Destination) | index("/var/run/docker.sock") | not)
    and ((.[0].Mounts // []) | map(.Destination) | index("/run/munge") | not)
    and ((.[0].Mounts // []) | map(.Source) | index("/") | not)
-   and ((.[0].Mounts // []) | map(.Source) | index("/srv/gpu-platform/users") | not)' \
+   and ((.[0].Mounts // []) | map(select(.Source == $workspace and .Destination == "/workspace" and .RW == true)) | length == 1)' \
   >/dev/null || fail 'staged container security validation failed'
 ss -H -lnt "sport = :${ssh_port}" | grep -q . && fail 'staged SSH port unexpectedly listens'
 
@@ -626,7 +665,7 @@ last_successful_step=CONTAINER_DEFINITION
 current_step=LIFECYCLE_STATE
 install -d -o root -g gpu-platform-admin -m 0750 "${STATE_DIR}"
 cat >"${temp_dir}/state" <<EOF
-VERSION=3
+VERSION=4
 STATUS=STAGED
 USERNAME=${username}
 UID=${uid}
@@ -639,6 +678,11 @@ MAX_GPUS=${max_gpus}
 REQUEST_ID=${request_id}
 PLAN_ID=${plan_id}
 DRY_RUN_OPERATION_ID=${dry_run_operation_id}
+DEVELOPMENT_PROFILE=STANDARD_8CPU_32GB
+WORKSPACE_LAYOUT=LEGACY_BIND_ALIAS
+STORAGE_ROOT=${user_root}
+BACKING_WORKSPACE=${backing_workspace}
+WORKSPACE_PATH=${workspace_root}
 SSH_KEY_STATE=REQUIRED_BEFORE_ACTIVATION
 LEASE_STATE=NOT_STARTED
 LEASE_START=

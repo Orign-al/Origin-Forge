@@ -35,12 +35,12 @@ h100-portal-lease-expiry = "h100_portal_api.expiry_service:main"
 h100-portal-provision-reconcile = "h100_portal_api.provision_reconciliation:main"
 
 [tool.setuptools.packages.find]
-where = ["apps/api/src", "apps/worker/src"]
+where = ["apps/api/src", "apps/worker/src", "apps/shared/src"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers --strict-config"
 testpaths = ["apps/api/tests", "apps/worker/tests", "tests"]
-pythonpath = ["apps/api/src", "apps/worker/src"]
+pythonpath = ["apps/api/src", "apps/worker/src", "apps/shared/src"]
 
 [tool.ruff]
 target-version = "py314"
@@ -70,7 +70,7 @@ python_version = "3.14"
 strict = true
 warn_unreachable = true
 plugins = ["pydantic.mypy", "sqlalchemy.ext.mypy.plugin"]
-mypy_path = ["apps/api/src", "apps/worker/src"]
+mypy_path = ["apps/api/src", "apps/worker/src", "apps/shared/src"]
 exclude = ["apps/api/alembic/versions"]
 
 [[tool.mypy.overrides]]

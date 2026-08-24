@@ -66,6 +66,7 @@ from h100_portal_api.terminal_service import (
     terminal_registry,
 )
 from h100_portal_api.worker_client import WorkerClientError, call_worker
+from h100_portal_api.workspace_service import WorkspaceResolution, resolve_workspace
 
 router = APIRouter(tags=["self-service"])
 
@@ -212,6 +213,51 @@ def _container_view(container: PortalContainer, lease_active: bool) -> dict[str,
         "privileged": False,
         "docker_socket": False,
         "munge": False,
+    }
+
+
+def _verified_workspace(
+    context: AuthContext, db: Session
+) -> tuple[WorkspaceResolution, dict[str, Any]]:
+    resolution = resolve_workspace(db, context.user)
+    evidence = _worker(
+        "self.workspace.check",
+        payload=resolution.worker_payload(),
+        context=context,
+        idempotency_key=f"self-workspace-check:{resolution.workspace_id}",
+        timeout_seconds=30,
+    )
+    resolution.public_contract(evidence)
+    return resolution, evidence
+
+
+@router.get("/self/workspace")
+def self_workspace(
+    context: AuthContext = Depends(permission_dependency("self.storage.read")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    resolution, evidence = _verified_workspace(context, db)
+    return {"status": "OK", "workspace": resolution.public_contract(evidence)}
+
+
+@router.get("/self/workspace/check")
+def self_workspace_check(
+    context: AuthContext = Depends(permission_dependency("self.storage.read")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    resolution, _evidence = _verified_workspace(context, db)
+    return {
+        "status": "READY",
+        "workspace_id": str(resolution.workspace_id),
+        "checks": {
+            "mount": "PASS",
+            "permissions": "PASS",
+            "storage": "PASS",
+            "ownership": "PASS",
+            "quota": "PASS",
+            "same_inode": True,
+            "required_directories": "PASS",
+        },
     }
 
 

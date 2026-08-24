@@ -4,6 +4,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from h100_portal_contracts.workspace import workspace_binding
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 KNOWN_READS = {
@@ -28,6 +29,7 @@ KNOWN_READS = {
     "self.job.logs.read",
     "self.job.status.read",
     "self.storage.read",
+    "self.workspace.check",
     "compute.provision.retry_verify",
 }
 KNOWN_WRITES = {
@@ -1565,6 +1567,49 @@ def validate_payload(
                 "STORAGE_TARGET_REJECTED", "storage target fields are invalid"
             )
         return _managed_identity(payload)
+    if operation_type == "self.workspace.check":
+        fields = {
+            "managed_user_id",
+            "username",
+            "uid",
+            "gid",
+            "workspace_path",
+            "quota_root",
+            "project_id",
+            "quota_bytes",
+        }
+        if set(payload) != fields:
+            raise PayloadValidationError(
+                "WORKSPACE_CHECK_TARGET_REJECTED", "workspace check fields are invalid"
+            )
+        result = _managed_identity(payload)
+        binding = workspace_binding(result["username"], result["uid"], result["gid"])
+        if payload.get("workspace_path") != str(binding.canonical_workspace) or payload.get(
+            "quota_root"
+        ) != str(binding.quota_root):
+            raise PayloadValidationError(
+                "WORKSPACE_BINDING_REJECTED", "workspace is not derived from the managed owner"
+            )
+        project_id = payload.get("project_id")
+        quota_bytes = payload.get("quota_bytes")
+        if (
+            not isinstance(project_id, int)
+            or isinstance(project_id, bool)
+            or not PROJECT_ID_MIN <= project_id <= PROJECT_ID_MAX
+            or quota_bytes != STANDARD_COMPUTE_STORAGE_BYTES
+        ):
+            raise PayloadValidationError(
+                "WORKSPACE_QUOTA_REJECTED", "workspace project or quota is invalid"
+            )
+        result.update(
+            {
+                "workspace_path": str(binding.canonical_workspace),
+                "quota_root": str(binding.quota_root),
+                "project_id": project_id,
+                "quota_bytes": quota_bytes,
+            }
+        )
+        return result
     if operation_type == "self.container.terminal":
         return _validate_container_terminal(payload)
     if (

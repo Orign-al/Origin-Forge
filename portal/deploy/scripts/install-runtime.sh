@@ -7,11 +7,15 @@ readonly RUNTIME_DIR=/opt/h100-portal
 readonly UNIT_DIR=/etc/systemd/system
 readonly CONFIG_DIR=/etc/h100-portal
 readonly SSH_KEY_STAGING_DIR=/var/lib/h100-portal/ssh-key-staging
+readonly PLATFORM_LIBRARY_DIR=/usr/local/lib/h100-platform
 readonly PORTAL3F_ACCEPTANCE_SOURCE="${PLATFORM_DIR}/scripts/h100-origin-pilot-acceptance"
 readonly PORTAL3F_GPU_PROBE_SOURCE="${PLATFORM_DIR}/tests/gpu-device-mapping/gpu-device-context-probe.c"
 readonly COMPUTE_STAGE_SOURCE="${PLATFORM_DIR}/scripts/h100-provision-stage"
+readonly PLATFORM_COMMON_SOURCE="${PLATFORM_DIR}/scripts/h100-platform-common.sh"
+readonly WORKSPACE_ALIAS_SOURCE="${PLATFORM_DIR}/scripts/h100-workspace-alias"
 readonly CONTAINER_START_SOURCE="${PLATFORM_DIR}/scripts/h100-container-start"
 readonly CONTAINER_STOP_SOURCE="${PLATFORM_DIR}/scripts/h100-container-stop"
+readonly CONTAINER_DELETE_SOURCE="${PLATFORM_DIR}/scripts/h100-container-delete"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "install-runtime.sh must run as root" >&2
@@ -32,10 +36,16 @@ done
 
 [[ -f "$COMPUTE_STAGE_SOURCE" && ! -L "$COMPUTE_STAGE_SOURCE" ]] \
   || { echo "required deployment input missing: $COMPUTE_STAGE_SOURCE" >&2; exit 1; }
+[[ -f "$PLATFORM_COMMON_SOURCE" && ! -L "$PLATFORM_COMMON_SOURCE" ]] \
+  || { echo "required deployment input missing: $PLATFORM_COMMON_SOURCE" >&2; exit 1; }
+[[ -f "$WORKSPACE_ALIAS_SOURCE" && ! -L "$WORKSPACE_ALIAS_SOURCE" ]] \
+  || { echo "required deployment input missing: $WORKSPACE_ALIAS_SOURCE" >&2; exit 1; }
 [[ -f "$CONTAINER_START_SOURCE" && ! -L "$CONTAINER_START_SOURCE" ]] \
   || { echo "required deployment input missing: $CONTAINER_START_SOURCE" >&2; exit 1; }
 [[ -f "$CONTAINER_STOP_SOURCE" && ! -L "$CONTAINER_STOP_SOURCE" ]] \
   || { echo "required deployment input missing: $CONTAINER_STOP_SOURCE" >&2; exit 1; }
+[[ -f "$CONTAINER_DELETE_SOURCE" && ! -L "$CONTAINER_DELETE_SOURCE" ]] \
+  || { echo "required deployment input missing: $CONTAINER_DELETE_SOURCE" >&2; exit 1; }
 
 rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
   --exclude=/node_modules/ \
@@ -83,6 +93,17 @@ rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
 # never passes an arbitrary host path and cannot write this root-owned tree.
 install -d -o root -g root -m 0700 "${SSH_KEY_STAGING_DIR}"
 
+# Workspace V4 scripts source this exact library. Publish the library and
+# alias handler before the Stage handler and integrity manifest can refer to
+# them, so an interrupted deployment remains fail closed.
+install -d -o root -g gpu-platform-admin -m 0750 "${PLATFORM_LIBRARY_DIR}"
+install -o root -g gpu-platform-admin -m 0640 \
+  "$PLATFORM_COMMON_SOURCE" \
+  "${PLATFORM_LIBRARY_DIR}/h100-platform-common.sh"
+install -o root -g gpu-platform-admin -m 0750 \
+  "$WORKSPACE_ALIAS_SOURCE" \
+  /usr/local/sbin/h100-workspace-alias
+
 # Resource recycle uses this fixed root-owned artifact. Install it before the
 # matching manifest: any interrupted deployment therefore fails closed on an
 # integrity mismatch instead of executing an unbound lifecycle script.
@@ -92,6 +113,9 @@ install -o root -g gpu-platform-admin -m 0750 \
 install -o root -g gpu-platform-admin -m 0750 \
   "$CONTAINER_STOP_SOURCE" \
   /usr/local/sbin/h100-container-stop
+install -o root -g gpu-platform-admin -m 0750 \
+  "$CONTAINER_DELETE_SOURCE" \
+  /usr/local/sbin/h100-container-delete
 
 install -o root -g root -m 0640 \
   "$SOURCE_DIR/deploy/worker-scripts.json" \

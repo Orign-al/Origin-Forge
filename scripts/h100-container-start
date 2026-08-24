@@ -38,10 +38,10 @@ require_activated_pilot_access() {
     'root:gpu-platform-admin:640' ]] \
     || h100_fail 'managed Pilot lifecycle state ownership or mode is invalid'
   state_version="$(pilot_state_value "${state_file}" VERSION)"
-  [[ "${state_version}" == 2 || "${state_version}" == 3 ]] \
+  [[ "${state_version}" == 2 || "${state_version}" == 3 || "${state_version}" == 4 ]] \
     || h100_fail 'managed Pilot lifecycle state version is invalid'
   state_status="$(pilot_state_value "${state_file}" STATUS)"
-  if [[ "${state_version}" == 3 ]]; then
+  if [[ "${state_version}" == 3 || "${state_version}" == 4 ]]; then
     [[ "${state_status}" == ACTIVATING || "${state_status}" == ACTIVE ]] \
       || h100_fail 'multi-user Container start requires ACTIVATING or ACTIVE state'
   else
@@ -57,7 +57,25 @@ require_activated_pilot_access() {
   [[ "$(id -u "${user_name}")" == "${state_uid}" \
     && "$(id -g "${user_name}")" == "${state_gid}" ]] \
     || h100_fail 'managed Pilot UID/GID is inconsistent'
-  if [[ "${state_version}" == 3 ]]; then
+  if [[ "${state_version}" == 3 || "${state_version}" == 4 ]]; then
+    if [[ "${state_version}" == 4 ]]; then
+      h100_require_workspace_alias "${user_name}"
+      [[ "$(pilot_state_value "${state_file}" WORKSPACE_LAYOUT)" == \
+        LEGACY_BIND_ALIAS ]] \
+        || h100_fail 'multi-user Container workspace layout is invalid'
+      [[ "$(pilot_state_value "${state_file}" STORAGE_ROOT)" == \
+        "${H100_DATA_ROOT}/users/${user_name}" ]] \
+        || h100_fail 'multi-user Container quota root binding is invalid'
+      [[ "$(pilot_state_value "${state_file}" BACKING_WORKSPACE)" == \
+        "${H100_DATA_ROOT}/users/${user_name}/workspace" ]] \
+        || h100_fail 'multi-user Container backing workspace binding is invalid'
+      [[ "$(pilot_state_value "${state_file}" WORKSPACE_PATH)" == \
+        "${H100_WORKSPACE_ROOT}/${state_uid}" ]] \
+        || h100_fail 'multi-user Container workspace binding is invalid'
+      [[ "$(pilot_state_value "${state_file}" DEVELOPMENT_PROFILE)" == \
+        STANDARD_8CPU_32GB ]] \
+        || h100_fail 'workspace V4 requires the CPU development profile'
+    fi
     [[ "$(getent passwd "${user_name}" | cut -d: -f7)" == /usr/sbin/nologin ]] \
       || h100_fail 'multi-user Container activation must keep Host shell nologin'
     host_authorized_keys="/home/${user_name}/.ssh/authorized_keys"

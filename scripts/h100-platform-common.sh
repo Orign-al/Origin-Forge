@@ -5,6 +5,7 @@ set -euo pipefail
 
 readonly H100_PLATFORM_ROOT=/srv/gpu-platform/platform
 readonly H100_DATA_ROOT=/srv/gpu-platform
+readonly H100_WORKSPACE_ROOT=/storage/users
 readonly H100_MANAGEMENT_IP=10.82.36.1
 readonly H100_AUDIT_LOG=/var/log/h100-platform-audit.log
 readonly H100_LOCK_FILE=/run/lock/h100-platform.lock
@@ -65,18 +66,18 @@ h100_acquire_lock() {
 }
 
 h100_audit() {
-  local action=$1
-  local target=$2
-  local outcome=$3
-  local rc=$4
-  local actor=${SUDO_USER:-root}
+  local h100_audit_action_value=$1
+  local h100_audit_target_value=$2
+  local h100_audit_outcome_value=$3
+  local h100_audit_rc_value=$4
+  local h100_audit_actor_value=${SUDO_USER:-root}
   printf '%s actor=%s action=%s target=%s outcome=%s rc=%s\n' \
     "$(date --iso-8601=seconds)" \
-    "${actor}" \
-    "${action}" \
-    "${target}" \
-    "${outcome}" \
-    "${rc}" \
+    "${h100_audit_actor_value}" \
+    "${h100_audit_action_value}" \
+    "${h100_audit_target_value}" \
+    "${h100_audit_outcome_value}" \
+    "${h100_audit_rc_value}" \
     >>"${H100_AUDIT_LOG}"
 }
 
@@ -113,6 +114,32 @@ h100_require_managed_user() {
     || h100_fail "managed workspace is missing: ${managed_username}"
   [[ -d "${H100_DATA_ROOT}/users/${managed_username}/shared" ]] \
     || h100_fail "managed shared directory is missing: ${managed_username}"
+}
+
+h100_require_workspace_alias() {
+  local managed_username=$1 managed_uid managed_gid backing_workspace canonical_workspace options
+  managed_uid="$(id -u "${managed_username}")"
+  managed_gid="$(id -g "${managed_username}")"
+  backing_workspace="${H100_DATA_ROOT}/users/${managed_username}/workspace"
+  canonical_workspace="${H100_WORKSPACE_ROOT}/${managed_uid}"
+  [[ -d "${backing_workspace}" && ! -L "${backing_workspace}" ]] \
+    || h100_fail "authoritative workspace is missing: ${managed_username}"
+  [[ -d "${canonical_workspace}" && ! -L "${canonical_workspace}" ]] \
+    || h100_fail "canonical workspace alias is missing: ${managed_username}"
+  findmnt --noheadings --mountpoint "${canonical_workspace}" >/dev/null 2>&1 \
+    || h100_fail "canonical workspace alias is not mounted: ${managed_username}"
+  [[ "$(stat -c '%u:%g' "${backing_workspace}")" == "${managed_uid}:${managed_gid}" \
+    && "$(stat -c '%u:%g' "${canonical_workspace}")" == "${managed_uid}:${managed_gid}" ]] \
+    || h100_fail "workspace ownership is invalid: ${managed_username}"
+  [[ "$(stat -c '%d:%i' "${backing_workspace}")" == \
+    "$(stat -c '%d:%i' "${canonical_workspace}")" ]] \
+    || h100_fail "canonical workspace is not the authoritative bind alias: ${managed_username}"
+  options="$(findmnt --noheadings --output OPTIONS --mountpoint "${canonical_workspace}")" \
+    || h100_fail "canonical workspace mount options are unavailable: ${managed_username}"
+  for option in rw nosuid nodev; do
+    tr ',' '\n' <<<"${options}" | grep -Fxq "${option}" \
+      || h100_fail "canonical workspace mount option is missing: ${option}"
+  done
 }
 
 h100_require_pilot_gpu_isolation_if_managed() {

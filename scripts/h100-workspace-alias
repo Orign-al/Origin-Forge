@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /usr/local/lib/h100-platform/h100-platform-common.sh
+
+readonly UNIT_ROOT=/etc/systemd/system
+readonly STORAGE_ROOT=/storage
+readonly UID_MIN=20000
+readonly UID_MAX=60000
+
+usage() {
+  printf '%s\n' \
+    'Usage:' \
+    '  sudo h100-workspace-alias prepare USER UID GID' \
+    '  sudo h100-workspace-alias verify USER UID GID' \
+    '  sudo h100-workspace-alias remove USER UID GID --confirm-remove USER'
+}
+
+if [[ "${1:-}" == --help ]]; then
+  usage
+  exit 0
+fi
+if (($# != 4 && $# != 6)); then
+  usage >&2
+  exit 2
+fi
+
+readonly action=$1
+readonly user_name=$2
+readonly user_uid=$3
+readonly user_gid=$4
+readonly backing_root="${H100_DATA_ROOT}/users/${user_name}"
+readonly backing_workspace="${backing_root}/workspace"
+readonly canonical_workspace="${H100_WORKSPACE_ROOT}/${user_uid}"
+readonly unit_name="storage-users-${user_uid}.mount"
+readonly unit_path="${UNIT_ROOT}/${unit_name}"
+readonly -a required_workspace_directories=(
+  projects
+  datasets
+  outputs
+  .portal
+  .portal/job-scripts
+  .portal/jobs
+  .portal/templates
+  .portal/logs
+  .portal/runtime
+)
+
+h100_require_root
+h100_validate_username "${user_name}"
+[[ "${user_name}" =~ ^[a-z][a-z0-9-]{0,31}$ ]] \
+  || h100_fail 'workspace username is outside the managed contract'
+[[ "${user_uid}" =~ ^[0-9]+$ && "${user_gid}" =~ ^[0-9]+$ ]] \
+  || h100_fail 'workspace UID/GID must be numeric'
+((user_uid >= UID_MIN && user_uid <= UID_MAX && user_gid >= UID_MIN && user_gid <= UID_MAX)) \
+  || h100_fail 'workspace UID/GID is outside the managed range'
+[[ "$(id -u "${user_name}")" == "${user_uid}" \
+  && "$(id -g "${user_name}")" == "${user_gid}" ]] \
+  || h100_fail 'workspace identity differs from NSS'
+[[ "${backing_root}" == /srv/gpu-platform/users/"${user_name}" \
+  && "${canonical_workspace}" == /storage/users/"${user_uid}" ]] \
+  || h100_fail 'workspace path escaped the fixed roots'
+[[ -d "${STORAGE_ROOT}" && ! -L "${STORAGE_ROOT}" \
+  && "$(stat -c '%U:%G' "${STORAGE_ROOT}")" == root:root \
+  && "$(stat -c '%a' "${STORAGE_ROOT}")" =~ ^(711|755)$ ]] \
+  || h100_fail 'storage namespace root metadata is invalid'
+h100_acquire_lock
+h100_install_audit_trap workspace-alias "${user_name}:${user_uid}"
+temp_unit=
+created_mountpoint=0
+installed_unit=0
+created_workspace_directories=()
+
+cleanup_workspace_alias() {
+  local exit_status=$?
+  if ((exit_status != 0)); then
+    if ((installed_unit == 1)); then
+      systemctl disable --now "${unit_name}" >/dev/null 2>&1 || true
+      rm -f -- "${unit_path}"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    if ((created_mountpoint == 1)) \
+      && ! findmnt --noheadings --mountpoint "${canonical_workspace}" >/dev/null 2>&1 \
+      && [[ -d "${canonical_workspace}" && ! -L "${canonical_workspace}" ]] \
+      && [[ -z "$(find "${canonical_workspace}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+      rmdir -- "${canonical_workspace}" || true
+    fi
+    local created_index created_directory
+    for ((created_index = ${#created_workspace_directories[@]} - 1; created_index >= 0; created_index--)); do
+      created_directory="${created_workspace_directories[created_index]}"
+      if [[ -d "${created_directory}" && ! -L "${created_directory}" ]] \
+        && [[ -z "$(find "${created_directory}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+        rmdir -- "${created_directory}" || true
+      fi
+    done
+  fi
+  if [[ -n "${temp_unit}" ]]; then
+    case "${temp_unit}" in
+      /etc/systemd/system/.storage-users-*.mount.*) rm -f -- "${temp_unit}" ;;
+    esac
+  fi
+  trap - EXIT
+  h100_audit \
+    "${H100_AUDIT_ACTION}" \
+    "${H100_AUDIT_TARGET}" \
+    "${H100_AUDIT_OUTCOME}" \
+    "${exit_status}"
+  exit "${exit_status}"
+}
+trap cleanup_workspace_alias EXIT
+
+workspace_mode_is_private() {
+  local target=$1 mode
+  mode="$(stat -c '%a' "${target}")"
+  [[ "${mode}" =~ ^[0-7]+$ ]] || return 1
+  (((8#${mode} & 0007) == 0))
+}
+
+verify_backing() {
+  [[ -d "${backing_root}" && ! -L "${backing_root}" \
+    && -d "${backing_workspace}" && ! -L "${backing_workspace}" ]] \
+    || h100_fail 'authoritative workspace backing is unavailable'
+  [[ "$(stat -c '%u:%g' "${backing_root}")" == "${user_uid}:${user_gid}" \
+    && "$(stat -c '%u:%g' "${backing_workspace}")" == "${user_uid}:${user_gid}" ]] \
+    || h100_fail 'authoritative workspace ownership is invalid'
+  workspace_mode_is_private "${backing_root}" \
+    && workspace_mode_is_private "${backing_workspace}" \
+    || h100_fail 'authoritative workspace is accessible to other users'
+  [[ "$(stat -c '%d' "${backing_workspace}")" == "$(stat -c '%d' "${H100_DATA_ROOT}")" ]] \
+    || h100_fail 'authoritative workspace is outside the quota filesystem'
+}
+
+verify_workspace_directories() {
+  local relative target
+  for relative in "${required_workspace_directories[@]}"; do
+    target="${backing_workspace}/${relative}"
+    [[ -d "${target}" && ! -L "${target}" \
+      && "$(stat -c '%u:%g:%a' "${target}")" == "${user_uid}:${user_gid}:700" ]] \
+      || h100_fail "required workspace directory metadata is invalid: ${relative}"
+  done
+}
+
+prepare_workspace_directories() {
+  local relative target
+  for relative in "${required_workspace_directories[@]}"; do
+    target="${backing_workspace}/${relative}"
+    if [[ ! -e "${target}" ]]; then
+      install -d -o "${user_uid}" -g "${user_gid}" -m 0700 "${target}"
+      created_workspace_directories+=("${target}")
+    fi
+  done
+  verify_workspace_directories
+}
+
+verify_canonical_parent() {
+  [[ -d "${H100_WORKSPACE_ROOT}" && ! -L "${H100_WORKSPACE_ROOT}" \
+    && "$(stat -c '%u:%g:%a' "${H100_WORKSPACE_ROOT}")" == 0:0:711 ]] \
+    || h100_fail 'canonical workspace parent metadata is invalid'
+}
+
+verify_unmounted_mountpoint() {
+  [[ -d "${canonical_workspace}" && ! -L "${canonical_workspace}" \
+    && "$(stat -c '%u:%g:%a' "${canonical_workspace}")" == 0:0:700 \
+    && -z "$(find "${canonical_workspace}" -mindepth 1 -maxdepth 1 -print -quit)" ]] \
+    || h100_fail 'canonical mountpoint collision or metadata is invalid'
+}
+
+expected_unit() {
+  cat <<EOF
+[Unit]
+Description=Portal workspace alias for UID ${user_uid}
+RequiresMountsFor=/srv/gpu-platform
+Before=h100-portal-worker.service h100-portal-api.service
+
+[Mount]
+What=${backing_workspace}
+Where=${canonical_workspace}
+Type=none
+Options=bind,rw,nosuid,nodev
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+verify_alias() {
+  local observed_target observed_options
+  verify_backing
+  verify_workspace_directories
+  verify_canonical_parent
+  [[ -d "${canonical_workspace}" && ! -L "${canonical_workspace}" ]] \
+    || h100_fail 'canonical workspace mountpoint is unavailable'
+  observed_target="$(findmnt --noheadings --output TARGET --mountpoint "${canonical_workspace}")" \
+    || h100_fail 'canonical workspace is not a mountpoint'
+  [[ "${observed_target}" == "${canonical_workspace}" ]] \
+    || h100_fail 'canonical workspace mount target is inconsistent'
+  [[ "$(stat -c '%d:%i' "${backing_workspace}")" == \
+    "$(stat -c '%d:%i' "${canonical_workspace}")" ]] \
+    || h100_fail 'canonical workspace does not reference the backing inode'
+  [[ "$(stat -c '%u:%g' "${canonical_workspace}")" == "${user_uid}:${user_gid}" ]] \
+    && workspace_mode_is_private "${canonical_workspace}" \
+    || h100_fail 'canonical workspace ownership or mode is invalid'
+  observed_options="$(findmnt --noheadings --output OPTIONS --mountpoint "${canonical_workspace}")" \
+    || h100_fail 'canonical workspace mount options are unavailable'
+  for option in rw nosuid nodev; do
+    tr ',' '\n' <<<"${observed_options}" | grep -Fxq "${option}" \
+      || h100_fail "canonical workspace mount option is missing: ${option}"
+  done
+  [[ -f "${unit_path}" && ! -L "${unit_path}" \
+    && "$(stat -c '%u:%g:%a' "${unit_path}")" == 0:0:644 ]] \
+    || h100_fail 'workspace mount unit metadata is invalid'
+  cmp -s <(expected_unit) "${unit_path}" \
+    || h100_fail 'workspace mount unit content is inconsistent'
+}
+
+case "${action}" in
+  prepare)
+    (($# == 4)) || h100_fail 'prepare does not accept removal confirmation fields'
+    verify_backing
+    prepare_workspace_directories
+    if [[ ! -e "${H100_WORKSPACE_ROOT}" ]]; then
+      install -d -o root -g root -m 0711 "${H100_WORKSPACE_ROOT}"
+    fi
+    verify_canonical_parent
+    if [[ ! -e "${canonical_workspace}" ]]; then
+      install -d -o root -g root -m 0700 "${canonical_workspace}"
+      created_mountpoint=1
+    elif findmnt --noheadings --mountpoint "${canonical_workspace}" >/dev/null 2>&1; then
+      verify_alias
+      h100_mark_success
+      printf 'WORKSPACE ALIAS READY user=%s uid=%s\n' "${user_name}" "${user_uid}"
+      exit 0
+    else
+      verify_unmounted_mountpoint
+    fi
+    [[ ! -e "${unit_path}" && ! -L "${unit_path}" ]] \
+      || h100_fail 'workspace mount unit collision detected'
+    temp_unit="$(mktemp "${UNIT_ROOT}/.${unit_name}.XXXXXX")"
+    expected_unit >"${temp_unit}"
+    chown root:root "${temp_unit}"
+    chmod 0644 "${temp_unit}"
+    sync -f "${temp_unit}"
+    mv -fT -- "${temp_unit}" "${unit_path}"
+    temp_unit=
+    installed_unit=1
+    systemctl daemon-reload
+    systemctl enable --now "${unit_name}"
+    verify_alias
+    ;;
+  verify)
+    (($# == 4)) || h100_fail 'verify does not accept removal confirmation fields'
+    verify_alias
+    ;;
+  remove)
+    (($# == 6)) || h100_fail 'remove requires an explicit owner confirmation'
+    [[ "$5" == --confirm-remove && "$6" == "${user_name}" ]] \
+      || h100_fail 'workspace alias removal confirmation is invalid'
+    verify_alias
+    [[ "$(findmnt --noheadings --output TARGET --submounts "${canonical_workspace}" | wc -l)" == 1 ]] \
+      || h100_fail 'canonical workspace has dependent submounts'
+    systemctl disable --now "${unit_name}"
+    findmnt --noheadings --mountpoint "${canonical_workspace}" >/dev/null 2>&1 \
+      && h100_fail 'canonical workspace remained mounted'
+    [[ -z "$(find "${canonical_workspace}" -mindepth 1 -maxdepth 1 -print -quit)" ]] \
+      || h100_fail 'unmounted canonical workspace contains unexpected data'
+    rmdir -- "${canonical_workspace}"
+    rm -f -- "${unit_path}"
+    systemctl daemon-reload
+    verify_backing
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
+printf 'WORKSPACE ALIAS %s user=%s uid=%s backing=%s canonical=%s\n' \
+  "${action^^}" "${user_name}" "${user_uid}" "${backing_workspace}" "${canonical_workspace}"
+h100_mark_success
