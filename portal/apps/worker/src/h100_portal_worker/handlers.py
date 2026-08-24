@@ -8144,6 +8144,14 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
     suspended = active.with_name("authorized_keys.portal-recycle")
     started_by_restore = False
     try:
+        if request.operation_type == "self.resource.restore" and (
+            request.requested_by != payload["username"]
+            or request.approved_by != payload["username"]
+        ):
+            raise LifecycleValidationError(
+                "RESOURCE_OWNERSHIP_REJECTED",
+                "self-service restore actor does not own the target resource",
+            )
         account = _managed_account(payload)
         if account.pw_shell != "/usr/sbin/nologin":
             raise LifecycleValidationError(
@@ -8187,7 +8195,7 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
                 )
             return {
                 "status": "SUCCEEDED",
-                "handler": "resource.restore",
+                "handler": request.operation_type,
                 "request_id": request.request_id,
                 "container_state": "RUNNING",
                 "container_gpu": "NONE",
@@ -8217,7 +8225,7 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
         _managed_container_security(lifecycle_payload, require_running=True)
         return {
             "status": "SUCCEEDED",
-            "handler": "resource.restore",
+            "handler": request.operation_type,
             "request_id": request.request_id,
             "container_state": "RUNNING",
             "container_gpu": "NONE",
@@ -8706,7 +8714,7 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
                 and "uid" in payload
             ):
                 return _execute_managed_container_lifecycle(request, payload)
-            if request.operation_type == "resource.restore":
+            if request.operation_type in {"resource.restore", "self.resource.restore"}:
                 return _execute_resource_restore(request, payload)
             if request.operation_type in {"lease.expire", "resource.recycle"}:
                 return _execute_resource_recycle(request, payload)

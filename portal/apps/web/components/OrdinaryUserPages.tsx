@@ -359,7 +359,7 @@ function LeaseAction({ lease }: { lease: ComputeLease }) {
   if (!lease.active) {
     return (
       <Link className="ui-button ui-button-primary" href="/recycle-bin">
-        {t("申请恢复")}
+        {t("恢复容器")}
       </Link>
     );
   }
@@ -972,14 +972,26 @@ export function OrdinaryStorage() {
 export function OrdinaryRecycleBin() {
   const queryClient = useQueryClient();
   const { locale, t } = useI18n();
+  const [restoreMessage, setRestoreMessage] = useState<string | null>(null);
   const query = useQuery({
     queryKey: ["self-recycle-bin"],
     queryFn: selfRecycleBin,
   });
   const restore = useMutation({
     mutationFn: (itemId: string) => requestRestore(itemId),
-    onSuccess: async () =>
-      queryClient.invalidateQueries({ queryKey: ["self-recycle-bin"] }),
+    onSuccess: async (result) => {
+      setRestoreMessage(
+        result.status === "RESTORED"
+          ? t("恢复完成，新的 96 小时 Lease 已创建。")
+          : t("恢复状态：{status}", { status: result.status }),
+      );
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["self-recycle-bin"] }),
+        queryClient.invalidateQueries({ queryKey: ["self-environment"] }),
+        queryClient.invalidateQueries({ queryKey: ["self-container"] }),
+        queryClient.invalidateQueries({ queryKey: ["self-container-connection"] }),
+      ]);
+    },
   });
   if (query.isPending) return <LoadingBlock />;
   if (query.isError) return <ErrorBlock message={t("回收站暂时不可用。")} />;
@@ -987,8 +999,20 @@ export function OrdinaryRecycleBin() {
     <>
       <PageHeading
         title="回收站"
-        description="过期资源可申请恢复，数据不会立即删除"
+        description="资源所有者可自助恢复过期容器，无需管理员审批"
       />
+      {restoreMessage ? (
+        <div className="notice" role="status">
+          {restoreMessage}
+        </div>
+      ) : null}
+      {restore.isError ? (
+        <div className="error-box" role="alert">
+          {restore.error instanceof ApiError
+            ? t(restore.error.message)
+            : t("恢复失败，未启动容器。")}
+        </div>
+      ) : null}
       {!query.data.items.length ? (
         <Card>
           <EmptyState
@@ -1005,8 +1029,12 @@ export function OrdinaryRecycleBin() {
               <StatusBadge
                 value={
                   item.state === "RESTORE_PENDING"
-                    ? t("恢复申请待审批")
-                    : t("已过期")
+                    ? t("历史恢复申请待处理")
+                    : item.state === "RESTORING"
+                      ? t("正在恢复")
+                      : item.state === "FAILED"
+                        ? t("恢复失败")
+                        : t("已过期")
                 }
               />
             }
@@ -1032,10 +1060,13 @@ export function OrdinaryRecycleBin() {
             <div className="button-row access-actions">
               <Button
                 tone="primary"
-                disabled={restore.isPending || item.state !== "RECYCLE_BIN"}
+                disabled={
+                  restore.isPending ||
+                  !["RECYCLE_BIN", "RESTORE_PENDING"].includes(item.state)
+                }
                 onClick={() => restore.mutate(item.id)}
               >
-                {t("申请恢复")}
+                {restore.isPending ? t("正在恢复") : t("恢复容器")}
               </Button>
             </div>
           </SectionCard>
@@ -1148,7 +1179,7 @@ export function OrdinaryHelp() {
       <SectionCard title="租约与恢复">
         <p>
           {t(
-            "到期前24小时可申请续期，每次最多4天。资源到期后开发容器会停止并进入回收站，数据不会立即删除；批准恢复后可继续使用。",
+            "到期前24小时可申请续期，每次最多4天。资源到期后开发容器会停止并进入回收站，数据不会立即删除；资源所有者可自助恢复。",
           )}
         </p>
       </SectionCard>

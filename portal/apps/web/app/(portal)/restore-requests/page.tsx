@@ -61,8 +61,8 @@ export default function RestoreRequestsPage() {
   return (
     <>
       <PageHeading
-        title="恢复申请"
-        description="一次管理员决定；后端自动执行安全预检、恢复与 96h Lease"
+        title="历史恢复申请"
+        description="仅处理升级前已存在的待审批记录；新恢复由资源所有者自助执行"
         action={<StatusBadge value={`${query.data.count} REQUESTS`} />}
       />
       {message ? (

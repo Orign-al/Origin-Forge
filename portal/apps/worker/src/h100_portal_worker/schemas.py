@@ -63,6 +63,7 @@ KNOWN_WRITES = {
     "lease.expire",
     "resource.recycle",
     "resource.restore",
+    "self.resource.restore",
     "host_access.revoke_managed_user",
 }
 KNOWN_STREAMS = {"self.container.terminal"}
@@ -1617,7 +1618,7 @@ def validate_payload(
         and "uid" in payload
     ):
         return _validate_container_lifecycle(payload)
-    if operation_type == "resource.restore":
+    if operation_type in {"resource.restore", "self.resource.restore"}:
         return _validate_restore(payload)
     if operation_type in {"lease.expire", "resource.recycle"}:
         return _validate_recycle(payload)

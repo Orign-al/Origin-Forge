@@ -2759,10 +2759,33 @@ def test_portal4a_restore_is_idempotent_after_worker_success(
         "run_allowlisted_script",
         lambda *_args, **_kwargs: pytest.fail("idempotent replay must not restart the container"),
     )
-    result = handlers._execute_resource_restore(request("resource.restore"), payload)
+    result = handlers._execute_resource_restore(
+        request(
+            "self.resource.restore",
+            requested_by="origin-pilot",
+            approved_by="origin-pilot",
+        ),
+        payload,
+    )
     assert result["status"] == "SUCCEEDED"
+    assert result["handler"] == "self.resource.restore"
     assert result["idempotent_replay"] is True
     assert result["container_key_fingerprints"] == [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT]
+
+
+def test_portal4a_self_restore_rejects_non_owner_before_runtime_access() -> None:
+    payload = portal4a_restore_payload()
+    assert validate_payload("self.resource.restore", payload)["username"] == "origin-pilot"
+    result = handlers._execute_resource_restore(
+        request(
+            "self.resource.restore",
+            requested_by="origin-pilot2",
+            approved_by="origin-pilot2",
+        ),
+        payload,
+    )
+    assert result["status"] == "ERROR"
+    assert result["error"]["code"] == "RESOURCE_OWNERSHIP_REJECTED"
 
 
 def test_portal4a_restore_rolls_back_container_and_key_after_postcondition_failure(

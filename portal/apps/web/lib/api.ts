@@ -969,7 +969,7 @@ export const selfRecycleBin = () =>
     auto_permanent_delete: false;
   }>("/self/recycle-bin");
 export const requestRestore = (itemId: string, durationSeconds = 345600) =>
-  apiFetch<{ status: string; restore_request_id: string }>(
+  apiFetch<{ status: string; restore_request_id: string; lease_id: string | null }>(
     `/self/recycle-bin/${encodeURIComponent(itemId)}/restore-requests`,
     {
       method: "POST",

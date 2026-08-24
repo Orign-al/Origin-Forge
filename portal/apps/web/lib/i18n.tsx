@@ -346,10 +346,20 @@ const EN_US: Record<string, string> = {
     "Other ordinary users cannot read, list, or write this directory. Shared data uses separately approved datasets.",
   "过期资源可申请恢复，数据不会立即删除":
     "Expired resources can be restored by request; data is not deleted immediately",
+  "资源所有者可自助恢复过期容器，无需管理员审批":
+    "Resource owners can restore expired containers without administrator approval",
   "回收站暂时不可用。": "The recycle bin is temporarily unavailable.",
   回收站为空: "Recycle Bin Empty",
   当前没有过期的计算资源: "There are no expired compute resources",
   恢复申请待审批: "Restore request pending approval",
+  历史恢复申请待处理: "Legacy restore request pending",
+  恢复容器: "Restore Container",
+  正在恢复: "Restoring",
+  恢复失败: "Restore Failed",
+  "恢复失败，未启动容器。": "Restore failed; the container was not started.",
+  "恢复完成，新的 96 小时 Lease 已创建。":
+    "Restore completed and a new 96-hour lease was created.",
+  "恢复状态：{status}": "Restore status: {status}",
   已过期: "Expired",
   租约到期: "Lease Expiry",
   进入回收站: "Moved to Recycle Bin",
@@ -379,6 +389,8 @@ const EN_US: Record<string, string> = {
   租约与恢复: "Lease & Restore",
   "到期前24小时可申请续期，每次最多4天。资源到期后开发容器会停止并进入回收站，数据不会立即删除；批准恢复后可继续使用。":
     "You can request renewal within 24 hours of expiry, for up to 4 days each time. After expiry, the development container stops and enters the recycle bin; data is not immediately deleted. Use can resume after an approved restore.",
+  "到期前24小时可申请续期，每次最多4天。资源到期后开发容器会停止并进入回收站，数据不会立即删除；资源所有者可自助恢复。":
+    "You can request renewal within 24 hours of expiry, for up to 4 days each time. After expiry, the development container stops and enters the recycle bin; data is retained and the resource owner can restore it directly.",
   宿主机: "Host",
   "宿主机 + 容器": "Host + Container",
   "SSH Key 用途": "SSH key scope",

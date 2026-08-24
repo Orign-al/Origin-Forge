@@ -6,9 +6,10 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from h100_portal_api import expiry_service
+from h100_portal_api.auth import AuthContext
 from h100_portal_api.enums import (
     AccountState,
     OnboardingState,
@@ -44,6 +45,8 @@ from h100_portal_api.models import (
     ensure_utc,
     utcnow,
 )
+from h100_portal_api.routes import self_service
+from h100_portal_api.schemas import RestoreCreateRequest
 from h100_portal_api.security import digest_secret, hash_password
 from h100_portal_api.terminal_service import TerminalServiceError
 from sqlalchemy import select
@@ -216,6 +219,22 @@ def _login(client, origin_headers: dict[str, str], username: str) -> dict[str, s
     )
     assert response.status_code == 200
     return {**origin_headers, "X-CSRF-Token": client.cookies["h100_csrf"]}
+
+
+def _restore_http_request(item_id: uuid.UUID) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": f"/api/v1/self/recycle-bin/{item_id}/restore-requests",
+            "raw_path": b"",
+            "query_string": b"",
+            "headers": [(b"user-agent", b"portal-restore-unit-test")],
+            "client": ("127.0.0.1", 41000),
+            "server": ("127.0.0.1", 18080),
+        }
+    )
 
 
 def _job(db: Session, identity: SimpleNamespace, name: str) -> PortalJob:
@@ -883,7 +902,7 @@ def test_job_and_container_operations_enforce_active_lease_gpu_and_time(
 
     identity.lease.state = "EXPIRED"
     identity.lease.expired_at = utcnow()
-    identity.managed.compute_environment_state = "RECYCLED"
+    identity.managed.compute_environment_state = "RESTORE_PENDING"
     database.commit()
     denied = client.post(
         "/api/v1/self/container/start",
@@ -1344,14 +1363,132 @@ def test_web_terminal_refuses_host_access_regression_and_expired_lease(
     assert expired.json()["detail"]["code"] == "LEASE_INACTIVE"
 
 
-def test_restore_request_is_idempotent_and_admin_restore_reactivates_all_resources(
-    client,
+def test_owner_restore_is_idempotent_and_reactivates_all_resources_without_admin(
     database: Session,
-    origin_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # type: ignore[no-untyped-def]
     identity = _identity(database, remaining_hours=0)
-    admin = _admin(database)
+    identity.lease.state = "RECYCLE_BIN"
+    identity.lease.expired_at = utcnow()
+    identity.lease.recycled_at = utcnow()
+    identity.managed.compute_environment_state = "RESTORE_PENDING"
+    identity.container.desired_state = "STOPPED"
+    identity.container.observed_state = "STOPPED"
+    identity.key.container_install_state = "SUSPENDED_BY_RECYCLE"
+    storage = database.scalar(
+        select(PortalStorageResource).where(
+            PortalStorageResource.owner_managed_user_id == identity.managed.id
+        )
+    )
+    storage.state = "PRESERVED"
+    item = PortalResourceRecycleItem(
+        owner_managed_user_id=identity.managed.id,
+        lease_id=identity.lease.id,
+        container_id=identity.container.id,
+        state="RESTORE_PENDING",
+        resource_name=identity.container.name,
+        image_digest=identity.container.image_digest,
+        retained_spec=identity.container.safe_spec,
+        connection_state="DISABLED",
+        data_preserved=True,
+        auto_permanent_delete=False,
+        expires_at=identity.lease.expires_at,
+        recycled_at=utcnow(),
+    )
+    database.add(item)
+    database.flush()
+    legacy_restore = PortalResourceRestoreRequest(
+        owner_managed_user_id=identity.managed.id,
+        recycle_item_id=item.id,
+        state="REQUESTED",
+        requested_duration_seconds=MAX_LEASE_DURATION_SECONDS,
+        idempotency_key=str(uuid.uuid4()),
+    )
+    database.add(legacy_restore)
+    database.commit()
+
+    calls: list[dict[str, object]] = []
+
+    def restore_worker(operation_type: str, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append({"operation_type": operation_type, **kwargs})
+        assert operation_type == "self.resource.restore"
+        assert kwargs["requested_by"] == identity.user.normalized_login
+        assert kwargs["approved_by"] == identity.user.normalized_login
+        assert kwargs["payload"]["expected_key_fingerprints"] == [identity.key.fingerprint_sha256]
+        return {
+            "status": "SUCCEEDED",
+            "request_id": str(uuid.uuid4()),
+            "container_state": "RUNNING",
+            "container_gpu": "NONE",
+            "container_key_state": "INSTALLED",
+            "container_key_fingerprints": [identity.key.fingerprint_sha256],
+        }
+
+    monkeypatch.setattr("h100_portal_api.routes.self_service.call_worker", restore_worker)
+    monkeypatch.setattr(self_service, "require_session_csrf", lambda *_args: None)
+    idempotency_key = str(uuid.uuid4())
+    body = RestoreCreateRequest(
+        duration_seconds=MAX_LEASE_DURATION_SECONDS,
+        idempotency_key=uuid.UUID(idempotency_key),
+    )
+    context = AuthContext(identity.user, None, "")
+    request = _restore_http_request(item.id)
+    first = self_service.create_restore_request(item.id, body, request, context, database)
+    repeated = self_service.create_restore_request(item.id, body, request, context, database)
+    with pytest.raises(HTTPException) as conflict:
+        self_service.create_restore_request(
+            item.id,
+            RestoreCreateRequest(
+                duration_seconds=3600,
+                idempotency_key=uuid.UUID(idempotency_key),
+            ),
+            request,
+            context,
+            database,
+        )
+    assert first["status"] == repeated["status"] == "RESTORED"
+    assert first["restore_request_id"] == repeated["restore_request_id"]
+    assert first["lease_id"] == repeated["lease_id"]
+    assert conflict.value.status_code == 409
+    assert conflict.value.detail["code"] == "IDEMPOTENCY_CONFLICT"
+    requested_audits = database.scalars(
+        select(PortalAuditEvent).where(PortalAuditEvent.event_type == "RESOURCE_RESTORE_REQUESTED")
+    ).all()
+    assert [event.object_id for event in requested_audits] == [first["restore_request_id"]]
+    assert requested_audits[0].actor == "origin-pilot"
+    assert requested_audits[0].safe_metadata["approval_required"] is False
+    database.expire_all()
+    restored = database.get(PortalResourceRestoreRequest, uuid.UUID(first["restore_request_id"]))
+    successor = database.get(PortalComputeLease, restored.restored_lease_id)
+    operation = database.scalar(
+        select(PortalOperation).where(
+            PortalOperation.operation_type == "self.resource.restore",
+            PortalOperation.owner_managed_user_id == identity.managed.id,
+        )
+    )
+    assert len(calls) == 1
+    assert restored.state == "RESTORED"
+    assert database.get(PortalResourceRestoreRequest, legacy_restore.id).state == "CANCELLED"
+    assert successor.state == "ACTIVE"
+    assert successor.duration_seconds == MAX_LEASE_DURATION_SECONDS
+    assert identity.managed.compute_environment_state == "ACTIVE"
+    assert identity.managed.host_access_state == "DISABLED_BY_PLATFORM_POLICY"
+    assert identity.managed.shell == "/usr/sbin/nologin"
+    assert identity.container.desired_state == identity.container.observed_state == "RUNNING"
+    assert identity.key.container_install_state == "INSTALLED"
+    assert storage.state == "ACTIVE"
+    assert item.state == "RESTORED"
+    assert operation.status == OperationStatus.SUCCEEDED
+    assert operation.owner_managed_user_id == identity.managed.id
+    assert operation.requested_by == identity.user.id
+    assert operation.approved_by == identity.user.id
+
+
+def test_owner_restore_failure_with_verified_rollback_remains_self_retryable(
+    database: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(database, remaining_hours=0)
     identity.lease.state = "RECYCLE_BIN"
     identity.lease.expired_at = utcnow()
     identity.lease.recycled_at = utcnow()
@@ -1382,12 +1519,21 @@ def test_restore_request_is_idempotent_and_admin_restore_reactivates_all_resourc
     database.add(item)
     database.commit()
 
-    calls: list[dict[str, object]] = []
+    attempts = 0
 
-    def restore_worker(operation_type: str, **kwargs):  # type: ignore[no-untyped-def]
-        calls.append({"operation_type": operation_type, **kwargs})
-        assert operation_type == "resource.restore"
-        assert kwargs["payload"]["expected_key_fingerprints"] == [identity.key.fingerprint_sha256]
+    def restore_worker(operation_type: str, **_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal attempts
+        attempts += 1
+        assert operation_type == "self.resource.restore"
+        if attempts == 1:
+            return {
+                "status": "ERROR",
+                "error": {
+                    "code": "CONTAINER_START_FAILED",
+                    "message": "restored container failed to start",
+                    "rollback_status": "ROLLED_BACK",
+                },
+            }
         return {
             "status": "SUCCEEDED",
             "request_id": str(uuid.uuid4()),
@@ -1398,67 +1544,82 @@ def test_restore_request_is_idempotent_and_admin_restore_reactivates_all_resourc
         }
 
     monkeypatch.setattr("h100_portal_api.routes.self_service.call_worker", restore_worker)
-    user_headers = _login(client, origin_headers, "origin-pilot")
-    idempotency_key = str(uuid.uuid4())
-    body = {"duration_seconds": MAX_LEASE_DURATION_SECONDS, "idempotency_key": idempotency_key}
-    first = client.post(
-        f"/api/v1/self/recycle-bin/{item.id}/restore-requests",
-        headers=user_headers,
-        json=body,
-    )
-    repeated = client.post(
-        f"/api/v1/self/recycle-bin/{item.id}/restore-requests",
-        headers=user_headers,
-        json=body,
-    )
-    conflict = client.post(
-        f"/api/v1/self/recycle-bin/{item.id}/restore-requests",
-        headers=user_headers,
-        json={**body, "duration_seconds": 3600},
-    )
-    assert first.status_code == repeated.status_code == 200
-    assert first.json()["restore_request_id"] == repeated.json()["restore_request_id"]
-    assert conflict.status_code == 409
-    assert conflict.json()["detail"]["code"] == "IDEMPOTENCY_CONFLICT"
-    requested_audits = database.scalars(
-        select(PortalAuditEvent).where(PortalAuditEvent.event_type == "RESOURCE_RESTORE_REQUESTED")
-    ).all()
-    assert [event.object_id for event in requested_audits] == [first.json()["restore_request_id"]]
-    assert requested_audits[0].actor == "origin-pilot"
+    monkeypatch.setattr(self_service, "require_session_csrf", lambda *_args: None)
+    context = AuthContext(identity.user, None, "")
+    request = _restore_http_request(item.id)
 
-    client.cookies.clear()
-    admin_headers = _login(client, origin_headers, admin.normalized_login)
-    decision = client.post(
-        f"/api/v1/admin/restore-requests/{first.json()['restore_request_id']}/decision",
-        headers=admin_headers,
-        json={"decision": "APPROVE", "comment": "fixture restore approval"},
-    )
-    assert decision.status_code == 200
-    assert decision.json()["status"] == "RESTORED"
-    database.expire_all()
-    restored = database.get(
-        PortalResourceRestoreRequest, uuid.UUID(first.json()["restore_request_id"])
-    )
-    successor = database.get(PortalComputeLease, restored.restored_lease_id)
-    operation = database.scalar(
-        select(PortalOperation).where(
-            PortalOperation.operation_type == "resource.restore",
-            PortalOperation.owner_managed_user_id == identity.managed.id,
+    def restore_once() -> dict[str, object]:
+        return self_service.create_restore_request(
+            item.id,
+            RestoreCreateRequest(duration_seconds=3600, idempotency_key=uuid.uuid4()),
+            request,
+            context,
+            database,
         )
+
+    with pytest.raises(HTTPException) as first:
+        restore_once()
+    assert first.value.status_code == 409
+    assert first.value.detail == {
+        "code": "CONTAINER_START_FAILED",
+        "message": "restored container failed to start",
+        "rollback_status": "ROLLED_BACK",
+    }
+    database.expire_all()
+    assert database.get(PortalResourceRecycleItem, item.id).state == "RECYCLE_BIN"
+    assert database.get(PortalManagedUser, identity.managed.id).compute_environment_state == (
+        "RECYCLED"
     )
-    assert len(calls) == 1
-    assert restored.state == "RESTORED"
-    assert successor.state == "ACTIVE"
-    assert successor.duration_seconds == MAX_LEASE_DURATION_SECONDS
-    assert identity.managed.compute_environment_state == "ACTIVE"
-    assert identity.managed.host_access_state == "DISABLED_BY_PLATFORM_POLICY"
-    assert identity.managed.shell == "/usr/sbin/nologin"
-    assert identity.container.desired_state == identity.container.observed_state == "RUNNING"
-    assert identity.key.container_install_state == "INSTALLED"
-    assert storage.state == "ACTIVE"
-    assert item.state == "RESTORED"
-    assert operation.status == OperationStatus.SUCCEEDED
-    assert operation.owner_managed_user_id == identity.managed.id
+
+    retry = restore_once()
+    assert retry["status"] == "RESTORED"
+    assert attempts == 2
+
+
+def test_owner_self_restore_cannot_target_another_users_recycle_item(
+    database: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = _identity(database)
+    other = _identity(
+        database,
+        login="fixture-user-b",
+        username="fixture-user-b",
+        uid=20002,
+        port=22024,
+    )
+    item = PortalResourceRecycleItem(
+        owner_managed_user_id=other.managed.id,
+        lease_id=other.lease.id,
+        container_id=other.container.id,
+        state="RECYCLE_BIN",
+        resource_name=other.container.name,
+        image_digest=other.container.image_digest,
+        retained_spec=other.container.safe_spec,
+        connection_state="DISABLED",
+        data_preserved=True,
+        auto_permanent_delete=False,
+        expires_at=other.lease.expires_at,
+        recycled_at=utcnow(),
+    )
+    database.add(item)
+    database.commit()
+    monkeypatch.setattr(self_service, "require_session_csrf", lambda *_args: None)
+    monkeypatch.setattr(
+        self_service,
+        "call_worker",
+        lambda *_args, **_kwargs: pytest.fail("cross-owner restore must not reach Worker"),
+    )
+
+    with pytest.raises(HTTPException) as denied:
+        self_service.create_restore_request(
+            item.id,
+            RestoreCreateRequest(duration_seconds=3600, idempotency_key=uuid.uuid4()),
+            _restore_http_request(item.id),
+            AuthContext(owner.user, None, ""),
+            database,
+        )
+    assert denied.value.status_code == 404
+    assert denied.value.detail["code"] == "RECYCLE_ITEM_NOT_FOUND"
 
 
 def test_api_rejects_97_hour_renewal_and_restore_requests(

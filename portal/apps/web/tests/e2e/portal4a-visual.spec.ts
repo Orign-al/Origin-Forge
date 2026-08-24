@@ -323,10 +323,12 @@ async function installPortal4aApi(
       requestPath === `/self/recycle-bin/${RECYCLE_ID}/restore-requests` &&
       request.method() === "POST"
     ) {
-      state.recycleMode = "restore-pending";
+      state.recycleMode = "empty";
+      state.leaseMode = "normal";
       await json(route, {
-        status: "REQUESTED",
+        status: "RESTORED",
         restore_request_id: "00000000-0000-4000-8000-000000000048",
+        lease_id: "00000000-0000-4000-8000-000000000049",
       });
       return;
     }
@@ -524,11 +526,12 @@ for (const viewport of [
     await expect(page.getByText("已保留", { exact: true })).toBeVisible();
     await capture(page, viewport.label, "14-recycle-bin-expired");
 
-    await page.getByRole("button", { name: "申请恢复" }).click();
+    await page.getByRole("button", { name: "恢复容器" }).click();
     await expect(
-      page.getByText("恢复申请待审批", { exact: true }),
+      page.getByText("恢复完成，新的 96 小时 Lease 已创建。", { exact: true }),
     ).toBeVisible();
-    await capture(page, viewport.label, "15-restore-requested");
+    await expect(page.getByText("回收站为空")).toBeVisible();
+    await capture(page, viewport.label, "15-owner-self-restored");
 
     await page.goto("/users");
     await expect(page.getByText("当前账号无权查看此模块。")).toBeVisible();
