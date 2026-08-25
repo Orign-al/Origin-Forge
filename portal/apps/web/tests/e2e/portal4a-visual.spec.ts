@@ -4,7 +4,7 @@ import path from "node:path";
 import { expect, test, type Page, type Route } from "@playwright/test";
 
 type LeaseMode = "normal" | "warning" | "expired";
-type RecycleMode = "empty" | "expired" | "restore-pending";
+type RecycleMode = "empty" | "expired" | "restore-pending" | "failed";
 
 type Portal4aState = {
   authenticated: boolean;
@@ -91,7 +91,9 @@ function container(state: Portal4aState) {
     name: "gpu-dev-origin-pilot",
     state: active ? "RUNNING" : "STOPPED",
     connection_state: active ? "AVAILABLE" : "DISABLED",
-    gpu: "NONE",
+    profile: "STANDARD_8CPU_32GB",
+    gpu: 0,
+    gpu_allocation_state: "NONE",
     cpus: 8,
     memory_gb: 32,
     pids_limit: 4096,
@@ -107,7 +109,13 @@ function environment(state: Portal4aState) {
     job_submission: active ? "AVAILABLE" : "DISABLED",
     lease: lease(state),
     container: container(state),
-    storage: { quota_bytes: 300 * 1024 ** 3, state: "ACTIVE" },
+    storage: {
+      quota_bytes: 300 * 1024 ** 3,
+      state: "ACTIVE",
+      workspace: "/storage/users/20001",
+      container_mount: "/workspace",
+      default_job_workdir: "/storage/users/20001/projects",
+    },
   };
 }
 
@@ -136,7 +144,9 @@ function recycleItems(state: Portal4aState) {
       state:
         state.recycleMode === "restore-pending"
           ? "RESTORE_PENDING"
-          : "RECYCLE_BIN",
+          : state.recycleMode === "failed"
+            ? "FAILED"
+            : "RECYCLE_BIN",
       expires_at: "2026-08-09T20:00:00Z",
       recycled_at: "2026-08-09T20:01:00Z",
       data_preserved: true,
@@ -156,13 +166,10 @@ function submittedJob(body: Record<string, unknown>) {
     memory_mb: body.memory_mb,
     gpu_count: body.gpu_count,
     time_limit_seconds: body.time_limit_seconds,
-    script_path:
-      "workspace/.portal/job-scripts/00000000-0000-4000-8000-000000000047.sh",
-    workdir: "workspace",
-    stdout_path:
-      "/srv/gpu-platform/users/origin-pilot/portal-jobs/00000000-0000-4000-8000-000000000047.stdout",
-    stderr_path:
-      "/srv/gpu-platform/users/origin-pilot/portal-jobs/00000000-0000-4000-8000-000000000047.stderr",
+    script_path: ".portal/job-scripts/00000000-0000-4000-8000-000000000047.sh",
+    workdir: "projects",
+    stdout_path: "outputs/00000000-0000-4000-8000-000000000047.out",
+    stderr_path: "outputs/00000000-0000-4000-8000-000000000047.err",
     lease_deadline_at: "2026-08-13T20:00:00Z",
     created_at: "2026-08-09T21:00:00Z",
     submitted_at: "2026-08-09T21:00:01Z",
@@ -301,7 +308,7 @@ async function installPortal4aApi(
       await json(route, {
         status: "OK",
         storage: {
-          root: "/srv/gpu-platform/users/origin-pilot",
+          root: "/storage/users/20001",
           quota_bytes: 300 * 1024 ** 3,
           used_bytes: 42 * 1024 ** 3,
           available_bytes: 258 * 1024 ** 3,
@@ -526,7 +533,12 @@ for (const viewport of [
     await expect(page.getByText("已保留", { exact: true })).toBeVisible();
     await capture(page, viewport.label, "14-recycle-bin-expired");
 
-    await page.getByRole("button", { name: "恢复容器" }).click();
+    state.recycleMode = "failed";
+    await page.goto("/recycle-bin");
+    await expect(page.getByText("恢复失败", { exact: true })).toBeVisible();
+    const failedRestore = page.getByRole("button", { name: "恢复容器" });
+    await expect(failedRestore).toBeEnabled();
+    await failedRestore.click();
     await expect(
       page.getByText("恢复完成，新的 96 小时 Lease 已创建。", { exact: true }),
     ).toBeVisible();

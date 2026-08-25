@@ -16,6 +16,8 @@ readonly WORKSPACE_ALIAS_SOURCE="${PLATFORM_DIR}/scripts/h100-workspace-alias"
 readonly CONTAINER_START_SOURCE="${PLATFORM_DIR}/scripts/h100-container-start"
 readonly CONTAINER_STOP_SOURCE="${PLATFORM_DIR}/scripts/h100-container-stop"
 readonly CONTAINER_DELETE_SOURCE="${PLATFORM_DIR}/scripts/h100-container-delete"
+readonly CONTAINER_GPU_RUNTIME_SOURCE="${PLATFORM_DIR}/scripts/h100-container-gpu-runtime"
+readonly GPU_DEVELOPMENT_EPILOG_SOURCE="${PLATFORM_DIR}/scripts/h100-gpu-development-epilog"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "install-runtime.sh must run as root" >&2
@@ -46,6 +48,10 @@ done
   || { echo "required deployment input missing: $CONTAINER_STOP_SOURCE" >&2; exit 1; }
 [[ -f "$CONTAINER_DELETE_SOURCE" && ! -L "$CONTAINER_DELETE_SOURCE" ]] \
   || { echo "required deployment input missing: $CONTAINER_DELETE_SOURCE" >&2; exit 1; }
+[[ -f "$CONTAINER_GPU_RUNTIME_SOURCE" && ! -L "$CONTAINER_GPU_RUNTIME_SOURCE" ]] \
+  || { echo "required deployment input missing: $CONTAINER_GPU_RUNTIME_SOURCE" >&2; exit 1; }
+[[ -f "$GPU_DEVELOPMENT_EPILOG_SOURCE" && ! -L "$GPU_DEVELOPMENT_EPILOG_SOURCE" ]] \
+  || { echo "required deployment input missing: $GPU_DEVELOPMENT_EPILOG_SOURCE" >&2; exit 1; }
 
 rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
   --exclude=/node_modules/ \
@@ -116,6 +122,12 @@ install -o root -g gpu-platform-admin -m 0750 \
 install -o root -g gpu-platform-admin -m 0750 \
   "$CONTAINER_DELETE_SOURCE" \
   /usr/local/sbin/h100-container-delete
+install -o root -g gpu-platform-admin -m 0750 \
+  "$CONTAINER_GPU_RUNTIME_SOURCE" \
+  /usr/local/sbin/h100-container-gpu-runtime
+install -o root -g root -m 0750 \
+  "$GPU_DEVELOPMENT_EPILOG_SOURCE" \
+  /usr/local/sbin/h100-gpu-development-epilog
 
 install -o root -g root -m 0640 \
   "$SOURCE_DIR/deploy/worker-scripts.json" \

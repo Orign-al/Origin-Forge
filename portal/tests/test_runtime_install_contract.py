@@ -73,12 +73,46 @@ def test_container_start_is_integrity_bound_and_supports_pre_lease_activation() 
     assert "ACTIVATING or ACTIVE state" in source_text
     assert "Lease must remain NOT_STARTED during activation" in source_text
     assert "Lease timestamps started before activation succeeded" in source_text
-    assert "lease_expires_epoch - lease_start_epoch == 345600" in source_text
+    assert "lease_expires_epoch - lease_start_epoch <= 345600" in source_text
+    assert "lease_start_epoch <= now_epoch" in source_text
     assert "Host authorized_keys" in source_text
     install_text = installer.read_text()
     assert 'CONTAINER_START_SOURCE="${PLATFORM_DIR}/scripts/h100-container-start"' in install_text
     assert '"$CONTAINER_START_SOURCE"' in install_text
     assert "/usr/local/sbin/h100-container-start" in install_text
+
+
+def test_gpu_development_runtime_and_fail_safe_epilog_are_integrity_bound() -> None:
+    runtime = PLATFORM_ROOT / "scripts/h100-container-gpu-runtime"
+    epilog = PLATFORM_ROOT / "scripts/h100-gpu-development-epilog"
+    installer = PORTAL_ROOT / "deploy/scripts/install-runtime.sh"
+    manifest = json.loads((PORTAL_ROOT / "deploy/worker-scripts.json").read_text())
+    slurm = (PLATFORM_ROOT / "config/slurm.conf").read_text()
+
+    assert runtime.is_file() and epilog.is_file()
+    assert (
+        manifest["h100-container-gpu-runtime"] == hashlib.sha256(runtime.read_bytes()).hexdigest()
+    )
+    assert (
+        manifest["h100-gpu-development-epilog"] == hashlib.sha256(epilog.read_bytes()).hexdigest()
+    )
+    assert epilog.stat().st_mode & 0o111 == 0o111
+
+    install_text = installer.read_text()
+    assert 'GPU_DEVELOPMENT_EPILOG_SOURCE="${PLATFORM_DIR}/scripts/' in install_text
+    assert '"$GPU_DEVELOPMENT_EPILOG_SOURCE"' in install_text
+    assert "/usr/local/sbin/h100-gpu-development-epilog" in install_text
+    assert "Epilog=/usr/local/sbin/h100-gpu-development-epilog" in slurm.splitlines()
+
+    runtime_text = runtime.read_text()
+    epilog_text = epilog.read_text()
+    assert (
+        runtime_text.index("h100_acquire_lock")
+        < runtime_text.index("validate_live_slurm_allocation")
+        < runtime_text.index("docker compose")
+    )
+    assert epilog_text.index("h100_acquire_lock") < epilog_text.index("docker ps --all")
+    assert epilog_text.index("docker rm --force") < epilog_text.index("create --no-build")
 
 
 def test_portal3f_worker_can_write_only_the_guard_metrics_directory() -> None:

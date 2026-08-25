@@ -18,6 +18,13 @@ h100_require_managed_compose "${user_name}"
 h100_require_slurm_drained
 h100_require_pilot_gpu_isolation_if_managed "${user_name}"
 
+state_file="/etc/h100-platform/users/${user_name}.state"
+if [[ -f "${state_file}" && ! -L "${state_file}" ]] \
+  && grep -Fxq 'VERSION=4' "${state_file}" \
+  && grep -Fxq 'DEVELOPMENT_PROFILE=GPU_1_8CPU_32GB' "${state_file}"; then
+  h100_fail 'GPU Development must use the allocation-aware restart handler'
+fi
+
 container="$(h100_container_name "${user_name}")"
 compose_file="$(h100_compose_file "${user_name}")"
 config_dir="$(h100_config_dir "${user_name}")"

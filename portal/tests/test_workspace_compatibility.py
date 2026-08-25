@@ -119,10 +119,13 @@ def test_worker_workspace_readiness_proves_inode_mount_owner_directories_and_quo
     assert rejected["error"]["code"] == "WORKSPACE_DIRECTORY_REJECTED"
 
 
-def test_workspace_runtime_is_zero_copy_cpu_only_and_alias_aware() -> None:
+def test_workspace_runtime_is_zero_copy_profile_aware_and_alias_aware() -> None:
+    fstab = (PLATFORM_ROOT / "config/fstab").read_text()
     alias = (PLATFORM_ROOT / "scripts/h100-workspace-alias").read_text()
     common = (PLATFORM_ROOT / "scripts/h100-platform-common.sh").read_text()
     stage = (PLATFORM_ROOT / "scripts/h100-provision-stage").read_text()
+    create = (PLATFORM_ROOT / "scripts/h100-container-create").read_text()
+    gpu_runtime = (PLATFORM_ROOT / "scripts/h100-container-gpu-runtime").read_text()
     start = (PLATFORM_ROOT / "scripts/h100-container-start").read_text()
     delete = (PLATFORM_ROOT / "scripts/h100-container-delete").read_text()
 
@@ -144,7 +147,15 @@ def test_workspace_runtime_is_zero_copy_cpu_only_and_alias_aware() -> None:
     assert "local h100_audit_target_value=$2" in common
     assert "canonical workspace has dependent submounts" in alias
     assert "rsync" not in alias
-    assert "GPU_1_8CPU_32GB" not in stage
+    assert "/srv/gpu-platform/workspaces" not in fstab
+    assert "/storage/users none bind" not in fstab
+    assert "GPU_1_8CPU_32GB" in stage
+    assert "GPU development profile requires max GPU one" in stage
+    assert "target: /shared" in stage
+    assert "target: /shared" in create
+    assert "cuInit(0)" in gpu_runtime
+    assert "count.value != 1" in gpu_runtime
+    assert "cuCtxCreate_v2" in gpu_runtime
     assert "runtime: nvidia" not in stage
     assert "driver: nvidia" not in stage
     assert "DeviceRequests" in stage

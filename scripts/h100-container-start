@@ -74,7 +74,10 @@ require_activated_pilot_access() {
         || h100_fail 'multi-user Container workspace binding is invalid'
       [[ "$(pilot_state_value "${state_file}" DEVELOPMENT_PROFILE)" == \
         STANDARD_8CPU_32GB ]] \
-        || h100_fail 'workspace V4 requires the CPU development profile'
+        || h100_fail 'GPU Development must use the Slurm-bound GPU runtime handler'
+      [[ "$(pilot_state_value "${state_file}" LEASE_ID)" =~ \
+        ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] \
+        || h100_fail 'multi-user Container Lease ID is invalid'
     fi
     [[ "$(getent passwd "${user_name}" | cut -d: -f7)" == /usr/sbin/nologin ]] \
       || h100_fail 'multi-user Container activation must keep Host shell nologin'
@@ -100,8 +103,11 @@ require_activated_pilot_access() {
       lease_expires_epoch="$(date -u -d "${lease_expires}" +%s 2>/dev/null)" \
         || h100_fail 'multi-user Container Lease expiry is invalid'
       now_epoch="$(date -u +%s)"
-      ((lease_expires_epoch - lease_start_epoch == 345600)) \
-        || h100_fail 'multi-user Container Lease duration is not 96 hours'
+      ((lease_expires_epoch > lease_start_epoch \
+        && lease_expires_epoch - lease_start_epoch <= 345600)) \
+        || h100_fail 'multi-user Container Lease duration is outside the 96-hour maximum'
+      ((lease_start_epoch <= now_epoch)) \
+        || h100_fail 'multi-user Container Lease has not started'
       ((lease_expires_epoch > now_epoch)) \
         || h100_fail 'multi-user Container Lease has expired'
     fi

@@ -1,10 +1,18 @@
 import hashlib
 import uuid
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from h100_portal_contracts.workspace import (
+    GPU_DEVELOPMENT_PROFILE,
+    WORKSPACE_CONTAINER_PATH,
+    WORKSPACE_DEFAULT_WORKDIR,
+    workspace_path,
+)
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from h100_portal_api import expiry_service
@@ -140,12 +148,124 @@ def _worker(
         error = result.get("error", {})
         code = str(error.get("code", "WORKER_OPERATION_FAILED"))
         message = str(error.get("message", "受控 Worker 操作失败"))
-        detail = {"code": code, "message": message}
+        detail: dict[str, Any] = {"code": code, "message": message}
         rollback_status = error.get("rollback_status")
         if rollback_status in {"NOT_REQUIRED", "ROLLED_BACK", "ROLLBACK_FAILED"}:
             detail["rollback_status"] = rollback_status
+        if result.get("gpu_allocation_state_known") is True:
+            detail.update(
+                {
+                    "gpu_allocation_state_known": True,
+                    "gpu_allocation_job_id": result.get("gpu_allocation_job_id"),
+                    "gpu_allocation_uuid": result.get("gpu_allocation_uuid"),
+                }
+            )
         raise HTTPException(status_code=409, detail=detail)
     return result
+
+
+def _rollback_restored_resource(
+    *,
+    payload: dict[str, Any],
+    worker_result: dict[str, Any],
+    context: AuthContext,
+    restore_id: uuid.UUID,
+    recycled_lease_id: uuid.UUID,
+    recycled_lease_starts_at: datetime,
+    recycled_lease_expires_at: datetime,
+) -> bool:
+    """Return a Worker-restored environment to RECYCLE_BIN after API failure."""
+
+    recycle_payload = {
+        key: payload[key]
+        for key in (
+            "managed_user_id",
+            "username",
+            "uid",
+            "gid",
+            "container_name",
+            "workspace_path",
+            "development_profile",
+            "container_gpu",
+            "slurm_account",
+            "slurm_qos",
+            "expected_gpu",
+            "host_access",
+            "expected_key_fingerprints",
+        )
+    }
+    recycle_payload.update(
+        {
+            "restore_request_id": str(restore_id),
+            "attempted_lease_id": payload["lease_id"],
+            "attempted_lease_starts_at": payload["lease_starts_at"],
+            "attempted_lease_expires_at": payload["lease_expires_at"],
+            "recycle_lease_id": str(recycled_lease_id),
+            "recycle_lease_starts_at": ensure_utc(recycled_lease_starts_at).isoformat(),
+            "recycle_lease_expires_at": ensure_utc(recycled_lease_expires_at).isoformat(),
+            "gpu_allocation_job_id": worker_result.get("gpu_allocation_job_id"),
+            "gpu_allocation_uuid": worker_result.get("gpu_allocation_uuid"),
+        }
+    )
+    try:
+        rollback = call_worker(
+            "resource.restore.rollback",
+            payload=recycle_payload,
+            requested_by=context.user.normalized_login,
+            approved_by=context.user.normalized_login,
+            idempotency_key=f"resource-restore-rollback:{restore_id}",
+            dry_run=False,
+            timeout_seconds=180,
+        )
+    except WorkerClientError:
+        return False
+    return bool(
+        rollback.get("status") == "SUCCEEDED"
+        and rollback.get("container_state") == "STOPPED"
+        and rollback.get("gpu_allocation_job_id") is None
+        and rollback.get("gpu_allocation_uuid") is None
+        and rollback.get("container_key_state") == "SUSPENDED_BY_RECYCLE"
+        and rollback.get("data_preserved") is True
+    )
+
+
+def _apply_restore_failure_state(
+    db: Session,
+    *,
+    operation: PortalOperation,
+    restore: PortalResourceRestoreRequest,
+    item: PortalResourceRecycleItem,
+    managed: PortalManagedUser,
+    container: PortalContainer,
+    suspended_keys: Sequence[PortalSshKey],
+    code: str,
+    rollback_ok: bool,
+) -> None:
+    operation.status = OperationStatus.FAILED
+    operation.error_code = code[:64]
+    operation.finished_at = utcnow()
+    operation.rollback_status = "ROLLED_BACK" if rollback_ok else "REQUIRES_MANUAL_REVIEW"
+    restore.state = "FAILED"
+    if rollback_ok:
+        item.state = "RECYCLE_BIN"
+        managed.compute_environment_state = "RECYCLED"
+        container.desired_state = "STOPPED"
+        container.observed_state = "STOPPED"
+        container.gpu_allocation_job_id = None
+        container.gpu_allocation_uuid = None
+        for key in suspended_keys:
+            key.container_install_state = "SUSPENDED_BY_RECYCLE"
+        storage = db.scalar(
+            select(PortalStorageResource).where(
+                PortalStorageResource.owner_managed_user_id == managed.id
+            )
+        )
+        if storage is not None:
+            storage.state = "PRESERVED"
+    else:
+        item.state = "FAILED"
+        managed.compute_environment_state = "FAILED"
+        container.observed_state = "UNKNOWN"
 
 
 def _new_operation(
@@ -210,7 +330,11 @@ def _container_view(container: PortalContainer, lease_active: bool) -> dict[str,
         "connection_state": "AVAILABLE"
         if lease_active and container.observed_state == "RUNNING"
         else "DISABLED",
-        "gpu": "NONE",
+        "profile": container.development_profile,
+        "gpu": container.gpu_count,
+        "gpu_allocation_state": (
+            "ALLOCATED" if container.gpu_allocation_job_id is not None else "NONE"
+        ),
         "cpus": container.safe_spec.get("cpus", 8),
         "memory_gb": container.safe_spec.get("memory_gb", 32),
         "pids_limit": container.safe_spec.get("pids_limit", 4096),
@@ -245,6 +369,19 @@ def _execute_restore(
     expected_key_fingerprints = sorted(key.fingerprint_sha256 for key in suspended_keys)
     if not expected_key_fingerprints:
         raise _error(409, "CONTAINER_KEY_RESTORE_FAILED", "没有可恢复的容器 SSH 公钥")
+    recycled_lease = db.get(PortalComputeLease, item.lease_id)
+    if recycled_lease is None or recycled_lease.owner_managed_user_id != managed.id:
+        raise _error(409, "RESTORE_OWNERSHIP_MISMATCH", "原租约所有权不一致")
+    lease = create_lease(
+        managed_user_id=managed.id,
+        starts_at=utcnow(),
+        duration_seconds=restore.requested_duration_seconds,
+        gpu_count=recycled_lease.gpu_count,
+        approved_by=context.user.id,
+        restored=True,
+    )
+    lease.id = uuid.uuid4()
+    expected_gpu = "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1"
     payload = {
         "restore_request_id": str(restore.id),
         "managed_user_id": str(managed.id),
@@ -252,7 +389,17 @@ def _execute_restore(
         "uid": managed.uid,
         "gid": managed.gid,
         "container_name": container.name,
-        "expected_gpu": "NONE",
+        "workspace_path": str(workspace_path(managed.uid)),
+        "development_profile": container.development_profile,
+        "container_gpu": container.gpu_count,
+        "gpu_allocation_job_id": None,
+        "gpu_allocation_uuid": None,
+        "slurm_account": managed.slurm_account,
+        "slurm_qos": managed.slurm_qos,
+        "lease_id": str(lease.id),
+        "lease_starts_at": ensure_utc(lease.starts_at).isoformat(),
+        "lease_expires_at": ensure_utc(lease.expires_at).isoformat(),
+        "expected_gpu": expected_gpu,
         "host_access": "DISABLED_BY_PLATFORM_POLICY",
         "expected_key_fingerprints": expected_key_fingerprints,
     }
@@ -270,6 +417,7 @@ def _execute_restore(
     )
     restore.state = "RESTORING"
     item.state = "RESTORING"
+    db.commit()
     try:
         result = _worker(
             worker_operation_type,
@@ -279,19 +427,38 @@ def _execute_restore(
             timeout_seconds=180,
         )
     except HTTPException as exc:
-        operation.status = OperationStatus.FAILED
-        operation.finished_at = utcnow()
         detail = getattr(exc, "detail", {})
-        error_code = (
-            detail.get("code", "RESTORE_WORKER_FAILED")
-            if isinstance(detail, dict)
-            else "RESTORE_WORKER_FAILED"
+        safe_detail = detail if isinstance(detail, dict) else {}
+        allocation_job_id = safe_detail.get("gpu_allocation_job_id")
+        allocation_uuid = safe_detail.get("gpu_allocation_uuid")
+        valid_pair = (allocation_job_id is None and allocation_uuid is None) or (
+            container.development_profile == GPU_DEVELOPMENT_PROFILE
+            and isinstance(allocation_job_id, int)
+            and not isinstance(allocation_job_id, bool)
+            and allocation_job_id > 0
+            and isinstance(allocation_uuid, str)
+            and allocation_uuid.startswith("GPU-")
         )
-        operation.error_code = str(error_code)[:64]
-        restore.state = "FAILED"
-        rolled_back = isinstance(detail, dict) and detail.get("rollback_status") == "ROLLED_BACK"
-        item.state = "RECYCLE_BIN" if rolled_back else "FAILED"
-        managed.compute_environment_state = "RECYCLED" if rolled_back else "FAILED"
+        if safe_detail.get("gpu_allocation_state_known") is True and valid_pair:
+            container.gpu_allocation_job_id = allocation_job_id
+            container.gpu_allocation_uuid = allocation_uuid
+        rollback_ok = (
+            safe_detail.get("rollback_status") == "ROLLED_BACK"
+            and safe_detail.get("gpu_allocation_state_known", True) is True
+            and allocation_job_id is None
+            and allocation_uuid is None
+        )
+        _apply_restore_failure_state(
+            db,
+            operation=operation,
+            restore=restore,
+            item=item,
+            managed=managed,
+            container=container,
+            suspended_keys=suspended_keys,
+            code=str(safe_detail.get("code", "RESTORE_WORKER_FAILED")),
+            rollback_ok=rollback_ok,
+        )
         _audit(
             db,
             request,
@@ -302,28 +469,52 @@ def _execute_restore(
             result="FAILED",
             metadata={
                 "error_code": operation.error_code,
-                "rollback_status": detail.get("rollback_status")
-                if isinstance(detail, dict)
-                else None,
+                "rollback_status": operation.rollback_status,
             },
         )
         db.commit()
         raise
     observed_fingerprints = result.get("container_key_fingerprints")
+    allocation_job_id = result.get("gpu_allocation_job_id")
+    allocation_uuid = result.get("gpu_allocation_uuid")
+    allocation_valid = (
+        allocation_job_id is None and allocation_uuid is None
+        if container.gpu_count == 0
+        else isinstance(allocation_job_id, int)
+        and not isinstance(allocation_job_id, bool)
+        and allocation_job_id > 0
+        and isinstance(allocation_uuid, str)
+        and allocation_uuid.startswith("GPU-")
+    )
     if (
         result.get("container_state") != "RUNNING"
-        or result.get("container_gpu") != "NONE"
+        or result.get("container_gpu") != expected_gpu
+        or not allocation_valid
         or result.get("container_key_state") != "INSTALLED"
         or not isinstance(observed_fingerprints, list)
         or sorted(str(fingerprint) for fingerprint in observed_fingerprints)
         != expected_key_fingerprints
     ):
-        operation.status = OperationStatus.FAILED
-        operation.error_code = "RESTORE_POSTCONDITION_FAILED"
-        operation.finished_at = utcnow()
-        restore.state = "FAILED"
-        item.state = "FAILED"
-        managed.compute_environment_state = "FAILED"
+        rollback_ok = _rollback_restored_resource(
+            payload=payload,
+            worker_result=result,
+            context=context,
+            restore_id=restore.id,
+            recycled_lease_id=recycled_lease.id,
+            recycled_lease_starts_at=recycled_lease.starts_at,
+            recycled_lease_expires_at=recycled_lease.expires_at,
+        )
+        _apply_restore_failure_state(
+            db,
+            operation=operation,
+            restore=restore,
+            item=item,
+            managed=managed,
+            container=container,
+            suspended_keys=suspended_keys,
+            code="RESTORE_POSTCONDITION_FAILED",
+            rollback_ok=rollback_ok,
+        )
         _audit(
             db,
             request,
@@ -332,50 +523,110 @@ def _execute_restore(
             object_type="resource_restore_request",
             object_id=str(restore.id),
             result="FAILED",
-            metadata={"error_code": "RESTORE_POSTCONDITION_FAILED"},
+            metadata={
+                "error_code": "RESTORE_POSTCONDITION_FAILED",
+                "rollback_status": operation.rollback_status,
+            },
         )
         db.commit()
-        raise _error(409, "RESTORE_POSTCONDITION_FAILED", "恢复安全后置条件失败")
-    lease = create_lease(
-        managed_user_id=managed.id,
-        starts_at=utcnow(),
-        duration_seconds=restore.requested_duration_seconds,
-        gpu_count=1,
-        approved_by=context.user.id,
-        restored=True,
-    )
-    db.add(lease)
-    db.flush()
-    restore.state = "RESTORED"
-    restore.restored_lease_id = lease.id
-    item.state = "RESTORED"
-    item.restored_at = utcnow()
-    managed.compute_environment_state = "ACTIVE"
-    container.observed_state = "RUNNING"
-    container.desired_state = "RUNNING"
-    for key in suspended_keys:
-        key.container_install_state = "INSTALLED"
-    storage = db.scalar(
-        select(PortalStorageResource).where(
-            PortalStorageResource.owner_managed_user_id == managed.id
+        message = (
+            "恢复安全后置条件失败；环境已返回回收站"
+            if rollback_ok
+            else "恢复安全后置条件失败；自动回滚未完成，需要人工检查"
         )
-    )
-    if storage is not None:
-        storage.state = "ACTIVE"
-    operation.status = OperationStatus.SUCCEEDED
-    operation.worker_execution_id = str(result.get("request_id", ""))[:64] or None
-    operation.finished_at = utcnow()
-    operation.result_summary = "Recoverable environment restored with Host access disabled"
-    _audit(
-        db,
-        request,
-        context,
-        event_type="RESOURCE_RESTORED",
-        object_type="resource_restore_request",
-        object_id=str(restore.id),
-        metadata={"lease_id": str(lease.id), "host_access": "DISABLED"},
-    )
-    db.commit()
+        raise _error(409, "RESTORE_POSTCONDITION_FAILED", message)
+    try:
+        db.add(lease)
+        db.flush()
+        restore.state = "RESTORED"
+        restore.restored_lease_id = lease.id
+        item.state = "RESTORED"
+        item.restored_at = utcnow()
+        managed.compute_environment_state = "ACTIVE"
+        container.observed_state = "RUNNING"
+        container.desired_state = "RUNNING"
+        container.gpu_allocation_job_id = allocation_job_id
+        container.gpu_allocation_uuid = allocation_uuid
+        for key in suspended_keys:
+            key.container_install_state = "INSTALLED"
+        storage = db.scalar(
+            select(PortalStorageResource).where(
+                PortalStorageResource.owner_managed_user_id == managed.id
+            )
+        )
+        if storage is not None:
+            storage.state = "ACTIVE"
+        operation.status = OperationStatus.SUCCEEDED
+        operation.worker_execution_id = str(result.get("request_id", ""))[:64] or None
+        operation.finished_at = utcnow()
+        operation.result_summary = "Recoverable environment restored with Host access disabled"
+        _audit(
+            db,
+            request,
+            context,
+            event_type="RESOURCE_RESTORED",
+            object_type="resource_restore_request",
+            object_id=str(restore.id),
+            metadata={"lease_id": str(lease.id), "host_access": "DISABLED"},
+        )
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        rollback_ok = _rollback_restored_resource(
+            payload=payload,
+            worker_result=result,
+            context=context,
+            restore_id=restore.id,
+            recycled_lease_id=recycled_lease.id,
+            recycled_lease_starts_at=recycled_lease.starts_at,
+            recycled_lease_expires_at=recycled_lease.expires_at,
+        )
+        persisted_operation = db.get(PortalOperation, operation.id)
+        persisted_restore = db.get(PortalResourceRestoreRequest, restore.id)
+        persisted_item = db.get(PortalResourceRecycleItem, item.id)
+        persisted_managed = db.get(PortalManagedUser, managed.id)
+        persisted_container = db.get(PortalContainer, container.id)
+        persisted_keys = db.scalars(
+            select(PortalSshKey).where(PortalSshKey.id.in_([key.id for key in suspended_keys]))
+        ).all()
+        if not all(
+            value is not None
+            for value in (
+                persisted_operation,
+                persisted_restore,
+                persisted_item,
+                persisted_managed,
+                persisted_container,
+            )
+        ):
+            raise _error(
+                409,
+                "RESTORE_PERSISTENCE_FAILED",
+                "恢复状态提交失败；需要人工核对 Root Worker 状态",
+            ) from exc
+        assert persisted_operation is not None
+        assert persisted_restore is not None
+        assert persisted_item is not None
+        assert persisted_managed is not None
+        assert persisted_container is not None
+        _apply_restore_failure_state(
+            db,
+            operation=persisted_operation,
+            restore=persisted_restore,
+            item=persisted_item,
+            managed=persisted_managed,
+            container=persisted_container,
+            suspended_keys=persisted_keys,
+            code="RESTORE_PERSISTENCE_FAILED",
+            rollback_ok=rollback_ok,
+        )
+        db.commit()
+        message = (
+            "恢复状态提交失败；环境已返回回收站"
+            if rollback_ok
+            else "恢复状态提交失败；自动回滚未完成，需要人工检查"
+        )
+        raise _error(409, "RESTORE_PERSISTENCE_FAILED", message) from exc
     return {
         "status": "RESTORED",
         "restore_request_id": str(restore.id),
@@ -453,6 +704,9 @@ def self_environment(
             "storage": {
                 "quota_bytes": storage.quota_bytes if storage else managed.quota_bytes,
                 "state": storage.state if storage else "ACTIVE",
+                "workspace": str(workspace_path(managed.uid)),
+                "container_mount": str(WORKSPACE_CONTAINER_PATH),
+                "default_job_workdir": str(workspace_path(managed.uid) / WORKSPACE_DEFAULT_WORKDIR),
             },
         },
     }
@@ -541,7 +795,7 @@ def self_container_connection(
             "port": container.ssh_port,
             "username": managed.unix_username,
             "authentication": "SSH_PUBLIC_KEY",
-            "gpu": "NONE",
+            "gpu": "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1",
             "key_fingerprint": key.fingerprint_sha256 if key else None,
             "command": (
                 f"ssh -i <你的私钥路径> -p {container.ssh_port} "
@@ -573,10 +827,11 @@ def _container_action(
     managed = managed_identity_for_user(db, context.user, lock=True)
     container = _container_for_owner(db, managed.id, lock=True)
     lease_id: uuid.UUID | None = None
+    lease_starts_at: datetime | None = None
     lease_deadline: datetime | None = None
     if action in {"start", "restart"}:
         try:
-            active, terminal = entitlement(db, managed.id, lock=True)
+            active, _terminal = entitlement(db, managed.id, lock=True)
         except HTTPException as exc:
             raw_detail: Any = getattr(exc, "detail", None)
             detail = raw_detail if isinstance(raw_detail, dict) else {}
@@ -588,9 +843,22 @@ def _container_action(
                 ) from exc
             raise
         lease_id = active.id
-        lease_deadline = terminal.expires_at
+        lease_starts_at = active.starts_at
+        lease_deadline = active.expires_at
         if managed.compute_environment_state != "ACTIVE":
             raise _error(409, "CONTAINER_OPERATION_DENIED_LEASE_INACTIVE", "计算环境不可用")
+    else:
+        latest_lease = db.scalar(
+            select(PortalComputeLease)
+            .where(PortalComputeLease.owner_managed_user_id == managed.id)
+            .order_by(PortalComputeLease.starts_at.desc())
+        )
+        if latest_lease is not None:
+            lease_id = latest_lease.id
+            lease_starts_at = latest_lease.starts_at
+            lease_deadline = latest_lease.expires_at
+        elif container.gpu_count == 1 and container.gpu_allocation_job_id is not None:
+            raise _error(409, "GPU_ALLOCATION_BINDING_REJECTED", "GPU 容器缺少 Lease 绑定")
     operation_type = f"container.{action}"
     key = f"self-container-{action}:{managed.id}:{body.idempotency_key}"
     existing = db.scalar(
@@ -607,9 +875,17 @@ def _container_action(
         "uid": managed.uid,
         "gid": managed.gid,
         "name": container.name,
+        "workspace_path": str(workspace_path(managed.uid)),
+        "development_profile": container.development_profile,
+        "container_gpu": container.gpu_count,
+        "gpu_allocation_job_id": container.gpu_allocation_job_id,
+        "gpu_allocation_uuid": container.gpu_allocation_uuid,
+        "slurm_account": managed.slurm_account,
+        "slurm_qos": managed.slurm_qos,
         "lease_id": str(lease_id) if lease_id else None,
+        "lease_starts_at": (ensure_utc(lease_starts_at).isoformat() if lease_starts_at else None),
         "lease_expires_at": ensure_utc(lease_deadline).isoformat() if lease_deadline else None,
-        "expected_gpu": "NONE",
+        "expected_gpu": "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1",
     }
     operation = _new_operation(
         db,
@@ -633,11 +909,46 @@ def _container_action(
     except HTTPException as exc:
         operation.status = OperationStatus.FAILED
         operation.finished_at = utcnow()
-        operation.error_code = str(getattr(exc, "detail", {}).get("code", "WORKER_FAILED"))
+        detail = getattr(exc, "detail", {})
+        safe_detail = detail if isinstance(detail, dict) else {}
+        operation.error_code = str(safe_detail.get("code", "WORKER_FAILED"))
+        if safe_detail.get("gpu_allocation_state_known") is True:
+            allocation_job_id = safe_detail.get("gpu_allocation_job_id")
+            allocation_uuid = safe_detail.get("gpu_allocation_uuid")
+            valid_pair = (allocation_job_id is None and allocation_uuid is None) or (
+                isinstance(allocation_job_id, int)
+                and allocation_job_id > 0
+                and isinstance(allocation_uuid, str)
+                and allocation_uuid.startswith("GPU-")
+            )
+            if valid_pair:
+                container.gpu_allocation_job_id = allocation_job_id
+                container.gpu_allocation_uuid = allocation_uuid
+                if (
+                    allocation_job_id is None
+                    and container.development_profile != "STANDARD_8CPU_32GB"
+                ):
+                    container.desired_state = "STOPPED"
+                    container.observed_state = "STOPPED"
         db.commit()
         raise
     expected_state = "STOPPED" if action == "stop" else "RUNNING"
-    if result.get("container_state") != expected_state or result.get("container_gpu") != "NONE":
+    expected_gpu = "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1"
+    allocation_job_id = result.get("gpu_allocation_job_id")
+    allocation_uuid = result.get("gpu_allocation_uuid")
+    gpu_postcondition = (
+        allocation_job_id is None and allocation_uuid is None
+        if container.gpu_count == 0 or expected_state == "STOPPED"
+        else isinstance(allocation_job_id, int)
+        and allocation_job_id > 0
+        and isinstance(allocation_uuid, str)
+        and allocation_uuid.startswith("GPU-")
+    )
+    if (
+        result.get("container_state") != expected_state
+        or result.get("container_gpu") != expected_gpu
+        or not gpu_postcondition
+    ):
         operation.status = OperationStatus.FAILED
         operation.error_code = "CONTAINER_POSTCONDITION_FAILED"
         operation.finished_at = utcnow()
@@ -645,6 +956,8 @@ def _container_action(
         raise _error(409, "CONTAINER_POSTCONDITION_FAILED", "容器安全后置条件失败")
     container.observed_state = expected_state
     container.desired_state = expected_state
+    container.gpu_allocation_job_id = allocation_job_id
+    container.gpu_allocation_uuid = allocation_uuid
     operation.status = OperationStatus.SUCCEEDED
     operation.worker_execution_id = str(result.get("request_id", ""))[:64] or None
     operation.finished_at = utcnow()
@@ -655,7 +968,12 @@ def _container_action(
         event_type=operation_type,
         object_type="container",
         object_id=str(container.id),
-        metadata={"state": expected_state, "gpu": "NONE"},
+        metadata={
+            "state": expected_state,
+            "gpu": expected_gpu,
+            "development_profile": container.development_profile,
+            "gpu_allocation_job_id": allocation_job_id,
+        },
     )
     db.commit()
     return {"status": "SUCCEEDED", "operation_id": str(operation.id), "state": expected_state}
@@ -788,9 +1106,16 @@ def create_self_terminal(
         "uid": managed.uid,
         "gid": managed.gid,
         "name": container.name,
+        "workspace_path": str(workspace_path(managed.uid)),
+        "development_profile": container.development_profile,
+        "container_gpu": container.gpu_count,
+        "gpu_allocation_job_id": container.gpu_allocation_job_id,
+        "gpu_allocation_uuid": container.gpu_allocation_uuid,
+        "slurm_account": managed.slurm_account,
+        "slurm_qos": managed.slurm_qos,
         "lease_id": str(resources.active_lease.id),
         "lease_expires_at": ensure_utc(resources.terminal_lease.expires_at).isoformat(),
-        "expected_gpu": "NONE",
+        "expected_gpu": "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1",
         "host_access": "DISABLED_BY_PLATFORM_POLICY",
         "expected_key_fingerprints": fingerprints,
         "cols": body.cols,
@@ -836,7 +1161,11 @@ def create_self_terminal(
             object_type="container",
             object_id=str(container.id),
             result="DENIED",
-            metadata={"code": exc.code, "gpu": "NONE", "host_access": "DISABLED"},
+            metadata={
+                "code": exc.code,
+                "gpu": payload["expected_gpu"],
+                "host_access": "DISABLED",
+            },
         )
         db.commit()
         raise _terminal_error(exc) from exc
@@ -854,7 +1183,7 @@ def create_self_terminal(
             "container": container.name,
             "uid": managed.uid,
             "gid": managed.gid,
-            "gpu": "NONE",
+            "gpu": payload["expected_gpu"],
             "host_access": "DISABLED",
             "transport": "AUTHENTICATED_HTTP_LONG_POLL",
             "input_logged": False,
@@ -868,7 +1197,7 @@ def create_self_terminal(
             "operation_id": str(operation.id),
             "container": container.name,
             "username": managed.unix_username,
-            "gpu": "NONE",
+            "gpu": payload["expected_gpu"],
             "host_access": "DISABLED",
             "state": record.worker.state,
             "expires_at": record.expires_at.isoformat(),
@@ -980,6 +1309,7 @@ def _refresh_job(context: AuthContext, resources: SelfResourceContext, job: Port
                 "username": managed.unix_username,
                 "uid": managed.uid,
                 "gid": managed.gid,
+                "workspace_path": resources.workspace,
                 "slurm_job_id": job.slurm_job_id,
             },
             requested_by=context.user.normalized_login,
@@ -1067,12 +1397,13 @@ def submit_self_job(
     if len(script_bytes) > 8 * 1024:
         raise _error(422, "JOB_SCRIPT_REJECTED", "执行脚本不能超过8 KiB")
     script_sha256 = hashlib.sha256(script_bytes).hexdigest()
-    script_path = f"workspace/.portal/job-scripts/{job_id}.sh"
-    workdir = "workspace"
-    stdout = f"workspace/.portal/jobs/{job_id}.out"
-    stderr = f"workspace/.portal/jobs/{job_id}.err"
+    script_path = f".portal/job-scripts/{job_id}.sh"
+    workdir = str(WORKSPACE_DEFAULT_WORKDIR)
+    stdout = f"outputs/{job_id}.out"
+    stderr = f"outputs/{job_id}.err"
     payload = {
         **resources.worker_identity(),
+        "workspace_path": resources.workspace,
         "portal_job_id": str(job_id),
         "lease_id": str(active.id),
         "name": body.name,
@@ -1224,6 +1555,7 @@ def self_job_logs(
             "username": managed.unix_username,
             "uid": managed.uid,
             "gid": managed.gid,
+            "workspace_path": resources.workspace,
             "stdout_relative_path": job.stdout_relative_path,
             "stderr_relative_path": job.stderr_relative_path,
         },
@@ -1270,6 +1602,7 @@ def cancel_self_job(
             "username": managed.unix_username,
             "uid": managed.uid,
             "gid": managed.gid,
+            "workspace_path": resources.workspace,
             "slurm_job_id": job.slurm_job_id,
         },
         context=context,
@@ -1311,6 +1644,7 @@ def self_storage(
                 "username": managed.unix_username,
                 "uid": managed.uid,
                 "gid": managed.gid,
+                "workspace_path": str(workspace_path(managed.uid)),
             },
             requested_by=context.user.normalized_login,
             idempotency_key=f"self-storage-read:{managed.id}",
@@ -1324,7 +1658,7 @@ def self_storage(
     return {
         "status": "OK",
         "storage": {
-            "root": f"/srv/gpu-platform/users/{managed.unix_username}",
+            "root": str(workspace_path(managed.uid)),
             "quota_bytes": quota,
             "used_bytes": used,
             "available_bytes": max(0, quota - used)
@@ -1406,7 +1740,7 @@ def create_restore_request(
         .where(
             PortalResourceRecycleItem.id == item_id,
             PortalResourceRecycleItem.owner_managed_user_id == managed.id,
-            PortalResourceRecycleItem.state.in_({"RECYCLE_BIN", "RESTORE_PENDING"}),
+            PortalResourceRecycleItem.state.in_({"RECYCLE_BIN", "RESTORE_PENDING", "FAILED"}),
         )
         .with_for_update()
     )

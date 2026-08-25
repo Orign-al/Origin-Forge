@@ -12,6 +12,7 @@ const ORIGIN = `http://127.0.0.1:${e2ePort}`;
 
 type FixtureAccount = {
   username: string;
+  uid: number;
   password: string;
   displayName: string;
   userId: string;
@@ -24,6 +25,7 @@ type FixtureAccount = {
 
 const accountA: FixtureAccount = {
   username: "fixture-user-a",
+  uid: 20001,
   password: "fixture password a only",
   displayName: "Fixture User A",
   userId: "60000000-0000-4000-8000-000000000001",
@@ -36,6 +38,7 @@ const accountA: FixtureAccount = {
 
 const accountB: FixtureAccount = {
   username: "fixture-user-b",
+  uid: 20002,
   password: "fixture password b only",
   displayName: "Fixture User B",
   userId: "60000000-0000-4000-8000-000000000002",
@@ -104,7 +107,9 @@ function container(account: FixtureAccount) {
     name: `gpu-dev-${account.username}`,
     state: "RUNNING",
     connection_state: "READY",
-    gpu: "NONE",
+    profile: "STANDARD_8CPU_32GB",
+    gpu: 0,
+    gpu_allocation_state: "NONE",
     cpus: 8,
     memory_gb: 32,
     pids_limit: 4096,
@@ -121,10 +126,10 @@ function job(account: FixtureAccount) {
     memory_mb: 4096,
     gpu_count: 1,
     time_limit_seconds: 600,
-    script_path: `workspace/.portal/job-scripts/${account.jobId}.sh`,
-    workdir: "workspace",
-    stdout_path: `workspace/.portal/jobs/${account.jobId}.out`,
-    stderr_path: `workspace/.portal/jobs/${account.jobId}.err`,
+    script_path: `.portal/job-scripts/${account.jobId}.sh`,
+    workdir: "projects",
+    stdout_path: `outputs/${account.jobId}.out`,
+    stderr_path: `outputs/${account.jobId}.err`,
     lease_deadline_at: "2026-08-21T12:21:08Z",
     created_at: "2026-08-17T12:30:00Z",
     submitted_at: "2026-08-17T12:30:01Z",
@@ -280,7 +285,13 @@ class PortalSessionFixture {
           job_submission: "AVAILABLE",
           lease: lease(account),
           container: container(account),
-          storage: { quota_bytes: 300 * 1024 ** 3, state: "ACTIVE" },
+          storage: {
+            quota_bytes: 300 * 1024 ** 3,
+            state: "ACTIVE",
+            workspace: `/storage/users/${account.uid}`,
+            container_mount: "/workspace",
+            default_job_workdir: `/storage/users/${account.uid}/projects`,
+          },
         },
       });
       return;
@@ -289,7 +300,7 @@ class PortalSessionFixture {
       await json(route, {
         status: "OK",
         storage: {
-          root: `/srv/gpu-platform/users/${account.username}`,
+          root: `/storage/users/${account.uid}`,
           quota_bytes: 300 * 1024 ** 3,
           used_bytes: 1024,
           available_bytes: 300 * 1024 ** 3 - 1024,

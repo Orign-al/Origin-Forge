@@ -133,7 +133,7 @@ class WorkerTerminal:
                 or ready.get("username") != payload["username"]
                 or ready.get("uid") != payload["uid"]
                 or ready.get("gid") != payload["gid"]
-                or ready.get("gpu") != "NONE"
+                or ready.get("gpu") != payload["expected_gpu"]
                 or ready.get("host_access") != "DISABLED"
             ):
                 raise TerminalServiceError(
@@ -449,7 +449,7 @@ class TerminalRegistry:
                             "reason": record.worker.reason or "UNKNOWN",
                             "exit_code": record.worker.exit_code,
                             "container": record.container_name,
-                            "gpu": "NONE",
+                            "gpu": record.worker.ready.get("gpu", "UNKNOWN"),
                             "host_access": "DISABLED",
                             "input_logged": False,
                         },

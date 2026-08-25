@@ -1,10 +1,18 @@
 import hashlib
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from h100_portal_contracts.workspace import workspace_binding
+from h100_portal_contracts.workspace import (
+    CPU_DEVELOPMENT_PROFILE,
+    DEVELOPMENT_PROFILES,
+    GPU_DEVELOPMENT_PROFILE,
+    WORKSPACE_DEFAULT_WORKDIR,
+    profile_gpu_count,
+    workspace_binding,
+    workspace_path,
+)
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 KNOWN_READS = {
@@ -63,6 +71,7 @@ KNOWN_WRITES = {
     "lease.expire",
     "resource.recycle",
     "resource.restore",
+    "resource.restore.rollback",
     "self.resource.restore",
     "host_access.revoke_managed_user",
 }
@@ -89,8 +98,8 @@ FORBIDDEN_SECRET_OR_COMMAND_FIELDS = {
 }
 COMPUTE_STAGE_HANDLER_IDENTITY = "h100-provision-stage"
 COMPUTE_STAGE_HANDLER_PATH = "/usr/local/sbin/h100-provision-stage"
-COMPUTE_STAGE_ARGV_CONTRACT_VERSION = "compute-provision-stage-argv-v1"
-COMPUTE_STAGE_CONFIRMATION_VALIDATOR_VERSION = "compute-provision-stage-confirmation-validator-v1"
+COMPUTE_STAGE_ARGV_CONTRACT_VERSION = "compute-provision-stage-argv-v2"
+COMPUTE_STAGE_CONFIRMATION_VALIDATOR_VERSION = "compute-provision-stage-confirmation-validator-v2"
 COMPUTE_STAGE_IMAGE_VALIDATOR_VERSION = "compute-provision-stage-local-image-v2"
 COMPUTE_STAGE_CONTRACT_HASH = re.compile(r"^[0-9a-f]{64}$")
 APPROVED_SSH_KEY_TYPES = {
@@ -170,7 +179,7 @@ APPROVED_PRODUCTION_PILOT_PAYLOAD: dict[str, Any] = {
 }
 APPROVED_JOB_IMAGE = PORTAL3F_IMAGE_REF
 STANDARD_COMPUTE_STORAGE_BYTES = 300 * 1024**3
-STANDARD_COMPUTE_PROFILE = "STANDARD_8CPU_32GB"
+STANDARD_COMPUTE_PROFILE = CPU_DEVELOPMENT_PROFILE
 STANDARD_COMPUTE_LEASE_SECONDS = 96 * 60 * 60
 PILOT_UID_MIN = 20_000
 PILOT_UID_MAX = 60_000
@@ -264,9 +273,10 @@ def _validate_compute_provision_plan(payload: dict[str, Any]) -> dict[str, Any]:
     gpu_max = payload.get("requested_gpu_max")
     if gpu_max not in {0, 1} or isinstance(gpu_max, bool):
         raise PayloadValidationError("GPU_MAX_REJECTED", "GPU max must be zero or one")
+    profile = payload.get("requested_container_profile")
     if (
         payload.get("requested_storage_bytes") != STANDARD_COMPUTE_STORAGE_BYTES
-        or payload.get("requested_container_profile") != STANDARD_COMPUTE_PROFILE
+        or profile not in DEVELOPMENT_PROFILES
         or payload.get("requested_lease_seconds") != STANDARD_COMPUTE_LEASE_SECONDS
     ):
         raise PayloadValidationError(
@@ -276,7 +286,7 @@ def _validate_compute_provision_plan(payload: dict[str, Any]) -> dict[str, Any]:
         {
             "requested_gpu_max": gpu_max,
             "requested_storage_bytes": STANDARD_COMPUTE_STORAGE_BYTES,
-            "requested_container_profile": STANDARD_COMPUTE_PROFILE,
+            "requested_container_profile": profile,
             "requested_lease_seconds": STANDARD_COMPUTE_LEASE_SECONDS,
             "reserved_uids": _reserved_number_list(
                 payload, "reserved_uids", minimum=PILOT_UID_MIN, maximum=PILOT_UID_MAX
@@ -298,6 +308,11 @@ def _validate_compute_provision_plan(payload: dict[str, Any]) -> dict[str, Any]:
             ),
         }
     )
+    if profile == GPU_DEVELOPMENT_PROFILE and gpu_max != 1:
+        raise PayloadValidationError(
+            "GPU_PROFILE_ENTITLEMENT_REJECTED",
+            "GPU development profile requires max GPU one",
+        )
     container_names = payload.get("reserved_container_names")
     if (
         not isinstance(container_names, list)
@@ -351,13 +366,18 @@ def _validate_compute_provision_dry_run(payload: dict[str, Any]) -> dict[str, An
     result: dict[str, Any] = _compute_request_identity(payload)
     result["plan_id"] = _canonical_uuid(payload.get("plan_id"), "provision plan ID")
     username = result["username"]
+    profile = payload.get("container_profile")
+    if profile not in DEVELOPMENT_PROFILES:
+        raise PayloadValidationError(
+            "COMPUTE_DRY_RUN_PLAN_MISMATCH", "development profile is not approved"
+        )
     expected = {
         "storage_bytes": STANDARD_COMPUTE_STORAGE_BYTES,
-        "container_profile": STANDARD_COMPUTE_PROFILE,
         "container_cpus": 8,
         "container_memory_gb": 32,
         "container_pids_limit": 4096,
-        "container_gpu": 0,
+        "container_profile": profile,
+        "container_gpu": profile_gpu_count(str(profile)),
         "slurm_account": "company",
         "slurm_qos": "general",
         "lease_seconds": STANDARD_COMPUTE_LEASE_SECONDS,
@@ -375,6 +395,11 @@ def _validate_compute_provision_dry_run(payload: dict[str, Any]) -> dict[str, An
     gpu_max = payload.get("gpu_max")
     if gpu_max not in {0, 1} or isinstance(gpu_max, bool):
         raise PayloadValidationError("GPU_MAX_REJECTED", "GPU max must be zero or one")
+    if profile == GPU_DEVELOPMENT_PROFILE and gpu_max != 1:
+        raise PayloadValidationError(
+            "GPU_PROFILE_ENTITLEMENT_REJECTED",
+            "GPU development profile requires max GPU one",
+        )
     numbers = {
         "uid": (PILOT_UID_MIN, PILOT_UID_MAX),
         "gid": (PILOT_UID_MIN, PILOT_UID_MAX),
@@ -473,15 +498,15 @@ def _validate_compute_stage_contract(value: Any) -> dict[str, Any]:
             "shell_argument_count",
             "expected_shell_argument_count",
             "multi_digit_position_status",
-            "argument_13",
             "argument_14",
+            "argument_15",
         }
         or argv_contract.get("version") != COMPUTE_STAGE_ARGV_CONTRACT_VERSION
         or not isinstance(argv_contract.get("sha256"), str)
         or not COMPUTE_STAGE_CONTRACT_HASH.fullmatch(argv_contract["sha256"])
         or argv_contract.get("shape_status") != "PASS"
-        or argv_contract.get("shell_argument_count") != 14
-        or argv_contract.get("expected_shell_argument_count") != 14
+        or argv_contract.get("shell_argument_count") != 15
+        or argv_contract.get("expected_shell_argument_count") != 15
         or argv_contract.get("multi_digit_position_status") != "PASS"
         or not isinstance(confirmation_gate, dict)
         or set(confirmation_gate) != {"identity", "validator_version", "validator_sha256", "status"}
@@ -539,13 +564,13 @@ def _validate_compute_stage_contract(value: Any) -> dict[str, Any]:
         )
     arguments = (
         (
-            argv_contract.get("argument_13"),
-            13,
+            argv_contract.get("argument_14"),
+            14,
             "EXPLICIT_STAGE_CONFIRMATION_FLAG",
         ),
         (
-            argv_contract.get("argument_14"),
-            14,
+            argv_contract.get("argument_15"),
+            15,
             "CONFIRMED_TARGET_USERNAME",
         ),
     )
@@ -567,8 +592,8 @@ def _validate_compute_stage_contract(value: Any) -> dict[str, Any]:
         "handler": dict(handler),
         "argv_contract": {
             **argv_contract,
-            "argument_13": dict(argv_contract["argument_13"]),
             "argument_14": dict(argv_contract["argument_14"]),
+            "argument_15": dict(argv_contract["argument_15"]),
         },
         "confirmation_gate": dict(confirmation_gate),
         "image_contract": dict(image_contract),
@@ -781,6 +806,9 @@ def _validate_compute_activate_self(payload: dict[str, Any]) -> dict[str, Any]:
         "project_id",
         "ssh_port",
         "container_name",
+        "workspace_path",
+        "development_profile",
+        "container_gpu",
         "slurm_account",
         "slurm_qos",
         "ssh_key_record_ids",
@@ -793,6 +821,7 @@ def _validate_compute_activate_self(payload: dict[str, Any]) -> dict[str, Any]:
         "expected_shell",
         "expected_password_state",
         "expected_gpu",
+        "lease_id",
         "deployment_version",
     }
     if set(payload) != fields or set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
@@ -835,8 +864,18 @@ def _validate_compute_activate_self(payload: dict[str, Any]) -> dict[str, Any]:
             "ACTIVATION_RESOURCE_BINDING_REJECTED",
             "activation resource coordinates are invalid",
         )
+    profile = payload.get("development_profile")
+    if profile not in DEVELOPMENT_PROFILES:
+        raise PayloadValidationError(
+            "ACTIVATION_SECURITY_CONTRACT_REJECTED",
+            "activation development profile is not approved",
+        )
+    profile_gpu = profile_gpu_count(str(profile))
+    expected_gpu = "NONE" if profile_gpu == 0 else "SLURM_ALLOCATED_1"
     if (
         payload.get("container_name") != f"gpu-dev-{username}"
+        or payload.get("workspace_path") != str(workspace_path(int(uid)))
+        or payload.get("container_gpu") != profile_gpu
         or payload.get("slurm_account") != "company"
         or payload.get("slurm_qos") != "general"
         or payload.get("gpu_max") not in {0, 1}
@@ -846,7 +885,8 @@ def _validate_compute_activate_self(payload: dict[str, Any]) -> dict[str, Any]:
         or payload.get("expected_host_access") != "DISABLED_BY_PLATFORM_POLICY"
         or payload.get("expected_shell") != "/usr/sbin/nologin"
         or payload.get("expected_password_state") != "LOCKED"
-        or payload.get("expected_gpu") != "NONE"
+        or payload.get("expected_gpu") != expected_gpu
+        or (profile == GPU_DEVELOPMENT_PROFILE and payload.get("gpu_max") != 1)
     ):
         raise PayloadValidationError(
             "ACTIVATION_SECURITY_CONTRACT_REJECTED",
@@ -905,6 +945,9 @@ def _validate_compute_activate_self(payload: dict[str, Any]) -> dict[str, Any]:
         "project_id": project_id,
         "ssh_port": ssh_port,
         "container_name": f"gpu-dev-{username}",
+        "workspace_path": str(workspace_path(int(uid))),
+        "development_profile": profile,
+        "container_gpu": profile_gpu,
         "slurm_account": "company",
         "slurm_qos": "general",
         "ssh_key_record_ids": canonical_record_ids,
@@ -916,7 +959,8 @@ def _validate_compute_activate_self(payload: dict[str, Any]) -> dict[str, Any]:
         "expected_host_access": "DISABLED_BY_PLATFORM_POLICY",
         "expected_shell": "/usr/sbin/nologin",
         "expected_password_state": "LOCKED",
-        "expected_gpu": "NONE",
+        "expected_gpu": expected_gpu,
+        "lease_id": _canonical_uuid(payload.get("lease_id"), "lease ID"),
         "deployment_version": version,
     }
 
@@ -1147,6 +1191,7 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
         "username",
         "uid",
         "gid",
+        "workspace_path",
         "name",
         "script_relative_path",
         "script_content",
@@ -1167,6 +1212,12 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
     if set(payload) != fields:
         raise PayloadValidationError("JOB_SPEC_REJECTED", "job specification fields are incomplete")
     result = _managed_identity(payload)
+    expected_workspace = str(workspace_path(result["uid"]))
+    if payload.get("workspace_path") != expected_workspace:
+        raise PayloadValidationError(
+            "WORKSPACE_BINDING_REJECTED", "workspace is not derived from the managed UID"
+        )
+    result["workspace_path"] = expected_workspace
     portal_job_id = _canonical_uuid(payload.get("portal_job_id"), "Portal job ID")
     result.update(
         {
@@ -1228,7 +1279,7 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
         or hashlib.sha256(encoded_script).hexdigest() != script_sha256
     ):
         raise PayloadValidationError("JOB_SCRIPT_REJECTED", "job script artifact is invalid")
-    expected_script = f"workspace/.portal/job-scripts/{portal_job_id}.sh"
+    expected_script = f".portal/job-scripts/{portal_job_id}.sh"
     workdir = _relative_user_path(payload.get("workdir_relative_path"), "workdir")
     slurm_account = payload.get("slurm_account")
     slurm_qos = payload.get("slurm_qos")
@@ -1239,8 +1290,8 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
     stdout_path = _relative_user_path(payload.get("stdout_relative_path"), "stdout path")
     stderr_path = _relative_user_path(payload.get("stderr_relative_path"), "stderr path")
     if (
-        stdout_path != f"workspace/.portal/jobs/{portal_job_id}.out"
-        or stderr_path != f"workspace/.portal/jobs/{portal_job_id}.err"
+        stdout_path != f"outputs/{portal_job_id}.out"
+        or stderr_path != f"outputs/{portal_job_id}.err"
     ):
         raise PayloadValidationError("JOB_OUTPUT_REJECTED", "job output path is not fixed")
     result.update(
@@ -1265,7 +1316,9 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
             "image_ref": image_ref,
         }
     )
-    if result["script_relative_path"] != expected_script or workdir != "workspace":
+    if result["script_relative_path"] != expected_script or workdir != str(
+        WORKSPACE_DEFAULT_WORKDIR
+    ):
         raise PayloadValidationError(
             "JOB_SCRIPT_REJECTED", "job script and working directory are not server-bound"
         )
@@ -1280,6 +1333,7 @@ def _validate_self_job_target(payload: dict[str, Any], *, logs: bool = False) ->
             "username",
             "uid",
             "gid",
+            "workspace_path",
             "stdout_relative_path",
             "stderr_relative_path",
         }
@@ -1290,20 +1344,27 @@ def _validate_self_job_target(payload: dict[str, Any], *, logs: bool = False) ->
             "username",
             "uid",
             "gid",
+            "workspace_path",
             "slurm_job_id",
         }
     )
     if set(payload) != expected:
         raise PayloadValidationError("JOB_TARGET_REJECTED", "job target fields are invalid")
     result = _managed_identity(payload)
+    expected_workspace = str(workspace_path(result["uid"]))
+    if payload.get("workspace_path") != expected_workspace:
+        raise PayloadValidationError(
+            "WORKSPACE_BINDING_REJECTED", "workspace is not derived from the managed UID"
+        )
+    result["workspace_path"] = expected_workspace
     portal_job_id = _canonical_uuid(payload.get("portal_job_id"), "Portal job ID")
     result["portal_job_id"] = portal_job_id
     if logs:
         stdout_path = _relative_user_path(payload.get("stdout_relative_path"), "stdout path")
         stderr_path = _relative_user_path(payload.get("stderr_relative_path"), "stderr path")
         if (
-            stdout_path != f"workspace/.portal/jobs/{portal_job_id}.out"
-            or stderr_path != f"workspace/.portal/jobs/{portal_job_id}.err"
+            stdout_path != f"outputs/{portal_job_id}.out"
+            or stderr_path != f"outputs/{portal_job_id}.err"
         ):
             raise PayloadValidationError("JOB_OUTPUT_REJECTED", "job output path is not fixed")
         result["stdout_relative_path"] = stdout_path
@@ -1316,14 +1377,24 @@ def _validate_self_job_target(payload: dict[str, Any], *, logs: bool = False) ->
     return result
 
 
-def _validate_container_lifecycle(payload: dict[str, Any]) -> dict[str, Any]:
+def _validate_container_lifecycle(
+    payload: dict[str, Any], *, require_active_lease: bool
+) -> dict[str, Any]:
     fields = {
         "managed_user_id",
         "username",
         "uid",
         "gid",
         "name",
+        "workspace_path",
+        "development_profile",
+        "container_gpu",
+        "gpu_allocation_job_id",
+        "gpu_allocation_uuid",
+        "slurm_account",
+        "slurm_qos",
         "lease_id",
+        "lease_starts_at",
         "lease_expires_at",
         "expected_gpu",
     }
@@ -1331,18 +1402,91 @@ def _validate_container_lifecycle(payload: dict[str, Any]) -> dict[str, Any]:
         raise PayloadValidationError("CONTAINER_TARGET_REJECTED", "container fields are invalid")
     result = _managed_identity(payload)
     expected_name = f"gpu-dev-{result['username']}"
-    if payload.get("name") != expected_name or payload.get("expected_gpu") != "NONE":
+    profile = payload.get("development_profile")
+    if profile not in DEVELOPMENT_PROFILES:
+        raise PayloadValidationError(
+            "CONTAINER_PROFILE_REJECTED", "development profile is not approved"
+        )
+    gpu_count = profile_gpu_count(str(profile))
+    expected_gpu = "NONE" if gpu_count == 0 else "SLURM_ALLOCATED_1"
+    if (
+        payload.get("name") != expected_name
+        or payload.get("expected_gpu") != expected_gpu
+        or payload.get("container_gpu") != gpu_count
+        or payload.get("workspace_path") != str(workspace_path(result["uid"]))
+        or payload.get("slurm_account") != "company"
+        or payload.get("slurm_qos") != "general"
+    ):
         raise PayloadValidationError("CONTAINER_TARGET_REJECTED", "container target is invalid")
     result["name"] = expected_name
-    result["expected_gpu"] = "NONE"
-    if payload.get("lease_id") is None and payload.get("lease_expires_at") is None:
+    result["workspace_path"] = str(workspace_path(result["uid"]))
+    result["development_profile"] = profile
+    result["container_gpu"] = gpu_count
+    allocation_job_id = payload.get("gpu_allocation_job_id")
+    allocation_uuid = payload.get("gpu_allocation_uuid")
+    if (allocation_job_id is None) != (allocation_uuid is None):
+        raise PayloadValidationError(
+            "GPU_ALLOCATION_BINDING_REJECTED", "GPU allocation coordinates are incomplete"
+        )
+    if allocation_job_id is not None and (
+        profile != GPU_DEVELOPMENT_PROFILE
+        or not isinstance(allocation_job_id, int)
+        or isinstance(allocation_job_id, bool)
+        or not 0 < allocation_job_id < 2**63
+        or not isinstance(allocation_uuid, str)
+        or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", allocation_uuid) is None
+    ):
+        raise PayloadValidationError(
+            "GPU_ALLOCATION_BINDING_REJECTED", "GPU allocation coordinates are invalid"
+        )
+    result["gpu_allocation_job_id"] = allocation_job_id
+    result["gpu_allocation_uuid"] = allocation_uuid
+    result["slurm_account"] = "company"
+    result["slurm_qos"] = "general"
+    result["expected_gpu"] = expected_gpu
+    if (
+        payload.get("lease_id") is None
+        and payload.get("lease_starts_at") is None
+        and payload.get("lease_expires_at") is None
+    ):
         result["lease_id"] = None
+        result["lease_starts_at"] = None
         result["lease_expires_at"] = None
     else:
         result["lease_id"] = _canonical_uuid(payload.get("lease_id"), "lease ID")
-        result["lease_expires_at"] = _future_timestamp(
-            payload.get("lease_expires_at"), "lease expiry"
-        )
+        starts_at = payload.get("lease_starts_at")
+        if not isinstance(starts_at, str) or len(starts_at) > 64:
+            raise PayloadValidationError("PAYLOAD_REJECTED", "invalid lease start")
+        try:
+            parsed_start = datetime.fromisoformat(starts_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise PayloadValidationError("PAYLOAD_REJECTED", "invalid lease start") from exc
+        if parsed_start.tzinfo is None:
+            raise PayloadValidationError("PAYLOAD_REJECTED", "invalid lease start")
+        parsed_start = parsed_start.astimezone(UTC)
+        result["lease_starts_at"] = parsed_start.isoformat()
+        if require_active_lease:
+            parsed_expiry = datetime.fromisoformat(
+                _future_timestamp(payload.get("lease_expires_at"), "lease expiry")
+            ).astimezone(UTC)
+        else:
+            expires_at = payload.get("lease_expires_at")
+            if not isinstance(expires_at, str) or len(expires_at) > 64:
+                raise PayloadValidationError("PAYLOAD_REJECTED", "invalid lease expiry")
+            try:
+                parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise PayloadValidationError("PAYLOAD_REJECTED", "invalid lease expiry") from exc
+            if parsed.tzinfo is None:
+                raise PayloadValidationError("PAYLOAD_REJECTED", "invalid lease expiry")
+            parsed_expiry = parsed.astimezone(UTC)
+        if (
+            not timedelta(seconds=1)
+            <= parsed_expiry - parsed_start
+            <= timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS)
+        ):
+            raise PayloadValidationError("PAYLOAD_REJECTED", "invalid lease window")
+        result["lease_expires_at"] = parsed_expiry.isoformat()
     return result
 
 
@@ -1353,6 +1497,13 @@ def _validate_container_terminal(payload: dict[str, Any]) -> dict[str, Any]:
         "uid",
         "gid",
         "name",
+        "workspace_path",
+        "development_profile",
+        "container_gpu",
+        "gpu_allocation_job_id",
+        "gpu_allocation_uuid",
+        "slurm_account",
+        "slurm_qos",
         "lease_id",
         "lease_expires_at",
         "expected_gpu",
@@ -1367,9 +1518,34 @@ def _validate_container_terminal(payload: dict[str, Any]) -> dict[str, Any]:
         )
     result = _managed_identity(payload)
     expected_name = f"gpu-dev-{result['username']}"
+    profile = payload.get("development_profile")
+    if profile not in DEVELOPMENT_PROFILES:
+        raise PayloadValidationError(
+            "TERMINAL_TARGET_REJECTED", "terminal development profile is not approved"
+        )
+    gpu_count = profile_gpu_count(str(profile))
+    expected_gpu = "NONE" if gpu_count == 0 else "SLURM_ALLOCATED_1"
+    allocation_job_id = payload.get("gpu_allocation_job_id")
+    allocation_uuid = payload.get("gpu_allocation_uuid")
     if (
         payload.get("name") != expected_name
-        or payload.get("expected_gpu") != "NONE"
+        or payload.get("workspace_path") != str(workspace_path(result["uid"]))
+        or payload.get("container_gpu") != gpu_count
+        or payload.get("expected_gpu") != expected_gpu
+        or payload.get("slurm_account") != "company"
+        or payload.get("slurm_qos") != "general"
+        or (allocation_job_id is None) != (allocation_uuid is None)
+        or (
+            profile == GPU_DEVELOPMENT_PROFILE
+            and (
+                not isinstance(allocation_job_id, int)
+                or isinstance(allocation_job_id, bool)
+                or not 0 < allocation_job_id < 2**63
+                or not isinstance(allocation_uuid, str)
+                or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", allocation_uuid) is None
+            )
+        )
+        or (profile == CPU_DEVELOPMENT_PROFILE and allocation_job_id is not None)
         or payload.get("host_access") != "DISABLED_BY_PLATFORM_POLICY"
     ):
         raise PayloadValidationError(
@@ -1384,9 +1560,16 @@ def _validate_container_terminal(payload: dict[str, Any]) -> dict[str, Any]:
     result.update(
         {
             "name": expected_name,
+            "workspace_path": str(workspace_path(result["uid"])),
+            "development_profile": profile,
+            "container_gpu": gpu_count,
+            "gpu_allocation_job_id": allocation_job_id,
+            "gpu_allocation_uuid": allocation_uuid,
+            "slurm_account": "company",
+            "slurm_qos": "general",
             "lease_id": _canonical_uuid(payload.get("lease_id"), "lease ID"),
             "lease_expires_at": _future_timestamp(payload.get("lease_expires_at"), "lease expiry"),
-            "expected_gpu": "NONE",
+            "expected_gpu": expected_gpu,
             "host_access": "DISABLED_BY_PLATFORM_POLICY",
             "expected_key_fingerprints": _validated_key_fingerprints(
                 payload.get("expected_key_fingerprints")
@@ -1422,6 +1605,16 @@ def _validate_restore(payload: dict[str, Any]) -> dict[str, Any]:
         "uid",
         "gid",
         "container_name",
+        "workspace_path",
+        "development_profile",
+        "container_gpu",
+        "gpu_allocation_job_id",
+        "gpu_allocation_uuid",
+        "slurm_account",
+        "slurm_qos",
+        "lease_id",
+        "lease_starts_at",
+        "lease_expires_at",
         "expected_gpu",
         "host_access",
         "expected_key_fingerprints",
@@ -1430,19 +1623,60 @@ def _validate_restore(payload: dict[str, Any]) -> dict[str, Any]:
         raise PayloadValidationError("RESTORE_PAYLOAD_REJECTED", "restore fields are invalid")
     result = _managed_identity(payload)
     expected_name = f"gpu-dev-{result['username']}"
+    profile = payload.get("development_profile")
+    if profile not in DEVELOPMENT_PROFILES:
+        raise PayloadValidationError("RESTORE_PAYLOAD_REJECTED", "restore profile is invalid")
+    gpu_count = profile_gpu_count(str(profile))
+    expected_gpu = "NONE" if gpu_count == 0 else "SLURM_ALLOCATED_1"
     if (
         payload.get("container_name") != expected_name
-        or payload.get("expected_gpu") != "NONE"
+        or payload.get("workspace_path") != str(workspace_path(result["uid"]))
+        or payload.get("container_gpu") != gpu_count
+        or payload.get("gpu_allocation_job_id") is not None
+        or payload.get("gpu_allocation_uuid") is not None
+        or payload.get("slurm_account") != "company"
+        or payload.get("slurm_qos") != "general"
+        or payload.get("expected_gpu") != expected_gpu
         or payload.get("host_access") != "DISABLED_BY_PLATFORM_POLICY"
     ):
         raise PayloadValidationError("RESTORE_PAYLOAD_REJECTED", "restore target is invalid")
+    lease_starts_at = payload.get("lease_starts_at")
+    if not isinstance(lease_starts_at, str) or len(lease_starts_at) > 64:
+        raise PayloadValidationError("RESTORE_PAYLOAD_REJECTED", "restore Lease start is invalid")
+    try:
+        parsed_start = datetime.fromisoformat(lease_starts_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PayloadValidationError(
+            "RESTORE_PAYLOAD_REJECTED", "restore Lease start is invalid"
+        ) from exc
+    if parsed_start.tzinfo is None:
+        raise PayloadValidationError("RESTORE_PAYLOAD_REJECTED", "restore Lease start is invalid")
+    parsed_start = parsed_start.astimezone(UTC)
+    parsed_expiry = datetime.fromisoformat(
+        _future_timestamp(payload.get("lease_expires_at"), "lease expiry")
+    ).astimezone(UTC)
+    duration = parsed_expiry - parsed_start
+    if not timedelta(seconds=1) <= duration <= timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS):
+        raise PayloadValidationError(
+            "RESTORE_PAYLOAD_REJECTED", "restore Lease duration is invalid"
+        )
     result.update(
         {
             "restore_request_id": _canonical_uuid(
                 payload.get("restore_request_id"), "restore request ID"
             ),
             "container_name": expected_name,
-            "expected_gpu": "NONE",
+            "workspace_path": str(workspace_path(result["uid"])),
+            "development_profile": profile,
+            "container_gpu": gpu_count,
+            "gpu_allocation_job_id": None,
+            "gpu_allocation_uuid": None,
+            "slurm_account": "company",
+            "slurm_qos": "general",
+            "lease_id": _canonical_uuid(payload.get("lease_id"), "lease ID"),
+            "lease_starts_at": parsed_start.isoformat(),
+            "lease_expires_at": parsed_expiry.isoformat(),
+            "expected_gpu": expected_gpu,
             "host_access": "DISABLED_BY_PLATFORM_POLICY",
             "expected_key_fingerprints": _validated_key_fingerprints(
                 payload.get("expected_key_fingerprints")
@@ -1460,6 +1694,13 @@ def _validate_recycle(payload: dict[str, Any]) -> dict[str, Any]:
         "uid",
         "gid",
         "container_name",
+        "workspace_path",
+        "development_profile",
+        "container_gpu",
+        "gpu_allocation_job_id",
+        "gpu_allocation_uuid",
+        "slurm_account",
+        "slurm_qos",
         "expires_at",
         "expected_gpu",
         "host_access",
@@ -1469,9 +1710,32 @@ def _validate_recycle(payload: dict[str, Any]) -> dict[str, Any]:
         raise PayloadValidationError("RECYCLE_PAYLOAD_REJECTED", "recycle fields are invalid")
     result = _managed_identity(payload)
     expected_name = f"gpu-dev-{result['username']}"
+    profile = payload.get("development_profile")
+    if profile not in DEVELOPMENT_PROFILES:
+        raise PayloadValidationError("RECYCLE_PAYLOAD_REJECTED", "recycle profile is invalid")
+    gpu_count = profile_gpu_count(str(profile))
+    expected_gpu = "NONE" if gpu_count == 0 else "SLURM_ALLOCATED_1"
+    allocation_job_id = payload.get("gpu_allocation_job_id")
+    allocation_uuid = payload.get("gpu_allocation_uuid")
     if (
         payload.get("container_name") != expected_name
-        or payload.get("expected_gpu") != "NONE"
+        or payload.get("workspace_path") != str(workspace_path(result["uid"]))
+        or payload.get("container_gpu") != gpu_count
+        or payload.get("slurm_account") != "company"
+        or payload.get("slurm_qos") != "general"
+        or payload.get("expected_gpu") != expected_gpu
+        or (allocation_job_id is None) != (allocation_uuid is None)
+        or (
+            allocation_job_id is not None
+            and (
+                profile != GPU_DEVELOPMENT_PROFILE
+                or not isinstance(allocation_job_id, int)
+                or isinstance(allocation_job_id, bool)
+                or not 0 < allocation_job_id < 2**63
+                or not isinstance(allocation_uuid, str)
+                or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", allocation_uuid) is None
+            )
+        )
         or payload.get("host_access") != "DISABLED_BY_PLATFORM_POLICY"
     ):
         raise PayloadValidationError("RECYCLE_PAYLOAD_REJECTED", "recycle target is invalid")
@@ -1488,8 +1752,143 @@ def _validate_recycle(payload: dict[str, Any]) -> dict[str, Any]:
         {
             "lease_id": _canonical_uuid(payload.get("lease_id"), "lease ID"),
             "container_name": expected_name,
+            "workspace_path": str(workspace_path(result["uid"])),
+            "development_profile": profile,
+            "container_gpu": gpu_count,
+            "gpu_allocation_job_id": allocation_job_id,
+            "gpu_allocation_uuid": allocation_uuid,
+            "slurm_account": "company",
+            "slurm_qos": "general",
             "expires_at": parsed.astimezone(UTC).isoformat(),
-            "expected_gpu": "NONE",
+            "expected_gpu": expected_gpu,
+            "host_access": "DISABLED_BY_PLATFORM_POLICY",
+            "expected_key_fingerprints": _validated_key_fingerprints(
+                payload.get("expected_key_fingerprints")
+            ),
+        }
+    )
+    return result
+
+
+def _validate_restore_rollback(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "restore_request_id",
+        "attempted_lease_id",
+        "attempted_lease_starts_at",
+        "attempted_lease_expires_at",
+        "recycle_lease_id",
+        "recycle_lease_starts_at",
+        "recycle_lease_expires_at",
+        "managed_user_id",
+        "username",
+        "uid",
+        "gid",
+        "container_name",
+        "workspace_path",
+        "development_profile",
+        "container_gpu",
+        "gpu_allocation_job_id",
+        "gpu_allocation_uuid",
+        "slurm_account",
+        "slurm_qos",
+        "expected_gpu",
+        "host_access",
+        "expected_key_fingerprints",
+    }
+    if set(payload) != fields:
+        raise PayloadValidationError(
+            "RESTORE_ROLLBACK_PAYLOAD_REJECTED", "restore rollback fields are invalid"
+        )
+    result = _managed_identity(payload)
+    profile = payload.get("development_profile")
+    if profile not in DEVELOPMENT_PROFILES:
+        raise PayloadValidationError(
+            "RESTORE_ROLLBACK_PAYLOAD_REJECTED", "restore rollback profile is invalid"
+        )
+    gpu_count = profile_gpu_count(str(profile))
+    allocation_job_id = payload.get("gpu_allocation_job_id")
+    allocation_uuid = payload.get("gpu_allocation_uuid")
+    expected_gpu = "NONE" if gpu_count == 0 else "SLURM_ALLOCATED_1"
+    if (
+        payload.get("container_name") != f"gpu-dev-{result['username']}"
+        or payload.get("workspace_path") != str(workspace_path(result["uid"]))
+        or payload.get("container_gpu") != gpu_count
+        or payload.get("slurm_account") != "company"
+        or payload.get("slurm_qos") != "general"
+        or payload.get("expected_gpu") != expected_gpu
+        or payload.get("host_access") != "DISABLED_BY_PLATFORM_POLICY"
+        or (allocation_job_id is None) != (allocation_uuid is None)
+        or (
+            allocation_job_id is not None
+            and (
+                profile != GPU_DEVELOPMENT_PROFILE
+                or not isinstance(allocation_job_id, int)
+                or isinstance(allocation_job_id, bool)
+                or not 0 < allocation_job_id < 2**63
+                or not isinstance(allocation_uuid, str)
+                or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", allocation_uuid) is None
+            )
+        )
+    ):
+        raise PayloadValidationError(
+            "RESTORE_ROLLBACK_PAYLOAD_REJECTED", "restore rollback target is invalid"
+        )
+
+    def timestamp(field: str) -> datetime:
+        value = payload.get(field)
+        if not isinstance(value, str) or len(value) > 64:
+            raise PayloadValidationError("RESTORE_ROLLBACK_PAYLOAD_REJECTED", f"{field} is invalid")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise PayloadValidationError(
+                "RESTORE_ROLLBACK_PAYLOAD_REJECTED", f"{field} is invalid"
+            ) from exc
+        if parsed.tzinfo is None:
+            raise PayloadValidationError("RESTORE_ROLLBACK_PAYLOAD_REJECTED", f"{field} is invalid")
+        return parsed.astimezone(UTC)
+
+    attempted_start = timestamp("attempted_lease_starts_at")
+    attempted_expiry = timestamp("attempted_lease_expires_at")
+    recycle_start = timestamp("recycle_lease_starts_at")
+    recycle_expiry = timestamp("recycle_lease_expires_at")
+    if (
+        not timedelta(seconds=1)
+        <= attempted_expiry - attempted_start
+        <= timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS)
+        or attempted_expiry <= datetime.now(UTC)
+        or not timedelta(seconds=1)
+        <= recycle_expiry - recycle_start
+        <= timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS)
+        or recycle_expiry > datetime.now(UTC)
+    ):
+        raise PayloadValidationError(
+            "RESTORE_ROLLBACK_PAYLOAD_REJECTED", "restore rollback Lease windows are invalid"
+        )
+    result.update(
+        {
+            "restore_request_id": _canonical_uuid(
+                payload.get("restore_request_id"), "restore request ID"
+            ),
+            "attempted_lease_id": _canonical_uuid(
+                payload.get("attempted_lease_id"), "attempted Lease ID"
+            ),
+            "attempted_lease_starts_at": attempted_start.isoformat(),
+            "attempted_lease_expires_at": attempted_expiry.isoformat(),
+            "recycle_lease_id": _canonical_uuid(
+                payload.get("recycle_lease_id"), "recycled Lease ID"
+            ),
+            "recycle_lease_starts_at": recycle_start.isoformat(),
+            "recycle_lease_expires_at": recycle_expiry.isoformat(),
+            "container_name": f"gpu-dev-{result['username']}",
+            "workspace_path": str(workspace_path(result["uid"])),
+            "development_profile": profile,
+            "container_gpu": gpu_count,
+            "gpu_allocation_job_id": allocation_job_id,
+            "gpu_allocation_uuid": allocation_uuid,
+            "slurm_account": "company",
+            "slurm_qos": "general",
+            "expected_gpu": expected_gpu,
             "host_access": "DISABLED_BY_PLATFORM_POLICY",
             "expected_key_fingerprints": _validated_key_fingerprints(
                 payload.get("expected_key_fingerprints")
@@ -1563,11 +1962,18 @@ def validate_payload(
     if operation_type == "self.job.status.read":
         return _validate_self_job_target(payload)
     if operation_type == "self.storage.read":
-        if set(payload) != {"managed_user_id", "username", "uid", "gid"}:
+        if set(payload) != {"managed_user_id", "username", "uid", "gid", "workspace_path"}:
             raise PayloadValidationError(
                 "STORAGE_TARGET_REJECTED", "storage target fields are invalid"
             )
-        return _managed_identity(payload)
+        result = _managed_identity(payload)
+        expected_workspace = str(workspace_path(result["uid"]))
+        if payload.get("workspace_path") != expected_workspace:
+            raise PayloadValidationError(
+                "WORKSPACE_BINDING_REJECTED", "workspace is not derived from the managed UID"
+            )
+        result["workspace_path"] = expected_workspace
+        return result
     if operation_type == "self.workspace.check":
         fields = {
             "managed_user_id",
@@ -1617,9 +2023,13 @@ def validate_payload(
         operation_type in {"container.start", "container.stop", "container.restart"}
         and "uid" in payload
     ):
-        return _validate_container_lifecycle(payload)
+        return _validate_container_lifecycle(
+            payload, require_active_lease=operation_type != "container.stop"
+        )
     if operation_type in {"resource.restore", "self.resource.restore"}:
         return _validate_restore(payload)
+    if operation_type == "resource.restore.rollback":
+        return _validate_restore_rollback(payload)
     if operation_type in {"lease.expire", "resource.recycle"}:
         return _validate_recycle(payload)
     if operation_type == "host_access.revoke_managed_user":

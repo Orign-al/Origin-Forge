@@ -154,26 +154,26 @@ def stage_contract_fixture() -> dict[str, object]:
             "integrity_status": "PASS",
         },
         "argv_contract": {
-            "version": "compute-provision-stage-argv-v1",
+            "version": "compute-provision-stage-argv-v2",
             "sha256": "b" * 64,
             "shape_status": "PASS",
-            "shell_argument_count": 14,
-            "expected_shell_argument_count": 14,
+            "shell_argument_count": 15,
+            "expected_shell_argument_count": 15,
             "multi_digit_position_status": "PASS",
-            "argument_13": {
-                "index": 13,
+            "argument_14": {
+                "index": 14,
                 "semantic_role": "EXPLICIT_STAGE_CONFIRMATION_FLAG",
                 "binding_status": "VALID",
             },
-            "argument_14": {
-                "index": 14,
+            "argument_15": {
+                "index": 15,
                 "semantic_role": "CONFIRMED_TARGET_USERNAME",
                 "binding_status": "VALID",
             },
         },
         "confirmation_gate": {
             "identity": "EXPLICIT_STAGE_CONFIRMATION_GATE",
-            "validator_version": "compute-provision-stage-confirmation-validator-v1",
+            "validator_version": "compute-provision-stage-confirmation-validator-v2",
             "validator_sha256": "c" * 64,
             "status": "PASS",
         },
@@ -288,7 +288,9 @@ def worker_stage():
                 "container_authorized_keys": "ABSENT",
                 "onboarding_state": "STAGED",
                 "ssh_key_state": "REQUIRED_BEFORE_ACTIVATION",
-                "storage_path": f"/srv/gpu-platform/users/{payload['username']}",
+                "storage_path": f"/storage/users/{payload['uid']}",
+                "container_workspace": "/workspace",
+                "default_job_workdir": f"/storage/users/{payload['uid']}/projects",
                 "slurm": {
                     "account": "company",
                     "qos": "general",
@@ -508,6 +510,40 @@ def test_compute_request_submission_uses_existing_rate_limiter(
     assert denied.json()["detail"]["code"] == "COMPUTE_REQUEST_RATE_LIMITED"
     assert database.scalar(select(func.count()).select_from(PortalComputeResourceRequest)) == 0
     assert all(assert_zero_compute_side_effects(database, user.id).values())
+
+
+def test_gpu_development_profile_requires_exactly_one_gpu_entitlement(
+    client, database, origin_headers
+) -> None:  # type: ignore[no-untyped-def]
+    user = account(database, login="gpu-development-requester")
+    headers = login(client, origin_headers, user.normalized_login)
+
+    missing_gpu = submit(
+        client,
+        headers,
+        requested_container_profile="GPU_1_8CPU_32GB",
+        requested_gpu_max=0,
+    )
+    assert missing_gpu.status_code == 422
+
+    too_many = submit(
+        client,
+        headers,
+        requested_container_profile="GPU_1_8CPU_32GB",
+        requested_gpu_max=2,
+    )
+    assert too_many.status_code == 422
+
+    created = submit(
+        client,
+        headers,
+        requested_container_profile="GPU_1_8CPU_32GB",
+        requested_gpu_max=1,
+    )
+    assert created.status_code == 201
+    request_view = created.json()["request"]
+    assert request_view["requested_container_profile"] == "GPU_1_8CPU_32GB"
+    assert request_view["requested_gpu_max"] == 1
 
 
 def test_compute_request_rejects_existing_managed_username_collision(

@@ -50,6 +50,7 @@ project_name=
 user_root=
 backing_workspace=
 workspace_root=
+development_profile=
 container_name=
 compose_dir=
 compose_file=
@@ -67,7 +68,7 @@ last_successful_step=WORKER_FIXED_ARGV_DISPATCH
 
 usage() {
   printf '%s\n' \
-    'Usage: h100-provision-stage --execute USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS MAX_GPUS REQUEST_ID PLAN_ID DRY_RUN_OPERATION_ID --confirm-stage USER'
+    'Usage: h100-provision-stage --execute USER UID GID PROJECT_ID SSH_PORT ACCOUNT QOS MAX_GPUS REQUEST_ID PLAN_ID DRY_RUN_OPERATION_ID DEVELOPMENT_PROFILE --confirm-stage USER'
 }
 
 fail() {
@@ -328,13 +329,13 @@ if [[ "${1:-}" == --help ]]; then
   usage
   exit 0
 fi
-if (($# != 14)); then
+if (($# != 15)); then
   usage >&2
   exit 2
 fi
 last_successful_step=SCRIPT_ARGUMENT_COUNT
 current_step=EXPLICIT_STAGE_CONFIRMATION_GATE
-[[ "${1:-}" == --execute && "${13:-}" == --confirm-stage && "${2:-}" == "${14:-}" ]] \
+[[ "${1:-}" == --execute && "${14:-}" == --confirm-stage && "${2:-}" == "${15:-}" ]] \
   || fail 'explicit Stage confirmation is invalid'
 last_successful_step=EXPLICIT_STAGE_CONFIRMATION_GATE
 current_step=STATIC_INPUT_VALIDATION
@@ -351,6 +352,7 @@ request_id=${10}
 plan_id=${11}
 dry_run_operation_id=${12}
 expected_local_image_identity=${H100_EXPECTED_LOCAL_IMAGE_IDENTITY:-}
+development_profile=${13}
 unset H100_EXPECTED_LOCAL_IMAGE_IDENTITY
 
 h100_require_root
@@ -368,6 +370,11 @@ h100_validate_port "${ssh_port}"
 [[ "${slurm_account}" == company && "${slurm_qos}" == general ]] \
   || fail 'Slurm policy differs from standard profile'
 [[ "${max_gpus}" == 0 || "${max_gpus}" == 1 ]] || fail 'GPU max must be zero or one'
+[[ "${development_profile}" == STANDARD_8CPU_32GB \
+  || "${development_profile}" == GPU_1_8CPU_32GB ]] \
+  || fail 'development profile is not approved'
+[[ "${development_profile}" != GPU_1_8CPU_32GB || "${max_gpus}" == 1 ]] \
+  || fail 'GPU development profile requires max GPU one'
 uuid_valid "${request_id}" && uuid_valid "${plan_id}" && uuid_valid "${dry_run_operation_id}" \
   || fail 'operation binding UUID is invalid'
 
@@ -678,7 +685,7 @@ MAX_GPUS=${max_gpus}
 REQUEST_ID=${request_id}
 PLAN_ID=${plan_id}
 DRY_RUN_OPERATION_ID=${dry_run_operation_id}
-DEVELOPMENT_PROFILE=STANDARD_8CPU_32GB
+DEVELOPMENT_PROFILE=${development_profile}
 WORKSPACE_LAYOUT=LEGACY_BIND_ALIAS
 STORAGE_ROOT=${user_root}
 BACKING_WORKSPACE=${backing_workspace}

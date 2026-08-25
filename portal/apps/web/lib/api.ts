@@ -287,12 +287,20 @@ export type SelfEnvironment = {
     name: string;
     state: string;
     connection_state: string;
-    gpu: "NONE";
+    profile: DevelopmentContainerProfile;
+    gpu: 0 | 1;
+    gpu_allocation_state: "NONE" | "ALLOCATED";
     cpus: number;
     memory_gb: number;
     pids_limit: number;
   };
-  storage: { quota_bytes: number | null; state: string };
+  storage: {
+    quota_bytes: number | null;
+    state: string;
+    workspace: string;
+    container_mount: "/workspace";
+    default_job_workdir: string;
+  };
 };
 
 export type SelfJob = {
@@ -320,13 +328,16 @@ export type SelfTerminal = {
   operation_id: string;
   container: string;
   username: string;
-  gpu: "NONE";
+  gpu: "NONE" | "SLURM_ALLOCATED_1";
   host_access: "DISABLED";
   state: string;
   expires_at: string;
   idle_timeout_seconds: number;
   max_duration_seconds: number;
 };
+
+export type DevelopmentContainerProfile =
+  "STANDARD_8CPU_32GB" | "GPU_1_8CPU_32GB";
 
 export type ProvisionPlan = {
   id: string;
@@ -340,11 +351,11 @@ export type ProvisionPlan = {
   container_name?: string;
   container_ssh_port?: number;
   storage_bytes: number;
-  container_profile: "STANDARD_8CPU_32GB";
+  container_profile: DevelopmentContainerProfile;
   container_cpus: 8;
   container_memory_gb: 32;
   container_pids_limit: 4096;
-  container_gpu: 0;
+  container_gpu: 0 | 1;
   slurm_account?: "company";
   slurm_qos?: "general";
   gpu_max: 0 | 1;
@@ -407,7 +418,7 @@ export type ComputeResourceRequest = {
   user_status_message?: string;
   requested_gpu_max: 0 | 1;
   requested_storage_bytes: 322122547200;
-  requested_container_profile: "STANDARD_8CPU_32GB";
+  requested_container_profile: DevelopmentContainerProfile;
   requested_lease_seconds: 345600;
   purpose: string;
   user_note: string | null;
@@ -656,7 +667,7 @@ export const selfComputeRequest = () =>
 export const createSelfComputeRequest = (payload: {
   requested_gpu_max: 0 | 1;
   requested_storage_bytes: 322122547200;
-  requested_container_profile: "STANDARD_8CPU_32GB";
+  requested_container_profile: DevelopmentContainerProfile;
   requested_lease_seconds: 345600;
   purpose: string;
   user_note: string | null;
@@ -969,16 +980,17 @@ export const selfRecycleBin = () =>
     auto_permanent_delete: false;
   }>("/self/recycle-bin");
 export const requestRestore = (itemId: string, durationSeconds = 345600) =>
-  apiFetch<{ status: string; restore_request_id: string; lease_id: string | null }>(
-    `/self/recycle-bin/${encodeURIComponent(itemId)}/restore-requests`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        duration_seconds: durationSeconds,
-        idempotency_key: randomUuid(),
-      }),
-    },
-  );
+  apiFetch<{
+    status: string;
+    restore_request_id: string;
+    lease_id: string | null;
+  }>(`/self/recycle-bin/${encodeURIComponent(itemId)}/restore-requests`, {
+    method: "POST",
+    body: JSON.stringify({
+      duration_seconds: durationSeconds,
+      idempotency_key: randomUuid(),
+    }),
+  });
 export type AdminRestoreRequest = {
   id: string;
   username: string;

@@ -5,6 +5,11 @@ from datetime import timedelta
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from h100_portal_contracts.workspace import (
+    CPU_DEVELOPMENT_PROFILE,
+    profile_gpu_count,
+    workspace_path,
+)
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -65,7 +70,7 @@ _ORCHESTRATION_OPERATION_ID: ContextVar[uuid.UUID | None] = ContextVar(
 )
 
 STANDARD_STORAGE_BYTES = 300 * 1024**3
-STANDARD_CONTAINER_PROFILE = "STANDARD_8CPU_32GB"
+STANDARD_CONTAINER_PROFILE = CPU_DEVELOPMENT_PROFILE
 STANDARD_LEASE_SECONDS = 96 * 60 * 60
 RESERVATION_LIFETIME = timedelta(hours=24)
 PROTECTED_USERNAMES = {"root", "origin-al", "codexops"}
@@ -105,8 +110,8 @@ def _ready_stage_contract(result: Any) -> dict[str, Any] | None:
     argv_contract = contract.get("argv_contract")
     confirmation_gate = contract.get("confirmation_gate")
     image_contract = contract.get("image_contract")
-    argument_13 = argv_contract.get("argument_13") if isinstance(argv_contract, dict) else None
     argument_14 = argv_contract.get("argument_14") if isinstance(argv_contract, dict) else None
+    argument_15 = argv_contract.get("argument_15") if isinstance(argv_contract, dict) else None
     if (
         set(contract)
         != {
@@ -135,31 +140,31 @@ def _ready_stage_contract(result: Any) -> dict[str, Any] | None:
             "shell_argument_count",
             "expected_shell_argument_count",
             "multi_digit_position_status",
-            "argument_13",
             "argument_14",
+            "argument_15",
         }
-        or argv_contract.get("version") != "compute-provision-stage-argv-v1"
+        or argv_contract.get("version") != "compute-provision-stage-argv-v2"
         or not isinstance(argv_contract.get("sha256"), str)
         or re.fullmatch(r"[0-9a-f]{64}", argv_contract["sha256"]) is None
         or argv_contract.get("shape_status") != "PASS"
-        or argv_contract.get("shell_argument_count") != 14
-        or argv_contract.get("expected_shell_argument_count") != 14
+        or argv_contract.get("shell_argument_count") != 15
+        or argv_contract.get("expected_shell_argument_count") != 15
         or argv_contract.get("multi_digit_position_status") != "PASS"
-        or not isinstance(argument_13, dict)
-        or set(argument_13) != {"index", "semantic_role", "binding_status"}
-        or argument_13.get("index") != 13
-        or argument_13.get("semantic_role") != "EXPLICIT_STAGE_CONFIRMATION_FLAG"
-        or argument_13.get("binding_status") != "VALID"
         or not isinstance(argument_14, dict)
         or set(argument_14) != {"index", "semantic_role", "binding_status"}
         or argument_14.get("index") != 14
-        or argument_14.get("semantic_role") != "CONFIRMED_TARGET_USERNAME"
+        or argument_14.get("semantic_role") != "EXPLICIT_STAGE_CONFIRMATION_FLAG"
         or argument_14.get("binding_status") != "VALID"
+        or not isinstance(argument_15, dict)
+        or set(argument_15) != {"index", "semantic_role", "binding_status"}
+        or argument_15.get("index") != 15
+        or argument_15.get("semantic_role") != "CONFIRMED_TARGET_USERNAME"
+        or argument_15.get("binding_status") != "VALID"
         or not isinstance(confirmation_gate, dict)
         or set(confirmation_gate) != {"identity", "validator_version", "validator_sha256", "status"}
         or confirmation_gate.get("identity") != "EXPLICIT_STAGE_CONFIRMATION_GATE"
         or confirmation_gate.get("validator_version")
-        != "compute-provision-stage-confirmation-validator-v1"
+        != "compute-provision-stage-confirmation-validator-v2"
         or not isinstance(confirmation_gate.get("validator_sha256"), str)
         or re.fullmatch(r"[0-9a-f]{64}", confirmation_gate["validator_sha256"]) is None
         or confirmation_gate.get("status") != "PASS"
@@ -1194,7 +1199,7 @@ def create_self_compute_request(
                 "portal_account_id": str(account.id),
                 "gpu_max": body.requested_gpu_max,
                 "storage_bytes": STANDARD_STORAGE_BYTES,
-                "container_profile": STANDARD_CONTAINER_PROFILE,
+                "container_profile": item.requested_container_profile,
                 "lease_seconds": STANDARD_LEASE_SECONDS,
             },
             result_summary="Compute request entered REQUESTED; no infrastructure was created",
@@ -2517,11 +2522,11 @@ def create_provision_plan(
         container_name=str(worker["proposed_container_name"]),
         container_ssh_port=int(worker["proposed_ssh_port"]),
         storage_bytes=STANDARD_STORAGE_BYTES,
-        container_profile=STANDARD_CONTAINER_PROFILE,
+        container_profile=item.requested_container_profile,
         container_cpus=8,
         container_memory_gb=32,
         container_pids_limit=4096,
-        container_gpu=0,
+        container_gpu=profile_gpu_count(item.requested_container_profile),
         slurm_account="company",
         slurm_qos="general",
         gpu_max=item.requested_gpu_max,
@@ -3455,6 +3460,9 @@ def provision_reserved_compute_environment(
         and container_stage.get("state") == "STOPPED"
         and container_stage.get("gpu") == "NONE"
         and container_stage.get("ssh_port") == plan.container_ssh_port
+        and stage.get("storage_path") == str(workspace_path(plan.uid))
+        and stage.get("container_workspace") == "/workspace"
+        and stage.get("default_job_workdir") == str(workspace_path(plan.uid) / "projects")
         and isinstance(slurm_stage, dict)
         and slurm_stage.get("account") == plan.slurm_account
         and slurm_stage.get("qos") == plan.slurm_qos
@@ -3528,7 +3536,8 @@ def provision_reserved_compute_environment(
             "cpus": 8,
             "memory_gb": 32,
             "pids_limit": 4096,
-            "gpu": "NONE",
+            "gpu": "NONE" if plan.container_gpu == 0 else "SLURM_ALLOCATED_1",
+            "development_profile": plan.container_profile,
             "privileged": False,
             "host_network": False,
             "host_pid": False,
@@ -3555,15 +3564,15 @@ def provision_reserved_compute_environment(
                 ssh_port=plan.container_ssh_port,
                 desired_state="STOPPED",
                 observed_state="STOPPED",
+                development_profile=plan.container_profile,
+                gpu_count=plan.container_gpu,
                 safe_spec=safe_spec,
             )
         )
         db.add(
             PortalStorageResource(
                 owner_managed_user_id=managed.id,
-                root_path=str(
-                    stage.get("storage_path", f"/srv/gpu-platform/users/{plan.username}")
-                ),
+                root_path=str(workspace_path(plan.uid)),
                 quota_bytes=plan.storage_bytes,
                 state="STAGED",
             )

@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+source /usr/local/lib/h100-platform/h100-platform-common.sh
+
+readonly slurm_job_id="${SLURM_JOB_ID:-}"
+readonly slurm_job_user="${SLURM_JOB_USER:-}"
+readonly slurm_job_partition="${SLURM_JOB_PARTITION:-}"
+
+h100_require_root
+[[ "${slurm_job_id}" =~ ^[1-9][0-9]{0,18}$ ]] \
+  || h100_fail 'GPU Development epilog received an invalid Slurm job ID'
+h100_acquire_lock
+h100_install_audit_trap gpu-development-epilog "${slurm_job_id}"
+[[ -n "${slurm_job_partition}" ]] \
+  || h100_fail 'GPU Development epilog received no Slurm partition binding'
+if [[ "${slurm_job_partition}" != gpu-dev ]]; then
+  h100_mark_success
+  exit 0
+fi
+
+matching_output="$(
+  docker ps --all --quiet --filter "label=h100.dev.gpu-allocation-job=${slurm_job_id}"
+)" || h100_fail 'GPU Development epilog could not inspect managed containers'
+readonly matching_output
+matching_containers=()
+if [[ -n "${matching_output}" ]]; then
+  mapfile -t matching_containers <<<"${matching_output}"
+fi
+if ((${#matching_containers[@]} == 0)); then
+  h100_mark_success
+  exit 0
+fi
+((${#matching_containers[@]} == 1)) \
+  || h100_fail 'multiple containers claim the completed GPU allocation'
+
+readonly container_id="${matching_containers[0]}"
+[[ "${container_id}" =~ ^[0-9a-f]{12,64}$ ]] \
+  || h100_fail 'GPU Development epilog resolved an invalid container ID'
+inspection="$(docker inspect "${container_id}")" \
+  || h100_fail 'GPU Development epilog could not inspect the bound container'
+readonly inspection
+user_name="$(
+  jq -er '.[0].Config.Labels["h100.dev.user"]' <<<"${inspection}"
+)" || h100_fail 'GPU Development epilog found no managed container owner'
+readonly user_name
+gpu_uuid="$(
+  jq -er '.[0].Config.Labels["h100.dev.gpu-uuid"]' <<<"${inspection}"
+)" || h100_fail 'GPU Development epilog found no assigned GPU UUID'
+readonly gpu_uuid
+
+h100_validate_username "${user_name}"
+[[ -z "${slurm_job_user}" || "${slurm_job_user}" == "${user_name}" ]] \
+  || h100_fail 'GPU Development epilog owner differs from the Slurm allocation owner'
+[[ "${gpu_uuid}" =~ ^GPU-[0-9a-fA-F-]{32,40}$ ]] \
+  || h100_fail 'GPU Development epilog found an invalid assigned GPU UUID'
+h100_require_managed_user "${user_name}"
+h100_require_managed_compose "${user_name}"
+
+readonly expected_container="$(h100_container_name "${user_name}")"
+readonly user_uid="$(id -u "${user_name}")"
+readonly user_gid="$(id -g "${user_name}")"
+jq -e \
+  --arg container "/${expected_container}" \
+  --arg user "${user_name}" \
+  --arg uid "${user_uid}" \
+  --arg gid "${user_gid}" \
+  --arg job "${slurm_job_id}" \
+  --arg uuid "${gpu_uuid}" '
+    .[0] as $c
+    | $c.Name == $container
+    and $c.Config.Labels["h100.dev.user"] == $user
+    and $c.Config.Labels["h100.dev.uid"] == $uid
+    and $c.Config.Labels["h100.dev.gid"] == $gid
+    and $c.Config.Labels["h100.dev.gpu-allocation-job"] == $job
+    and $c.Config.Labels["h100.dev.gpu-uuid"] == $uuid
+    and $c.HostConfig.Runtime == "nvidia"
+    and (($c.HostConfig.DeviceRequests // []) | length == 1)
+    and $c.HostConfig.DeviceRequests[0].Driver == "nvidia"
+    and $c.HostConfig.DeviceRequests[0].DeviceIDs == [$uuid]
+    and $c.HostConfig.DeviceRequests[0].Capabilities == [["gpu"]]
+  ' <<<"${inspection}" >/dev/null \
+  || h100_fail 'GPU Development epilog container binding is invalid'
+
+readonly config_dir="$(h100_config_dir "${user_name}")"
+readonly compose_file="$(h100_compose_file "${user_name}")"
+docker rm --force "${container_id}" >/dev/null
+docker compose --project-directory "${config_dir}" --file "${compose_file}" \
+  create --no-build
+docker inspect "${expected_container}" | jq -e '
+  .[0].State.Running == false
+  and ((.[0].HostConfig.DeviceRequests // []) | length == 0)
+  and ((.[0].Config.Env // []) | map(select(startswith("NVIDIA_VISIBLE_DEVICES=") or startswith("CUDA_VISIBLE_DEVICES="))) | length == 0)
+  and .[0].Config.Labels["h100.dev.gpu-allocation-job"] == null
+  and .[0].Config.Labels["h100.dev.gpu-uuid"] == null
+' >/dev/null \
+  || h100_fail 'GPU Development epilog did not prove GPU-less container teardown'
+
+printf 'GPU DEVELOPMENT EPILOG STOPPED %s allocation=%s gpu=%s\n' \
+  "${expected_container}" "${slurm_job_id}" "${gpu_uuid}"
+h100_mark_success

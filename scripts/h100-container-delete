@@ -73,6 +73,10 @@ host_key_root="${H100_DATA_ROOT}/container-data/${user_name}"
   || h100_fail 'user data path validation failed'
 [[ "${user_root}" == /srv/gpu-platform/users/"${user_name}" ]] \
   || h100_fail 'user data path escaped approved root'
+[[ ! -L "${workspace_root}" && "$(realpath -e "${workspace_root}")" == "${workspace_root}" ]] \
+  || h100_fail 'workspace path validation failed'
+[[ "${workspace_root}" == /storage/users/"${user_uid}" ]] \
+  || h100_fail 'workspace path escaped approved root'
 [[ ! -L "${host_key_root}" && "$(realpath -e "${host_key_root}")" == "${host_key_root}" ]] \
   || h100_fail 'container-data path validation failed'
 [[ "${host_key_root}" == /srv/gpu-platform/container-data/"${user_name}" ]] \
@@ -81,7 +85,7 @@ host_key_root="${H100_DATA_ROOT}/container-data/${user_name}"
 project_name="h100_${user_name}"
 project_id="$(awk -F: -v name="${project_name}" '$1 == name {print $2}' /etc/projid)"
 [[ "${project_id}" =~ ^[0-9]+$ ]] || h100_fail 'project ID mapping is invalid'
-grep -Fxq "${project_id}:${user_root}" /etc/projects \
+grep -Fxq "${project_id}:${workspace_root}" /etc/projects \
   || h100_fail 'project path mapping is invalid'
 
 if findmnt --noheadings --mountpoint "${workspace_root}" >/dev/null 2>&1; then
@@ -119,6 +123,7 @@ awk -F: -v id="${project_id}" '$1 != id' /etc/projects >"${temp_dir}/projects"
 awk -F: -v name="${project_name}" '$1 != name' /etc/projid >"${temp_dir}/projid"
 
 rm -rf --one-file-system -- "${user_root}"
+rm -rf --one-file-system -- "${workspace_root}"
 rm -rf --one-file-system -- "${host_key_root}"
 install -o root -g root -m 0644 "${temp_dir}/projects" /etc/projects
 install -o root -g root -m 0644 "${temp_dir}/projid" /etc/projid

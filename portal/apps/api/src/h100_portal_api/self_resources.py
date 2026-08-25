@@ -4,6 +4,11 @@ import uuid
 from dataclasses import dataclass
 
 from fastapi import HTTPException
+from h100_portal_contracts.workspace import (
+    CPU_DEVELOPMENT_PROFILE,
+    GPU_DEVELOPMENT_PROFILE,
+    workspace_path,
+)
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -31,7 +36,7 @@ class SelfResourceContext:
     container: PortalContainer
     active_lease: PortalComputeLease
     terminal_lease: PortalComputeLease
-    storage: PortalStorageResource | None
+    storage: PortalStorageResource
 
     @property
     def username(self) -> str:
@@ -40,6 +45,10 @@ class SelfResourceContext:
     @property
     def max_gpu(self) -> int:
         return min(1, self.active_lease.gpu_count)
+
+    @property
+    def workspace(self) -> str:
+        return str(workspace_path(self.managed.uid))
 
     def worker_identity(self) -> dict[str, str | int]:
         return {
@@ -78,6 +87,12 @@ def resolve_self_compute_context(
     storage = db.scalar(storage_query)
     if container is None:
         raise _error(404, "MANAGED_CONTAINER_NOT_FOUND", "开发容器不存在")
+    if storage is None:
+        raise _error(
+            409,
+            "SELF_COMPUTE_CONTEXT_INVALID",
+            "无法确认当前计算环境，请联系管理员。",
+        )
 
     expected_container = f"gpu-dev-{managed.unix_username}"
     binding_valid = (
@@ -93,7 +108,23 @@ def resolve_self_compute_context(
         and active_lease.managed_user_id == managed.id
         and active_lease.owner_managed_user_id == managed.id
         and terminal_lease.owner_managed_user_id == managed.id
-        and (storage is None or storage.owner_managed_user_id == managed.id)
+        and storage.owner_managed_user_id == managed.id
+        and storage.root_path == str(workspace_path(managed.uid))
+        and container.development_profile in {CPU_DEVELOPMENT_PROFILE, GPU_DEVELOPMENT_PROFILE}
+        and container.gpu_count
+        == (1 if container.development_profile == GPU_DEVELOPMENT_PROFILE else 0)
+        and (
+            container.observed_state != "RUNNING"
+            or container.development_profile == CPU_DEVELOPMENT_PROFILE
+            or (
+                container.gpu_allocation_job_id is not None
+                and container.gpu_allocation_uuid is not None
+            )
+        )
+        and (
+            container.development_profile != CPU_DEVELOPMENT_PROFILE
+            or (container.gpu_allocation_job_id is None and container.gpu_allocation_uuid is None)
+        )
     )
     if not binding_valid:
         raise _error(

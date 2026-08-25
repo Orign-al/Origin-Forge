@@ -40,6 +40,12 @@ config_dir="$(h100_config_dir "${user_name}")"
 compose_file="$(h100_compose_file "${user_name}")"
 user_uid="$(id -u "${user_name}")"
 user_gid="$(id -g "${user_name}")"
+workspace="${H100_WORKSPACE_ROOT}/${user_uid}"
+
+[[ -d "${workspace}" && ! -L "${workspace}" ]] \
+  || h100_fail 'canonical workspace is unavailable'
+[[ "$(stat -c '%u:%g:%a' "${workspace}")" == "${user_uid}:${user_gid}:700" ]] \
+  || h100_fail 'canonical workspace ownership or mode is invalid'
 
 [[ ! -e "${compose_file}" ]] || h100_fail 'managed Compose file already exists'
 docker container inspect "${container}" >/dev/null 2>&1 \
@@ -137,7 +143,7 @@ services:
         bind:
           propagation: rprivate
       - type: bind
-        source: ${H100_DATA_ROOT}/users/${user_name}/workspace
+        source: ${workspace}
         target: /workspace
         bind:
           propagation: rprivate
@@ -177,7 +183,8 @@ h100_wait_healthy "${container}" 120 \
 
 docker inspect "${container}" | jq -e \
   --arg host_ip "${H100_MANAGEMENT_IP}" \
-  --arg host_port "${ssh_port}" '
+  --arg host_port "${ssh_port}" \
+  --arg workspace "${workspace}" '
     .[0] as $c
     | $c.HostConfig.Privileged == false
     and $c.HostConfig.NetworkMode != "host"
@@ -190,6 +197,9 @@ docker inspect "${container}" | jq -e \
     and $c.HostConfig.PidsLimit == 4096
     and $c.HostConfig.PortBindings["22/tcp"][0].HostIp == $host_ip
     and $c.HostConfig.PortBindings["22/tcp"][0].HostPort == $host_port
+    and (($c.Mounts // []) | map(select(.Source == $workspace and .Destination == "/workspace" and .RW == true)) | length == 1)
+    and (($c.Mounts // []) | map(.Destination) | index("/var/run/docker.sock") | not)
+    and (($c.Mounts // []) | map(.Source) | index("/") | not)
   ' >/dev/null || h100_fail 'created container failed isolation/resource validation'
 
 fingerprint="$(ssh-keygen -lf "${host_key_dir}/ssh_host_ed25519_key.pub")"

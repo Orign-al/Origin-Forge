@@ -30,6 +30,7 @@ host_public_key_input=
 container_public_key_input=
 project_name=
 user_root=
+workspace_root=
 state_file=
 key_hash=
 key_fingerprints_csv=
@@ -459,6 +460,9 @@ validate_new_user_plan() {
   getent group "${user_gid}" >/dev/null \
     && h100_fail "GID already exists: ${user_gid}"
   [[ ! -e "${user_root}" ]] || h100_fail 'managed user data path already exists'
+  [[ -d "${H100_WORKSPACE_ROOT}" && ! -L "${H100_WORKSPACE_ROOT}" ]] \
+    || h100_fail 'canonical workspace root is unavailable'
+  [[ ! -e "${workspace_root}" ]] || h100_fail 'managed workspace path already exists'
   [[ ! -e "${state_file}" ]] || h100_fail 'Pilot user state file already exists'
   grep -q "^${project_name}:" /etc/projid \
     && h100_fail 'project name already exists'
@@ -532,6 +536,7 @@ load_staged_state() {
   fi
   project_name="h100_${user_name}"
   user_root="${H100_DATA_ROOT}/users/${user_name}"
+  workspace_root="${H100_WORKSPACE_ROOT}/${user_uid}"
   validate_identity_numbers
   [[ "$(id -u "${user_name}")" == "${user_uid}" ]] \
     || h100_fail 'host UID no longer matches staged state'
@@ -563,6 +568,7 @@ load_active_state_for_rollback() {
   slurm_qos="$(state_value SLURM_QOS)"
   project_name="h100_${user_name}"
   user_root="${H100_DATA_ROOT}/users/${user_name}"
+  workspace_root="${H100_WORKSPACE_ROOT}/${user_uid}"
   validate_identity_numbers
   [[ "$(id -u "${user_name}")" == "${user_uid}" \
     && "$(id -g "${user_name}")" == "${user_gid}" ]] \
@@ -634,6 +640,9 @@ enable_and_verify_guard() {
 prepare_common_paths() {
   project_name="h100_${user_name}"
   user_root="${H100_DATA_ROOT}/users/${user_name}"
+  if [[ -n "${user_uid}" ]]; then
+    workspace_root="${H100_WORKSPACE_ROOT}/${user_uid}"
+  fi
   state_file="${STATE_DIR}/${user_name}.state"
 }
 
@@ -655,7 +664,7 @@ atomic_append_project_mappings() {
   projid_temp="$(mktemp /etc/.projid.h100.XXXXXX)"
   cp -- /etc/projects "${projects_temp}"
   printf '\n' >>"${projects_temp}"
-  printf '%s:%s\n' "${project_id}" "${user_root}" >>"${projects_temp}"
+  printf '%s:%s\n' "${project_id}" "${workspace_root}" >>"${projects_temp}"
   cp -- /etc/projid "${projid_temp}"
   printf '\n' >>"${projid_temp}"
   printf '%s:%s\n' "${project_name}" "${project_id}" >>"${projid_temp}"
@@ -705,8 +714,14 @@ run_stage() {
   install -d -o "${user_name}" -g "${user_name}" -m 0710 "${user_root}"
   install -d -o "${user_name}" -g "${user_name}" -m 0700 \
     "${user_root}/home" "${user_root}/home/.ssh"
-  install -d -o "${user_name}" -g "${user_name}" -m 0750 \
-    "${user_root}/workspace" "${user_root}/shared"
+  install -d -o "${user_name}" -g "${user_name}" -m 0700 \
+    "${workspace_root}" \
+    "${workspace_root}/projects" \
+    "${workspace_root}/datasets" \
+    "${workspace_root}/outputs" \
+    "${workspace_root}/.portal" \
+    "${workspace_root}/.portal/job-scripts" \
+    "${workspace_root}/.portal/jobs"
   install -d -o root -g root -m 0700 \
     "${H100_DATA_ROOT}/container-data/${user_name}" \
     "${H100_DATA_ROOT}/container-data/${user_name}/ssh-host-keys"
@@ -805,7 +820,7 @@ validate_staged_resources() {
   assert_forbidden_groups_absent
   "${ISOLATION_TOOL}" verify "${user_name}"
   "${ISOLATION_TOOL}" self-test "${user_name}"
-  grep -Fxq "${project_id}:${user_root}" /etc/projects \
+  grep -Fxq "${project_id}:${workspace_root}" /etc/projects \
     || h100_fail 'staged project mapping is missing'
   grep -Fxq "${project_name}:${project_id}" /etc/projid \
     || h100_fail 'staged project name mapping is missing'

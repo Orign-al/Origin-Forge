@@ -106,14 +106,18 @@ h100_compose_file() {
 
 h100_require_managed_user() {
   local managed_username=$1
+  local managed_uid managed_gid managed_workspace
   getent passwd "${managed_username}" >/dev/null \
     || h100_fail "host user does not exist: ${managed_username}"
+  managed_uid="$(id -u "${managed_username}")"
+  managed_gid="$(id -g "${managed_username}")"
+  managed_workspace="${H100_WORKSPACE_ROOT}/${managed_uid}"
   [[ -d "${H100_DATA_ROOT}/users/${managed_username}/home" ]] \
     || h100_fail "managed home is missing: ${managed_username}"
-  [[ -d "${H100_DATA_ROOT}/users/${managed_username}/workspace" ]] \
+  [[ -d "${managed_workspace}" && ! -L "${managed_workspace}" ]] \
     || h100_fail "managed workspace is missing: ${managed_username}"
-  [[ -d "${H100_DATA_ROOT}/users/${managed_username}/shared" ]] \
-    || h100_fail "managed shared directory is missing: ${managed_username}"
+  [[ "$(stat -c '%u:%g:%a' "${managed_workspace}")" == "${managed_uid}:${managed_gid}:700" ]] \
+    || h100_fail "managed workspace ownership or mode is invalid: ${managed_username}"
 }
 
 h100_require_workspace_alias() {

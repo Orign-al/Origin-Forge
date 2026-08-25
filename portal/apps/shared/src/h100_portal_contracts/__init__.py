@@ -1,6 +1,9 @@
 """Cross-process contracts shared by the Portal API and Root Worker."""
 
 from h100_portal_contracts.workspace import (
+    CPU_DEVELOPMENT_PROFILE,
+    DEVELOPMENT_PROFILES,
+    GPU_DEVELOPMENT_PROFILE,
     LEGACY_STORAGE_ROOT,
     WORKSPACE_COMPUTE_PATH,
     WORKSPACE_CONTAINER_PATH,
@@ -14,12 +17,16 @@ from h100_portal_contracts.workspace import (
     WorkspaceLayout,
     legacy_storage_path,
     logical_workspace_path,
+    profile_gpu_count,
     workspace_binding,
     workspace_path,
     workspace_relative_parts,
 )
 
 __all__ = [
+    "CPU_DEVELOPMENT_PROFILE",
+    "DEVELOPMENT_PROFILES",
+    "GPU_DEVELOPMENT_PROFILE",
     "LEGACY_STORAGE_ROOT",
     "WORKSPACE_COMPUTE_PATH",
     "WORKSPACE_CONTAINER_PATH",
@@ -33,6 +40,7 @@ __all__ = [
     "WorkspaceLayout",
     "legacy_storage_path",
     "logical_workspace_path",
+    "profile_gpu_count",
     "workspace_binding",
     "workspace_path",
     "workspace_relative_parts",

@@ -7,6 +7,7 @@ from datetime import timedelta
 from typing import Any, cast
 
 import httpx
+from h100_portal_contracts.workspace import workspace_path
 from sqlalchemy import select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -116,8 +117,16 @@ PORTAL3ER_KEY_FINGERPRINT = "SHA256:nek6vyEb3GT+UJAcY5y/8PgY4achF2ouNy+8C2JqUVc"
 PORTAL4A_FINAL_CREDENTIAL_SETTING_KEY = "portal4a.final_ordinary_user_credential"
 PORTAL4A_LOCAL_API_BASE = "http://127.0.0.1:18081/api/v1"
 PORTAL4A_BROWSER_ORIGIN = "http://127.0.0.1:18080"
-PORTAL4A_CPU_GATE_SCRIPT = "workspace/portal4a-cpu-gate.sh"
-PORTAL4A_GPU_GATE_SCRIPT = "workspace/portal4a-gpu-gate.sh"
+PORTAL4A_CPU_GATE_SCRIPT = (
+    'printf "PORTAL4A_CPU_GATE_PASS uid=%s user=%s\\n" "$(id -u)" "$(id -un)"\n'
+)
+PORTAL4A_GPU_GATE_SCRIPT = (
+    'gpu_count="$(nvidia-smi --query-gpu=uuid --format=csv,noheader '
+    "| sed '/^[[:space:]]*$/d' | wc -l)\"\n"
+    'test "${gpu_count}" -eq 1\n'
+    'printf "PORTAL4A_GPU_GATE_PASS uid=%s user=%s gpu_count=%s\\n" '
+    '"$(id -u)" "$(id -un)" "${gpu_count}"\n'
+)
 PORTAL4A_APPROVED_IMAGE = (
     "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
     "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
@@ -2052,7 +2061,7 @@ def portal4a_create_origin_pilot_user(base_url: str) -> int:
         container.owner_managed_user_id = managed.id
         storage = PortalStorageResource(
             owner_managed_user_id=managed.id,
-            root_path="/srv/gpu-platform/users/origin-pilot",
+            root_path=str(workspace_path(managed.uid)),
             quota_bytes=300 * 1024**3,
             state="ACTIVE",
         )
@@ -2185,7 +2194,7 @@ def _portal4a_submit_gate_job(
     client: httpx.Client,
     *,
     name: str,
-    script_path: str,
+    script: str,
     gpu_count: int,
     image_ref: str | None,
 ) -> dict[str, Any]:
@@ -2195,8 +2204,7 @@ def _portal4a_submit_gate_job(
             headers=_portal4a_csrf_headers(client),
             json={
                 "name": name,
-                "script_path": script_path,
-                "workdir": "workspace",
+                "script": script,
                 "cpus": 1,
                 "memory_mb": 2048 if gpu_count else 1024,
                 "gpu_count": gpu_count,
@@ -2338,7 +2346,7 @@ def portal4a_run_origin_pilot_job_gate() -> int:
                 _portal4a_submit_gate_job(
                     client,
                     name="portal4a-cpu-gate",
-                    script_path=PORTAL4A_CPU_GATE_SCRIPT,
+                    script=PORTAL4A_CPU_GATE_SCRIPT,
                     gpu_count=0,
                     image_ref=None,
                 ),
@@ -2349,7 +2357,7 @@ def portal4a_run_origin_pilot_job_gate() -> int:
                 _portal4a_submit_gate_job(
                     client,
                     name="portal4a-gpu-gate",
-                    script_path=PORTAL4A_GPU_GATE_SCRIPT,
+                    script=PORTAL4A_GPU_GATE_SCRIPT,
                     gpu_count=1,
                     image_ref=PORTAL4A_APPROVED_IMAGE,
                 ),

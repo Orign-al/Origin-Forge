@@ -170,8 +170,7 @@ export default function ComputeRequestDetailPage() {
     currentAttempt?.provision_operation ??
     currentAttempt?.stage_operation ??
     null;
-  const failureOperation =
-    currentAttempt?.stage_operation ?? lifecycleOperation;
+  const failureOperation = lifecycleOperation;
   const lifecycleState = item.lifecycle_state ?? item.status;
   const recentAuthValid = current.data?.recent_auth_valid === true;
   const unknownResources = failureOperation?.unknown_resource_state ?? [];
@@ -219,7 +218,12 @@ export default function ComputeRequestDetailPage() {
           <dl className="kv-grid">
             <div className="kv">
               <dt>Container</dt>
-              <dd>8 CPU / 32GB / GPU NONE</dd>
+              <dd>
+                8 CPU / 32GB / GPU{" "}
+                {item.requested_container_profile === "GPU_1_8CPU_32GB"
+                  ? "1 (Slurm scheduled)"
+                  : "NONE"}
+              </dd>
             </div>
             <div className="kv">
               <dt>Slurm</dt>
@@ -273,7 +277,8 @@ export default function ComputeRequestDetailPage() {
                 onChange={(event) => setApprovalPassword(event.target.value)}
               />
               <p className="muted">
-                本次 recent-auth 同时授权批准与完整 Provision，不会在内部步骤重复询问。
+                本次 recent-auth 同时授权批准与完整
+                Provision，不会在内部步骤重复询问。
               </p>
             </div>
           ) : null}
@@ -340,7 +345,14 @@ export default function ComputeRequestDetailPage() {
             <div className="kv">
               <dt>回滚</dt>
               <dd>
-                {item.retry_available ? "已完成" : "需要人工处理"}
+                <StatusBadge
+                  value={
+                    failureOperation?.rollback_status ??
+                    (item.retry_available
+                      ? "ROLLED_BACK"
+                      : "REQUIRES_MANUAL_REVIEW")
+                  }
+                />
               </dd>
             </div>
             <div className="kv">

@@ -1603,7 +1603,7 @@ def managed_container_inspect(*, state: str = "STOPPED") -> dict[str, object]:
                 },
                 {
                     "Type": "bind",
-                    "Source": "/srv/gpu-platform/users/origin-pilot/workspace",
+                    "Source": "/storage/users/20001",
                     "Destination": "/workspace",
                     "RW": True,
                 },
@@ -1621,6 +1621,72 @@ def managed_container_inspect(*, state: str = "STOPPED") -> dict[str, object]:
                 },
             ],
         },
+    }
+
+
+def managed_gpu_container_inspect(
+    *,
+    state: str = "RUNNING",
+    job_id: int = 701,
+    gpu_uuid: str = "GPU-11111111-2222-3333-4444-555555555555",
+) -> dict[str, object]:
+    inspected = managed_container_inspect(state=state)
+    container = inspected["container"]
+    assert isinstance(container, dict)
+    container.update(
+        {
+            "gpu": "REQUESTED",
+            "device_requests": [
+                {
+                    "Driver": "nvidia",
+                    "DeviceIDs": [gpu_uuid],
+                    "Capabilities": [["gpu"]],
+                    "Options": None,
+                }
+            ],
+            "devices": [],
+            "device_cgroup_rules": [],
+            "cap_add": [],
+            "runtime": "nvidia",
+            "runtime_user": "20001:20001",
+            "safe_environment": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "NVIDIA_VISIBLE_DEVICES": gpu_uuid,
+            },
+            "safe_labels": {
+                "h100.dev.user": "origin-pilot",
+                "h100.dev.uid": "20001",
+                "h100.dev.gid": "20001",
+                "h100.dev.gpu-allocation-job": str(job_id),
+                "h100.dev.gpu-uuid": gpu_uuid,
+            },
+        }
+    )
+    return inspected
+
+
+def managed_container_lifecycle_payload(
+    *, development_profile: str = "STANDARD_8CPU_32GB"
+) -> dict[str, object]:
+    gpu = development_profile == "GPU_1_8CPU_32GB"
+    lease_starts_at = datetime.now(UTC)
+    return {
+        "managed_user_id": "3b95b4f0-95d9-444a-8f0b-46288195a807",
+        "username": "origin-pilot",
+        "uid": 20001,
+        "gid": 20001,
+        "name": "gpu-dev-origin-pilot",
+        "workspace_path": "/storage/users/20001",
+        "development_profile": development_profile,
+        "container_gpu": 1 if gpu else 0,
+        "gpu_allocation_job_id": None,
+        "gpu_allocation_uuid": None,
+        "slurm_account": "company",
+        "slurm_qos": "general",
+        "lease_id": str(uuid.uuid4()),
+        "lease_starts_at": lease_starts_at.isoformat(),
+        "lease_expires_at": (lease_starts_at + timedelta(hours=2)).isoformat(),
+        "expected_gpu": "SLURM_ALLOCATED_1" if gpu else "NONE",
     }
 
 
@@ -2153,13 +2219,14 @@ def managed_job_payload(*, username: str = "origin-pilot", uid: int = 20001) -> 
         "username": username,
         "uid": uid,
         "gid": uid,
+        "workspace_path": f"/storage/users/{uid}",
         "name": "portal-job",
-        "script_relative_path": f"workspace/.portal/job-scripts/{portal_job_id}.sh",
+        "script_relative_path": f".portal/job-scripts/{portal_job_id}.sh",
         "script_content": script,
         "script_sha256": hashlib.sha256(script.encode()).hexdigest(),
-        "workdir_relative_path": "workspace",
-        "stdout_relative_path": f"workspace/.portal/jobs/{portal_job_id}.out",
-        "stderr_relative_path": f"workspace/.portal/jobs/{portal_job_id}.err",
+        "workdir_relative_path": "projects",
+        "stdout_relative_path": f"outputs/{portal_job_id}.out",
+        "stderr_relative_path": f"outputs/{portal_job_id}.err",
         "cpus": 1,
         "memory_mb": 1024,
         "gpu_count": 1,
@@ -2181,6 +2248,13 @@ def managed_terminal_payload(
         "uid": uid,
         "gid": uid,
         "name": f"gpu-dev-{username}",
+        "workspace_path": f"/storage/users/{uid}",
+        "development_profile": "STANDARD_8CPU_32GB",
+        "container_gpu": 0,
+        "gpu_allocation_job_id": None,
+        "gpu_allocation_uuid": None,
+        "slurm_account": "company",
+        "slurm_qos": "general",
         "lease_id": str(uuid.uuid4()),
         "lease_expires_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
         "expected_gpu": "NONE",
@@ -2198,14 +2272,15 @@ def test_portal4a_worker_schema_fixes_job_outputs_and_gpu_limit() -> None:
     with pytest.raises(ValueError, match="output path"):
         validate_payload(
             "self.job.submit",
-            {**payload, "stdout_relative_path": "workspace/other.out"},
+            {**payload, "stdout_relative_path": "outputs/other.out"},
         )
     with pytest.raises(ValueError, match="GPU"):
         validate_payload("self.job.submit", {**payload, "gpu_count": 2})
     for changed in (
         {"script_sha256": "0" * 64},
-        {"script_relative_path": "workspace/user-selected.sh"},
-        {"workdir_relative_path": "workspace/other"},
+        {"script_relative_path": "user-selected.sh"},
+        {"workdir_relative_path": "datasets"},
+        {"workspace_path": "/storage/users/20002"},
         {"slurm_account": "platform-admin"},
         {"username": "root", "uid": 0, "gid": 0},
     ):
@@ -2437,7 +2512,15 @@ def test_portal4a_worker_rejects_spoofed_self_actor_and_container_actor() -> Non
         "uid": 20001,
         "gid": 20001,
         "name": "gpu-dev-origin-pilot",
+        "workspace_path": "/storage/users/20001",
+        "development_profile": "STANDARD_8CPU_32GB",
+        "container_gpu": 0,
+        "gpu_allocation_job_id": None,
+        "gpu_allocation_uuid": None,
+        "slurm_account": "company",
+        "slurm_qos": "general",
         "lease_id": str(uuid.uuid4()),
+        "lease_starts_at": datetime.now(UTC).isoformat(),
         "lease_expires_at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
         "expected_gpu": "NONE",
     }
@@ -2476,8 +2559,7 @@ def test_portal4a_component_open_rejects_symlink_and_pins_staged_inode(
 ) -> None:
     uid = os.getuid()
     gid = os.getgid()
-    root = tmp_path / "users" / "origin-pilot"
-    workspace = root / "workspace"
+    workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True)
     script = workspace / "job.sh"
     script.write_bytes(b"#!/bin/sh\necho approved\n")
@@ -2486,8 +2568,8 @@ def test_portal4a_component_open_rejects_symlink_and_pins_staged_inode(
 
     with pytest.raises(handlers.LifecycleValidationError) as escaped:
         handlers._managed_user_path(
-            "origin-pilot",
-            "workspace/escape/passwd",
+            workspace,
+            "escape/passwd",
             directory=False,
             uid=uid,
             gid=gid,
@@ -2501,6 +2583,7 @@ def test_portal4a_component_open_rejects_symlink_and_pins_staged_inode(
             "username": "origin-pilot",
             "uid": uid,
             "gid": gid,
+            "workspace_path": str(workspace),
         },
         script.read_bytes(),
     )
@@ -2513,6 +2596,47 @@ def test_portal4a_component_open_rejects_symlink_and_pins_staged_inode(
         assert staged.read_bytes() == b"#!/bin/sh\necho replaced\n"
     finally:
         os.close(descriptor)
+
+
+def test_unified_workspace_visibility_and_output_persistence_share_one_inode(
+    tmp_path: Path,
+) -> None:
+    uid = os.getuid()
+    gid = os.getgid()
+    host_workspace = tmp_path / "storage/users/20002"
+    for relative in ("projects", "datasets", "outputs", ".portal/job-scripts", ".portal/jobs"):
+        path = host_workspace / relative
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    host_workspace.chmod(0o700)
+    container_workspace = tmp_path / "container/workspace"
+    container_workspace.parent.mkdir()
+    container_workspace.symlink_to(host_workspace, target_is_directory=True)
+
+    container_source = container_workspace / "projects/train.py"
+    container_source.write_text("print('workspace-visible')\n", encoding="utf-8")
+    slurm_source = handlers._managed_user_path(
+        host_workspace,
+        "projects/train.py",
+        directory=False,
+        uid=uid,
+        gid=gid,
+    )
+    assert slurm_source.read_text(encoding="utf-8") == "print('workspace-visible')\n"
+    assert container_source.samefile(slurm_source)
+
+    slurm_output = host_workspace / "outputs/result.txt"
+    slurm_output.write_text("completed\n", encoding="utf-8")
+    assert (container_workspace / "outputs/result.txt").read_text(encoding="utf-8") == "completed\n"
+    assert (container_workspace / "outputs/result.txt").samefile(slurm_output)
+
+
+def test_workspace_payload_rejects_cross_user_storage_binding() -> None:
+    payload = managed_job_payload(username="origin-pilot", uid=20001)
+    with pytest.raises(ValueError, match="WORKSPACE_BINDING_REJECTED"):
+        validate_payload(
+            "self.job.submit",
+            {**payload, "workspace_path": "/storage/users/20002"},
+        )
 
 
 def test_portal4a_setpriv_uses_fixed_argv_and_never_shell(
@@ -2559,14 +2683,11 @@ def test_job_script_is_staged_then_only_fixed_sbatch_runs_as_target_user(
         "self.job.submit",
         managed_job_payload(username="origin-pilot2", uid=20002),
     )
-    users_root = tmp_path / "users"
-    output_parent = users_root / "origin-pilot2/workspace/.portal/jobs"
-    output_parent.mkdir(parents=True)
-    workdir = users_root / "origin-pilot2/workspace"
+    output_parent = Path(str(payload["workspace_path"])) / "outputs"
+    workdir = Path(str(payload["workspace_path"])) / "projects"
     staged = tmp_path / "staged-job.sh"
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", users_root)
     monkeypatch.setattr(handlers, "_managed_slurm_security_preflight", lambda _payload: None)
     monkeypatch.setattr(
         handlers,
@@ -2618,24 +2739,590 @@ def test_portal4a_gpu_job_mounts_only_owned_root_and_disables_host_home(
         "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
     )
     payload["lease_deadline_at"] = "2026-08-14T05:24:55.083442+00:00"
-    users_root = tmp_path / "users"
-    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", users_root)
+    workspace = Path(str(payload["workspace_path"]))
     argv = handlers._managed_sbatch_argv(
         payload,
-        workdir=users_root / "origin-pilot/workspace",
-        stdout=users_root / "origin-pilot/workspace/.portal/jobs/job.out",
-        stderr=users_root / "origin-pilot/workspace/.portal/jobs/job.err",
+        workdir=workspace / "projects",
+        stdout=workspace / "outputs/job.out",
+        stderr=workspace / "outputs/job.err",
         staged_descriptor=9,
     )
-    owned_root = users_root / "origin-pilot"
-    assert "--gres=gpu:1" in argv
+    assert "--gres=gpu:h100:1" in argv
     assert "--deadline=2026-08-14T05:24:55" in argv
     assert not any(".083442" in item for item in argv)
     assert f"--container-image={payload['image_ref']}" in argv
     assert "--no-container-mount-home" in argv
-    assert f"--container-mounts={owned_root}:{owned_root}" in argv
+    assert f"--container-mounts={workspace}:{workspace},{workspace}:/workspace" in argv
     assert argv[-1] == "/proc/self/fd/9"
     assert not any("/home/origin-pilot" in item for item in argv)
+
+
+def test_gpu_development_allocation_is_owner_lease_and_scheduler_bound_across_renewal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = managed_container_lifecycle_payload(development_profile="GPU_1_8CPU_32GB")
+    gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
+    allocation_lease_id = str(payload["lease_id"])
+
+    def fixed(binary: str, args: list[str], **_kwargs):  # type: ignore[no-untyped-def]
+        if binary == "scontrol":
+            return {
+                "ok": True,
+                "stdout": (
+                    "JobId=701 UserId=origin-pilot(20001) JobState=RUNNING "
+                    "Account=company QOS=general Partition=gpu-dev Gres=gpu:h100:1 "
+                    f"Comment=h100-gpu-dev:{payload['managed_user_id']}:{allocation_lease_id} "
+                    "TresPerNode=gres/gpu:h100:1 GRES=gpu:h100:1(IDX:3)\n"
+                ),
+            }
+        assert binary == "nvidia-smi"
+        return {"ok": True, "stdout": f"3, {gpu_uuid}\n4, GPU-{('2' * 32)}\n"}
+
+    monkeypatch.setattr(handlers, "run_fixed", fixed)
+    assert handlers._gpu_allocation_binding(payload, 701) == gpu_uuid
+
+    cross_user = {**payload, "username": "origin-pilot2", "uid": 20002, "gid": 20002}
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._gpu_allocation_binding(cross_user, 701)
+    assert rejected.value.code == "GPU_ALLOCATION_NOT_RUNNING"
+
+    successor_lease = {**payload, "lease_id": str(uuid.uuid4())}
+    assert handlers._gpu_allocation_binding(successor_lease, 701) == gpu_uuid
+
+    allocation_lease_id = "not-a-lease-uuid"
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._gpu_allocation_binding(payload, 701)
+    assert rejected.value.code == "GPU_ALLOCATION_NOT_RUNNING"
+
+
+def test_gpu_development_submit_uses_exact_one_gpu_and_fixed_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = managed_container_lifecycle_payload(development_profile="GPU_1_8CPU_32GB")
+    captured: dict[str, object] = {}
+
+    def run_as_user(bound_payload, argv, timeout, **_kwargs):  # type: ignore[no-untyped-def]
+        captured["payload"] = bound_payload
+        captured["argv"] = argv
+        captured["timeout"] = timeout
+        return {"ok": True, "stdout": "701\n", "stderr": ""}
+
+    monkeypatch.setattr(handlers, "_run_as_managed_user", run_as_user)
+    monkeypatch.setattr(handlers, "_gpu_development_partition_preflight", lambda: None)
+    monkeypatch.setattr(
+        handlers,
+        "_gpu_allocation_binding",
+        lambda bound_payload, job_id: (
+            "GPU-11111111-2222-3333-4444-555555555555"
+            if bound_payload == payload and job_id == 701
+            else pytest.fail("allocation lookup lost its exact binding")
+        ),
+    )
+    job_id, gpu_uuid = handlers._submit_gpu_development_allocation(payload)
+    argv = captured["argv"]
+    assert job_id == 701
+    assert gpu_uuid == "GPU-11111111-2222-3333-4444-555555555555"
+    assert "--gres=gpu:h100:1" in argv
+    assert "--partition=gpu-dev" in argv
+    assert not any("gpu:2" in item for item in argv)
+    assert not any(item.startswith("--time=") or item.startswith("--deadline=") for item in argv)
+    assert f"--export=ALL,WORKSPACE={payload['workspace_path']}" in argv
+    assert f"--chdir={payload['workspace_path']}" in argv
+    assert f"--comment=h100-gpu-dev:{payload['managed_user_id']}:{payload['lease_id']}" in argv
+    assert argv[-1] == "--wrap=/usr/bin/sleep infinity"
+    assert captured["payload"] == payload
+
+
+def test_gpu_allocation_cancel_accepts_only_owner_bound_terminal_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = managed_container_lifecycle_payload(development_profile="GPU_1_8CPU_32GB")
+    job_id = 701
+    lease_id = str(payload["lease_id"])
+
+    def not_running(*_args):  # type: ignore[no-untyped-def]
+        raise handlers.LifecycleValidationError(
+            "GPU_ALLOCATION_NOT_RUNNING", "fixture allocation is terminal"
+        )
+
+    monkeypatch.setattr(handlers, "_gpu_allocation_binding", not_running)
+    monkeypatch.setattr(
+        handlers,
+        "_run_as_managed_user",
+        lambda *_args, **_kwargs: pytest.fail("terminal replay must not call scancel"),
+    )
+
+    owner = str(payload["username"])
+
+    def accounting(_binary: str, _args: list[str], **_kwargs):  # type: ignore[no-untyped-def]
+        return {
+            "ok": True,
+            "stdout": (
+                f"{job_id}|{owner}|company|general|gpu-dev|CANCELLED by 0|"
+                "billing=8,cpu=8,gres/gpu:h100=1|"
+                "billing=8,cpu=8,gres/gpu:h100=1|"
+                f"h100-gpu-dev:{payload['managed_user_id']}:{lease_id}|\n"
+            ),
+        }
+
+    monkeypatch.setattr(handlers, "run_fixed", accounting)
+    handlers._cancel_gpu_development_allocation(payload, job_id)
+
+    owner = "origin-pilot2"
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._cancel_gpu_development_allocation(payload, job_id)
+    assert rejected.value.code == "GPU_ALLOCATION_OWNERSHIP_REJECTED"
+
+
+def test_gpu_allocation_cancel_waits_for_accounting_terminal_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = managed_container_lifecycle_payload(development_profile="GPU_1_8CPU_32GB")
+    job_id = 701
+    gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
+    monkeypatch.setattr(handlers, "_gpu_allocation_binding", lambda *_args: gpu_uuid)
+    cancelled: list[int] = []
+    monkeypatch.setattr(
+        handlers,
+        "_run_as_managed_user",
+        lambda _payload, argv, **_kwargs: cancelled.append(int(argv[-1])) or {"ok": True},
+    )
+    states = iter(("RUNNING", "COMPLETED"))
+
+    def accounting(_binary: str, _args: list[str], **_kwargs):  # type: ignore[no-untyped-def]
+        state = next(states)
+        return {
+            "ok": True,
+            "stdout": (
+                f"{job_id}|{payload['username']}|company|general|gpu-dev|{state}|"
+                "billing=8,cpu=8,gres/gpu:h100=1|"
+                "billing=8,cpu=8,gres/gpu:h100=1|"
+                f"h100-gpu-dev:{payload['managed_user_id']}:{payload['lease_id']}|\n"
+            ),
+        }
+
+    monkeypatch.setattr(handlers, "run_fixed", accounting)
+    monkeypatch.setattr(handlers.time, "sleep", lambda _seconds: None)
+
+    handlers._cancel_gpu_development_allocation(payload, job_id)
+    assert cancelled == [job_id]
+
+
+def test_container_lifecycle_rejects_incomplete_or_oversized_lease_window() -> None:
+    payload = managed_container_lifecycle_payload()
+    validated = validate_payload("container.start", payload)
+    assert validated["lease_starts_at"] == payload["lease_starts_at"]
+
+    with pytest.raises(ValueError, match="PAYLOAD_REJECTED"):
+        validate_payload("container.start", {**payload, "lease_starts_at": None})
+
+    starts_at = datetime.now(UTC)
+    with pytest.raises(ValueError, match="PAYLOAD_REJECTED"):
+        validate_payload(
+            "container.start",
+            {
+                **payload,
+                "lease_starts_at": starts_at.isoformat(),
+                "lease_expires_at": (starts_at + timedelta(hours=97)).isoformat(),
+            },
+        )
+
+
+def test_active_container_lifecycle_advances_only_to_contiguous_successor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    starts_at = datetime.now(UTC) - timedelta(hours=2)
+    prior_expiry = datetime.now(UTC) - timedelta(seconds=1)
+    payload = {
+        **managed_container_lifecycle_payload(),
+        "lease_starts_at": prior_expiry.isoformat(),
+        "lease_expires_at": (prior_expiry + timedelta(hours=2)).isoformat(),
+    }
+    prior = {
+        "VERSION": "4",
+        "STATUS": "ACTIVE",
+        "USERNAME": str(payload["username"]),
+        "UID": str(payload["uid"]),
+        "GID": str(payload["gid"]),
+        "SLURM_ACCOUNT": str(payload["slurm_account"]),
+        "SLURM_QOS": str(payload["slurm_qos"]),
+        "CONTAINER_KEY_FINGERPRINTS": handlers.PORTAL3E_FINAL_KEY_FINGERPRINT,
+        "DEVELOPMENT_PROFILE": str(payload["development_profile"]),
+        "WORKSPACE_LAYOUT": "LEGACY_BIND_ALIAS",
+        "STORAGE_ROOT": f"/srv/gpu-platform/users/{payload['username']}",
+        "BACKING_WORKSPACE": f"/srv/gpu-platform/users/{payload['username']}/workspace",
+        "WORKSPACE_PATH": str(payload["workspace_path"]),
+        "SSH_KEY_STATE": "INSTALLED",
+        "LEASE_STATE": "ACTIVE",
+        "LEASE_ID": str(uuid.uuid4()),
+        "LEASE_START": starts_at.isoformat(),
+        "LEASE_EXPIRES": prior_expiry.isoformat(),
+        "GPU_ALLOCATION_JOB_ID": "",
+        "GPU_ALLOCATION_UUID": "",
+    }
+    committed: list[dict[str, str]] = []
+    monkeypatch.setattr(handlers, "_read_managed_lifecycle_state", lambda _username: dict(prior))
+    monkeypatch.setattr(
+        handlers,
+        "_commit_managed_lifecycle_values",
+        lambda _username, values: committed.append(dict(values)),
+    )
+
+    handlers._bind_active_container_lifecycle(
+        payload, gpu_allocation_job_id=None, gpu_allocation_uuid=None
+    )
+    assert committed[0]["LEASE_ID"] == payload["lease_id"]
+    assert committed[0]["LEASE_START"] == payload["lease_starts_at"]
+
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._bind_active_container_lifecycle(
+            {
+                **payload,
+                "lease_starts_at": (prior_expiry + timedelta(seconds=1)).isoformat(),
+            },
+            gpu_allocation_job_id=None,
+            gpu_allocation_uuid=None,
+        )
+    assert rejected.value.code == "RESOURCE_LIFECYCLE_STATE_REJECTED"
+
+
+def test_gpu_development_partition_must_be_non_default_and_infinite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {
+            "h100-platform-common": {"integrity_ok": True},
+            "h100-gpu-development-epilog": {"integrity_ok": True},
+        },
+    )
+
+    def valid_preflight(binary: str, args: list[str], **_kwargs):  # type: ignore[no-untyped-def]
+        assert binary == "scontrol"
+        if args == ["show", "config"]:
+            return {
+                "ok": True,
+                "stdout": "Epilog                = /usr/local/sbin/h100-gpu-development-epilog\n",
+            }
+        return {
+            "ok": True,
+            "stdout": (
+                "PartitionName=gpu-dev AllowAccounts=ALL Default=NO "
+                "MaxTime=INFINITE Nodes=sagsh100server State=UP\n"
+            ),
+        }
+
+    monkeypatch.setattr(
+        handlers,
+        "run_fixed",
+        valid_preflight,
+    )
+    handlers._gpu_development_partition_preflight()
+
+    def finite_preflight(binary: str, args: list[str], **_kwargs):  # type: ignore[no-untyped-def]
+        result = valid_preflight(binary, args)
+        if args != ["show", "config"]:
+            result["stdout"] = str(result["stdout"]).replace("INFINITE", "08:00:00")
+        return result
+
+    monkeypatch.setattr(handlers, "run_fixed", finite_preflight)
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._gpu_development_partition_preflight()
+    assert rejected.value.code == "GPU_DEVELOPMENT_PARTITION_REJECTED"
+
+    monkeypatch.setattr(
+        handlers,
+        "run_fixed",
+        lambda binary, args, **_kwargs: (
+            {"ok": True, "stdout": "Epilog = (null)\n"}
+            if args == ["show", "config"]
+            else valid_preflight(binary, args)
+        ),
+    )
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._gpu_development_partition_preflight()
+    assert rejected.value.code == "GPU_DEVELOPMENT_PARTITION_REJECTED"
+
+
+def test_cpu_container_security_rejects_any_nvidia_runtime_surface(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    uid = os.getuid()
+    gid = os.getgid()
+    workspace = tmp_path / str(uid)
+    workspace.mkdir(mode=0o700)
+    inspected = managed_container_inspect(state="RUNNING")
+    container = inspected["container"]
+    assert isinstance(container, dict)
+    container["safe_labels"] = {
+        "h100.dev.user": "origin-pilot",
+        "h100.dev.uid": str(uid),
+        "h100.dev.gid": str(gid),
+    }
+    container["devices"] = []
+    container["device_cgroup_rules"] = []
+    container["cap_add"] = []
+    mounts = container["mounts"]
+    assert isinstance(mounts, list)
+    for mount in mounts:
+        if isinstance(mount, dict) and mount.get("Destination") == "/workspace":
+            mount["Source"] = str(workspace)
+    payload = {
+        **managed_container_lifecycle_payload(),
+        "uid": uid,
+        "gid": gid,
+        "workspace_path": str(workspace),
+    }
+    monkeypatch.setattr(
+        handlers,
+        "_managed_account",
+        lambda _payload: SimpleNamespace(pw_uid=uid, pw_gid=gid),
+    )
+    monkeypatch.setattr(handlers, "workspace_path", lambda _uid: workspace)
+    monkeypatch.setattr(handlers, "containers_inspect", lambda _payload: inspected)
+    handlers._managed_container_security(payload, require_running=True)
+
+    container["runtime"] = "nvidia"
+    container["safe_environment"] = {"NVIDIA_VISIBLE_DEVICES": "all"}
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._managed_container_security(payload, require_running=True)
+    assert rejected.value.code == "CONTAINER_SECURITY_REJECTED"
+
+
+def test_cpu_container_security_accepts_legacy_backing_mount_only_for_same_inode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    uid = os.getuid()
+    gid = os.getgid()
+    canonical = tmp_path / "canonical" / str(uid)
+    backing = tmp_path / "users" / "origin-pilot" / "workspace"
+    canonical.mkdir(parents=True, mode=0o700)
+    backing.mkdir(parents=True, mode=0o700)
+    canonical.chmod(0o700)
+    backing.chmod(0o700)
+    inspected = managed_container_inspect(state="STOPPED")
+    container = inspected["container"]
+    assert isinstance(container, dict)
+    container["safe_labels"] = {
+        "h100.dev.user": "origin-pilot",
+        "h100.dev.uid": str(uid),
+        "h100.dev.gid": str(gid),
+    }
+    container["devices"] = []
+    container["device_cgroup_rules"] = []
+    container["cap_add"] = []
+    mounts = container["mounts"]
+    assert isinstance(mounts, list)
+    for mount in mounts:
+        if not isinstance(mount, dict):
+            continue
+        source = str(mount.get("Source", ""))
+        if mount.get("Destination") == "/workspace":
+            mount["Source"] = str(backing)
+        elif source == "/srv/gpu-platform/users/origin-pilot/home":
+            mount["Source"] = str(tmp_path / "users/origin-pilot/home")
+        elif source == "/srv/gpu-platform/users/origin-pilot/shared":
+            mount["Source"] = str(tmp_path / "users/origin-pilot/shared")
+    payload = {
+        **managed_container_lifecycle_payload(),
+        "uid": uid,
+        "gid": gid,
+        "workspace_path": str(canonical),
+    }
+    original_lstat = Path.lstat
+    canonical_metadata = canonical.lstat()
+
+    def same_inode_lstat(path: Path):
+        if path == backing:
+            return canonical_metadata
+        return original_lstat(path)
+
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", tmp_path / "users")
+    monkeypatch.setattr(
+        handlers,
+        "_managed_account",
+        lambda _payload: SimpleNamespace(pw_uid=uid, pw_gid=gid),
+    )
+    monkeypatch.setattr(handlers, "workspace_path", lambda _uid: canonical)
+    monkeypatch.setattr(handlers, "containers_inspect", lambda _payload: inspected)
+    monkeypatch.setattr(Path, "lstat", same_inode_lstat)
+
+    handlers._managed_container_security(payload, require_running=False)
+
+    monkeypatch.setattr(Path, "lstat", original_lstat)
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._managed_container_security(payload, require_running=False)
+    assert rejected.value.code == "CONTAINER_SECURITY_REJECTED"
+
+
+def test_gpu_container_security_requires_one_uuid_and_no_host_escape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    uid = os.getuid()
+    gid = os.getgid()
+    job_id = 701
+    gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
+    workspace = tmp_path / str(uid)
+    workspace.mkdir(mode=0o700)
+    inspected = managed_gpu_container_inspect(job_id=job_id, gpu_uuid=gpu_uuid)
+    container = inspected["container"]
+    assert isinstance(container, dict)
+    labels = container["safe_labels"]
+    assert isinstance(labels, dict)
+    labels.update({"h100.dev.uid": str(uid), "h100.dev.gid": str(gid)})
+    mounts = container["mounts"]
+    assert isinstance(mounts, list)
+    for mount in mounts:
+        if isinstance(mount, dict) and mount.get("Destination") == "/workspace":
+            mount["Source"] = str(workspace)
+    payload = {
+        **managed_container_lifecycle_payload(development_profile="GPU_1_8CPU_32GB"),
+        "uid": uid,
+        "gid": gid,
+        "workspace_path": str(workspace),
+        "gpu_allocation_job_id": job_id,
+        "gpu_allocation_uuid": gpu_uuid,
+    }
+    monkeypatch.setattr(
+        handlers,
+        "_managed_account",
+        lambda _payload: SimpleNamespace(pw_uid=uid, pw_gid=gid),
+    )
+    monkeypatch.setattr(handlers, "workspace_path", lambda _uid: workspace)
+    monkeypatch.setattr(handlers, "containers_inspect", lambda _payload: inspected)
+    handlers._managed_container_security(payload, require_running=True)
+
+    device_requests = container["device_requests"]
+    assert isinstance(device_requests, list)
+    other_user_uuid = "GPU-22222222-3333-4444-5555-666666666666"
+    device_requests[0]["DeviceIDs"] = [other_user_uuid]
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._managed_container_security(payload, require_running=True)
+    assert rejected.value.code == "CONTAINER_SECURITY_REJECTED"
+
+    device_requests[0]["DeviceIDs"] = [gpu_uuid, other_user_uuid]
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._managed_container_security(payload, require_running=True)
+    assert rejected.value.code == "CONTAINER_SECURITY_REJECTED"
+
+    device_requests[0]["DeviceIDs"] = [gpu_uuid]
+    mounts.append(
+        {
+            "Type": "bind",
+            "Source": "/var/run/docker.sock",
+            "Destination": "/var/run/docker.sock",
+            "RW": True,
+        }
+    )
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._managed_container_security(payload, require_running=True)
+    assert rejected.value.code == "CONTAINER_SECURITY_REJECTED"
+
+
+def test_gpu_start_failure_cancels_new_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = managed_container_lifecycle_payload(development_profile="GPU_1_8CPU_32GB")
+    job_id = 701
+    gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
+    monkeypatch.setattr(
+        handlers,
+        "_managed_container_security",
+        lambda *_args, **_kwargs: {"state": {"Running": False}},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {
+            "h100-container-stop": {"integrity_ok": True},
+            "h100-container-start": {"integrity_ok": True},
+            "h100-container-gpu-runtime": {"integrity_ok": True},
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_submit_gpu_development_allocation",
+        lambda _payload: (job_id, gpu_uuid),
+    )
+    monkeypatch.setattr(
+        handlers, "_bind_active_container_lifecycle", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        handlers, "_clear_active_gpu_lifecycle_binding", lambda *_args, **_kwargs: None
+    )
+    calls: list[list[str]] = []
+
+    def script(argv, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append(argv)
+        return {"ok": argv[1] == "stop"}
+
+    cancelled: list[int] = []
+    monkeypatch.setattr(handlers, "run_allowlisted_script", script)
+    monkeypatch.setattr(
+        handlers,
+        "_cancel_gpu_development_allocation",
+        lambda _payload, allocation: cancelled.append(allocation),
+    )
+    result = handlers._execute_managed_container_lifecycle(
+        request("container.start", requested_by="origin-pilot"), payload
+    )
+    assert result["error"]["code"] == "CONTAINER_START_FAILED"
+    assert [call[1] for call in calls] == ["start", "stop"]
+    assert cancelled == [job_id]
+
+
+def test_gpu_stop_removes_container_before_allocation_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = 701
+    gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
+    payload = {
+        **managed_container_lifecycle_payload(development_profile="GPU_1_8CPU_32GB"),
+        "gpu_allocation_job_id": job_id,
+        "gpu_allocation_uuid": gpu_uuid,
+        "lease_id": None,
+        "lease_starts_at": None,
+        "lease_expires_at": None,
+    }
+    inspections = iter(({"state": {"Running": True}}, {"state": {"Running": False}}))
+    monkeypatch.setattr(
+        handlers,
+        "_managed_container_security",
+        lambda *_args, **_kwargs: next(inspections),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {
+            "h100-container-stop": {"integrity_ok": True},
+            "h100-container-gpu-runtime": {"integrity_ok": True},
+        },
+    )
+    monkeypatch.setattr(handlers, "_gpu_allocation_binding", lambda *_args: gpu_uuid)
+    events: list[str] = []
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: events.append("container-removed") or {"ok": True},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_cancel_gpu_development_allocation",
+        lambda *_args, **_kwargs: events.append("allocation-cancelled"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_clear_active_gpu_lifecycle_binding",
+        lambda *_args, **_kwargs: events.append("lifecycle-cleared"),
+    )
+    result = handlers._execute_managed_container_lifecycle(
+        request("container.stop", requested_by="origin-pilot"), payload
+    )
+    assert result["status"] == "SUCCEEDED"
+    assert events == ["container-removed", "allocation-cancelled", "lifecycle-cleared"]
+    assert result["gpu_allocation_job_id"] is None
+    assert result["gpu_allocation_uuid"] is None
 
 
 def test_portal4a_host_revoke_rolls_back_shell_and_key_on_postcondition_failure(
@@ -2707,6 +3394,7 @@ def test_portal4a_host_revoke_rolls_back_shell_and_key_on_postcondition_failure(
 
 
 def portal4a_restore_payload() -> dict[str, object]:
+    lease_starts_at = datetime.now(UTC)
     return {
         "restore_request_id": str(uuid.uuid4()),
         "managed_user_id": "3b95b4f0-95d9-444a-8f0b-46288195a807",
@@ -2714,6 +3402,16 @@ def portal4a_restore_payload() -> dict[str, object]:
         "uid": 20001,
         "gid": 20001,
         "container_name": "gpu-dev-origin-pilot",
+        "workspace_path": "/storage/users/20001",
+        "development_profile": "STANDARD_8CPU_32GB",
+        "container_gpu": 0,
+        "gpu_allocation_job_id": None,
+        "gpu_allocation_uuid": None,
+        "slurm_account": "company",
+        "slurm_qos": "general",
+        "lease_id": str(uuid.uuid4()),
+        "lease_starts_at": lease_starts_at.isoformat(),
+        "lease_expires_at": (lease_starts_at + timedelta(hours=2)).isoformat(),
         "expected_gpu": "NONE",
         "host_access": "DISABLED_BY_PLATFORM_POLICY",
         "expected_key_fingerprints": [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
@@ -2723,17 +3421,351 @@ def portal4a_restore_payload() -> dict[str, object]:
 def portal4a_recycle_payload() -> dict[str, object]:
     payload = {
         **portal4a_restore_payload(),
-        "lease_id": str(uuid.uuid4()),
         "expires_at": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
     }
     payload.pop("restore_request_id")
+    payload.pop("lease_starts_at")
+    payload.pop("lease_expires_at")
     return payload
+
+
+def portal4a_restore_rollback_payload() -> dict[str, object]:
+    restored = portal4a_restore_payload()
+    recycled_expiry = datetime.now(UTC) - timedelta(hours=1)
+    return {
+        "restore_request_id": restored["restore_request_id"],
+        "attempted_lease_id": restored["lease_id"],
+        "attempted_lease_starts_at": restored["lease_starts_at"],
+        "attempted_lease_expires_at": restored["lease_expires_at"],
+        "recycle_lease_id": str(uuid.uuid4()),
+        "recycle_lease_starts_at": (recycled_expiry - timedelta(hours=96)).isoformat(),
+        "recycle_lease_expires_at": recycled_expiry.isoformat(),
+        **{
+            key: restored[key]
+            for key in (
+                "managed_user_id",
+                "username",
+                "uid",
+                "gid",
+                "container_name",
+                "workspace_path",
+                "development_profile",
+                "container_gpu",
+                "gpu_allocation_job_id",
+                "gpu_allocation_uuid",
+                "slurm_account",
+                "slurm_qos",
+                "expected_gpu",
+                "host_access",
+                "expected_key_fingerprints",
+            )
+        },
+    }
+
+
+def configure_resource_lifecycle_transitions(monkeypatch: pytest.MonkeyPatch) -> None:
+    prior = {"VERSION": "3", "USERNAME": "origin-pilot", "STATUS": "ACTIVE"}
+    monkeypatch.setattr(handlers, "_read_managed_lifecycle_state", lambda _username: dict(prior))
+    monkeypatch.setattr(
+        handlers,
+        "_activate_restored_lifecycle",
+        lambda *_args, **_kwargs: dict(prior),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_validate_active_restored_lifecycle",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(handlers, "_restore_prior_lifecycle", lambda *_args: None)
+    monkeypatch.setattr(handlers, "_mark_recycled_lifecycle", lambda *_args, **_kwargs: None)
+
+
+def legacy_expired_lifecycle(payload: dict[str, object]) -> dict[str, str]:
+    expired_at = datetime.now(UTC) - timedelta(hours=1)
+    return {
+        "VERSION": "3",
+        "STATUS": "ACTIVE",
+        "USERNAME": str(payload["username"]),
+        "UID": str(payload["uid"]),
+        "GID": str(payload["gid"]),
+        "SLURM_ACCOUNT": str(payload["slurm_account"]),
+        "SLURM_QOS": str(payload["slurm_qos"]),
+        "SSH_KEY_STATE": "INSTALLED",
+        "CONTAINER_KEY_FINGERPRINTS": handlers.PORTAL3E_FINAL_KEY_FINGERPRINT,
+        "LEASE_STATE": "ACTIVE",
+        "LEASE_START": (expired_at - timedelta(hours=96)).isoformat(),
+        "LEASE_EXPIRES": expired_at.isoformat(),
+    }
+
+
+def test_restore_rebinds_legacy_expired_lifecycle_to_new_lease_before_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = portal4a_restore_payload()
+    prior = legacy_expired_lifecycle(payload)
+    committed: list[dict[str, str]] = []
+    monkeypatch.setattr(handlers, "_read_managed_lifecycle_state", lambda _username: dict(prior))
+    monkeypatch.setattr(
+        handlers,
+        "_commit_managed_lifecycle_values",
+        lambda _username, values: committed.append(dict(values)),
+    )
+
+    observed_prior = handlers._activate_restored_lifecycle(
+        payload,
+        [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+        gpu_allocation_job_id=None,
+        gpu_allocation_uuid=None,
+    )
+
+    assert observed_prior == prior
+    assert len(committed) == 1
+    restored = committed[0]
+    assert restored["STATUS"] == "ACTIVE"
+    assert restored["SSH_KEY_STATE"] == "INSTALLED"
+    assert restored["LEASE_STATE"] == "ACTIVE"
+    assert restored["LEASE_ID"] == payload["lease_id"]
+    assert restored["LEASE_START"] == payload["lease_starts_at"]
+    assert restored["LEASE_EXPIRES"] == payload["lease_expires_at"]
+    assert restored["RESTORE_REQUEST_ID"] == payload["restore_request_id"]
+    assert restored["GPU_ALLOCATION_JOB_ID"] == ""
+    assert restored["GPU_ALLOCATION_UUID"] == ""
+
+
+def test_cpu_restore_commits_new_lifecycle_before_container_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = portal4a_restore_payload()
+    suspended = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys.portal-recycle"
+    suspended.parent.mkdir(parents=True)
+    suspended.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", tmp_path / "users")
+    monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
+    monkeypatch.setattr(
+        handlers,
+        "_managed_account",
+        lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_installed_key_fingerprints",
+        lambda *_args: [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+    )
+    security_calls = 0
+
+    def security(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        nonlocal security_calls
+        security_calls += 1
+        return {"state": {"Running": security_calls > 1}}
+
+    monkeypatch.setattr(handlers, "_managed_container_security", security)
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {"h100-container-start": {"integrity_ok": True}},
+    )
+    prior = legacy_expired_lifecycle(payload)
+    monkeypatch.setattr(handlers, "_read_managed_lifecycle_state", lambda _username: dict(prior))
+    events: list[str] = []
+
+    def activate(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        events.append("lifecycle")
+        return dict(prior)
+
+    def run_script(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        events.append("start")
+        return {"ok": True}
+
+    monkeypatch.setattr(handlers, "_activate_restored_lifecycle", activate)
+    monkeypatch.setattr(handlers, "run_allowlisted_script", run_script)
+
+    result = handlers._execute_resource_restore(request("resource.restore"), payload)
+
+    assert result["status"] == "SUCCEEDED"
+    assert result["container_state"] == "RUNNING"
+    assert events == ["lifecycle", "start"]
+
+
+def test_recycle_marks_lifecycle_non_startable_and_preserves_owner_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = portal4a_recycle_payload()
+    active_payload = portal4a_restore_payload()
+    active_payload.update(
+        {
+            "lease_id": payload["lease_id"],
+            "username": payload["username"],
+            "uid": payload["uid"],
+            "gid": payload["gid"],
+            "slurm_account": payload["slurm_account"],
+            "slurm_qos": payload["slurm_qos"],
+        }
+    )
+    lifecycle = legacy_expired_lifecycle(active_payload)
+    lifecycle["LEASE_EXPIRES"] = str(payload["expires_at"])
+    lifecycle["LEASE_START"] = (
+        datetime.fromisoformat(str(payload["expires_at"])) - timedelta(hours=96)
+    ).isoformat()
+    committed: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        handlers, "_read_managed_lifecycle_state", lambda _username: dict(lifecycle)
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_commit_managed_lifecycle_values",
+        lambda _username, values: committed.append(dict(values)),
+    )
+
+    handlers._mark_recycled_lifecycle(payload, [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT])
+
+    assert len(committed) == 1
+    recycled = committed[0]
+    assert recycled["STATUS"] == "RECYCLED"
+    assert recycled["SSH_KEY_STATE"] == "SUSPENDED_BY_RECYCLE"
+    assert recycled["LEASE_STATE"] == "RECYCLE_BIN"
+    assert recycled["LEASE_ID"] == payload["lease_id"]
+    assert recycled["GPU_ALLOCATION_JOB_ID"] == ""
+    assert recycled["GPU_ALLOCATION_UUID"] == ""
+
+
+def test_recycle_rejects_a_different_v4_lease_or_gpu_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        **portal4a_recycle_payload(),
+        "development_profile": "GPU_1_8CPU_32GB",
+        "container_gpu": 1,
+        "expected_gpu": "SLURM_ALLOCATED_1",
+        "gpu_allocation_job_id": 701,
+        "gpu_allocation_uuid": "GPU-11111111-2222-3333-4444-555555555555",
+    }
+    expires_at = datetime.fromisoformat(str(payload["expires_at"]))
+    lifecycle = {
+        "VERSION": "4",
+        "STATUS": "ACTIVE",
+        "USERNAME": str(payload["username"]),
+        "UID": str(payload["uid"]),
+        "GID": str(payload["gid"]),
+        "SLURM_ACCOUNT": str(payload["slurm_account"]),
+        "SLURM_QOS": str(payload["slurm_qos"]),
+        "CONTAINER_KEY_FINGERPRINTS": handlers.PORTAL3E_FINAL_KEY_FINGERPRINT,
+        "DEVELOPMENT_PROFILE": str(payload["development_profile"]),
+        "WORKSPACE_LAYOUT": "LEGACY_BIND_ALIAS",
+        "STORAGE_ROOT": f"/srv/gpu-platform/users/{payload['username']}",
+        "BACKING_WORKSPACE": f"/srv/gpu-platform/users/{payload['username']}/workspace",
+        "WORKSPACE_PATH": str(payload["workspace_path"]),
+        "SSH_KEY_STATE": "INSTALLED",
+        "LEASE_STATE": "ACTIVE",
+        "LEASE_ID": str(uuid.uuid4()),
+        "LEASE_START": (expires_at - timedelta(hours=96)).isoformat(),
+        "LEASE_EXPIRES": expires_at.isoformat(),
+        "GPU_ALLOCATION_JOB_ID": "702",
+        "GPU_ALLOCATION_UUID": str(payload["gpu_allocation_uuid"]),
+    }
+    monkeypatch.setattr(
+        handlers, "_read_managed_lifecycle_state", lambda _username: dict(lifecycle)
+    )
+
+    with pytest.raises(handlers.LifecycleValidationError) as wrong_lease:
+        handlers._mark_recycled_lifecycle(payload, [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT])
+    assert wrong_lease.value.code == "RESOURCE_LIFECYCLE_STATE_REJECTED"
+
+    lifecycle["LEASE_ID"] = str(payload["lease_id"])
+    with pytest.raises(handlers.LifecycleValidationError) as wrong_gpu:
+        handlers._mark_recycled_lifecycle(payload, [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT])
+    assert wrong_gpu.value.code == "RESOURCE_LIFECYCLE_STATE_REJECTED"
+
+
+def test_restore_rollback_reinstates_the_exact_prior_recycled_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = validate_payload("resource.restore.rollback", portal4a_restore_rollback_payload())
+    lifecycle = {
+        "VERSION": "3",
+        "STATUS": "ACTIVE",
+        "USERNAME": str(payload["username"]),
+        "UID": str(payload["uid"]),
+        "GID": str(payload["gid"]),
+        "SLURM_ACCOUNT": str(payload["slurm_account"]),
+        "SLURM_QOS": str(payload["slurm_qos"]),
+        "CONTAINER_KEY_FINGERPRINTS": handlers.PORTAL3E_FINAL_KEY_FINGERPRINT,
+        "SSH_KEY_STATE": "INSTALLED",
+        "LEASE_STATE": "ACTIVE",
+        "LEASE_ID": str(payload["attempted_lease_id"]),
+        "LEASE_START": str(payload["attempted_lease_starts_at"]),
+        "LEASE_EXPIRES": str(payload["attempted_lease_expires_at"]),
+        "RESTORE_REQUEST_ID": str(payload["restore_request_id"]),
+        "GPU_ALLOCATION_JOB_ID": "",
+        "GPU_ALLOCATION_UUID": "",
+    }
+    committed: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        handlers, "_read_managed_lifecycle_state", lambda _username: dict(lifecycle)
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_commit_managed_lifecycle_values",
+        lambda _username, values: committed.append(dict(values)),
+    )
+
+    handlers._mark_recycled_lifecycle(
+        payload,
+        [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+        restore_rollback=True,
+    )
+
+    assert committed[0]["STATUS"] == "RECYCLED"
+    assert committed[0]["LEASE_ID"] == payload["recycle_lease_id"]
+    assert committed[0]["LEASE_START"] == payload["recycle_lease_starts_at"]
+    assert committed[0]["LEASE_EXPIRES"] == payload["recycle_lease_expires_at"]
+    assert committed[0]["RESTORE_REQUEST_ID"] == ""
+
+    lifecycle["RESTORE_REQUEST_ID"] = str(uuid.uuid4())
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._mark_recycled_lifecycle(
+            payload,
+            [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+            restore_rollback=True,
+        )
+    assert rejected.value.code == "RESOURCE_LIFECYCLE_STATE_REJECTED"
+
+
+def test_gpu_restore_and_recycle_payloads_are_exactly_allocation_bound() -> None:
+    restore = {
+        **portal4a_restore_payload(),
+        "development_profile": "GPU_1_8CPU_32GB",
+        "container_gpu": 1,
+        "expected_gpu": "SLURM_ALLOCATED_1",
+    }
+    validated_restore = validate_payload("resource.restore", restore)
+    assert validated_restore["workspace_path"] == "/storage/users/20001"
+    assert validated_restore["gpu_allocation_job_id"] is None
+
+    allocation_uuid = "GPU-11111111-2222-3333-4444-555555555555"
+    recycle = {
+        **portal4a_recycle_payload(),
+        "development_profile": "GPU_1_8CPU_32GB",
+        "container_gpu": 1,
+        "expected_gpu": "SLURM_ALLOCATED_1",
+        "gpu_allocation_job_id": 701,
+        "gpu_allocation_uuid": allocation_uuid,
+    }
+    validated_recycle = validate_payload("resource.recycle", recycle)
+    assert validated_recycle["gpu_allocation_job_id"] == 701
+    assert validated_recycle["gpu_allocation_uuid"] == allocation_uuid
+
+    with pytest.raises(ValueError, match="RECYCLE_PAYLOAD_REJECTED"):
+        validate_payload(
+            "resource.recycle",
+            {**recycle, "gpu_allocation_job_id": None},
+        )
 
 
 def test_portal4a_restore_is_idempotent_after_worker_success(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     payload = portal4a_restore_payload()
+    configure_resource_lifecycle_transitions(monkeypatch)
     active = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys"
     active.parent.mkdir(parents=True)
     active.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
@@ -2792,6 +3824,7 @@ def test_portal4a_restore_rolls_back_container_and_key_after_postcondition_failu
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     payload = portal4a_restore_payload()
+    configure_resource_lifecycle_transitions(monkeypatch)
     suspended = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys.portal-recycle"
     suspended.parent.mkdir(parents=True)
     suspended.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
@@ -2851,6 +3884,7 @@ def test_portal4a_restore_stops_partial_start_before_resuspending_key(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     payload = portal4a_restore_payload()
+    configure_resource_lifecycle_transitions(monkeypatch)
     suspended = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys.portal-recycle"
     suspended.parent.mkdir(parents=True)
     suspended.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
@@ -2899,10 +3933,79 @@ def test_portal4a_restore_stops_partial_start_before_resuspending_key(
     assert not active.exists()
 
 
+def test_gpu_restore_retains_allocation_when_partial_container_removal_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = {
+        **portal4a_restore_payload(),
+        "development_profile": "GPU_1_8CPU_32GB",
+        "container_gpu": 1,
+        "expected_gpu": "SLURM_ALLOCATED_1",
+    }
+    configure_resource_lifecycle_transitions(monkeypatch)
+    job_id = 701
+    gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
+    suspended = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys.portal-recycle"
+    suspended.parent.mkdir(parents=True)
+    suspended.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
+    active = suspended.with_name("authorized_keys")
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", tmp_path / "users")
+    monkeypatch.setattr(handlers, "MANAGED_HOME_ROOT", tmp_path / "host-home")
+    monkeypatch.setattr(
+        handlers,
+        "_managed_account",
+        lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_installed_key_fingerprints",
+        lambda *_args: [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_managed_container_security",
+        lambda *_args, **_kwargs: {"state": {"Running": False}},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {"h100-container-gpu-runtime": {"integrity_ok": True}},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_submit_gpu_development_allocation",
+        lambda _payload: (job_id, gpu_uuid),
+    )
+    events: list[str] = []
+
+    def run_script(argv, **_kwargs):  # type: ignore[no-untyped-def]
+        events.append(str(argv[1]))
+        return {"ok": False}
+
+    monkeypatch.setattr(handlers, "run_allowlisted_script", run_script)
+    monkeypatch.setattr(
+        handlers,
+        "_cancel_gpu_development_allocation",
+        lambda *_args: pytest.fail("allocation must remain until container removal is proven"),
+    )
+
+    result = handlers._execute_resource_restore(request("resource.restore"), payload)
+
+    assert result["status"] == "ERROR"
+    assert result["error"]["code"] == "RESTORE_ROLLBACK_FAILED"
+    assert result["gpu_allocation_state_known"] is True
+    assert result["gpu_allocation_job_id"] == job_id
+    assert result["gpu_allocation_uuid"] == gpu_uuid
+    assert events == ["start", "stop"]
+    assert suspended.exists()
+    assert not active.exists()
+
+
 def test_portal4a_recycle_rejects_unapproved_key_before_runtime_changes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     payload = portal4a_recycle_payload()
+    configure_resource_lifecycle_transitions(monkeypatch)
     active = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys"
     active.parent.mkdir(parents=True)
     active.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
@@ -2940,6 +4043,7 @@ def test_recycle_suspends_new_ssh_access_before_container_stop_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     payload = portal4a_recycle_payload()
+    configure_resource_lifecycle_transitions(monkeypatch)
     active = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys"
     active.parent.mkdir(parents=True)
     active.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
@@ -2996,6 +4100,7 @@ def test_recycle_retry_after_stop_failure_is_idempotent_and_preserves_data(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     payload = portal4a_recycle_payload()
+    configure_resource_lifecycle_transitions(monkeypatch)
     suspended = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys.portal-recycle"
     suspended.parent.mkdir(parents=True)
     suspended.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
@@ -3052,6 +4157,7 @@ def test_recycle_running_job_uses_controlled_cancel_and_preserves_history_bindin
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     payload = portal4a_recycle_payload()
+    configure_resource_lifecycle_transitions(monkeypatch)
     active = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys"
     active.parent.mkdir(parents=True)
     active.write_text("ssh-ed25519 fixture\n", encoding="utf-8")

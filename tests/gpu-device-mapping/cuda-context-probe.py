@@ -44,7 +44,11 @@ class Driver:
         self.lib.cuDeviceGetCount.restype = ctypes.c_int
         self.lib.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
         self.lib.cuDeviceGet.restype = ctypes.c_int
-        self.lib.cuDeviceGetName.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        self.lib.cuDeviceGetName.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
         self.lib.cuDeviceGetName.restype = ctypes.c_int
         self.lib.cuCtxSynchronize.argtypes = []
         self.lib.cuCtxSynchronize.restype = ctypes.c_int
@@ -219,8 +223,7 @@ def main() -> int:
         print("CUDA_CONTEXT_RESULT=PASSED")
     else:
         print(
-            "CUDA_CONTEXT_RESULT=BLOCKED "
-            f"stage={failure_stage} detail={failure_detail}"
+            f"CUDA_CONTEXT_RESULT=BLOCKED stage={failure_stage} detail={failure_detail}"
         )
 
     if args.expect == "success":

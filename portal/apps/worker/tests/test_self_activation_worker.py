@@ -26,6 +26,9 @@ def activation_payload() -> dict[str, Any]:
         "project_id": 30002,
         "ssh_port": 22024,
         "container_name": "gpu-dev-origin-pilot2",
+        "workspace_path": "/storage/users/20002",
+        "development_profile": "STANDARD_8CPU_32GB",
+        "container_gpu": 0,
         "slurm_account": "company",
         "slurm_qos": "general",
         "ssh_key_record_ids": [str(uuid.uuid4())],
@@ -38,7 +41,17 @@ def activation_payload() -> dict[str, Any]:
         "expected_shell": "/usr/sbin/nologin",
         "expected_password_state": "LOCKED",
         "expected_gpu": "NONE",
+        "lease_id": str(uuid.uuid4()),
         "deployment_version": "f" * 40,
+    }
+
+
+def gpu_activation_payload() -> dict[str, Any]:
+    return {
+        **activation_payload(),
+        "development_profile": "GPU_1_8CPU_32GB",
+        "container_gpu": 1,
+        "expected_gpu": "SLURM_ALLOCATED_1",
     }
 
 
@@ -83,6 +96,11 @@ def test_self_activation_payload_is_closed_and_container_only() -> None:
         validate_payload("compute.activate.self", {**payload, "username": "root"})
     with pytest.raises(ValueError, match="ACTIVATION_PAYLOAD_REJECTED"):
         validate_payload("compute.activate.self", {**payload, "command": "docker start any"})
+
+    gpu_payload = gpu_activation_payload()
+    assert validate_payload("compute.activate.self", gpu_payload) == gpu_payload
+    with pytest.raises(ValueError, match="ACTIVATION_SECURITY_CONTRACT_REJECTED"):
+        validate_payload("compute.activate.self", {**gpu_payload, "container_gpu": 2})
 
 
 def test_activation_records_bind_owner_and_allow_legacy_metadata_without_username(
@@ -153,7 +171,11 @@ def test_one_click_activation_keeps_lease_not_started_until_postconditions_pass(
         fingerprints: list[str],
         starts_at: datetime | None,
         expires_at: datetime | None,
+        gpu_allocation_job_id: int | None = None,
+        gpu_allocation_uuid: str | None = None,
     ) -> None:
+        assert gpu_allocation_job_id is None
+        assert gpu_allocation_uuid is None
         nonlocal active_starts_at
         nonlocal active_expires_at
         events.append((f"write-{status}", (starts_at, expires_at, list(fingerprints))))
@@ -210,6 +232,107 @@ def test_one_click_activation_keeps_lease_not_started_until_postconditions_pass(
         ("write-ACTIVE", (active_starts_at, active_expires_at, fingerprints)),
         ("active-postcondition", None),
     ]
+
+
+def test_gpu_activation_obtains_one_owner_bound_allocation_before_container_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = gpu_activation_payload()
+    fingerprints = list(payload["ssh_key_fingerprints"])
+    gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
+    lifecycle: dict[str, str] = {"STATUS": "STAGED"}
+    events: list[tuple[str, Any]] = []
+    active_starts_at: datetime | None = None
+    active_expires_at: datetime | None = None
+
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {
+            **script_integrity_pass(),
+            "h100-container-gpu-runtime": {"integrity_ok": True},
+        },
+    )
+    monkeypatch.setattr(handlers, "_activation_runtime_binding", lambda _payload: None)
+    monkeypatch.setattr(
+        handlers,
+        "_activation_records",
+        lambda _payload: ([{"record_id": payload["ssh_key_record_ids"][0]}], fingerprints),
+    )
+    monkeypatch.setattr(
+        handlers, "_read_managed_lifecycle_state", lambda _username: dict(lifecycle)
+    )
+    monkeypatch.setattr(handlers, "_activation_staged_lifecycle", lambda _payload: {})
+    monkeypatch.setattr(handlers, "_compute_stage_postconditions", lambda _payload: {})
+    monkeypatch.setattr(handlers, "_install_activation_keys", lambda *_args: True)
+    monkeypatch.setattr(handlers, "_activation_container_running", lambda _payload: False)
+
+    def security(bound_payload, *, require_running, expected_fingerprints):  # type: ignore[no-untyped-def]
+        assert expected_fingerprints == fingerprints
+        events.append(("security", require_running))
+        if require_running:
+            assert bound_payload["gpu_allocation_job_id"] == 701
+            assert bound_payload["gpu_allocation_uuid"] == gpu_uuid
+        return {}
+
+    monkeypatch.setattr(handlers, "_activation_container_security", security)
+
+    def write_state(
+        _payload: dict[str, Any],
+        *,
+        status: str,
+        fingerprints: list[str],
+        starts_at: datetime | None,
+        expires_at: datetime | None,
+        gpu_allocation_job_id: int | None = None,
+        gpu_allocation_uuid: str | None = None,
+    ) -> None:
+        nonlocal active_starts_at, active_expires_at
+        lifecycle.update(
+            {
+                "STATUS": status,
+                "GPU_ALLOCATION_JOB_ID": str(gpu_allocation_job_id or ""),
+                "GPU_ALLOCATION_UUID": gpu_allocation_uuid or "",
+            }
+        )
+        active_starts_at = starts_at if status == "ACTIVE" else active_starts_at
+        active_expires_at = expires_at if status == "ACTIVE" else active_expires_at
+        events.append(("state", (status, gpu_allocation_job_id, gpu_allocation_uuid)))
+
+    monkeypatch.setattr(handlers, "_write_activation_lifecycle_state", write_state)
+    monkeypatch.setattr(
+        handlers,
+        "_submit_gpu_development_allocation",
+        lambda bound_payload: (
+            events.append(("allocation", bound_payload["lease_expires_at"])) or (701, gpu_uuid)
+        ),
+    )
+
+    def run_script(argv: list[str], **_kwargs: Any) -> dict[str, bool]:
+        events.append((Path(argv[0]).name, argv[1:]))
+        return {"ok": True}
+
+    monkeypatch.setattr(handlers, "run_allowlisted_script", run_script)
+
+    def active_lifecycle(
+        _payload: dict[str, Any], _fingerprints: list[str]
+    ) -> tuple[dict[str, str], datetime, datetime]:
+        assert active_starts_at is not None and active_expires_at is not None
+        return lifecycle, active_starts_at, active_expires_at
+
+    monkeypatch.setattr(handlers, "_activation_active_lifecycle", active_lifecycle)
+    result = handlers.handle(worker_request(payload))
+
+    assert result["status"] == "SUCCEEDED"
+    assert result["container_gpu"] == "SLURM_ALLOCATED_1"
+    assert result["gpu_allocation_job_id"] == 701
+    assert result["gpu_allocation_uuid"] == gpu_uuid
+    allocation_index = next(i for i, event in enumerate(events) if event[0] == "allocation")
+    start_index = next(
+        i for i, event in enumerate(events) if event[0] == "h100-container-gpu-runtime"
+    )
+    assert allocation_index < start_index
+    assert events[start_index][1] == ["start", "origin-pilot2", "701", gpu_uuid]
 
 
 def test_container_start_failure_rolls_back_without_active_lease(

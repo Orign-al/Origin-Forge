@@ -26,10 +26,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from h100_portal_contracts.workspace import (
+    CPU_DEVELOPMENT_PROFILE,
+    GPU_DEVELOPMENT_PROFILE,
     WORKSPACE_QUOTA_BYTES,
     WORKSPACE_REQUIRED_DIRECTORIES,
     WorkspaceBinding,
     workspace_binding,
+    workspace_path,
 )
 
 from h100_portal_worker.local_image import DEPLOYMENT_VERSION_PATH, local_image_contract
@@ -92,6 +95,8 @@ SCRIPT_ALLOWLIST = {
     "h100-user-gpu-isolation": "/usr/local/sbin/h100-user-gpu-isolation",
     "h100-container-create": "/usr/local/sbin/h100-container-create",
     "h100-container-start": "/usr/local/sbin/h100-container-start",
+    "h100-container-gpu-runtime": "/usr/local/sbin/h100-container-gpu-runtime",
+    "h100-gpu-development-epilog": "/usr/local/sbin/h100-gpu-development-epilog",
     "h100-container-stop": "/usr/local/sbin/h100-container-stop",
     "h100-container-rebuild": "/usr/local/sbin/h100-container-rebuild",
     "h100-container-delete": "/usr/local/sbin/h100-container-delete",
@@ -224,6 +229,7 @@ COMPUTE_STAGE_ARGV_BINDINGS = (
     ("COMPUTE_REQUEST_ID", "payload", "request_id"),
     ("PROVISION_PLAN_ID", "payload", "plan_id"),
     ("DRY_RUN_OPERATION_ID", "payload", "dry_run_operation_id"),
+    ("DEVELOPMENT_PROFILE", "payload", "container_profile"),
     ("EXPLICIT_STAGE_CONFIRMATION_FLAG", "literal", "--confirm-stage"),
     ("CONFIRMED_TARGET_USERNAME", "payload", "username"),
 )
@@ -232,6 +238,7 @@ ACTIVATE_REQUIRED_SCRIPTS = frozenset(
         "h100-user-create",
         "h100-user-gpu-isolation",
         "h100-container-start",
+        "h100-container-gpu-runtime",
         "h100-container-stop",
         "h100-gpu-bypass-guard",
     }
@@ -859,7 +866,15 @@ def containers_inspect(payload: dict[str, Any]) -> dict[str, Any]:
     labels: dict[str, Any] = labels_value if isinstance(labels_value, dict) else {}
     safe_labels = {
         key: str(labels[key])[:255]
-        for key in ("h100.dev.user", "h100.base.digest", "org.opencontainers.image.version")
+        for key in (
+            "h100.dev.user",
+            "h100.dev.uid",
+            "h100.dev.gid",
+            "h100.base.digest",
+            "h100.dev.gpu-allocation-job",
+            "h100.dev.gpu-uuid",
+            "org.opencontainers.image.version",
+        )
         if key in labels
     }
     nano_cpus = host_config.get("NanoCpus")
@@ -878,6 +893,17 @@ def containers_inspect(payload: dict[str, Any]) -> dict[str, Any]:
         for mount in mounts
     )
     device_requests = host_config.get("DeviceRequests")
+    devices = host_config.get("Devices")
+    device_cgroup_rules = host_config.get("DeviceCgroupRules")
+    raw_environment = config.get("Env")
+    environment: list[Any] = raw_environment if isinstance(raw_environment, list) else []
+    safe_environment = {
+        key: value
+        for item in environment
+        if isinstance(item, str)
+        for key, separator, value in (item.partition("="),)
+        if separator and key in {"CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES"}
+    }
     return {
         "status": "OK",
         "container": {
@@ -902,6 +928,12 @@ def containers_inspect(payload: dict[str, Any]) -> dict[str, Any]:
             "ipc_mode": host_config.get("IpcMode"),
             "mounts": mounts,
             "device_requests": device_requests,
+            "devices": devices,
+            "device_cgroup_rules": device_cgroup_rules,
+            "cap_add": host_config.get("CapAdd"),
+            "runtime": host_config.get("Runtime"),
+            "runtime_user": config.get("User"),
+            "safe_environment": safe_environment,
             "gpu": "NONE" if not device_requests else "REQUESTED",
             "docker_socket_mounted": docker_socket,
             "restart_policy": host_config.get("RestartPolicy"),
@@ -2956,12 +2988,12 @@ def _compute_stage_contract(
     ]
     shape_valid = len(argv) == len(COMPUTE_STAGE_ARGV_BINDINGS)
     bindings_valid = shape_valid and argv == expected_argv
-    argument_13_valid = shape_valid and argv[13] == "--confirm-stage"
+    argument_14_valid = shape_valid and argv[14] == "--confirm-stage"
     username = str(payload["username"])
-    argument_14_valid = (
-        shape_valid and argv[2] == username and argv[14] == username and argv[2] == argv[14]
+    argument_15_valid = (
+        shape_valid and argv[2] == username and argv[15] == username and argv[2] == argv[15]
     )
-    confirmation_valid = argument_13_valid and argument_14_valid
+    confirmation_valid = argument_14_valid and argument_15_valid
     image_contract = (
         _standard_dev_image_identity() if image_identity is None else dict(image_identity)
     )
@@ -3013,9 +3045,9 @@ def _compute_stage_contract(
             "rules": [
                 "ARGV_LENGTH_EQUALS_CONTRACT",
                 "ARGV_VALUES_EQUAL_DECLARED_BINDINGS",
-                "SHELL_ARGUMENT_13_EQUALS_CONFIRMATION_FLAG",
-                "SHELL_ARGUMENT_14_EQUALS_TARGET_USERNAME",
-                "SHELL_ARGUMENT_2_EQUALS_ARGUMENT_14",
+                "SHELL_ARGUMENT_14_EQUALS_CONFIRMATION_FLAG",
+                "SHELL_ARGUMENT_15_EQUALS_TARGET_USERNAME",
+                "SHELL_ARGUMENT_2_EQUALS_ARGUMENT_15",
             ],
         }
     )
@@ -3059,15 +3091,15 @@ def _compute_stage_contract(
             "multi_digit_position_status": (
                 "PASS" if shape_valid and bindings_valid and confirmation_valid else "FAIL"
             ),
-            "argument_13": {
-                "index": 13,
-                "semantic_role": "EXPLICIT_STAGE_CONFIRMATION_FLAG",
-                "binding_status": "VALID" if argument_13_valid else "INVALID",
-            },
             "argument_14": {
                 "index": 14,
-                "semantic_role": "CONFIRMED_TARGET_USERNAME",
+                "semantic_role": "EXPLICIT_STAGE_CONFIRMATION_FLAG",
                 "binding_status": "VALID" if argument_14_valid else "INVALID",
+            },
+            "argument_15": {
+                "index": 15,
+                "semantic_role": "CONFIRMED_TARGET_USERNAME",
+                "binding_status": "VALID" if argument_15_valid else "INVALID",
             },
         },
         "confirmation_gate": {
@@ -3111,10 +3143,11 @@ def _compute_provision_dry_run(
                 "真实 Provision gate 意外开启",
             ),
             _check(
-                "container_gpu_none",
-                payload["container_gpu"] == 0,
-                "标准开发容器 GPU=NONE",
-                "开发容器不得配置 GPU",
+                "container_profile_gpu_contract",
+                payload["container_gpu"]
+                == (1 if payload["container_profile"] == GPU_DEVELOPMENT_PROFILE else 0),
+                "开发容器配置与固定 CPU/GPU Profile 一致",
+                "开发容器 Profile 与 GPU 计数不一致",
             ),
             _check(
                 "stage_handler_contract",
@@ -3125,8 +3158,8 @@ def _compute_provision_dry_run(
             _check(
                 "explicit_stage_confirmation_gate",
                 stage_contract["confirmation_gate"]["status"] == "PASS",
-                "Stage argument 13/14 显式确认绑定有效",
-                "Stage argument 13/14 显式确认绑定无效",
+                "Stage argument 14/15 显式确认绑定有效",
+                "Stage argument 14/15 显式确认绑定无效",
             ),
         ]
     )
@@ -3170,7 +3203,7 @@ def _compute_stage_state(payload: dict[str, Any]) -> dict[str, str]:
         if separator and re.fullmatch(r"[A-Z0-9_]{1,32}", key):
             values[key] = value[:256]
     expected = {
-        "VERSION": "3",
+        "VERSION": "4",
         "STATUS": "STAGED",
         "USERNAME": str(payload["username"]),
         "UID": str(payload["uid"]),
@@ -3183,6 +3216,10 @@ def _compute_stage_state(payload: dict[str, Any]) -> dict[str, str]:
         "REQUEST_ID": str(payload["request_id"]),
         "PLAN_ID": str(payload["plan_id"]),
         "DRY_RUN_OPERATION_ID": str(payload["dry_run_operation_id"]),
+        "DEVELOPMENT_PROFILE": str(
+            payload.get("container_profile") or payload.get("development_profile")
+        ),
+        "WORKSPACE_PATH": str(workspace_path(int(payload["uid"]))),
         "SSH_KEY_STATE": "REQUIRED_BEFORE_ACTIVATION",
         "LEASE_STATE": "NOT_STARTED",
         "LEASE_START": "",
@@ -3305,7 +3342,44 @@ def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
         )
 
     user_root = PILOT_DATA_ROOT / username
-    if f"{payload['project_id']}:{user_root}" not in _safe_file_lines(
+    workspace = Path(workspace_path(int(payload["uid"])))
+    required_workspace_directories = (
+        "projects",
+        "datasets",
+        "outputs",
+        ".portal",
+        ".portal/job-scripts",
+        ".portal/jobs",
+    )
+    try:
+        workspace_metadata = workspace.lstat()
+        directory_metadata = [
+            (workspace / relative).lstat() for relative in required_workspace_directories
+        ]
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED", "canonical workspace is incomplete"
+        ) from exc
+    if (
+        not stat.S_ISDIR(workspace_metadata.st_mode)
+        or stat.S_ISLNK(workspace_metadata.st_mode)
+        or workspace_metadata.st_uid != int(payload["uid"])
+        or workspace_metadata.st_gid != int(payload["gid"])
+        or stat.S_IMODE(workspace_metadata.st_mode) != 0o700
+        or any(
+            not stat.S_ISDIR(item.st_mode)
+            or stat.S_ISLNK(item.st_mode)
+            or item.st_uid != int(payload["uid"])
+            or item.st_gid != int(payload["gid"])
+            or stat.S_IMODE(item.st_mode) != 0o700
+            for item in directory_metadata
+        )
+    ):
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED",
+            "canonical workspace ownership or mode is invalid",
+        )
+    if f"{payload['project_id']}:{workspace}" not in _safe_file_lines(
         PROJECTS_FILE
     ) or f"h100_{username}:{payload['project_id']}" not in _safe_file_lines(PROJID_FILE):
         raise LifecycleValidationError(
@@ -3353,8 +3427,7 @@ def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
     mounts = container.get("mounts", []) if isinstance(container, dict) else []
     expected_sources = {
         str(user_root / "home"),
-        str(user_root / "workspace"),
-        str(user_root / "shared"),
+        str(workspace),
         f"/srv/gpu-platform/container-data/{username}/ssh-host-keys",
     }
     observed_sources = {str(item.get("Source", "")) for item in mounts if isinstance(item, dict)}
@@ -3410,7 +3483,9 @@ def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
             "cuda_context_probe": "DENIED",
         },
         "quota": quota,
-        "storage_path": str(user_root),
+        "storage_path": str(workspace),
+        "container_workspace": "/workspace",
+        "default_job_workdir": str(workspace / "projects"),
         "slurm": {
             "account": payload["slurm_account"],
             "qos": payload["slurm_qos"],
@@ -3421,6 +3496,9 @@ def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
             "name": payload["container_name"],
             "state": "STOPPED",
             "gpu": "NONE",
+            "development_profile": (
+                payload.get("container_profile") or payload.get("development_profile")
+            ),
             "ssh_port": payload["ssh_port"],
             "image_digest": container.get("image_digest") or container.get("image_id"),
         },
@@ -3442,6 +3520,7 @@ def _compute_stage_retained_resources(payload: dict[str, Any]) -> list[str]:
     for label, path in {
         "host-home": MANAGED_HOME_ROOT / username,
         "managed-data": PILOT_DATA_ROOT / username,
+        "managed-workspace": Path(workspace_path(int(payload["uid"]))),
         "container-data": Path("/srv/gpu-platform/container-data") / username,
         "container-config": PILOT_COMPOSE_ROOT / username,
         "lifecycle-state": PILOT_STATE_ROOT / f"{username}.state",
@@ -3637,13 +3716,13 @@ def _compute_stage_contract_mismatches(
             expected.get("argv_contract", {}).get("sha256"),
             current.get("argv_contract", {}).get("sha256"),
         ),
-        "ARGUMENT_13_BINDING": (
-            expected.get("argv_contract", {}).get("argument_13", {}).get("binding_status"),
-            current.get("argv_contract", {}).get("argument_13", {}).get("binding_status"),
-        ),
         "ARGUMENT_14_BINDING": (
             expected.get("argv_contract", {}).get("argument_14", {}).get("binding_status"),
             current.get("argv_contract", {}).get("argument_14", {}).get("binding_status"),
+        ),
+        "ARGUMENT_15_BINDING": (
+            expected.get("argv_contract", {}).get("argument_15", {}).get("binding_status"),
+            current.get("argv_contract", {}).get("argument_15", {}).get("binding_status"),
         ),
         "CONFIRMATION_VALIDATOR_VERSION": (
             expected.get("confirmation_gate", {}).get("validator_version"),
@@ -4131,7 +4210,7 @@ def _user_plan(requested_username: str) -> dict[str, Any]:
             }
         )
 
-    data_path = f"/srv/gpu-platform/users/{PILOT_USERNAME}"
+    data_path = str(workspace_path(uid)) if uid is not None else None
     compose_path = f"/srv/gpu-platform/platform/config/dev-containers/{PILOT_USERNAME}/compose.yml"
     plan_ready = (
         not conflicts and uid is not None and project_id is not None and ssh_port is not None
@@ -5081,7 +5160,7 @@ def _verify_managed_container_start_preconditions(payload: dict[str, Any]) -> di
     mounts = container.get("mounts", []) if isinstance(container, dict) else []
     expected_mounts = {
         (str(PILOT_DATA_ROOT / username / "home"), f"/home/{username}"),
-        (str(PILOT_DATA_ROOT / username / "workspace"), "/workspace"),
+        (str(workspace_path(uid)), "/workspace"),
         (str(PILOT_DATA_ROOT / username / "shared"), "/shared"),
         (
             f"/srv/gpu-platform/container-data/{username}/ssh-host-keys",
@@ -5246,7 +5325,7 @@ def _activation_runtime_binding(payload: dict[str, Any]) -> None:
 
 def _activation_lifecycle_common(payload: dict[str, Any]) -> dict[str, str]:
     return {
-        "VERSION": "3",
+        "VERSION": "4",
         "USERNAME": str(payload["username"]),
         "UID": str(payload["uid"]),
         "GID": str(payload["gid"]),
@@ -5258,6 +5337,11 @@ def _activation_lifecycle_common(payload: dict[str, Any]) -> dict[str, str]:
         "REQUEST_ID": str(payload["request_id"]),
         "PLAN_ID": str(payload["plan_id"]),
         "DRY_RUN_OPERATION_ID": str(payload["dry_run_operation_id"]),
+        "DEVELOPMENT_PROFILE": str(payload["development_profile"]),
+        "WORKSPACE_LAYOUT": "LEGACY_BIND_ALIAS",
+        "STORAGE_ROOT": str(PILOT_DATA_ROOT / str(payload["username"])),
+        "BACKING_WORKSPACE": str(PILOT_DATA_ROOT / str(payload["username"]) / "workspace"),
+        "WORKSPACE_PATH": str(payload["workspace_path"]),
     }
 
 
@@ -5302,6 +5386,7 @@ def _activation_in_progress_lifecycle(
         "SSH_KEY_STATE": "INSTALLED",
         "CONTAINER_KEY_FINGERPRINTS": ",".join(expected_fingerprints),
         "ACTIVATION_OPERATION_ID": str(payload["activation_operation_id"]),
+        "LEASE_ID": str(payload["lease_id"]),
         "LEASE_STATE": "NOT_STARTED",
         "LEASE_START": "",
         "LEASE_EXPIRES": "",
@@ -5311,6 +5396,24 @@ def _activation_in_progress_lifecycle(
         raise LifecycleValidationError(
             "ACTIVATION_STATE_CONFLICT",
             f"ACTIVATING lifecycle differs from this operation: {','.join(mismatches)}",
+        )
+    allocation_job_id = lifecycle.get("GPU_ALLOCATION_JOB_ID", "")
+    allocation_uuid = lifecycle.get("GPU_ALLOCATION_UUID", "")
+    if (not allocation_job_id) != (not allocation_uuid) or (
+        payload["development_profile"] == CPU_DEVELOPMENT_PROFILE
+        and (allocation_job_id or allocation_uuid)
+    ):
+        raise LifecycleValidationError(
+            "ACTIVATION_STATE_CONFLICT",
+            "ACTIVATING lifecycle GPU allocation binding is invalid",
+        )
+    if allocation_job_id and (
+        not allocation_job_id.isdigit()
+        or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", allocation_uuid) is None
+    ):
+        raise LifecycleValidationError(
+            "ACTIVATION_STATE_CONFLICT",
+            "ACTIVATING lifecycle GPU allocation coordinates are invalid",
         )
     return lifecycle
 
@@ -5339,6 +5442,7 @@ def _activation_active_lifecycle(
         "SSH_KEY_STATE": "INSTALLED",
         "CONTAINER_KEY_FINGERPRINTS": ",".join(expected_fingerprints),
         "ACTIVATION_OPERATION_ID": str(payload["activation_operation_id"]),
+        "LEASE_ID": str(payload["lease_id"]),
         "LEASE_STATE": "ACTIVE",
     }
     mismatches = sorted(key for key, value in expected.items() if lifecycle.get(key) != value)
@@ -5349,12 +5453,27 @@ def _activation_active_lifecycle(
         )
     starts_at = _activation_timestamp(lifecycle.get("LEASE_START", ""), "Lease start")
     expires_at = _activation_timestamp(lifecycle.get("LEASE_EXPIRES", ""), "Lease expiry")
-    if expires_at - starts_at != timedelta(
-        seconds=STANDARD_COMPUTE_LEASE_SECONDS
-    ) or expires_at <= datetime.now(UTC):
+    if (
+        expires_at - starts_at != timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS)
+        or starts_at > datetime.now(UTC)
+        or expires_at <= datetime.now(UTC)
+    ):
         raise LifecycleValidationError(
             "ACTIVATION_LEASE_STATE_REJECTED",
             "managed lifecycle does not contain one current 96-hour Lease",
+        )
+    allocation_job_id = lifecycle.get("GPU_ALLOCATION_JOB_ID", "")
+    allocation_uuid = lifecycle.get("GPU_ALLOCATION_UUID", "")
+    gpu_profile = payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
+    if gpu_profile != bool(allocation_job_id and allocation_uuid) or (
+        allocation_job_id
+        and (
+            not allocation_job_id.isdigit()
+            or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", allocation_uuid) is None
+        )
+    ):
+        raise LifecycleValidationError(
+            "ACTIVATION_STATE_CONFLICT", "ACTIVE lifecycle GPU allocation binding is invalid"
         )
     return lifecycle, starts_at, expires_at
 
@@ -5398,6 +5517,8 @@ def _write_activation_lifecycle_state(
     fingerprints: list[str],
     starts_at: datetime | None,
     expires_at: datetime | None,
+    gpu_allocation_job_id: int | None = None,
+    gpu_allocation_uuid: str | None = None,
 ) -> None:
     has_lease = starts_at is not None and expires_at is not None
     if (
@@ -5408,16 +5529,28 @@ def _write_activation_lifecycle_state(
         raise LifecycleValidationError(
             "ACTIVATION_STATE_WRITE_FAILED", "managed lifecycle transition is invalid"
         )
-    values = {"VERSION": "3", "STATUS": status, **_activation_lifecycle_common(payload)}
+    if (gpu_allocation_job_id is None) != (gpu_allocation_uuid is None) or (
+        gpu_allocation_job_id is not None
+        and payload["development_profile"] != GPU_DEVELOPMENT_PROFILE
+    ):
+        raise LifecycleValidationError(
+            "ACTIVATION_STATE_WRITE_FAILED", "GPU allocation transition is invalid"
+        )
+    values = {"VERSION": "4", "STATUS": status, **_activation_lifecycle_common(payload)}
     if status in {"ACTIVATING", "ACTIVE"}:
         values.update(
             {
                 "SSH_KEY_STATE": "INSTALLED",
                 "CONTAINER_KEY_FINGERPRINTS": ",".join(fingerprints),
                 "ACTIVATION_OPERATION_ID": str(payload["activation_operation_id"]),
+                "LEASE_ID": str(payload["lease_id"]),
                 "LEASE_STATE": "ACTIVE" if status == "ACTIVE" else "NOT_STARTED",
                 "LEASE_START": starts_at.astimezone(UTC).isoformat() if starts_at else "",
                 "LEASE_EXPIRES": expires_at.astimezone(UTC).isoformat() if expires_at else "",
+                "GPU_ALLOCATION_JOB_ID": (
+                    str(gpu_allocation_job_id) if gpu_allocation_job_id is not None else ""
+                ),
+                "GPU_ALLOCATION_UUID": gpu_allocation_uuid or "",
             }
         )
     else:
@@ -5427,6 +5560,8 @@ def _write_activation_lifecycle_state(
                 "LEASE_STATE": "NOT_STARTED",
                 "LEASE_START": "",
                 "LEASE_EXPIRES": "",
+                "GPU_ALLOCATION_JOB_ID": "",
+                "GPU_ALLOCATION_UUID": "",
             }
         )
     content = "".join(f"{key}={value}\n" for key, value in values.items()).encode("ascii")
@@ -5468,6 +5603,526 @@ def _write_activation_lifecycle_state(
         with suppress(FileNotFoundError, OSError):
             os.unlink(temporary, dir_fd=directory)
         os.close(directory)
+
+
+def _commit_managed_lifecycle_values(username: str, values: dict[str, str]) -> None:
+    """Atomically replace one validated root-owned managed lifecycle record."""
+
+    if (
+        re.fullmatch(r"[a-z][a-z0-9-]{0,31}", username) is None
+        or username in {"root", "origin-al", "codexops", "nobody"}
+        or values.get("USERNAME") != username
+        or not values
+        or any(
+            re.fullmatch(r"[A-Z0-9_]{1,32}", key) is None
+            or not isinstance(value, str)
+            or len(value) > 256
+            or "\n" in value
+            or "\r" in value
+            or not value.isascii()
+            for key, value in values.items()
+        )
+    ):
+        raise LifecycleValidationError(
+            "LIFECYCLE_STATE_WRITE_REJECTED",
+            "managed lifecycle replacement contains invalid fields",
+        )
+    content = "".join(f"{key}={value}\n" for key, value in values.items()).encode("ascii")
+    if not 0 < len(content) <= 16 * 1024:
+        raise LifecycleValidationError(
+            "LIFECYCLE_STATE_WRITE_REJECTED", "managed lifecycle replacement is too large"
+        )
+    try:
+        directory, group_gid = _open_activation_state_directory()
+    except LifecycleValidationError as exc:
+        raise LifecycleValidationError(
+            "LIFECYCLE_STATE_WRITE_FAILED", "managed lifecycle directory is unavailable"
+        ) from exc
+    temporary = f".{username}.lifecycle.{secrets.token_hex(8)}.tmp"
+    descriptor: int | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o640, dir_fd=directory)
+        os.fchmod(descriptor, 0o640)
+        os.fchown(descriptor, 0, group_gid)
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError("short lifecycle state write")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary,
+            f"{username}.state",
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+        )
+        os.fsync(directory)
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "LIFECYCLE_STATE_WRITE_FAILED", "managed lifecycle state could not be committed"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        with suppress(FileNotFoundError, OSError):
+            os.unlink(temporary, dir_fd=directory)
+        os.close(directory)
+
+
+def _validate_resource_lifecycle_binding(
+    lifecycle: dict[str, str],
+    payload: dict[str, Any],
+    fingerprints: list[str],
+) -> None:
+    version = lifecycle.get("VERSION")
+    expected = {
+        "USERNAME": str(payload["username"]),
+        "UID": str(payload["uid"]),
+        "GID": str(payload["gid"]),
+        "SLURM_ACCOUNT": str(payload["slurm_account"]),
+        "SLURM_QOS": str(payload["slurm_qos"]),
+        "CONTAINER_KEY_FINGERPRINTS": ",".join(fingerprints),
+    }
+    mismatches = sorted(key for key, value in expected.items() if lifecycle.get(key) != value)
+    if version not in {"3", "4"} or mismatches:
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_BINDING_REJECTED",
+            "managed lifecycle does not match the owner-bound resource",
+        )
+    if version == "3":
+        if payload["development_profile"] != CPU_DEVELOPMENT_PROFILE:
+            raise LifecycleValidationError(
+                "RESOURCE_LIFECYCLE_BINDING_REJECTED",
+                "legacy lifecycle state cannot authorize a GPU development profile",
+            )
+        return
+    version_four = {
+        "DEVELOPMENT_PROFILE": str(payload["development_profile"]),
+        "WORKSPACE_LAYOUT": "LEGACY_BIND_ALIAS",
+        "STORAGE_ROOT": str(PILOT_DATA_ROOT / str(payload["username"])),
+        "BACKING_WORKSPACE": str(PILOT_DATA_ROOT / str(payload["username"]) / "workspace"),
+        "WORKSPACE_PATH": str(payload["workspace_path"]),
+    }
+    if any(lifecycle.get(key) != value for key, value in version_four.items()):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_BINDING_REJECTED",
+            "managed lifecycle workspace or development profile binding changed",
+        )
+
+
+def _resource_lifecycle_timestamp(value: str, field: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED", f"managed lifecycle {field} is invalid"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            f"managed lifecycle {field} lacks a timezone",
+        )
+    return parsed.astimezone(UTC)
+
+
+def _restored_lease_window(payload: dict[str, Any]) -> tuple[datetime, datetime]:
+    starts_at = _resource_lifecycle_timestamp(str(payload["lease_starts_at"]), "Lease start")
+    expires_at = _resource_lifecycle_timestamp(str(payload["lease_expires_at"]), "Lease expiry")
+    duration = expires_at - starts_at
+    now = datetime.now(UTC)
+    if (
+        not timedelta(seconds=1) <= duration <= timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS)
+        or starts_at > now + timedelta(seconds=30)
+        or expires_at <= now
+    ):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            "restore does not carry one current bounded Lease",
+        )
+    return starts_at, expires_at
+
+
+def _lifecycle_fingerprints(lifecycle: dict[str, str]) -> list[str]:
+    raw = lifecycle.get("CONTAINER_KEY_FINGERPRINTS", "")
+    fingerprints = raw.split(",") if raw else []
+    if (
+        not 1 <= len(fingerprints) <= 5
+        or len(set(fingerprints)) != len(fingerprints)
+        or any(re.fullmatch(r"SHA256:[A-Za-z0-9+/]+", item) is None for item in fingerprints)
+    ):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            "managed lifecycle Container key binding is invalid",
+        )
+    return fingerprints
+
+
+def _active_container_lease_window(payload: dict[str, Any]) -> tuple[datetime, datetime]:
+    starts_at = _resource_lifecycle_timestamp(str(payload["lease_starts_at"]), "Lease start")
+    expires_at = _resource_lifecycle_timestamp(str(payload["lease_expires_at"]), "Lease expiry")
+    now = datetime.now(UTC)
+    if (
+        not timedelta(seconds=1)
+        <= expires_at - starts_at
+        <= timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS)
+        or starts_at > now
+        or expires_at <= now
+    ):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            "container action does not carry one current bounded Lease",
+        )
+    return starts_at, expires_at
+
+
+def _bind_active_container_lifecycle(
+    payload: dict[str, Any],
+    *,
+    gpu_allocation_job_id: int | None,
+    gpu_allocation_uuid: str | None,
+) -> None:
+    """Atomically bind one start/restart to the current Lease and GPU allocation."""
+
+    lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+    _validate_resource_lifecycle_binding(lifecycle, payload, _lifecycle_fingerprints(lifecycle))
+    if (
+        lifecycle.get("STATUS") != "ACTIVE"
+        or lifecycle.get("SSH_KEY_STATE") != "INSTALLED"
+        or lifecycle.get("LEASE_STATE") != "ACTIVE"
+    ):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            "managed lifecycle is not active for a container start",
+        )
+    current_start = _resource_lifecycle_timestamp(
+        lifecycle.get("LEASE_START", ""), "current Lease start"
+    )
+    current_expiry = _resource_lifecycle_timestamp(
+        lifecycle.get("LEASE_EXPIRES", ""), "current Lease expiry"
+    )
+    if (
+        not timedelta(seconds=1)
+        <= current_expiry - current_start
+        <= timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS)
+    ):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            "managed lifecycle current Lease window is invalid",
+        )
+    starts_at, expires_at = _active_container_lease_window(payload)
+    lease_id = str(payload["lease_id"])
+    current_lease_id = lifecycle.get("LEASE_ID", "")
+    same_window = current_start == starts_at and current_expiry == expires_at
+    successor_window = current_expiry <= datetime.now(UTC) and starts_at == current_expiry
+    if current_lease_id == lease_id:
+        lease_transition_valid = same_window
+    elif current_lease_id:
+        lease_transition_valid = successor_window
+    else:
+        # VERSION=3 production records predate LEASE_ID.  They may be bound
+        # only to their identical current window or to its contiguous successor.
+        lease_transition_valid = same_window or successor_window
+    if not lease_transition_valid:
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            "container action Lease does not match the managed lifecycle",
+        )
+    gpu_profile = payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
+    if gpu_profile != bool(gpu_allocation_job_id is not None and gpu_allocation_uuid is not None):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            "container action GPU lifecycle binding is incomplete",
+        )
+    if gpu_allocation_job_id is not None and (
+        not 0 < gpu_allocation_job_id < 2**63
+        or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", str(gpu_allocation_uuid)) is None
+    ):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            "container action GPU lifecycle binding is invalid",
+        )
+    updated = dict(lifecycle)
+    updated.update(
+        {
+            "LEASE_ID": lease_id,
+            "LEASE_START": starts_at.isoformat(),
+            "LEASE_EXPIRES": expires_at.isoformat(),
+            "GPU_ALLOCATION_JOB_ID": (
+                str(gpu_allocation_job_id) if gpu_allocation_job_id is not None else ""
+            ),
+            "GPU_ALLOCATION_UUID": gpu_allocation_uuid or "",
+        }
+    )
+    if updated != lifecycle:
+        _commit_managed_lifecycle_values(str(payload["username"]), updated)
+
+
+def _clear_active_gpu_lifecycle_binding(
+    payload: dict[str, Any],
+    *,
+    expected_job_id: int,
+    expected_gpu_uuid: str,
+) -> None:
+    lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+    _validate_resource_lifecycle_binding(lifecycle, payload, _lifecycle_fingerprints(lifecycle))
+    observed_job_id = lifecycle.get("GPU_ALLOCATION_JOB_ID", "")
+    observed_uuid = lifecycle.get("GPU_ALLOCATION_UUID", "")
+    if (observed_job_id or observed_uuid) and (
+        observed_job_id != str(expected_job_id) or observed_uuid != expected_gpu_uuid
+    ):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            "managed lifecycle GPU allocation differs from the stopped container",
+        )
+    updated = dict(lifecycle)
+    updated.update({"GPU_ALLOCATION_JOB_ID": "", "GPU_ALLOCATION_UUID": ""})
+    if updated != lifecycle:
+        _commit_managed_lifecycle_values(str(payload["username"]), updated)
+
+
+def _activate_restored_lifecycle(
+    payload: dict[str, Any],
+    fingerprints: list[str],
+    *,
+    gpu_allocation_job_id: int | None,
+    gpu_allocation_uuid: str | None,
+) -> dict[str, str]:
+    """Bind the fixed start scripts to the new restore Lease before runtime start."""
+
+    lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+    _validate_resource_lifecycle_binding(lifecycle, payload, fingerprints)
+    status = lifecycle.get("STATUS")
+    ssh_state = lifecycle.get("SSH_KEY_STATE")
+    lease_state = lifecycle.get("LEASE_STATE")
+    legacy_expired = False
+    if status == "ACTIVE" and ssh_state == "INSTALLED" and lease_state == "ACTIVE":
+        prior_start = _resource_lifecycle_timestamp(
+            lifecycle.get("LEASE_START", ""), "prior Lease start"
+        )
+        prior_expiry = _resource_lifecycle_timestamp(
+            lifecycle.get("LEASE_EXPIRES", ""), "prior Lease expiry"
+        )
+        legacy_expired = timedelta(seconds=1) <= prior_expiry - prior_start <= timedelta(
+            seconds=STANDARD_COMPUTE_LEASE_SECONDS
+        ) and prior_expiry <= datetime.now(UTC)
+    recycled = (
+        status == "RECYCLED"
+        and ssh_state == "SUSPENDED_BY_RECYCLE"
+        and lease_state == "RECYCLE_BIN"
+    )
+    if not legacy_expired and not recycled:
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            "managed lifecycle is not a recoverable expired resource",
+        )
+    gpu_profile = payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
+    if gpu_profile != bool(gpu_allocation_job_id is not None and gpu_allocation_uuid is not None):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            "restore lifecycle GPU allocation binding is incomplete",
+        )
+    if gpu_allocation_job_id is not None and (
+        not 0 < gpu_allocation_job_id < 2**63
+        or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", str(gpu_allocation_uuid)) is None
+    ):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            "restore lifecycle GPU allocation binding is invalid",
+        )
+    starts_at, expires_at = _restored_lease_window(payload)
+    updated = dict(lifecycle)
+    updated.update(
+        {
+            "STATUS": "ACTIVE",
+            "SSH_KEY_STATE": "INSTALLED",
+            "LEASE_STATE": "ACTIVE",
+            "LEASE_ID": str(payload["lease_id"]),
+            "LEASE_START": starts_at.isoformat(),
+            "LEASE_EXPIRES": expires_at.isoformat(),
+            "RESTORE_REQUEST_ID": str(payload["restore_request_id"]),
+            "GPU_ALLOCATION_JOB_ID": (
+                str(gpu_allocation_job_id) if gpu_allocation_job_id is not None else ""
+            ),
+            "GPU_ALLOCATION_UUID": gpu_allocation_uuid or "",
+        }
+    )
+    _commit_managed_lifecycle_values(str(payload["username"]), updated)
+    return lifecycle
+
+
+def _validate_active_restored_lifecycle(
+    payload: dict[str, Any],
+    fingerprints: list[str],
+    *,
+    gpu_allocation_job_id: int | None,
+    gpu_allocation_uuid: str | None,
+) -> None:
+    lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+    _validate_resource_lifecycle_binding(lifecycle, payload, fingerprints)
+    starts_at, expires_at = _restored_lease_window(payload)
+    expected = {
+        "STATUS": "ACTIVE",
+        "SSH_KEY_STATE": "INSTALLED",
+        "LEASE_STATE": "ACTIVE",
+        "LEASE_ID": str(payload["lease_id"]),
+        "LEASE_START": starts_at.isoformat(),
+        "LEASE_EXPIRES": expires_at.isoformat(),
+        "RESTORE_REQUEST_ID": str(payload["restore_request_id"]),
+        "GPU_ALLOCATION_JOB_ID": (
+            str(gpu_allocation_job_id) if gpu_allocation_job_id is not None else ""
+        ),
+        "GPU_ALLOCATION_UUID": gpu_allocation_uuid or "",
+    }
+    if any(lifecycle.get(key) != value for key, value in expected.items()):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            "running restored resource is not bound to this Lease and request",
+        )
+
+
+def _restore_prior_lifecycle(payload: dict[str, Any], lifecycle: dict[str, str]) -> None:
+    _commit_managed_lifecycle_values(str(payload["username"]), lifecycle)
+
+
+def _mark_recycled_lifecycle(
+    payload: dict[str, Any], fingerprints: list[str], *, restore_rollback: bool = False
+) -> None:
+    lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+    _validate_resource_lifecycle_binding(lifecycle, payload, fingerprints)
+    status = lifecycle.get("STATUS")
+    target_lease_id = str(payload["recycle_lease_id"] if restore_rollback else payload["lease_id"])
+    target_expiry = _resource_lifecycle_timestamp(
+        str(payload["recycle_lease_expires_at"] if restore_rollback else payload["expires_at"]),
+        "recycled Lease expiry",
+    )
+    target_start = (
+        _resource_lifecycle_timestamp(
+            str(payload["recycle_lease_starts_at"]), "recycled Lease start"
+        )
+        if restore_rollback
+        else None
+    )
+    if target_expiry > datetime.now(UTC) or (
+        target_start is not None
+        and not timedelta(seconds=1)
+        <= target_expiry - target_start
+        <= timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS)
+    ):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED", "recycled Lease window is invalid"
+        )
+    lifecycle_expiry = _resource_lifecycle_timestamp(
+        lifecycle.get("LEASE_EXPIRES", ""), "recorded Lease expiry"
+    )
+    if status == "ACTIVE":
+        starts_at = _resource_lifecycle_timestamp(
+            lifecycle.get("LEASE_START", ""), "recorded Lease start"
+        )
+        expected_active_id = str(
+            payload["attempted_lease_id"] if restore_rollback else payload["lease_id"]
+        )
+        expected_active_start = (
+            _resource_lifecycle_timestamp(
+                str(payload["attempted_lease_starts_at"]), "attempted Lease start"
+            )
+            if restore_rollback
+            else starts_at
+        )
+        expected_active_expiry = (
+            _resource_lifecycle_timestamp(
+                str(payload["attempted_lease_expires_at"]), "attempted Lease expiry"
+            )
+            if restore_rollback
+            else target_expiry
+        )
+        if (
+            lifecycle.get("SSH_KEY_STATE") != "INSTALLED"
+            or lifecycle.get("LEASE_STATE") != "ACTIVE"
+            or starts_at != expected_active_start
+            or lifecycle_expiry != expected_active_expiry
+            or not timedelta(seconds=1)
+            <= lifecycle_expiry - starts_at
+            <= timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS)
+            or (
+                (restore_rollback or lifecycle.get("VERSION") == "4")
+                and lifecycle.get("LEASE_ID") != expected_active_id
+            )
+            or (
+                restore_rollback
+                and lifecycle.get("RESTORE_REQUEST_ID") != str(payload["restore_request_id"])
+            )
+        ):
+            raise LifecycleValidationError(
+                "RESOURCE_LIFECYCLE_STATE_REJECTED",
+                "recycle request is not bound to the current active Lease",
+            )
+        expected_job_id = payload.get("gpu_allocation_job_id")
+        expected_uuid = payload.get("gpu_allocation_uuid")
+        if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE:
+            if (
+                not isinstance(expected_job_id, int)
+                or not isinstance(expected_uuid, str)
+                or lifecycle.get("GPU_ALLOCATION_JOB_ID") != str(expected_job_id)
+                or lifecycle.get("GPU_ALLOCATION_UUID") != expected_uuid
+            ):
+                raise LifecycleValidationError(
+                    "RESOURCE_LIFECYCLE_STATE_REJECTED",
+                    "recycle request does not match the active GPU allocation",
+                )
+        elif lifecycle.get("VERSION") == "4" and (
+            lifecycle.get("GPU_ALLOCATION_JOB_ID") or lifecycle.get("GPU_ALLOCATION_UUID")
+        ):
+            raise LifecycleValidationError(
+                "RESOURCE_LIFECYCLE_STATE_REJECTED",
+                "CPU development lifecycle unexpectedly contains a GPU allocation",
+            )
+    elif status == "RECYCLED":
+        if (
+            lifecycle.get("SSH_KEY_STATE") != "SUSPENDED_BY_RECYCLE"
+            or lifecycle.get("LEASE_STATE") != "RECYCLE_BIN"
+            or lifecycle.get("LEASE_ID") != target_lease_id
+            or lifecycle_expiry != target_expiry
+            or (
+                target_start is not None
+                and _resource_lifecycle_timestamp(
+                    lifecycle.get("LEASE_START", ""), "recorded recycled Lease start"
+                )
+                != target_start
+            )
+            or lifecycle.get("GPU_ALLOCATION_JOB_ID")
+            or lifecycle.get("GPU_ALLOCATION_UUID")
+        ):
+            raise LifecycleValidationError(
+                "RESOURCE_LIFECYCLE_STATE_REJECTED",
+                "recycled lifecycle does not match this Lease",
+            )
+    else:
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED",
+            "managed lifecycle cannot transition to the recycle bin",
+        )
+    updated = dict(lifecycle)
+    updated.update(
+        {
+            "STATUS": "RECYCLED",
+            "SSH_KEY_STATE": "SUSPENDED_BY_RECYCLE",
+            "LEASE_STATE": "RECYCLE_BIN",
+            "LEASE_ID": target_lease_id,
+            "LEASE_EXPIRES": target_expiry.isoformat(),
+            "RESTORE_REQUEST_ID": "",
+            "GPU_ALLOCATION_JOB_ID": "",
+            "GPU_ALLOCATION_UUID": "",
+        }
+    )
+    if target_start is not None:
+        updated["LEASE_START"] = target_start.isoformat()
+    _commit_managed_lifecycle_values(str(payload["username"]), updated)
 
 
 def _activation_account_preflight(payload: dict[str, Any]) -> pwd.struct_passwd:
@@ -5648,15 +6303,16 @@ def _activation_container_security(
     expected_fingerprints: list[str] | None,
 ) -> dict[str, Any]:
     _activation_account_preflight(payload)
-    inspected = containers_inspect({"name": str(payload["container_name"])})
-    raw = inspected.get("container", {})
-    container: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    container = _managed_container_security(
+        {**payload, "name": str(payload["container_name"])},
+        require_running=require_running,
+    )
     state = container.get("state", {})
     mounts = container.get("mounts", [])
     username = str(payload["username"])
     expected_mounts = {
         (str(PILOT_DATA_ROOT / username / "home"), f"/home/{username}"),
-        (str(PILOT_DATA_ROOT / username / "workspace"), "/workspace"),
+        (str(payload["workspace_path"]), "/workspace"),
         (str(PILOT_DATA_ROOT / username / "shared"), "/shared"),
         (
             f"/srv/gpu-platform/container-data/{username}/ssh-host-keys",
@@ -5670,9 +6326,7 @@ def _activation_container_security(
     }
     health = state.get("Health", {}) if isinstance(state, dict) else {}
     if not (
-        inspected.get("status") == "OK"
-        and str(container.get("name", "")).lstrip("/") == payload["container_name"]
-        and container.get("owner") == username
+        str(container.get("name", "")).lstrip("/") == payload["container_name"]
         and container.get("cpu_limit") == 8.0
         and container.get("memory_limit_bytes") == 32 * 1024**3
         and container.get("pids_limit") == 4096
@@ -5682,7 +6336,12 @@ def _activation_container_security(
         and container.get("network_mode") != "host"
         and container.get("pid_mode") != "host"
         and container.get("ipc_mode") != "host"
-        and container.get("gpu") == "NONE"
+        and container.get("gpu")
+        == (
+            "REQUESTED"
+            if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE and require_running
+            else "NONE"
+        )
         and not container.get("docker_socket_mounted")
         and isinstance(mounts, list)
         and len(mounts) == len(expected_mounts)
@@ -5703,7 +6362,7 @@ def _activation_container_security(
     ):
         raise LifecycleValidationError(
             "ACTIVATION_CONTAINER_SECURITY_REJECTED",
-            "development Container differs from the fixed GPU-less security contract",
+            "development Container differs from the fixed profile security contract",
         )
     if expected_fingerprints is not None:
         installed = _installed_key_fingerprints(
@@ -5761,6 +6420,8 @@ def _activation_result(
     fingerprints: list[str],
     starts_at: datetime,
     expires_at: datetime,
+    gpu_allocation_job_id: int | None,
+    gpu_allocation_uuid: str | None,
     *,
     replay: bool,
 ) -> dict[str, Any]:
@@ -5774,7 +6435,9 @@ def _activation_result(
         "username": payload["username"],
         "container_name": payload["container_name"],
         "container_state": "RUNNING",
-        "container_gpu": "NONE",
+        "container_gpu": payload["expected_gpu"],
+        "gpu_allocation_job_id": gpu_allocation_job_id,
+        "gpu_allocation_uuid": gpu_allocation_uuid,
         "container_cpus": 8,
         "container_memory_gb": 32,
         "container_pids_limit": 4096,
@@ -5817,6 +6480,15 @@ def _rollback_self_activation(payload: dict[str, Any], fingerprints: list[str]) 
             "ACTIVATION_ROLLBACK_STATE_UNKNOWN",
             "managed lifecycle is neither the bound STAGED, ACTIVATING, nor ACTIVE state",
         )
+    raw_allocation_job_id = lifecycle.get("GPU_ALLOCATION_JOB_ID", "")
+    raw_allocation_uuid = lifecycle.get("GPU_ALLOCATION_UUID", "")
+    allocation_job_id = int(raw_allocation_job_id) if raw_allocation_job_id.isdigit() else None
+    allocation_uuid = raw_allocation_uuid or None
+    runtime_payload = {
+        **payload,
+        "gpu_allocation_job_id": allocation_job_id,
+        "gpu_allocation_uuid": allocation_uuid,
+    }
     inspected = containers_inspect({"name": str(payload["container_name"])})
     raw_container = inspected.get("container", {})
     container = raw_container if isinstance(raw_container, dict) else {}
@@ -5833,14 +6505,29 @@ def _rollback_self_activation(payload: dict[str, Any], fingerprints: list[str]) 
             "development Container state could not be authoritatively resolved",
         )
     if state["Running"] is True:
-        stopped = run_allowlisted_script(
-            [SCRIPT_ALLOWLIST["h100-container-stop"], str(payload["username"])], timeout=90
-        )
+        if isinstance(allocation_job_id, int) and isinstance(allocation_uuid, str):
+            if _gpu_allocation_binding(payload, allocation_job_id) != allocation_uuid:
+                raise LifecycleValidationError(
+                    "ACTIVATION_ROLLBACK_CONTAINER_STOP_FAILED",
+                    "GPU allocation binding changed before activation rollback",
+                )
+            stop_argv = [
+                SCRIPT_ALLOWLIST["h100-container-gpu-runtime"],
+                "stop",
+                str(payload["username"]),
+                str(allocation_job_id),
+                allocation_uuid,
+            ]
+        else:
+            stop_argv = [SCRIPT_ALLOWLIST["h100-container-stop"], str(payload["username"])]
+        stopped = run_allowlisted_script(stop_argv, timeout=150)
         if not stopped.get("ok"):
             raise LifecycleValidationError(
                 "ACTIVATION_ROLLBACK_CONTAINER_STOP_FAILED",
                 "development Container could not be stopped during activation rollback",
             )
+    if isinstance(allocation_job_id, int):
+        _cancel_gpu_development_allocation(runtime_payload, allocation_job_id)
     _remove_activation_keys(payload, fingerprints)
     _write_activation_lifecycle_state(
         payload,
@@ -5871,10 +6558,11 @@ def _execute_self_compute_activation(
             "rollback_status": "NOT_REQUIRED",
         }
     integrity = script_integrity()
+    required_scripts = set(SELF_ACTIVATE_REQUIRED_SCRIPTS)
+    if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE:
+        required_scripts.add("h100-container-gpu-runtime")
     failed = sorted(
-        name
-        for name in SELF_ACTIVATE_REQUIRED_SCRIPTS
-        if not integrity.get(name, {}).get("integrity_ok", False)
+        name for name in required_scripts if not integrity.get(name, {}).get("integrity_ok", False)
     )
     if failed:
         return {
@@ -5893,22 +6581,44 @@ def _execute_self_compute_activation(
         records, fingerprints = _activation_records(payload)
         lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
         if lifecycle.get("STATUS") == "ACTIVE":
-            _lifecycle, starts_at, expires_at = _activation_active_lifecycle(payload, fingerprints)
+            active_lifecycle, starts_at, expires_at = _activation_active_lifecycle(
+                payload, fingerprints
+            )
+            raw_job_id = active_lifecycle.get("GPU_ALLOCATION_JOB_ID", "")
+            allocation_job_id = int(raw_job_id) if raw_job_id.isdigit() else None
+            allocation_uuid = active_lifecycle.get("GPU_ALLOCATION_UUID") or None
+            runtime_payload = {
+                **payload,
+                "gpu_allocation_job_id": allocation_job_id,
+                "gpu_allocation_uuid": allocation_uuid,
+            }
             _activation_container_security(
-                payload,
+                runtime_payload,
                 require_running=True,
                 expected_fingerprints=fingerprints,
             )
+            if isinstance(allocation_job_id, int) and (
+                _gpu_allocation_binding(payload, allocation_job_id) != allocation_uuid
+            ):
+                raise LifecycleValidationError(
+                    "GPU_ALLOCATION_POSTCONDITION_FAILED",
+                    "active container GPU differs from its live Slurm allocation",
+                )
             return _activation_result(
                 request,
                 payload,
                 fingerprints,
                 starts_at,
                 expires_at,
+                allocation_job_id,
+                allocation_uuid,
                 replay=True,
             )
         if lifecycle.get("STATUS") == "ACTIVATING":
-            _activation_in_progress_lifecycle(payload, fingerprints)
+            lifecycle = _activation_in_progress_lifecycle(payload, fingerprints)
+            raw_job_id = lifecycle.get("GPU_ALLOCATION_JOB_ID", "")
+            allocation_job_id = int(raw_job_id) if raw_job_id.isdigit() else None
+            allocation_uuid = lifecycle.get("GPU_ALLOCATION_UUID") or None
             mutated = True
         else:
             _activation_staged_lifecycle(payload)
@@ -5922,22 +6632,66 @@ def _execute_self_compute_activation(
                 starts_at=None,
                 expires_at=None,
             )
+            allocation_job_id = None
+            allocation_uuid = None
+        starts_at = datetime.now(UTC)
+        expires_at = starts_at + timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS)
+        runtime_payload = {
+            **payload,
+            "lease_expires_at": expires_at.isoformat(),
+            "gpu_allocation_job_id": allocation_job_id,
+            "gpu_allocation_uuid": allocation_uuid,
+        }
         running = _activation_container_running(payload)
         _activation_container_security(
-            payload,
+            runtime_payload,
             require_running=running,
             expected_fingerprints=fingerprints,
         )
+        if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE:
+            if allocation_job_id is None:
+                allocation_job_id, allocation_uuid = _submit_gpu_development_allocation(
+                    runtime_payload
+                )
+                runtime_payload.update(
+                    {
+                        "gpu_allocation_job_id": allocation_job_id,
+                        "gpu_allocation_uuid": allocation_uuid,
+                    }
+                )
+                _write_activation_lifecycle_state(
+                    payload,
+                    status="ACTIVATING",
+                    fingerprints=fingerprints,
+                    starts_at=None,
+                    expires_at=None,
+                    gpu_allocation_job_id=allocation_job_id,
+                    gpu_allocation_uuid=allocation_uuid,
+                )
+            elif _gpu_allocation_binding(payload, allocation_job_id) != allocation_uuid:
+                raise LifecycleValidationError(
+                    "GPU_ALLOCATION_POSTCONDITION_FAILED",
+                    "activation GPU differs from its live Slurm allocation",
+                )
         if not running:
-            started = run_allowlisted_script(
-                [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])], timeout=150
+            start_argv = (
+                [
+                    SCRIPT_ALLOWLIST["h100-container-gpu-runtime"],
+                    "start",
+                    str(payload["username"]),
+                    str(allocation_job_id),
+                    str(allocation_uuid),
+                ]
+                if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
+                else [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])]
             )
+            started = run_allowlisted_script(start_argv, timeout=150)
             if not started.get("ok"):
                 raise LifecycleValidationError(
                     "CONTAINER_START_FAILED", "development Container failed to start"
                 )
         _activation_container_security(
-            payload,
+            runtime_payload,
             require_running=True,
             expected_fingerprints=fingerprints,
         )
@@ -5949,14 +6703,14 @@ def _execute_self_compute_activation(
             raise LifecycleValidationError(
                 "GPU_ISOLATION_FAILED", "per-UID GPU isolation verification failed"
             )
-        starts_at = datetime.now(UTC)
-        expires_at = starts_at + timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS)
         _write_activation_lifecycle_state(
             payload,
             status="ACTIVE",
             fingerprints=fingerprints,
             starts_at=starts_at,
             expires_at=expires_at,
+            gpu_allocation_job_id=allocation_job_id,
+            gpu_allocation_uuid=allocation_uuid,
         )
         _activation_active_lifecycle(payload, fingerprints)
         return _activation_result(
@@ -5965,6 +6719,8 @@ def _execute_self_compute_activation(
             fingerprints,
             starts_at,
             expires_at,
+            allocation_job_id,
+            allocation_uuid,
             replay=False,
         )
     except (LifecycleValidationError, OSError) as exc:
@@ -6377,8 +7133,7 @@ def _activate_postcondition_summary(
     mounts = container.get("mounts", []) if isinstance(container, dict) else []
     expected_mounts = {
         (str(PILOT_DATA_ROOT / PILOT_USERNAME / "home"), f"/home/{PILOT_USERNAME}"),
-        (str(PILOT_DATA_ROOT / PILOT_USERNAME / "workspace"), "/workspace"),
-        (str(PILOT_DATA_ROOT / PILOT_USERNAME / "shared"), "/shared"),
+        (str(workspace_path(int(APPROVED_STAGE_PAYLOAD["uid"]))), "/workspace"),
         (
             f"/srv/gpu-platform/container-data/{PILOT_USERNAME}/ssh-host-keys",
             "/etc/ssh/persistent",
@@ -7388,10 +8143,9 @@ def _validate_owned_descriptor(
 
 @contextmanager
 def _open_managed_user_path(
-    username: str, relative: str, *, directory: bool, uid: int, gid: int
+    root: Path, relative: str, *, directory: bool, uid: int, gid: int
 ) -> Iterator[tuple[Path, int, os.stat_result]]:
     parts = _managed_relative_parts(relative)
-    root = PILOT_DATA_ROOT / username
     descriptors: list[int] = []
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -7461,10 +8215,8 @@ def _open_workspace_directory(
                 os.close(descriptor)
 
 
-def _managed_user_path(
-    username: str, relative: str, *, directory: bool, uid: int, gid: int
-) -> Path:
-    with _open_managed_user_path(username, relative, directory=directory, uid=uid, gid=gid) as (
+def _managed_user_path(root: Path, relative: str, *, directory: bool, uid: int, gid: int) -> Path:
+    with _open_managed_user_path(root, relative, directory=directory, uid=uid, gid=gid) as (
         path,
         _descriptor,
         _metadata,
@@ -7487,9 +8239,8 @@ def _read_regular_descriptor(descriptor: int, metadata: os.stat_result) -> bytes
     return bytes(content)
 
 
-def _ensure_managed_owned_directory(username: str, relative: str, uid: int, gid: int) -> Path:
+def _ensure_managed_owned_directory(root: Path, relative: str, uid: int, gid: int) -> Path:
     parts = _managed_relative_parts(relative)
-    root = PILOT_DATA_ROOT / username
     descriptors: list[int] = []
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -7534,13 +8285,14 @@ def _ensure_managed_owned_directory(username: str, relative: str, uid: int, gid:
 def _stage_user_job_script(payload: dict[str, Any], content: bytes) -> tuple[Path, int]:
     uid = int(payload["uid"])
     gid = int(payload["gid"])
-    username = str(payload["username"])
-    script_relative = "workspace/.portal/job-scripts"
-    _ensure_managed_owned_directory(username, script_relative, uid, gid)
-    _ensure_managed_owned_directory(username, "workspace/.portal/jobs", uid, gid)
+    root = Path(str(payload["workspace_path"]))
+    script_relative = ".portal/job-scripts"
+    _ensure_managed_owned_directory(root, script_relative, uid, gid)
+    _ensure_managed_owned_directory(root, ".portal/jobs", uid, gid)
+    _ensure_managed_owned_directory(root, "outputs", uid, gid)
     filename = f"{payload['portal_job_id']}.sh"
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    with _open_managed_user_path(username, script_relative, directory=True, uid=uid, gid=gid) as (
+    with _open_managed_user_path(root, script_relative, directory=True, uid=uid, gid=gid) as (
         script_dir,
         directory_descriptor,
         _metadata,
@@ -7688,19 +8440,20 @@ def _managed_sbatch_argv(
         f"--mem={payload['memory_mb']}M",
         f"--time={_slurm_time(int(payload['time_limit_seconds']))}",
         f"--deadline={deadline}",
+        f"--export=ALL,WORKSPACE={payload['workspace_path']}",
         f"--chdir={workdir}",
         f"--output={stdout}",
         f"--error={stderr}",
     ]
     if int(payload["gpu_count"]) == 1:
-        argv.append("--gres=gpu:1")
+        argv.append("--gres=gpu:h100:1")
     if payload.get("image_ref"):
-        owned_root = PILOT_DATA_ROOT / str(payload["username"])
+        owned_root = Path(str(payload["workspace_path"]))
         argv.extend(
             [
                 f"--container-image={payload['image_ref']}",
                 "--no-container-mount-home",
-                f"--container-mounts={owned_root}:{owned_root}",
+                f"--container-mounts={owned_root}:{owned_root},{owned_root}:/workspace",
             ]
         )
     argv.append(f"/proc/self/fd/{staged_descriptor}")
@@ -7713,22 +8466,23 @@ def _execute_self_job_submit(request: WorkerRequest, payload: dict[str, Any]) ->
         _managed_slurm_security_preflight(payload)
         uid = int(payload["uid"])
         gid = int(payload["gid"])
-        username = str(payload["username"])
+        root = Path(str(payload["workspace_path"]))
+        if root != Path(workspace_path(uid)):
+            raise LifecycleValidationError(
+                "WORKSPACE_BINDING_REJECTED", "workspace is not derived from the managed UID"
+            )
         content = str(payload["script_content"]).encode("utf-8")
         workdir = _managed_user_path(
-            username,
+            root,
             str(payload["workdir_relative_path"]),
             directory=True,
             uid=uid,
             gid=gid,
         )
         _staged, staged_descriptor = _stage_user_job_script(payload, content)
-        root = PILOT_DATA_ROOT / username
         stdout = root / str(payload["stdout_relative_path"])
         stderr = root / str(payload["stderr_relative_path"])
-        output_parent = _ensure_managed_owned_directory(
-            username, "workspace/.portal/jobs", uid, gid
-        )
+        output_parent = _ensure_managed_owned_directory(root, "outputs", uid, gid)
         if stdout.parent != output_parent or stderr.parent != output_parent:
             raise LifecycleValidationError(
                 "JOB_OUTPUT_REJECTED", "job output directories are inconsistent"
@@ -7804,9 +8558,9 @@ def _execute_self_job_cancel(request: WorkerRequest, payload: dict[str, Any]) ->
         return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
 
 
-def _read_job_log(username: str, relative: str, uid: int, gid: int) -> str:
+def _read_job_log(root: Path, relative: str, uid: int, gid: int) -> str:
     try:
-        with _open_managed_user_path(username, relative, directory=False, uid=uid, gid=gid) as (
+        with _open_managed_user_path(root, relative, directory=False, uid=uid, gid=gid) as (
             _path,
             descriptor,
             metadata,
@@ -7824,14 +8578,18 @@ def _read_job_log(username: str, relative: str, uid: int, gid: int) -> str:
 def _self_job_logs(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         _managed_account(payload)
-        username = str(payload["username"])
         uid = int(payload["uid"])
         gid = int(payload["gid"])
+        root = Path(str(payload["workspace_path"]))
+        if root != Path(workspace_path(uid)):
+            raise LifecycleValidationError(
+                "WORKSPACE_BINDING_REJECTED", "workspace is not derived from the managed UID"
+            )
         return {
             "status": "OK",
             "handler": "self.job.logs.read",
-            "stdout": _read_job_log(username, str(payload["stdout_relative_path"]), uid, gid),
-            "stderr": _read_job_log(username, str(payload["stderr_relative_path"]), uid, gid),
+            "stdout": _read_job_log(root, str(payload["stdout_relative_path"]), uid, gid),
+            "stderr": _read_job_log(root, str(payload["stderr_relative_path"]), uid, gid),
         }
     except LifecycleValidationError as exc:
         return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
@@ -7901,7 +8659,7 @@ def _self_job_status(payload: dict[str, Any]) -> dict[str, Any]:
 def _self_storage(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         account = _managed_account(payload)
-        root = PILOT_DATA_ROOT / str(payload["username"])
+        root = Path(workspace_path(int(payload["uid"])))
         resolved = root.resolve(strict=True)
         metadata = resolved.lstat()
         if (
@@ -8042,10 +8800,285 @@ def _self_workspace_check(payload: dict[str, Any]) -> dict[str, Any]:
         }
 
 
+def _gpu_allocation_binding(payload: dict[str, Any], job_id: int) -> str:
+    """Return the single physical GPU UUID held by a running Slurm allocation."""
+
+    detail = run_fixed("scontrol", ["show", "job", "-dd", "-o", str(job_id)], timeout=15)
+    line = str(detail.get("stdout", ""))
+    owner = re.search(r"(?:^|\s)UserId=([^\s(]+)", line)
+    state = re.search(r"(?:^|\s)JobState=([^\s]+)", line)
+    account = re.search(r"(?:^|\s)Account=([^\s]+)", line)
+    qos = re.search(r"(?:^|\s)QOS=([^\s]+)", line)
+    partition = re.search(r"(?:^|\s)Partition=([^\s]+)", line)
+    comment = re.search(r"(?:^|\s)Comment=([^\s]+)", line)
+    indexes = {int(value) for value in re.findall(r"IDX:(\d+)", line)}
+    h100_request = bool(
+        re.search(r"(?:^|\s)Gres=gpu:h100:1(?:\s|$)", line)
+        or re.search(r"(?:^|\s)TresPerNode=gres/gpu:h100:1(?:\s|$)", line)
+    )
+    comment_is_bound = False
+    if comment is not None:
+        lease_prefix = f"h100-gpu-dev:{payload['managed_user_id']}:"
+        lease_suffix = comment.group(1).removeprefix(lease_prefix)
+        with suppress(ValueError):
+            comment_is_bound = (
+                comment.group(1).startswith(lease_prefix)
+                and str(uuid.UUID(lease_suffix)) == lease_suffix
+            )
+    if (
+        not detail.get("ok")
+        or owner is None
+        or owner.group(1) != payload["username"]
+        or state is None
+        or state.group(1) != "RUNNING"
+        or account is None
+        or account.group(1) != payload["slurm_account"]
+        or qos is None
+        or qos.group(1) != payload["slurm_qos"]
+        or partition is None
+        or partition.group(1) != "gpu-dev"
+        or not comment_is_bound
+        or not h100_request
+        or len(indexes) != 1
+    ):
+        raise LifecycleValidationError(
+            "GPU_ALLOCATION_NOT_RUNNING",
+            "Slurm does not prove one running owner-bound GPU allocation",
+        )
+    mapping = run_fixed(
+        "nvidia-smi", ["--query-gpu=index,uuid", "--format=csv,noheader,nounits"], timeout=15
+    )
+    rows: dict[int, str] = {}
+    if mapping.get("ok"):
+        for raw in str(mapping.get("stdout", "")).splitlines():
+            index, separator, gpu_uuid = raw.partition(",")
+            if separator and index.strip().isdigit():
+                rows[int(index.strip())] = gpu_uuid.strip()
+    resolved_gpu_uuid = rows.get(next(iter(indexes)))
+    if (
+        resolved_gpu_uuid is None
+        or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", resolved_gpu_uuid) is None
+    ):
+        raise LifecycleValidationError(
+            "GPU_ALLOCATION_IDENTITY_REJECTED",
+            "allocated Slurm GPU could not be mapped to one physical UUID",
+        )
+    return resolved_gpu_uuid
+
+
+def _gpu_development_partition_preflight() -> None:
+    result = run_fixed("scontrol", ["show", "partition", "gpu-dev", "-o"], timeout=15)
+    line = str(result.get("stdout", ""))
+    configuration = run_fixed("scontrol", ["show", "config"], timeout=15)
+    configuration_text = str(configuration.get("stdout", ""))
+    integrity = script_integrity()
+    epilog_integrity = integrity.get("h100-gpu-development-epilog", {})
+    common_integrity = integrity.get("h100-platform-common", {})
+    if (
+        not result.get("ok")
+        or re.search(r"(?:^|\s)PartitionName=gpu-dev(?:\s|$)", line) is None
+        or re.search(r"(?:^|\s)Default=NO(?:\s|$)", line) is None
+        or re.search(r"(?:^|\s)State=UP(?:\s|$)", line) is None
+        or re.search(r"(?:^|\s)MaxTime=(?:INFINITE|UNLIMITED)(?:\s|$)", line) is None
+        or not configuration.get("ok")
+        or re.search(
+            r"(?:^|\n)Epilog\s*=\s*/usr/local/sbin/h100-gpu-development-epilog(?:\s|$)",
+            configuration_text,
+        )
+        is None
+        or epilog_integrity.get("integrity_ok") is not True
+        or common_integrity.get("integrity_ok") is not True
+    ):
+        raise LifecycleValidationError(
+            "GPU_DEVELOPMENT_PARTITION_REJECTED",
+            "the non-default GPU development safety-lock partition is unavailable",
+        )
+
+
+def _submit_gpu_development_allocation(payload: dict[str, Any]) -> tuple[int, str]:
+    _gpu_development_partition_preflight()
+    workspace = Path(str(payload["workspace_path"]))
+    argv = [
+        BINARIES["sbatch"],
+        "--parsable",
+        f"--account={payload['slurm_account']}",
+        f"--qos={payload['slurm_qos']}",
+        "--partition=gpu-dev",
+        f"--job-name=portal-gpu-dev-{payload['uid']}",
+        "--cpus-per-task=8",
+        "--mem=32768M",
+        "--gres=gpu:h100:1",
+        f"--chdir={workspace}",
+        f"--export=ALL,WORKSPACE={workspace}",
+        f"--comment=h100-gpu-dev:{payload['managed_user_id']}:{payload['lease_id']}",
+        f"--output={workspace}/outputs/.gpu-development-%j.out",
+        f"--error={workspace}/outputs/.gpu-development-%j.err",
+        "--wrap=/usr/bin/sleep infinity",
+    ]
+    submitted = _run_as_managed_user(payload, argv, timeout=30)
+    match = re.fullmatch(r"(\d+)(?:;[A-Za-z0-9_.-]+)?\s*", str(submitted.get("stdout", "")))
+    if not submitted.get("ok") or match is None:
+        raise LifecycleValidationError(
+            "GPU_ALLOCATION_SUBMIT_FAILED", "Slurm GPU development allocation failed"
+        )
+    job_id = int(match.group(1))
+    try:
+        for _attempt in range(120):
+            try:
+                return job_id, _gpu_allocation_binding(payload, job_id)
+            except LifecycleValidationError as exc:
+                if exc.code != "GPU_ALLOCATION_NOT_RUNNING":
+                    raise
+            time.sleep(0.5)
+        raise LifecycleValidationError(
+            "GPU_ALLOCATION_UNAVAILABLE", "one GPU did not become available before timeout"
+        )
+    except LifecycleValidationError:
+        _run_as_managed_user(payload, [BINARIES["scancel"], str(job_id)], timeout=20)
+        raise
+
+
+GPU_ALLOCATION_TERMINAL_STATES = frozenset(
+    {
+        "BOOT_FAIL",
+        "CANCELLED",
+        "COMPLETED",
+        "DEADLINE",
+        "FAILED",
+        "NODE_FAIL",
+        "OUT_OF_MEMORY",
+        "PREEMPTED",
+        "REVOKED",
+        "SPECIAL_EXIT",
+        "STOPPED",
+        "TIMEOUT",
+    }
+)
+
+
+def _gpu_allocation_terminal_binding(payload: dict[str, Any], job_id: int) -> None:
+    """Prove that one exact owner-bound GPU allocation reached a terminal state."""
+
+    accounting = run_fixed(
+        "sacct",
+        [
+            "-n",
+            "-X",
+            "-P",
+            "-j",
+            str(job_id),
+            "--format=JobIDRaw,User,Account,QOS,Partition,State,ReqTRES,AllocTRES,Comment",
+        ],
+        timeout=15,
+    )
+    rows: list[list[str]] = []
+    if accounting.get("ok"):
+        for raw_line in str(accounting.get("stdout", "")).splitlines():
+            fields = raw_line.rstrip("\n").split("|")
+            if len(fields) == 10 and fields[-1] == "" and fields[0] == str(job_id):
+                rows.append(fields[:-1])
+    if len(rows) != 1:
+        raise LifecycleValidationError(
+            "GPU_ALLOCATION_TERMINAL_UNPROVEN",
+            "Slurm accounting does not contain one exact GPU allocation record",
+        )
+    (
+        _job_id,
+        owner,
+        account,
+        qos,
+        partition,
+        raw_state,
+        requested_tres,
+        allocated_tres,
+        comment,
+    ) = rows[0]
+    lease_prefix = f"h100-gpu-dev:{payload['managed_user_id']}:"
+    lease_suffix = comment.removeprefix(lease_prefix)
+    comment_is_bound = False
+    with suppress(ValueError):
+        comment_is_bound = (
+            comment.startswith(lease_prefix) and str(uuid.UUID(lease_suffix)) == lease_suffix
+        )
+    typed_gpu = re.compile(r"(?:^|,)gres/gpu:h100=1(?:,|$)")
+    if (
+        owner != payload["username"]
+        or account != payload["slurm_account"]
+        or qos != payload["slurm_qos"]
+        or partition != "gpu-dev"
+        or not comment_is_bound
+        or typed_gpu.search(requested_tres) is None
+        or typed_gpu.search(allocated_tres) is None
+    ):
+        raise LifecycleValidationError(
+            "GPU_ALLOCATION_OWNERSHIP_REJECTED",
+            "terminal GPU allocation is not bound to this owner, account, QOS, and profile",
+        )
+    state = raw_state.partition(" ")[0].rstrip("+").upper()
+    if state not in GPU_ALLOCATION_TERMINAL_STATES:
+        raise LifecycleValidationError(
+            "GPU_ALLOCATION_STILL_ACTIVE",
+            "owner-bound GPU allocation has not reached a terminal state",
+        )
+
+
+def _cancel_gpu_development_allocation(payload: dict[str, Any], job_id: int) -> None:
+    try:
+        _gpu_allocation_binding(payload, job_id)
+    except LifecycleValidationError as exc:
+        if exc.code != "GPU_ALLOCATION_NOT_RUNNING":
+            raise LifecycleValidationError(
+                "GPU_ALLOCATION_OWNERSHIP_REJECTED",
+                "GPU allocation is not bound to this owner, lease, account, and QOS",
+            ) from exc
+        _gpu_allocation_terminal_binding(payload, job_id)
+        return
+    cancelled = _run_as_managed_user(payload, [BINARIES["scancel"], str(job_id)], timeout=20)
+    if not cancelled.get("ok"):
+        raise LifecycleValidationError(
+            "GPU_ALLOCATION_CANCEL_FAILED", "GPU allocation could not be revoked"
+        )
+    for _attempt in range(40):
+        try:
+            _gpu_allocation_terminal_binding(payload, job_id)
+        except LifecycleValidationError as exc:
+            if exc.code != "GPU_ALLOCATION_STILL_ACTIVE":
+                raise LifecycleValidationError(
+                    "GPU_ALLOCATION_CANCEL_UNPROVEN",
+                    "GPU allocation revocation could not be proven",
+                ) from exc
+            time.sleep(0.25)
+        else:
+            return
+    raise LifecycleValidationError(
+        "GPU_ALLOCATION_CANCEL_UNPROVEN",
+        "GPU allocation remained active after cancellation",
+    )
+
+
 def _managed_container_security(
     payload: dict[str, Any], *, require_running: bool | None
 ) -> dict[str, Any]:
-    _managed_account(payload)
+    account = _managed_account(payload)
+    workspace = Path(str(payload["workspace_path"]))
+    backing_workspace = PILOT_DATA_ROOT / str(payload["username"]) / "workspace"
+    try:
+        workspace_metadata = workspace.lstat()
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "WORKSPACE_BINDING_REJECTED", "canonical workspace is unavailable"
+        ) from exc
+    if (
+        workspace != Path(workspace_path(account.pw_uid))
+        or not stat.S_ISDIR(workspace_metadata.st_mode)
+        or stat.S_ISLNK(workspace_metadata.st_mode)
+        or workspace_metadata.st_uid != account.pw_uid
+        or workspace_metadata.st_gid != account.pw_gid
+        or stat.S_IMODE(workspace_metadata.st_mode) != 0o700
+    ):
+        raise LifecycleValidationError(
+            "WORKSPACE_BINDING_REJECTED", "canonical workspace ownership or mode is invalid"
+        )
     inspected = containers_inspect({"name": str(payload["name"])})
     raw_container = inspected.get("container", {})
     container: dict[str, Any] = raw_container if isinstance(raw_container, dict) else {}
@@ -8059,15 +9092,101 @@ def _managed_container_security(
         "/run/munge",
         "/var/run/munge",
     }
+    profile_is_gpu = payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
+    allocation_job_id = payload.get("gpu_allocation_job_id")
+    allocation_uuid = payload.get("gpu_allocation_uuid")
+    running = bool(state.get("Running"))
+    device_requests = container.get("device_requests")
+    safe_environment = container.get("safe_environment", {})
+    safe_labels = container.get("safe_labels", {})
+    gpu_runtime_valid = (
+        isinstance(device_requests, list)
+        and len(device_requests) == 1
+        and isinstance(device_requests[0], dict)
+        and device_requests[0].get("Driver") == "nvidia"
+        and device_requests[0].get("DeviceIDs") == [allocation_uuid]
+        and device_requests[0].get("Capabilities") == [["gpu"]]
+        and device_requests[0].get("Options") in (None, {})
+        and container.get("runtime") == "nvidia"
+        and safe_environment
+        == {"CUDA_VISIBLE_DEVICES": "0", "NVIDIA_VISIBLE_DEVICES": allocation_uuid}
+        and safe_labels.get("h100.dev.gpu-allocation-job") == str(allocation_job_id)
+        and safe_labels.get("h100.dev.gpu-uuid") == allocation_uuid
+    )
+    approved_workspace_mounts = {
+        (str(payload["workspace_path"]), "/workspace"),
+        (str(backing_workspace), "/workspace"),
+    }
+    observed_workspace_mounts = {
+        (str(item.get("Source", "")), str(item.get("Destination", "")))
+        for item in mounts
+        if isinstance(item, dict)
+        and item.get("Type") == "bind"
+        and item.get("RW") is True
+        and item.get("Destination") == "/workspace"
+    }
+    legacy_workspace_mount = (str(backing_workspace), "/workspace") in (observed_workspace_mounts)
+    legacy_workspace_safe = True
+    if legacy_workspace_mount:
+        try:
+            backing_metadata = backing_workspace.lstat()
+        except OSError:
+            legacy_workspace_safe = False
+        else:
+            legacy_workspace_safe = bool(
+                stat.S_ISDIR(backing_metadata.st_mode)
+                and not stat.S_ISLNK(backing_metadata.st_mode)
+                and backing_metadata.st_uid == account.pw_uid
+                and backing_metadata.st_gid == account.pw_gid
+                and stat.S_IMODE(backing_metadata.st_mode) == 0o700
+                and (workspace_metadata.st_dev, workspace_metadata.st_ino)
+                == (backing_metadata.st_dev, backing_metadata.st_ino)
+            )
+    allowed_rw_mounts = {
+        (
+            str(PILOT_DATA_ROOT / str(payload["username"]) / "home"),
+            f"/home/{payload['username']}",
+        ),
+        (
+            str(PILOT_DATA_ROOT / str(payload["username"]) / "shared"),
+            "/shared",
+        ),
+        (
+            f"/srv/gpu-platform/container-data/{payload['username']}/ssh-host-keys",
+            "/etc/ssh/persistent",
+        ),
+    } | observed_workspace_mounts
+    observed_rw_mounts = {
+        (str(item.get("Source", "")), str(item.get("Destination", "")))
+        for item in mounts
+        if isinstance(item, dict) and item.get("Type") == "bind" and item.get("RW") is True
+    }
     if not (
         inspected.get("status") == "OK"
         and container.get("owner") == payload["username"]
+        and safe_labels.get("h100.dev.uid") == str(payload["uid"])
+        and safe_labels.get("h100.dev.gid") == str(payload["gid"])
         and container.get("privileged") is False
         and container.get("network_mode") != "host"
         and container.get("pid_mode") != "host"
         and container.get("ipc_mode") != "host"
-        and container.get("gpu") == "NONE"
+        and not container.get("devices")
+        and not container.get("device_cgroup_rules")
+        and not container.get("cap_add")
+        and (
+            gpu_runtime_valid and container.get("gpu") == "REQUESTED"
+            if profile_is_gpu and allocation_job_id is not None and running
+            else container.get("gpu") == "NONE"
+            and not device_requests
+            and not safe_environment
+            and container.get("runtime") != "nvidia"
+        )
         and not container.get("docker_socket_mounted")
+        and len(observed_workspace_mounts) == 1
+        and observed_workspace_mounts <= approved_workspace_mounts
+        and legacy_workspace_safe
+        and observed_rw_mounts == allowed_rw_mounts
+        and len(mounts) == len(allowed_rw_mounts)
         and not any(
             str(item.get("Destination", "")) in forbidden_destinations
             or str(item.get("Source", "")) in forbidden_sources
@@ -8079,7 +9198,6 @@ def _managed_container_security(
         raise LifecycleValidationError(
             "CONTAINER_SECURITY_REJECTED", "managed container security contract changed"
         )
-    running = bool(state.get("Running"))
     if require_running is not None and running is not require_running:
         raise LifecycleValidationError(
             "CONTAINER_STATE_REJECTED", "managed container state differs from request"
@@ -8090,6 +9208,11 @@ def _managed_container_security(
 def _execute_managed_container_lifecycle(
     request: WorkerRequest, payload: dict[str, Any]
 ) -> dict[str, Any]:
+    new_allocation = False
+    start_invoked = False
+    allocation_lifecycle_bound = False
+    allocation_job_id = payload.get("gpu_allocation_job_id")
+    allocation_uuid = payload.get("gpu_allocation_uuid")
     try:
         if request.requested_by != payload["username"]:
             raise LifecycleValidationError(
@@ -8107,25 +9230,126 @@ def _execute_managed_container_lifecycle(
         required_scripts = {"h100-container-stop"}
         if action in {"start", "restart"}:
             required_scripts.add("h100-container-start")
+        if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE:
+            required_scripts.add("h100-container-gpu-runtime")
         integrity = script_integrity()
         if not all(integrity.get(name, {}).get("integrity_ok", False) for name in required_scripts):
             raise LifecycleValidationError(
                 "SCRIPT_INTEGRITY_FAILED", "container lifecycle script integrity failed"
             )
+        profile_is_gpu = payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
         if action in {"stop", "restart"} and bool(before.get("state", {}).get("Running")):
-            stopped = run_allowlisted_script(
-                [SCRIPT_ALLOWLIST["h100-container-stop"], str(payload["username"])], timeout=90
-            )
+            if profile_is_gpu:
+                if not isinstance(allocation_job_id, int) or not isinstance(allocation_uuid, str):
+                    raise LifecycleValidationError(
+                        "GPU_ALLOCATION_BINDING_REJECTED",
+                        "running GPU container has no allocation binding",
+                    )
+                _gpu_allocation_binding(payload, allocation_job_id)
+                stopped = run_allowlisted_script(
+                    [
+                        SCRIPT_ALLOWLIST["h100-container-gpu-runtime"],
+                        "stop",
+                        str(payload["username"]),
+                        str(allocation_job_id),
+                        allocation_uuid,
+                    ],
+                    timeout=150,
+                )
+                if stopped.get("ok"):
+                    _cancel_gpu_development_allocation(payload, allocation_job_id)
+                    stopped_job_id = allocation_job_id
+                    stopped_gpu_uuid = allocation_uuid
+                    allocation_job_id = None
+                    allocation_uuid = None
+                    _clear_active_gpu_lifecycle_binding(
+                        payload,
+                        expected_job_id=stopped_job_id,
+                        expected_gpu_uuid=stopped_gpu_uuid,
+                    )
+            else:
+                stopped = run_allowlisted_script(
+                    [SCRIPT_ALLOWLIST["h100-container-stop"], str(payload["username"])],
+                    timeout=90,
+                )
             if not stopped.get("ok"):
                 raise LifecycleValidationError("CONTAINER_STOP_FAILED", "container stop failed")
-        if action in {"start", "restart"}:
-            started = run_allowlisted_script(
-                [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])], timeout=150
+        elif (
+            action in {"stop", "restart"} and profile_is_gpu and isinstance(allocation_job_id, int)
+        ):
+            assert isinstance(allocation_uuid, str)
+            _cancel_gpu_development_allocation(payload, allocation_job_id)
+            stopped_job_id = allocation_job_id
+            stopped_gpu_uuid = allocation_uuid
+            allocation_job_id = None
+            allocation_uuid = None
+            _clear_active_gpu_lifecycle_binding(
+                payload,
+                expected_job_id=stopped_job_id,
+                expected_gpu_uuid=stopped_gpu_uuid,
             )
+        if action in {"start", "restart"}:
+            if profile_is_gpu:
+                allocation_payload = {
+                    **payload,
+                    "gpu_allocation_job_id": None,
+                    "gpu_allocation_uuid": None,
+                }
+                allocation_job_id, allocation_uuid = _submit_gpu_development_allocation(
+                    allocation_payload
+                )
+                new_allocation = True
+                _bind_active_container_lifecycle(
+                    payload,
+                    gpu_allocation_job_id=allocation_job_id,
+                    gpu_allocation_uuid=allocation_uuid,
+                )
+                allocation_lifecycle_bound = True
+                start_invoked = True
+                started = run_allowlisted_script(
+                    [
+                        SCRIPT_ALLOWLIST["h100-container-gpu-runtime"],
+                        "start",
+                        str(payload["username"]),
+                        str(allocation_job_id),
+                        allocation_uuid,
+                    ],
+                    timeout=150,
+                )
+                if not started.get("ok"):
+                    # The fixed wrapper can fail after Docker has created or started
+                    # the container.  Keep the allocation bound until the exception
+                    # rollback has first removed that possibly live container.
+                    pass
+            else:
+                _bind_active_container_lifecycle(
+                    payload,
+                    gpu_allocation_job_id=None,
+                    gpu_allocation_uuid=None,
+                )
+                started = run_allowlisted_script(
+                    [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])],
+                    timeout=150,
+                )
             if not started.get("ok"):
                 raise LifecycleValidationError("CONTAINER_START_FAILED", "container start failed")
         expected_running = action != "stop"
-        _managed_container_security(payload, require_running=expected_running)
+        postflight_payload = {
+            **payload,
+            "gpu_allocation_job_id": allocation_job_id,
+            "gpu_allocation_uuid": allocation_uuid,
+        }
+        _managed_container_security(postflight_payload, require_running=expected_running)
+        if (
+            profile_is_gpu
+            and expected_running
+            and isinstance(allocation_job_id, int)
+            and _gpu_allocation_binding(postflight_payload, allocation_job_id) != allocation_uuid
+        ):
+            raise LifecycleValidationError(
+                "GPU_ALLOCATION_POSTCONDITION_FAILED",
+                "container GPU differs from the live Slurm allocation",
+            )
         return {
             "status": "SUCCEEDED",
             "handler": request.operation_type,
@@ -8133,16 +9357,70 @@ def _execute_managed_container_lifecycle(
             "name": payload["name"],
             "username": payload["username"],
             "container_state": "RUNNING" if expected_running else "STOPPED",
-            "container_gpu": "NONE",
+            "container_gpu": payload["expected_gpu"],
+            "gpu_allocation_job_id": allocation_job_id,
+            "gpu_allocation_uuid": allocation_uuid,
         }
     except LifecycleValidationError as exc:
-        return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
+        rollback_failed = False
+        if new_allocation and isinstance(allocation_job_id, int):
+            failed_job_id = allocation_job_id
+            failed_gpu_uuid = allocation_uuid
+            if start_invoked and isinstance(allocation_uuid, str):
+                stopped = run_allowlisted_script(
+                    [
+                        SCRIPT_ALLOWLIST["h100-container-gpu-runtime"],
+                        "stop",
+                        str(payload["username"]),
+                        str(allocation_job_id),
+                        allocation_uuid,
+                    ],
+                    timeout=150,
+                )
+                rollback_failed = not bool(stopped.get("ok"))
+            if not rollback_failed:
+                try:
+                    _cancel_gpu_development_allocation(payload, allocation_job_id)
+                except LifecycleValidationError:
+                    rollback_failed = True
+            if not rollback_failed:
+                allocation_job_id = None
+                allocation_uuid = None
+                if allocation_lifecycle_bound and isinstance(failed_gpu_uuid, str):
+                    try:
+                        _clear_active_gpu_lifecycle_binding(
+                            payload,
+                            expected_job_id=failed_job_id,
+                            expected_gpu_uuid=failed_gpu_uuid,
+                        )
+                    except LifecycleValidationError:
+                        rollback_failed = True
+        if rollback_failed:
+            return {
+                "status": "ERROR",
+                "gpu_allocation_state_known": False,
+                "error": {
+                    "code": "GPU_ALLOCATION_ROLLBACK_FAILED",
+                    "message": "GPU container start failed and allocation cleanup is incomplete",
+                    "cause": exc.code,
+                },
+            }
+        return {
+            "status": "ERROR",
+            "gpu_allocation_state_known": True,
+            "gpu_allocation_job_id": allocation_job_id,
+            "gpu_allocation_uuid": allocation_uuid,
+            "error": {"code": exc.code, "message": str(exc)},
+        }
 
 
 def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
     active = PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys"
     suspended = active.with_name("authorized_keys.portal-recycle")
-    started_by_restore = False
+    start_invoked = False
+    prior_lifecycle: dict[str, str] | None = None
+    allocation_job_id: int | None = None
+    allocation_uuid: str | None = None
     try:
         if request.operation_type == "self.resource.restore" and (
             request.requested_by != payload["username"]
@@ -8182,9 +9460,36 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
         lifecycle_payload = {
             **payload,
             "name": payload["container_name"],
-            "lease_id": payload["restore_request_id"],
-            "lease_expires_at": "restored-by-approved-request",
         }
+        inspected = containers_inspect({"name": str(payload["container_name"])})
+        raw_container = inspected.get("container", {})
+        observed_container = raw_container if isinstance(raw_container, dict) else {}
+        observed_state = observed_container.get("state", {})
+        observed_running = bool(
+            isinstance(observed_state, dict) and observed_state.get("Running") is True
+        )
+        if observed_running and payload["development_profile"] == GPU_DEVELOPMENT_PROFILE:
+            labels = observed_container.get("safe_labels", {})
+            raw_job_id = labels.get("h100.dev.gpu-allocation-job")
+            raw_uuid = labels.get("h100.dev.gpu-uuid")
+            if (
+                not isinstance(raw_job_id, str)
+                or not raw_job_id.isdigit()
+                or not isinstance(raw_uuid, str)
+                or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", raw_uuid) is None
+            ):
+                raise LifecycleValidationError(
+                    "GPU_ALLOCATION_BINDING_REJECTED",
+                    "running restored GPU container lacks an allocation binding",
+                )
+            allocation_job_id = int(raw_job_id)
+            allocation_uuid = raw_uuid
+            lifecycle_payload.update(
+                {
+                    "gpu_allocation_job_id": allocation_job_id,
+                    "gpu_allocation_uuid": allocation_uuid,
+                }
+            )
         container = _managed_container_security(lifecycle_payload, require_running=None)
         running = bool(container.get("state", {}).get("Running"))
         if running:
@@ -8193,12 +9498,27 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
                     "CONTAINER_KEY_RESTORE_FAILED",
                     "running restored container does not have active SSH authorization",
                 )
+            _validate_active_restored_lifecycle(
+                payload,
+                fingerprints,
+                gpu_allocation_job_id=allocation_job_id,
+                gpu_allocation_uuid=allocation_uuid,
+            )
+            if isinstance(allocation_job_id, int) and (
+                _gpu_allocation_binding(lifecycle_payload, allocation_job_id) != allocation_uuid
+            ):
+                raise LifecycleValidationError(
+                    "GPU_ALLOCATION_POSTCONDITION_FAILED",
+                    "restored container GPU differs from its live Slurm allocation",
+                )
             return {
                 "status": "SUCCEEDED",
                 "handler": request.operation_type,
                 "request_id": request.request_id,
                 "container_state": "RUNNING",
-                "container_gpu": "NONE",
+                "container_gpu": payload["expected_gpu"],
+                "gpu_allocation_job_id": allocation_job_id,
+                "gpu_allocation_uuid": allocation_uuid,
                 "host_access": "DISABLED",
                 "container_key_state": "INSTALLED",
                 "container_key_fingerprints": fingerprints,
@@ -8207,28 +9527,76 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
         if suspended.exists():
             os.replace(suspended, active)
         integrity = script_integrity()
-        if not integrity.get("h100-container-start", {}).get("integrity_ok", False):
+        start_script = (
+            "h100-container-gpu-runtime"
+            if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
+            else "h100-container-start"
+        )
+        if not integrity.get(start_script, {}).get("integrity_ok", False):
             raise LifecycleValidationError(
                 "SCRIPT_INTEGRITY_FAILED", "container start script integrity failed"
             )
-        # Treat the start invocation as potentially state-changing even when the
-        # wrapper reports failure: a partially completed start must be stopped
-        # during rollback before SSH authorization is suspended again.
-        started_by_restore = True
-        started = run_allowlisted_script(
-            [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])], timeout=150
-        )
+        if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE:
+            allocation_job_id, allocation_uuid = _submit_gpu_development_allocation(payload)
+            prior_lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+            _activate_restored_lifecycle(
+                payload,
+                fingerprints,
+                gpu_allocation_job_id=allocation_job_id,
+                gpu_allocation_uuid=allocation_uuid,
+            )
+            # A failed start can still leave a partially created runtime, so
+            # rollback must prove it removed before releasing the allocation.
+            start_invoked = True
+            started = run_allowlisted_script(
+                [
+                    SCRIPT_ALLOWLIST["h100-container-gpu-runtime"],
+                    "start",
+                    str(payload["username"]),
+                    str(allocation_job_id),
+                    allocation_uuid,
+                ],
+                timeout=150,
+            )
+            lifecycle_payload.update(
+                {
+                    "gpu_allocation_job_id": allocation_job_id,
+                    "gpu_allocation_uuid": allocation_uuid,
+                }
+            )
+        else:
+            prior_lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+            _activate_restored_lifecycle(
+                payload,
+                fingerprints,
+                gpu_allocation_job_id=None,
+                gpu_allocation_uuid=None,
+            )
+            start_invoked = True
+            started = run_allowlisted_script(
+                [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])],
+                timeout=150,
+            )
         if not started.get("ok"):
             raise LifecycleValidationError(
                 "CONTAINER_START_FAILED", "restored container failed to start"
             )
         _managed_container_security(lifecycle_payload, require_running=True)
+        if isinstance(allocation_job_id, int) and (
+            _gpu_allocation_binding(lifecycle_payload, allocation_job_id) != allocation_uuid
+        ):
+            raise LifecycleValidationError(
+                "GPU_ALLOCATION_POSTCONDITION_FAILED",
+                "restored container GPU differs from its live Slurm allocation",
+            )
         return {
             "status": "SUCCEEDED",
             "handler": request.operation_type,
             "request_id": request.request_id,
             "container_state": "RUNNING",
-            "container_gpu": "NONE",
+            "container_gpu": payload["expected_gpu"],
+            "gpu_allocation_job_id": allocation_job_id,
+            "gpu_allocation_uuid": allocation_uuid,
             "host_access": "DISABLED",
             "container_key_state": "INSTALLED",
             "container_key_fingerprints": fingerprints,
@@ -8243,17 +9611,52 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
             )
         )
         rollback_errors: list[str] = []
-        if started_by_restore:
+        allocation_state_known = True
+        if start_invoked:
             integrity = script_integrity()
-            if not integrity.get("h100-container-stop", {}).get("integrity_ok", False):
+            stop_script = (
+                "h100-container-gpu-runtime"
+                if isinstance(allocation_job_id, int) and isinstance(allocation_uuid, str)
+                else "h100-container-stop"
+            )
+            container_removal_proven = False
+            if not integrity.get(stop_script, {}).get("integrity_ok", False):
                 rollback_errors.append("container stop script integrity failed")
             else:
-                stopped = run_allowlisted_script(
-                    [SCRIPT_ALLOWLIST["h100-container-stop"], str(payload["username"])],
-                    timeout=90,
+                stop_argv = (
+                    [
+                        SCRIPT_ALLOWLIST["h100-container-gpu-runtime"],
+                        "stop",
+                        str(payload["username"]),
+                        str(allocation_job_id),
+                        str(allocation_uuid),
+                    ]
+                    if stop_script == "h100-container-gpu-runtime"
+                    else [SCRIPT_ALLOWLIST["h100-container-stop"], str(payload["username"])]
                 )
+                stopped = run_allowlisted_script(stop_argv, timeout=150)
                 if not stopped.get("ok"):
                     rollback_errors.append("restored container could not be stopped")
+                else:
+                    container_removal_proven = True
+            if isinstance(allocation_job_id, int) and container_removal_proven:
+                try:
+                    _cancel_gpu_development_allocation(payload, allocation_job_id)
+                except LifecycleValidationError:
+                    allocation_state_known = False
+                    rollback_errors.append("restored GPU allocation could not be cancelled")
+                else:
+                    allocation_job_id = None
+                    allocation_uuid = None
+        elif isinstance(allocation_job_id, int):
+            try:
+                _cancel_gpu_development_allocation(payload, allocation_job_id)
+            except LifecycleValidationError:
+                allocation_state_known = False
+                rollback_errors.append("unused restored GPU allocation could not be cancelled")
+            else:
+                allocation_job_id = None
+                allocation_uuid = None
         if active.exists():
             try:
                 if suspended.exists():
@@ -8261,9 +9664,17 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
                 os.replace(active, suspended)
             except OSError:
                 rollback_errors.append("container SSH authorization could not be suspended")
+        if prior_lifecycle is not None:
+            try:
+                _restore_prior_lifecycle(payload, prior_lifecycle)
+            except LifecycleValidationError:
+                rollback_errors.append("managed lifecycle Lease could not be rolled back")
         if rollback_errors:
             return {
                 "status": "ERROR",
+                "gpu_allocation_state_known": allocation_state_known,
+                "gpu_allocation_job_id": allocation_job_id,
+                "gpu_allocation_uuid": allocation_uuid,
                 "error": {
                     "code": "RESTORE_ROLLBACK_FAILED",
                     "message": "restore failed and its safety rollback is incomplete",
@@ -8272,6 +9683,9 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
             }
         return {
             "status": "ERROR",
+            "gpu_allocation_state_known": True,
+            "gpu_allocation_job_id": None,
+            "gpu_allocation_uuid": None,
             "error": {"code": exc.code, "message": str(exc), "rollback_status": "ROLLED_BACK"},
         }
 
@@ -8292,12 +9706,23 @@ def _active_user_slurm_jobs(username: str) -> list[tuple[int, str]]:
 
 
 def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    restore_rollback = request.operation_type == "resource.restore.rollback"
+    result_lease_id = payload["recycle_lease_id"] if restore_rollback else payload["lease_id"]
     fingerprints: list[str] = []
     cancelled_pending_ids: list[int] = []
     cancelled_running_ids: list[int] = []
     key_suspended = False
+    gpu_allocation_revoked = False
     failed_step = "RECYCLE_PREFLIGHT"
     try:
+        if restore_rollback and (
+            request.requested_by != payload["username"]
+            or request.approved_by != payload["username"]
+        ):
+            raise LifecycleValidationError(
+                "RESOURCE_OWNERSHIP_REJECTED",
+                "restore rollback actor does not own the target resource",
+            )
         failed_step = "ACCOUNT_SECURITY_GATE"
         account = _managed_account(payload)
         if account.pw_shell != "/usr/sbin/nologin":
@@ -8343,6 +9768,57 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
                 "CONTAINER_KEY_SUSPEND_FAILED",
                 "container SSH authorization suspension is incomplete",
             )
+        lifecycle_payload = {
+            **payload,
+            "name": payload["container_name"],
+        }
+        failed_step = "CONTAINER_SECURITY_PREFLIGHT"
+        container = _managed_container_security(lifecycle_payload, require_running=None)
+        running = bool(container.get("state", {}).get("Running"))
+        allocation_job_id = payload.get("gpu_allocation_job_id")
+        allocation_uuid = payload.get("gpu_allocation_uuid")
+        if running:
+            failed_step = "CONTAINER_STOP"
+            is_gpu = payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
+            script_name = "h100-container-gpu-runtime" if is_gpu else "h100-container-stop"
+            integrity = script_integrity()
+            if not integrity.get(script_name, {}).get("integrity_ok", False):
+                raise LifecycleValidationError(
+                    "SCRIPT_INTEGRITY_FAILED", "container stop script integrity failed"
+                )
+            if is_gpu:
+                if not isinstance(allocation_job_id, int) or not isinstance(allocation_uuid, str):
+                    raise LifecycleValidationError(
+                        "GPU_ALLOCATION_BINDING_REJECTED",
+                        "running GPU container has no allocation binding",
+                    )
+                if _gpu_allocation_binding(lifecycle_payload, allocation_job_id) != allocation_uuid:
+                    raise LifecycleValidationError(
+                        "GPU_ALLOCATION_POSTCONDITION_FAILED",
+                        "container GPU differs from its live Slurm allocation",
+                    )
+                stop_argv = [
+                    SCRIPT_ALLOWLIST[script_name],
+                    "stop",
+                    str(payload["username"]),
+                    str(allocation_job_id),
+                    allocation_uuid,
+                ]
+            else:
+                stop_argv = [SCRIPT_ALLOWLIST[script_name], str(payload["username"])]
+            stopped = run_allowlisted_script(stop_argv, timeout=150)
+            if not stopped.get("ok"):
+                raise LifecycleValidationError("CONTAINER_STOP_FAILED", "container stop failed")
+        if isinstance(allocation_job_id, int):
+            failed_step = "GPU_ALLOCATION_CANCEL"
+            _cancel_gpu_development_allocation(payload, allocation_job_id)
+            allocation_job_id = None
+            allocation_uuid = None
+            gpu_allocation_revoked = True
+        lifecycle_payload.update({"gpu_allocation_job_id": None, "gpu_allocation_uuid": None})
+        failed_step = "CONTAINER_STOP_POSTCONDITION"
+        _managed_container_security(lifecycle_payload, require_running=False)
+
         failed_step = "SLURM_JOB_DISCOVERY"
         jobs = _active_user_slurm_jobs(str(payload["username"]))
         pending_ids = [job_id for job_id, state in jobs if state.startswith("PEND")]
@@ -8374,24 +9850,6 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
                     "RUNNING_JOB_CANCEL_FAILED", "running jobs could not be cancelled"
                 )
             cancelled_running_ids = running_ids
-        lifecycle_payload = {
-            **payload,
-            "name": payload["container_name"],
-        }
-        failed_step = "CONTAINER_SECURITY_PREFLIGHT"
-        container = _managed_container_security(lifecycle_payload, require_running=None)
-        if bool(container.get("state", {}).get("Running")):
-            failed_step = "CONTAINER_STOP"
-            integrity = script_integrity()
-            if not integrity.get("h100-container-stop", {}).get("integrity_ok", False):
-                raise LifecycleValidationError(
-                    "SCRIPT_INTEGRITY_FAILED", "container stop script integrity failed"
-                )
-            stopped = run_allowlisted_script(
-                [SCRIPT_ALLOWLIST["h100-container-stop"], str(payload["username"])], timeout=90
-            )
-            if not stopped.get("ok"):
-                raise LifecycleValidationError("CONTAINER_STOP_FAILED", "container stop failed")
         failed_step = "RECYCLE_POSTCONDITION"
         _managed_container_security(lifecycle_payload, require_running=False)
         if (
@@ -8402,29 +9860,34 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
             raise LifecycleValidationError(
                 "RECYCLE_POSTCONDITION_FAILED", "lease recycle postconditions are incomplete"
             )
+        failed_step = "LIFECYCLE_STATE_RECYCLE"
+        _mark_recycled_lifecycle(payload, fingerprints, restore_rollback=restore_rollback)
         return {
             "status": "SUCCEEDED",
-            "handler": "resource.recycle",
+            "handler": request.operation_type,
             "request_id": request.request_id,
-            "lease_id": payload["lease_id"],
+            "lease_id": result_lease_id,
             "cancelled_pending_job_ids": cancelled_pending_ids,
             "cancelled_running_job_ids": cancelled_running_ids,
             "container_state": "STOPPED",
-            "container_gpu": "NONE",
+            "container_gpu": payload["expected_gpu"],
+            "gpu_allocation_job_id": None,
+            "gpu_allocation_uuid": None,
             "container_key_state": "SUSPENDED_BY_RECYCLE",
             "container_key_fingerprints": fingerprints,
             "new_access": "DENIED",
             "host_access": "DISABLED",
             "data_preserved": True,
             "container_definition_preserved": True,
+            "gpu_allocation_revoked": True,
             "auto_permanent_delete": False,
         }
     except LifecycleValidationError as exc:
         return {
             "status": "ERROR",
-            "handler": "resource.recycle",
+            "handler": request.operation_type,
             "request_id": request.request_id,
-            "lease_id": payload["lease_id"],
+            "lease_id": result_lease_id,
             "error": {"code": exc.code, "message": str(exc)},
             "first_failed_step": failed_step,
             "cleanup_retryable": key_suspended,
@@ -8435,6 +9898,13 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
             "cancelled_running_job_ids": cancelled_running_ids,
             "data_preserved": True,
             "container_definition_preserved": True,
+            "gpu_allocation_revoked": gpu_allocation_revoked,
+            "gpu_allocation_job_id": (
+                None if gpu_allocation_revoked else payload.get("gpu_allocation_job_id")
+            ),
+            "gpu_allocation_uuid": (
+                None if gpu_allocation_revoked else payload.get("gpu_allocation_uuid")
+            ),
             "auto_permanent_delete": False,
         }
 
@@ -8716,7 +10186,11 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
                 return _execute_managed_container_lifecycle(request, payload)
             if request.operation_type in {"resource.restore", "self.resource.restore"}:
                 return _execute_resource_restore(request, payload)
-            if request.operation_type in {"lease.expire", "resource.recycle"}:
+            if request.operation_type in {
+                "lease.expire",
+                "resource.recycle",
+                "resource.restore.rollback",
+            }:
                 return _execute_resource_recycle(request, payload)
             if request.operation_type == "host_access.revoke_managed_user":
                 return _execute_host_access_revoke(request, payload)

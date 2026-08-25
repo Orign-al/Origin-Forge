@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+source /usr/local/lib/h100-platform/h100-platform-common.sh
+
+if (($# != 4)) || [[ "$1" != start && "$1" != stop ]]; then
+  printf 'Usage: h100-container-gpu-runtime {start|stop} USER SLURM_JOB_ID GPU_UUID\n' >&2
+  exit 2
+fi
+
+readonly action=$1
+readonly user_name=$2
+readonly slurm_job_id=$3
+readonly gpu_uuid=$4
+
+h100_require_root
+h100_validate_username "${user_name}"
+[[ "${slurm_job_id}" =~ ^[1-9][0-9]{0,18}$ ]] || h100_fail 'invalid Slurm allocation ID'
+[[ "${gpu_uuid}" =~ ^GPU-[0-9a-fA-F-]{32,40}$ ]] || h100_fail 'invalid assigned GPU UUID'
+h100_acquire_lock
+h100_install_audit_trap container-gpu-runtime "${user_name}:${action}"
+h100_require_managed_user "${user_name}"
+h100_require_managed_compose "${user_name}"
+h100_require_pilot_gpu_isolation_if_managed "${user_name}"
+
+readonly container="$(h100_container_name "${user_name}")"
+readonly config_dir="$(h100_config_dir "${user_name}")"
+readonly compose_file="$(h100_compose_file "${user_name}")"
+readonly user_uid="$(id -u "${user_name}")"
+readonly workspace="/storage/users/${user_uid}"
+readonly state_file="/etc/h100-platform/users/${user_name}.state"
+
+[[ -d "${workspace}" && ! -L "${workspace}" ]] || h100_fail 'canonical workspace is unavailable'
+[[ "$(stat -c '%u:%g:%a' "${workspace}")" == "${user_uid}:$(id -g "${user_name}"):700" ]] \
+  || h100_fail 'canonical workspace ownership or mode is invalid'
+h100_require_workspace_alias "${user_name}"
+
+lifecycle_value() {
+  local key=$1
+  awk -F= -v key="${key}" '
+    $1 == key { print substr($0, index($0, "=") + 1); found=1 }
+    END { exit found ? 0 : 1 }
+  ' "${state_file}"
+}
+
+validate_gpu_lifecycle() {
+  local lease_start lease_expires lease_start_epoch lease_expires_epoch now_epoch
+  [[ -f "${state_file}" && ! -L "${state_file}" ]] \
+    || h100_fail 'GPU Development lifecycle state is unavailable'
+  [[ "$(stat -c '%U:%G:%a' "${state_file}")" == 'root:gpu-platform-admin:640' ]] \
+    || h100_fail 'GPU Development lifecycle state metadata is invalid'
+  [[ "$(lifecycle_value VERSION)" == 4 \
+    && "$(lifecycle_value STATUS)" == ACTIVE \
+    && "$(lifecycle_value USERNAME)" == "${user_name}" \
+    && "$(lifecycle_value UID)" == "${user_uid}" \
+    && "$(lifecycle_value GID)" == "$(id -g "${user_name}")" \
+    && "$(lifecycle_value DEVELOPMENT_PROFILE)" == GPU_1_8CPU_32GB \
+    && "$(lifecycle_value WORKSPACE_PATH)" == "${workspace}" \
+    && "$(lifecycle_value SSH_KEY_STATE)" == INSTALLED \
+    && "$(lifecycle_value LEASE_STATE)" == ACTIVE ]] \
+    || h100_fail 'GPU Development lifecycle owner or profile binding changed'
+  [[ "$(lifecycle_value LEASE_ID)" =~ \
+    ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] \
+    || h100_fail 'GPU Development lifecycle Lease ID is invalid'
+  [[ "$(lifecycle_value GPU_ALLOCATION_JOB_ID)" == "${slurm_job_id}" \
+    && "$(lifecycle_value GPU_ALLOCATION_UUID)" == "${gpu_uuid}" ]] \
+    || h100_fail 'GPU Development lifecycle allocation binding changed'
+  if [[ "${action}" == start ]]; then
+    lease_start="$(lifecycle_value LEASE_START)"
+    lease_expires="$(lifecycle_value LEASE_EXPIRES)"
+    lease_start_epoch="$(date -u -d "${lease_start}" +%s 2>/dev/null)" \
+      || h100_fail 'GPU Development lifecycle Lease start is invalid'
+    lease_expires_epoch="$(date -u -d "${lease_expires}" +%s 2>/dev/null)" \
+      || h100_fail 'GPU Development lifecycle Lease expiry is invalid'
+    now_epoch="$(date -u +%s)"
+    ((lease_expires_epoch > lease_start_epoch \
+      && lease_expires_epoch - lease_start_epoch <= 345600 \
+      && lease_start_epoch <= now_epoch \
+      && lease_expires_epoch > now_epoch)) \
+      || h100_fail 'GPU Development lifecycle Lease is not current and bounded'
+  fi
+}
+
+validate_gpu_lifecycle
+
+validate_live_slurm_allocation() {
+  local detail allocated_uuid
+  local -a gpu_indexes=()
+  detail="$(scontrol show job -dd -o "${slurm_job_id}")" \
+    || h100_fail 'assigned Slurm allocation is unavailable'
+  grep -Eq "(^|[[:space:]])UserId=${user_name}\\(" <<<"${detail}" \
+    || h100_fail 'assigned Slurm allocation owner changed'
+  grep -Eq '(^|[[:space:]])JobState=RUNNING([[:space:]]|$)' <<<"${detail}" \
+    || h100_fail 'assigned Slurm allocation is not running'
+  grep -Eq '(^|[[:space:]])Account=company([[:space:]]|$)' <<<"${detail}" \
+    || h100_fail 'assigned Slurm allocation account changed'
+  grep -Eq '(^|[[:space:]])QOS=general([[:space:]]|$)' <<<"${detail}" \
+    || h100_fail 'assigned Slurm allocation QOS changed'
+  grep -Eq '(^|[[:space:]])Partition=gpu-dev([[:space:]]|$)' <<<"${detail}" \
+    || h100_fail 'assigned Slurm allocation partition changed'
+  grep -Eq '(^|[[:space:]])(Gres=gpu:h100:1|TresPerNode=gres/gpu:h100:1)([[:space:]]|$)' \
+    <<<"${detail}" || h100_fail 'assigned Slurm allocation is not one H100 GPU'
+  grep -Eq '(^|[[:space:]])Comment=h100-gpu-dev:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}([[:space:]]|$)' \
+    <<<"${detail}" || h100_fail 'assigned Slurm allocation Lease binding changed'
+  mapfile -t gpu_indexes < <(
+    grep -oE 'IDX:[0-9]+' <<<"${detail}" | cut -d: -f2 | sort -u
+  )
+  ((${#gpu_indexes[@]} == 1)) \
+    || h100_fail 'assigned Slurm allocation does not hold exactly one GPU'
+  allocated_uuid="$(
+    nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits \
+      | awk -F, -v index="${gpu_indexes[0]}" '
+          $1 ~ "^[[:space:]]*" index "[[:space:]]*$" {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2
+          }
+        '
+  )"
+  [[ "${allocated_uuid}" == "${gpu_uuid}" ]] \
+    || h100_fail 'assigned Slurm GPU identity changed before container start'
+}
+
+if [[ "${action}" == stop ]]; then
+  docker inspect "${container}" | jq -e \
+    --arg job "${slurm_job_id}" --arg uuid "${gpu_uuid}" '
+      .[0].Config.Labels["h100.dev.gpu-allocation-job"] == $job
+      and .[0].Config.Labels["h100.dev.gpu-uuid"] == $uuid
+    ' >/dev/null || h100_fail 'running GPU container allocation binding changed'
+  docker rm --force "${container}" >/dev/null
+  docker compose --project-directory "${config_dir}" --file "${compose_file}" \
+    create --no-build
+  docker inspect "${container}" | jq -e '
+    .[0].State.Running == false
+    and ((.[0].HostConfig.DeviceRequests // []) | length == 0)
+    and ((.[0].Config.Env // []) | map(select(startswith("NVIDIA_VISIBLE_DEVICES=") or startswith("CUDA_VISIBLE_DEVICES="))) | length == 0)
+  ' >/dev/null || h100_fail 'GPU container was not returned to its GPU-less stopped definition'
+  printf 'STOPPED GPU CONTAINER %s allocation=%s revoked-after-worker-confirmation\n' \
+    "${container}" "${slurm_job_id}"
+  h100_mark_success
+  exit 0
+fi
+
+validate_live_slurm_allocation
+docker inspect "${container}" | jq -e '
+  .[0].State.Running == false
+  and .[0].HostConfig.Privileged == false
+  and ((.[0].HostConfig.DeviceRequests // []) | length == 0)
+  and ((.[0].Config.Env // []) | map(select(startswith("NVIDIA_VISIBLE_DEVICES=") or startswith("CUDA_VISIBLE_DEVICES="))) | length == 0)
+' >/dev/null || h100_fail 'GPU start requires the stopped GPU-less base definition'
+
+temp_dir="$(mktemp -d /tmp/h100-container-gpu-runtime.XXXXXX)"
+cleanup_gpu_override() {
+  local rc=$?
+  case "${temp_dir}" in
+    /tmp/h100-container-gpu-runtime.*) rm -rf -- "${temp_dir}" ;;
+  esac
+  trap - EXIT
+  h100_audit "${H100_AUDIT_ACTION}" "${H100_AUDIT_TARGET}" "${H100_AUDIT_OUTCOME}" "${rc}"
+  exit "${rc}"
+}
+trap cleanup_gpu_override EXIT
+
+override="${temp_dir}/gpu-override.yml"
+cat >"${override}" <<EOF
+services:
+  dev:
+    runtime: nvidia
+    restart: "no"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${gpu_uuid}"
+      CUDA_VISIBLE_DEVICES: "0"
+    labels:
+      h100.dev.gpu-allocation-job: "${slurm_job_id}"
+      h100.dev.gpu-uuid: "${gpu_uuid}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${gpu_uuid}"]
+              capabilities: [gpu]
+EOF
+
+docker compose --project-directory "${config_dir}" --file "${compose_file}" \
+  --file "${override}" config --quiet
+docker compose --project-directory "${config_dir}" --file "${compose_file}" \
+  --file "${override}" up --detach --force-recreate --no-build
+h100_wait_healthy "${container}" 120 || h100_fail 'GPU container did not become healthy'
+
+docker inspect "${container}" | jq -e \
+  --arg job "${slurm_job_id}" --arg uuid "${gpu_uuid}" \
+  --arg workspace "${workspace}" '
+    .[0] as $c
+    | $c.State.Running == true
+    and $c.HostConfig.Privileged == false
+    and $c.HostConfig.NetworkMode != "host"
+    and $c.HostConfig.PidMode != "host"
+    and $c.HostConfig.IpcMode != "host"
+    and $c.HostConfig.Runtime == "nvidia"
+    and (($c.HostConfig.DeviceRequests // []) | length == 1)
+    and $c.HostConfig.DeviceRequests[0].Driver == "nvidia"
+    and $c.HostConfig.DeviceRequests[0].DeviceIDs == [$uuid]
+    and $c.HostConfig.DeviceRequests[0].Capabilities == [["gpu"]]
+    and (($c.HostConfig.DeviceRequests[0].Options // {}) | length == 0)
+    and (($c.HostConfig.Devices // []) | length == 0)
+    and (($c.HostConfig.DeviceCgroupRules // []) | length == 0)
+    and (($c.HostConfig.CapAdd // []) | length == 0)
+    and $c.Config.Labels["h100.dev.gpu-allocation-job"] == $job
+    and $c.Config.Labels["h100.dev.gpu-uuid"] == $uuid
+    and (($c.Config.Env // []) | index("NVIDIA_VISIBLE_DEVICES=" + $uuid)) != null
+    and (($c.Config.Env // []) | index("CUDA_VISIBLE_DEVICES=0")) != null
+    and (($c.Mounts // []) | map(select(.Source == $workspace and .Destination == "/workspace" and .RW == true)) | length == 1)
+    and (($c.Mounts // []) | map(.Destination) | index("/var/run/docker.sock") | not)
+    and (($c.Mounts // []) | map(.Source) | index("/") | not)
+  ' >/dev/null || h100_fail 'GPU container failed its allocation and isolation postconditions'
+
+visible="$(docker exec "${container}" nvidia-smi --query-gpu=uuid --format=csv,noheader)"
+[[ "${visible}" == "${gpu_uuid}" ]] || h100_fail 'GPU container can see other or unexpected GPUs'
+docker exec "${container}" python3 -c '
+import ctypes
+
+cuda = ctypes.CDLL("libcuda.so.1")
+count = ctypes.c_int()
+device = ctypes.c_int()
+context = ctypes.c_void_p()
+if cuda.cuInit(0) != 0:
+    raise SystemExit("cuInit failed")
+if cuda.cuDeviceGetCount(ctypes.byref(count)) != 0 or count.value != 1:
+    raise SystemExit("CUDA device count is not exactly one")
+if cuda.cuDeviceGet(ctypes.byref(device), 0) != 0:
+    raise SystemExit("cuDeviceGet failed")
+if cuda.cuCtxCreate_v2(ctypes.byref(context), 0, device) != 0:
+    raise SystemExit("cuCtxCreate failed")
+if cuda.cuCtxDestroy_v2(context) != 0:
+    raise SystemExit("cuCtxDestroy failed")
+print("CUDA_CONTEXT_OK devices=1")
+' >/dev/null || h100_fail 'GPU container could not create one isolated CUDA context'
+printf 'STARTED GPU CONTAINER %s allocation=%s gpu=%s\n' \
+  "${container}" "${slurm_job_id}" "${gpu_uuid}"
+h100_mark_success

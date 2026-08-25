@@ -87,6 +87,7 @@ def _staged_activation(
     username: str = "origin-pilot2",
     uid: int = 20002,
     key_scope: str | None = "CONTAINER",
+    development_profile: str = "STANDARD_8CPU_32GB",
 ) -> StagedActivation:
     user = _account(database, login=login)
     now = utcnow()
@@ -121,7 +122,7 @@ def _staged_activation(
         active_slot=None,
         requested_gpu_max=1,
         requested_storage_bytes=300 * 1024**3,
-        requested_container_profile="STANDARD_8CPU_32GB",
+        requested_container_profile=development_profile,
         requested_lease_seconds=LEASE_SECONDS,
         purpose="owner-bound activation fixture",
         submitted_at=now,
@@ -142,11 +143,11 @@ def _staged_activation(
         container_name=f"gpu-dev-{username}",
         container_ssh_port=uid + 2021,
         storage_bytes=300 * 1024**3,
-        container_profile="STANDARD_8CPU_32GB",
+        container_profile=development_profile,
         container_cpus=8,
         container_memory_gb=32,
         container_pids_limit=4096,
-        container_gpu=0,
+        container_gpu=1 if development_profile == "GPU_1_8CPU_32GB" else 0,
         slurm_account="company",
         slurm_qos="general",
         gpu_max=1,
@@ -197,8 +198,10 @@ def _staged_activation(
         ssh_port=uid + 2021,
         desired_state="STOPPED",
         observed_state="STOPPED",
+        development_profile=development_profile,
+        gpu_count=1 if development_profile == "GPU_1_8CPU_32GB" else 0,
         safe_spec={
-            "gpu": "NONE",
+            "gpu": ("SLURM_ALLOCATED_1" if development_profile == "GPU_1_8CPU_32GB" else "NONE"),
             "privileged": False,
             "host_network": False,
             "host_pid": False,
@@ -216,7 +219,7 @@ def _staged_activation(
     )
     storage = PortalStorageResource(
         owner_managed_user_id=managed.id,
-        root_path=f"/srv/gpu-platform/users/{username}",
+        root_path=f"/storage/users/{uid}",
         quota_bytes=300 * 1024**3,
         state="STAGED",
     )
@@ -303,7 +306,15 @@ def _worker_success(calls: list[tuple[str, dict[str, Any]]]):
             "username": payload["username"],
             "container_name": payload["container_name"],
             "container_state": "RUNNING",
-            "container_gpu": "NONE",
+            "container_gpu": payload["expected_gpu"],
+            "gpu_allocation_job_id": (
+                701 if payload["development_profile"] == "GPU_1_8CPU_32GB" else None
+            ),
+            "gpu_allocation_uuid": (
+                "GPU-11111111-2222-3333-4444-555555555555"
+                if payload["development_profile"] == "GPU_1_8CPU_32GB"
+                else None
+            ),
             "container_cpus": 8,
             "container_memory_gb": 32,
             "container_pids_limit": 4096,
@@ -400,6 +411,41 @@ def test_owner_can_activate_staged_compute_once_without_users_write(
         select(PortalAuditEvent).where(PortalAuditEvent.event_type == "COMPUTE_SELF_ACTIVATED")
     )
     assert audit is not None and audit.actor == target.user.normalized_login
+
+
+def test_owner_activation_persists_gpu_development_allocation_coordinates(
+    client: Any,
+    database: Session,
+    origin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _staged_activation(
+        database,
+        login="gpu-activation-user",
+        username="gpu-activation-user",
+        uid=20012,
+        development_profile="GPU_1_8CPU_32GB",
+    )
+    headers = _login(client, origin_headers, target.user.normalized_login)
+    calls: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(activation_routes, "call_worker", _worker_success(calls))
+
+    response = _activate(client, headers)
+    assert response.status_code == 200
+    payload = calls[0][1]["payload"]
+    assert payload["development_profile"] == "GPU_1_8CPU_32GB"
+    assert payload["container_gpu"] == 1
+    assert payload["expected_gpu"] == "SLURM_ALLOCATED_1"
+    assert payload["workspace_path"] == "/storage/users/20012"
+
+    database.expire_all()
+    container = database.get(PortalContainer, target.container.id)
+    assert container is not None
+    assert container.development_profile == "GPU_1_8CPU_32GB"
+    assert container.gpu_count == 1
+    assert container.observed_state == "RUNNING"
+    assert container.gpu_allocation_job_id == 701
+    assert container.gpu_allocation_uuid == "GPU-11111111-2222-3333-4444-555555555555"
 
 
 def test_double_activate_is_idempotent_and_never_extends_lease(

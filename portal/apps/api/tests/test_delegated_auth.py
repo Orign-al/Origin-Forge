@@ -27,6 +27,7 @@ from h100_portal_api.models import (
     PortalPasswordCredential,
     PortalRole,
     PortalSession,
+    PortalStorageResource,
     PortalUser,
     utcnow,
 )
@@ -110,7 +111,13 @@ def _managed_identity(db: Session, *, login: str, uid: int, port: int) -> Simple
         gpu_count=1,
         approved_by=user.id,
     )
-    db.add_all([container, lease])
+    storage = PortalStorageResource(
+        owner_managed_user_id=managed.id,
+        root_path=f"/storage/users/{uid}",
+        quota_bytes=300 * 1024**3,
+        state="ACTIVE",
+    )
+    db.add_all([container, lease, storage])
     db.commit()
     return SimpleNamespace(
         user=user,
@@ -194,10 +201,10 @@ def _job(
         slurm_job_id=slurm_job_id,
         name=f"delegated-job-{slurm_job_id}",
         state=state,
-        script_relative_path=f"workspace/.portal/job-scripts/{job_id}.sh",
-        workdir_relative_path="workspace",
-        stdout_relative_path=f"workspace/.portal/jobs/{job_id}.out",
-        stderr_relative_path=f"workspace/.portal/jobs/{job_id}.err",
+        script_relative_path=f".portal/job-scripts/{job_id}.sh",
+        workdir_relative_path="projects",
+        stdout_relative_path=f"outputs/{job_id}.out",
+        stderr_relative_path=f"outputs/{job_id}.err",
         requested_cpus=2,
         memory_mb=4096,
         gpu_count=1,

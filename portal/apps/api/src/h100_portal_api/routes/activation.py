@@ -3,6 +3,11 @@ from datetime import datetime, timedelta
 from typing import Any, NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from h100_portal_contracts.workspace import (
+    CPU_DEVELOPMENT_PROFILE,
+    GPU_DEVELOPMENT_PROFILE,
+    workspace_path,
+)
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -92,8 +97,14 @@ def _audit(
 
 def _safe_staged_container(container: PortalContainer) -> bool:
     spec = container.safe_spec if isinstance(container.safe_spec, dict) else {}
+    expected_gpu = "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1"
     return bool(
-        spec.get("gpu") == "NONE"
+        container.development_profile in {CPU_DEVELOPMENT_PROFILE, GPU_DEVELOPMENT_PROFILE}
+        and container.gpu_count
+        == (1 if container.development_profile == GPU_DEVELOPMENT_PROFILE else 0)
+        and container.gpu_allocation_job_id is None
+        and container.gpu_allocation_uuid is None
+        and spec.get("gpu") == expected_gpu
         and spec.get("privileged") is False
         and spec.get("host_network") is False
         and spec.get("host_pid") is False
@@ -236,13 +247,15 @@ def _load_staged_target(db: Session, context: AuthContext, *, lock: bool) -> Act
         and plan.host_ssh_enabled is False
         and plan.shell == "/usr/sbin/nologin"
         and plan.password_state == "LOCKED"  # noqa: S105 -- lifecycle state, not a secret
-        and plan.container_gpu == 0
+        and plan.container_profile == container.development_profile
+        and plan.container_gpu == container.gpu_count
         and plan.container_cpus == 8
         and plan.container_memory_gb == 32
         and plan.container_pids_limit == 4096
         and container.desired_state == "STOPPED"
         and container.observed_state == "STOPPED"
         and storage.state == "STAGED"
+        and storage.root_path == str(workspace_path(managed.uid))
         and _safe_staged_container(container)
         and all(
             key.host_install_state == "NOT_INSTALLED"
@@ -319,6 +332,9 @@ def _worker_payload(target: ActivationTarget, operation: PortalOperation) -> dic
         "project_id": target.plan.project_id,
         "ssh_port": target.plan.container_ssh_port,
         "container_name": target.container.name,
+        "workspace_path": str(workspace_path(target.managed.uid)),
+        "development_profile": target.container.development_profile,
+        "container_gpu": target.container.gpu_count,
         "slurm_account": target.plan.slurm_account,
         "slurm_qos": target.plan.slurm_qos,
         "ssh_key_record_ids": [str(key.id) for key in target.keys],
@@ -330,7 +346,8 @@ def _worker_payload(target: ActivationTarget, operation: PortalOperation) -> dic
         "expected_host_access": "DISABLED_BY_PLATFORM_POLICY",
         "expected_shell": "/usr/sbin/nologin",
         "expected_password_state": "LOCKED",
-        "expected_gpu": "NONE",
+        "expected_gpu": "NONE" if target.container.gpu_count == 0 else "SLURM_ALLOCATED_1",
+        "lease_id": str(uuid.uuid4()),
         "deployment_version": deployment_version(),
     }
 
@@ -384,6 +401,9 @@ def _record_failure(
             container.observed_state = (
                 "STOPPED" if rollback_status in {"NOT_REQUIRED", "ROLLED_BACK"} else "UNKNOWN"
             )
+            if rollback_status in {"NOT_REQUIRED", "ROLLED_BACK"}:
+                container.gpu_allocation_job_id = None
+                container.gpu_allocation_uuid = None
     db.add(
         PortalOperationEvent(
             operation_id=operation.id,
@@ -607,7 +627,7 @@ def activate_self_compute(
         and worker_result.get("username") == managed.unix_username
         and worker_result.get("container_name") == managed.container_name
         and worker_result.get("container_state") == "RUNNING"
-        and worker_result.get("container_gpu") == "NONE"
+        and worker_result.get("container_gpu") == payload.get("expected_gpu")
         and worker_result.get("container_cpus") == 8
         and worker_result.get("container_memory_gb") == 32
         and worker_result.get("container_pids_limit") == 4096
@@ -621,6 +641,17 @@ def activate_self_compute(
         and worker_result.get("container_key_fingerprints") == expected_fingerprints
         and worker_result.get("deployment_version") == payload.get("deployment_version")
     )
+    allocation_job_id = worker_result.get("gpu_allocation_job_id")
+    allocation_uuid = worker_result.get("gpu_allocation_uuid")
+    allocation_ok = (
+        allocation_job_id is None and allocation_uuid is None
+        if payload.get("development_profile") == CPU_DEVELOPMENT_PROFILE
+        else isinstance(allocation_job_id, int)
+        and allocation_job_id > 0
+        and isinstance(allocation_uuid, str)
+        and allocation_uuid.startswith("GPU-")
+    )
+    worker_ok = worker_ok and allocation_ok
     if not worker_ok:
         error = worker_result.get("error", {})
         code = str(error.get("code", "ACTIVATION_WORKER_RESULT_INVALID"))[:64]
@@ -648,7 +679,7 @@ def activate_self_compute(
         )
         raise _error(409, code, "计算环境激活失败；Lease 未启动")
 
-    lease_id = uuid.uuid4()
+    lease_id = uuid.UUID(str(payload["lease_id"]))
     try:
         persisted_operation = db.scalar(
             select(PortalOperation).where(PortalOperation.id == operation.id).with_for_update()
@@ -694,6 +725,8 @@ def activate_self_compute(
         target.request.active_slot = None
         target.container.desired_state = "RUNNING"
         target.container.observed_state = "RUNNING"
+        target.container.gpu_allocation_job_id = allocation_job_id
+        target.container.gpu_allocation_uuid = allocation_uuid
         target.container.safe_spec = {
             **target.container.safe_spec,
             "authorized_keys": "INSTALLED",

@@ -372,13 +372,13 @@ def test_exact_dry_run_reports_zero_side_effects_and_real_execution_is_disabled(
     contract = result["stage_contract"]
     assert contract["status"] == "PASS"
     assert contract["handler"]["sha256"] == "a" * 64
-    assert contract["argv_contract"]["argument_13"] == {
-        "index": 13,
+    assert contract["argv_contract"]["argument_14"] == {
+        "index": 14,
         "semantic_role": "EXPLICIT_STAGE_CONFIRMATION_FLAG",
         "binding_status": "VALID",
     }
-    assert contract["argv_contract"]["argument_14"] == {
-        "index": 14,
+    assert contract["argv_contract"]["argument_15"] == {
+        "index": 15,
         "semantic_role": "CONFIRMED_TARGET_USERNAME",
         "binding_status": "VALID",
     }
@@ -394,7 +394,7 @@ def test_exact_dry_run_reports_zero_side_effects_and_real_execution_is_disabled(
     assert denied["error"]["code"] == "WRITE_EXECUTION_DISABLED"
 
 
-@pytest.mark.parametrize("index", [13, 14])
+@pytest.mark.parametrize("index", [14, 15])
 def test_dry_run_argument_binding_mismatch_is_contract_incomplete_and_read_only(
     monkeypatch: pytest.MonkeyPatch, index: int
 ) -> None:
@@ -464,7 +464,7 @@ def test_compute_stage_runs_only_hash_pinned_fixed_handler(
     result = handlers.handle(request("compute.provision.stage", payload, dry_run=False))
     assert result["status"] == "SUCCEEDED"
     assert result["handler"] == "compute.provision.stage"
-    assert len(observed) == 15
+    assert len(observed) == 16
     assert observed[0] == "/usr/local/sbin/h100-provision-stage"
     assert observed[-2:] == ["--confirm-stage", payload["username"]]
 
@@ -492,8 +492,8 @@ def test_compute_stage_missing_contract_evidence_fails_before_execution(
 @pytest.mark.parametrize(
     ("index", "mismatch"),
     [
-        (13, "ARGUMENT_13_BINDING"),
         (14, "ARGUMENT_14_BINDING"),
+        (15, "ARGUMENT_15_BINDING"),
     ],
 )
 def test_compute_stage_argument_binding_mismatch_requires_new_dry_run(
@@ -648,10 +648,11 @@ def test_compute_stage_script_confirmation_uses_parameters_above_nine() -> None:
     content = source.read_text()
 
     subprocess.run(["/usr/bin/bash", "-n", str(source)], check=True)
-    assert '"${13:-}" == --confirm-stage' in content
-    assert '"${2:-}" == "${14:-}"' in content
+    assert '"${14:-}" == --confirm-stage' in content
+    assert '"${2:-}" == "${15:-}"' in content
     assert '"$13"' not in content
     assert '"$14"' not in content
+    assert '"$15"' not in content
     assert manifest["h100-provision-stage"] == hashlib.sha256(source.read_bytes()).hexdigest()
 
     argv = [
@@ -667,12 +668,13 @@ def test_compute_stage_script_confirmation_uses_parameters_above_nine() -> None:
         str(uuid.uuid4()),
         str(uuid.uuid4()),
         str(uuid.uuid4()),
+        "STANDARD_8CPU_32GB",
         "--confirm-stage",
         "fixture-user",
     ]
-    old_gate = '[[ "$1" == --execute && "$13" == --confirm-stage && "$2" == "$14" ]]'
+    old_gate = '[[ "$1" == --execute && "$14" == --confirm-stage && "$2" == "$15" ]]'
     fixed_gate = (
-        '[[ "${1:-}" == --execute && "${13:-}" == --confirm-stage && "${2:-}" == "${14:-}" ]]'
+        '[[ "${1:-}" == --execute && "${14:-}" == --confirm-stage && "${2:-}" == "${15:-}" ]]'
     )
     old = subprocess.run(["/usr/bin/bash", "-c", old_gate, "gate", *argv], check=False)
     fixed = subprocess.run(["/usr/bin/bash", "-c", fixed_gate, "gate", *argv], check=False)

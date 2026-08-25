@@ -989,7 +989,9 @@ export function OrdinaryRecycleBin() {
         queryClient.invalidateQueries({ queryKey: ["self-recycle-bin"] }),
         queryClient.invalidateQueries({ queryKey: ["self-environment"] }),
         queryClient.invalidateQueries({ queryKey: ["self-container"] }),
-        queryClient.invalidateQueries({ queryKey: ["self-container-connection"] }),
+        queryClient.invalidateQueries({
+          queryKey: ["self-container-connection"],
+        }),
       ]);
     },
   });
@@ -1062,7 +1064,9 @@ export function OrdinaryRecycleBin() {
                 tone="primary"
                 disabled={
                   restore.isPending ||
-                  !["RECYCLE_BIN", "RESTORE_PENDING"].includes(item.state)
+                  !["RECYCLE_BIN", "RESTORE_PENDING", "FAILED"].includes(
+                    item.state,
+                  )
                 }
                 onClick={() => restore.mutate(item.id)}
               >

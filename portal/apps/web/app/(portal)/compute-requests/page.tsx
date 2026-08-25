@@ -75,7 +75,10 @@ export default function ComputeRequestsPage() {
     status: item.lifecycle_state ?? item.status,
     gpu: item.requested_gpu_max,
     storage: "300GB",
-    container: "8CPU / 32GB / GPU NONE",
+    container:
+      item.requested_container_profile === "GPU_1_8CPU_32GB"
+        ? "8CPU / 32GB / GPU 1 scheduled"
+        : "8CPU / 32GB / GPU NONE",
     lease: "96h after activation",
     submitted: localTime(item.submitted_at),
   }));

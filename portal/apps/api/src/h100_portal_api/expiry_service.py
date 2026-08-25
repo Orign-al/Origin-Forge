@@ -3,6 +3,7 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
+from h100_portal_contracts.workspace import workspace_path
 from sqlalchemy import exists, or_, select, update
 from sqlalchemy.orm import Session, aliased
 
@@ -288,6 +289,10 @@ def _record_failure(
     managed.compute_environment_state = "SUSPENDED"
     container.desired_state = "STOPPED"
     worker_result = result or {}
+    if worker_result.get("gpu_allocation_revoked") is True:
+        container.gpu_allocation_job_id = None
+        container.gpu_allocation_uuid = None
+        container.observed_state = "STOPPED"
     observed = worker_result.get("container_key_fingerprints")
     key_suspension_verified = (
         worker_result.get("container_key_state") == "SUSPENDED_BY_RECYCLE"
@@ -394,6 +399,8 @@ def _record_success(
     managed.compute_environment_state = "RECYCLED"
     container.observed_state = "STOPPED"
     container.desired_state = "STOPPED"
+    container.gpu_allocation_job_id = None
+    container.gpu_allocation_uuid = None
     for key in keys:
         key.container_install_state = "SUSPENDED_BY_RECYCLE"
     storage = db.scalar(
@@ -504,8 +511,15 @@ def _execute_cleanup(
         "uid": managed.uid,
         "gid": managed.gid,
         "container_name": container.name,
+        "workspace_path": str(workspace_path(managed.uid)),
+        "development_profile": container.development_profile,
+        "container_gpu": container.gpu_count,
+        "gpu_allocation_job_id": container.gpu_allocation_job_id,
+        "gpu_allocation_uuid": container.gpu_allocation_uuid,
+        "slurm_account": managed.slurm_account,
+        "slurm_qos": managed.slurm_qos,
         "expires_at": ensure_utc(lease.expires_at).isoformat(),
-        "expected_gpu": "NONE",
+        "expected_gpu": "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1",
         "host_access": "DISABLED_BY_PLATFORM_POLICY",
         "expected_key_fingerprints": expected_key_fingerprints,
     }
@@ -543,10 +557,13 @@ def _execute_cleanup(
         )
         return False
     observed_fingerprints = result.get("container_key_fingerprints")
+    expected_gpu = "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1"
     success = (
         result.get("status") == "SUCCEEDED"
         and result.get("container_state") == "STOPPED"
-        and result.get("container_gpu") == "NONE"
+        and result.get("container_gpu") == expected_gpu
+        and result.get("gpu_allocation_job_id") is None
+        and result.get("gpu_allocation_uuid") is None
         and result.get("container_key_state") == "SUSPENDED_BY_RECYCLE"
         and isinstance(observed_fingerprints, list)
         and sorted(str(item) for item in observed_fingerprints) == expected_key_fingerprints

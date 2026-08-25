@@ -27,8 +27,7 @@ const IDEMPOTENCY_KEY = "10000000-0000-4000-8000-000000000004";
 
 vi.mock("next/navigation", () => ({
   useParams: () => ({ id: "10000000-0000-4000-8000-000000000001" }),
-  usePathname: () =>
-    "/compute-requests/10000000-0000-4000-8000-000000000001",
+  usePathname: () => "/compute-requests/10000000-0000-4000-8000-000000000001",
   useRouter: () => ({ replace: vi.fn(), push: vi.fn(), refresh: vi.fn() }),
 }));
 
@@ -75,9 +74,7 @@ function currentSession(
       setup_path: null,
     },
     recent_auth_valid: recentAuthValid,
-    recent_auth_valid_until: recentAuthValid
-      ? "2026-08-16T12:15:00Z"
-      : null,
+    recent_auth_valid_until: recentAuthValid ? "2026-08-16T12:15:00Z" : null,
   };
 }
 
@@ -113,13 +110,14 @@ function requestFixture(
     workflow_steps: {
       PREPARING: "SUCCEEDED",
       VALIDATING: "SUCCEEDED",
-      CREATING_ENVIRONMENT:
-        status === "PROVISIONING" ? "RUNNING" : "FAILED",
+      CREATING_ENVIRONMENT: status === "PROVISIONING" ? "RUNNING" : "FAILED",
       FINALIZING: "PENDING",
     },
     deployment_version: "a".repeat(40),
     canonical_execution_contract: "b".repeat(64),
-    reconciliation_status: options.retryAvailable ? "VERIFIED" : "MANUAL_REVIEW",
+    reconciliation_status: options.retryAvailable
+      ? "VERIFIED"
+      : "MANUAL_REVIEW",
     resource_residue: [],
     unknown_resource_state: options.unknown ?? [],
   };
@@ -306,11 +304,13 @@ describe("simplified Provision administrator workflow", () => {
     expect(
       await screen.findByText("Container image validation failed"),
     ).toBeInTheDocument();
-    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(screen.getByText("ROLLED_BACK")).toBeInTheDocument();
     const retry = screen.getByRole("button", { name: "重试 Provision" });
     expect(screen.queryByLabelText("Retry Reason")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Root Cause")).not.toBeInTheDocument();
-    expect(screen.queryByLabelText("Remediation Git SHA")).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Remediation Git SHA"),
+    ).not.toBeInTheDocument();
 
     fireEvent.click(retry);
     await waitFor(() => expect(retryProvision).toHaveBeenCalledTimes(1));
@@ -345,12 +345,16 @@ describe("simplified Provision administrator workflow", () => {
   it("renders simple progress and keeps implementation diagnostics collapsed", async () => {
     renderPage(requestFixture("PROVISIONING"), currentSession(true));
 
-    expect(await screen.findByTestId("provisioning-progress")).toBeInTheDocument();
+    expect(
+      await screen.findByTestId("provisioning-progress"),
+    ).toBeInTheDocument();
     expect(screen.getByText("Preparing")).toBeInTheDocument();
     expect(screen.getByText("Validating")).toBeInTheDocument();
     expect(screen.getByText("Creating environment")).toBeInTheDocument();
     expect(screen.getByText("Finalizing")).toBeInTheDocument();
-    const diagnostics = screen.getByText("Advanced diagnostics").closest("details");
+    const diagnostics = screen
+      .getByText("Advanced diagnostics")
+      .closest("details");
     expect(diagnostics).not.toHaveAttribute("open");
     expect(screen.queryByText(/Arg13/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/validator hash/i)).not.toBeInTheDocument();
@@ -360,7 +364,10 @@ describe("simplified Provision administrator workflow", () => {
     vi.mocked(adminComputeRequest).mockRejectedValue(new Error("FORBIDDEN"));
     vi.mocked(me).mockResolvedValue(currentSession(true, "user"));
     const queryClient = new QueryClient({
-      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
     });
     render(
       <QueryClientProvider client={queryClient}>
@@ -369,7 +376,9 @@ describe("simplified Provision administrator workflow", () => {
     );
 
     expect(await screen.findByText(/无权查看/)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "批准" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "批准" }),
+    ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "重试 Provision" }),
     ).not.toBeInTheDocument();

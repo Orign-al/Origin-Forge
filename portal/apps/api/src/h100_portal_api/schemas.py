@@ -67,11 +67,19 @@ class ComputeResourceRequestCreate(ApiModel):
 
     requested_gpu_max: Literal[0, 1] = 0
     requested_storage_bytes: Literal[322122547200] = 322122547200
-    requested_container_profile: Literal["STANDARD_8CPU_32GB"] = "STANDARD_8CPU_32GB"
+    requested_container_profile: Literal["STANDARD_8CPU_32GB", "GPU_1_8CPU_32GB"] = (
+        "STANDARD_8CPU_32GB"
+    )
     requested_lease_seconds: Literal[345600] = 345600
     purpose: str = Field(min_length=1, max_length=1000)
     user_note: str | None = Field(default=None, max_length=1000)
     idempotency_key: uuid.UUID
+
+    @model_validator(mode="after")
+    def gpu_profile_requires_one_gpu_entitlement(self) -> ComputeResourceRequestCreate:
+        if self.requested_container_profile == "GPU_1_8CPU_32GB" and self.requested_gpu_max != 1:
+            raise ValueError("GPU development profile requires a one-GPU entitlement")
+        return self
 
     @field_validator("purpose")
     @classmethod

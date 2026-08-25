@@ -1,4 +1,4 @@
-"""Portal-5A owner-bound workspace contract.
+"""Portal-5A owner-bound workspace and development-profile contract.
 
 Existing quota roots remain username-keyed. New containers and Slurm jobs use
 the UID-keyed canonical workspace, which is a bind alias of the existing
@@ -32,6 +32,10 @@ WORKSPACE_REQUIRED_DIRECTORIES = (
     PurePosixPath(".portal/logs"),
     PurePosixPath(".portal/runtime"),
 )
+
+CPU_DEVELOPMENT_PROFILE = "STANDARD_8CPU_32GB"
+GPU_DEVELOPMENT_PROFILE = "GPU_1_8CPU_32GB"
+DEVELOPMENT_PROFILES = frozenset({CPU_DEVELOPMENT_PROFILE, GPU_DEVELOPMENT_PROFILE})
 
 MANAGED_USERNAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 
@@ -138,3 +142,13 @@ def workspace_relative_parts(value: str | PurePosixPath) -> tuple[str, ...]:
     ):
         raise ValueError("logical workspace path is invalid")
     return path.parts[1:]
+
+
+def profile_gpu_count(profile: str) -> int:
+    """Return the fixed interactive GPU count for a development profile."""
+
+    if profile == CPU_DEVELOPMENT_PROFILE:
+        return 0
+    if profile == GPU_DEVELOPMENT_PROFILE:
+        return 1
+    raise ValueError("development profile is not approved")

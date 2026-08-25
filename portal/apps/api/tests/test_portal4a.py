@@ -65,6 +65,7 @@ def _identity(
     uid: int = 20001,
     port: int = 22023,
     remaining_hours: int = 96,
+    development_profile: str = "STANDARD_8CPU_32GB",
 ) -> SimpleNamespace:
     role = db.scalar(select(PortalRole).where(PortalRole.name == "user"))
     user = PortalUser(
@@ -152,6 +153,9 @@ def _identity(
         active=True,
     )
     db.add(key)
+    container_gpu = 1 if development_profile == "GPU_1_8CPU_32GB" else 0
+    allocation_job_id = 701 if container_gpu else None
+    allocation_uuid = "GPU-11111111-2222-3333-4444-555555555555" if container_gpu else None
     container = PortalContainer(
         managed_user_id=managed.id,
         owner_managed_user_id=managed.id,
@@ -160,13 +164,20 @@ def _identity(
         ssh_port=port,
         desired_state="RUNNING",
         observed_state="RUNNING",
-        safe_spec={"gpu": "NONE", "privileged": False},
+        development_profile=development_profile,
+        gpu_count=container_gpu,
+        gpu_allocation_job_id=allocation_job_id,
+        gpu_allocation_uuid=allocation_uuid,
+        safe_spec={
+            "gpu": "SLURM_ALLOCATED_1" if container_gpu else "NONE",
+            "privileged": False,
+        },
     )
     db.add(container)
     db.add(
         PortalStorageResource(
             owner_managed_user_id=managed.id,
-            root_path=f"/srv/gpu-platform/users/{username}",
+            root_path=f"/storage/users/{uid}",
             quota_bytes=300 * 1024**3,
             state="ACTIVE",
         )
@@ -261,10 +272,10 @@ def _job(db: Session, identity: SimpleNamespace, name: str) -> PortalJob:
         operation_id=operation.id,
         name=name,
         state="PENDING",
-        script_relative_path="workspace/job.sh",
-        workdir_relative_path="workspace",
-        stdout_relative_path=f"workspace/.portal/jobs/{job_id}.out",
-        stderr_relative_path=f"workspace/.portal/jobs/{job_id}.err",
+        script_relative_path=f".portal/job-scripts/{job_id}.sh",
+        workdir_relative_path="projects",
+        stdout_relative_path=f"outputs/{job_id}.out",
+        stderr_relative_path=f"outputs/{job_id}.err",
         requested_cpus=1,
         memory_mb=1024,
         gpu_count=0,
@@ -892,8 +903,10 @@ def test_job_and_container_operations_enforce_active_lease_gpu_and_time(
     assert worker_payload["slurm_account"] == "company"
     assert worker_payload["slurm_qos"] == "general"
     assert worker_payload["max_gpu"] == 1
-    assert worker_payload["workdir_relative_path"] == "workspace"
-    assert worker_payload["script_relative_path"].startswith("workspace/.portal/job-scripts/")
+    assert worker_payload["workspace_path"] == "/storage/users/20002"
+    assert worker_payload["workdir_relative_path"] == "projects"
+    assert worker_payload["script_relative_path"].startswith(".portal/job-scripts/")
+    assert worker_payload["stdout_relative_path"].startswith("outputs/")
     assert worker_payload["script_content"].startswith("#!/bin/bash\nset -eu")
     assert (
         worker_payload["script_sha256"]
@@ -991,6 +1004,58 @@ def test_expired_timestamp_denies_new_access_even_when_database_state_is_active(
     assert logs.json()["detail"]["code"] == "LEASE_INACTIVE"
     assert renewal.status_code == 409
     assert renewal.json()["detail"]["code"] == "LEASE_EXPIRED_RESTORE_REQUIRED"
+
+
+def test_failed_gpu_restart_persists_worker_confirmed_allocation_cleanup(
+    client,
+    database: Session,
+    origin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(
+        database,
+        login="gpu-restart-owner",
+        username="gpu-restart-owner",
+        uid=20011,
+        port=22031,
+        development_profile="GPU_1_8CPU_32GB",
+    )
+    headers = _login(client, origin_headers, identity.user.normalized_login)
+    captured: dict[str, object] = {}
+
+    def worker(operation_type: str, **kwargs):  # type: ignore[no-untyped-def]
+        captured["operation_type"] = operation_type
+        captured["payload"] = kwargs["payload"]
+        return {
+            "status": "ERROR",
+            "gpu_allocation_state_known": True,
+            "gpu_allocation_job_id": None,
+            "gpu_allocation_uuid": None,
+            "error": {"code": "CONTAINER_START_FAILED", "message": "fixture failure"},
+        }
+
+    monkeypatch.setattr("h100_portal_api.routes.self_service.call_worker", worker)
+    response = client.post(
+        "/api/v1/self/container/restart",
+        headers=headers,
+        json={"idempotency_key": str(uuid.uuid4())},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "CONTAINER_START_FAILED"
+    assert captured["operation_type"] == "container.restart"
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["gpu_allocation_job_id"] == 701
+    assert payload["gpu_allocation_uuid"] == "GPU-11111111-2222-3333-4444-555555555555"
+    assert payload["lease_id"] == str(identity.lease.id)
+    assert payload["lease_starts_at"] == ensure_utc(identity.lease.starts_at).isoformat()
+    assert payload["lease_expires_at"] == ensure_utc(identity.lease.expires_at).isoformat()
+
+    database.refresh(identity.container)
+    assert identity.container.observed_state == "STOPPED"
+    assert identity.container.desired_state == "STOPPED"
+    assert identity.container.gpu_allocation_job_id is None
+    assert identity.container.gpu_allocation_uuid is None
 
 
 def test_platform_owner_recovery_route_is_csrf_reauth_bound_and_idempotent(
@@ -1290,6 +1355,13 @@ def test_web_terminal_is_owner_scoped_lease_gated_and_does_not_audit_input(
         "uid": 20002,
         "gid": 20002,
         "name": "gpu-dev-origin-pilot2",
+        "workspace_path": "/storage/users/20002",
+        "development_profile": "STANDARD_8CPU_32GB",
+        "container_gpu": 0,
+        "gpu_allocation_job_id": None,
+        "gpu_allocation_uuid": None,
+        "slurm_account": "company",
+        "slurm_qos": "general",
         "lease_id": str(first.lease.id),
         "lease_expires_at": ensure_utc(first.lease.expires_at).isoformat(),
         "expected_gpu": "NONE",
@@ -1571,6 +1643,17 @@ def test_owner_restore_failure_with_verified_rollback_remains_self_retryable(
         "RECYCLED"
     )
 
+    # Production ea69317 could lose the Worker's nested rollback marker and
+    # leave an otherwise safely stopped/suspended resource in FAILED. The
+    # owner must be able to submit a fresh, owner-bound restore request; the
+    # Worker still proves the runtime and lifecycle preconditions.
+    recovered_item = database.get(PortalResourceRecycleItem, item.id)
+    recovered_managed = database.get(PortalManagedUser, identity.managed.id)
+    assert recovered_item is not None and recovered_managed is not None
+    recovered_item.state = "FAILED"
+    recovered_managed.compute_environment_state = "FAILED"
+    database.commit()
+
     retry = restore_once()
     assert retry["status"] == "RESTORED"
     assert attempts == 2
@@ -1620,6 +1703,77 @@ def test_owner_self_restore_cannot_target_another_users_recycle_item(
         )
     assert denied.value.status_code == 404
     assert denied.value.detail["code"] == "RECYCLE_ITEM_NOT_FOUND"
+
+
+def test_restore_rollback_recycles_container_and_preserves_workspace(
+    database: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    admin = _admin(database)
+    context = AuthContext(admin, None, "fixture")
+    lease_id = str(uuid.uuid4())
+    payload = {
+        "restore_request_id": str(uuid.uuid4()),
+        "managed_user_id": str(uuid.uuid4()),
+        "username": "origin-pilot2",
+        "uid": 20002,
+        "gid": 20002,
+        "container_name": "gpu-dev-origin-pilot2",
+        "workspace_path": "/storage/users/20002",
+        "development_profile": "GPU_1_8CPU_32GB",
+        "container_gpu": 1,
+        "gpu_allocation_job_id": None,
+        "gpu_allocation_uuid": None,
+        "slurm_account": "company",
+        "slurm_qos": "general",
+        "lease_id": lease_id,
+        "lease_starts_at": utcnow().isoformat(),
+        "lease_expires_at": (utcnow() + timedelta(hours=2)).isoformat(),
+        "expected_gpu": "SLURM_ALLOCATED_1",
+        "host_access": "DISABLED_BY_PLATFORM_POLICY",
+        "expected_key_fingerprints": ["SHA256:fixture20002"],
+    }
+    captured: dict[str, object] = {}
+
+    def worker(operation_type: str, **kwargs):  # type: ignore[no-untyped-def]
+        captured["operation_type"] = operation_type
+        captured["payload"] = kwargs["payload"]
+        return {
+            "status": "SUCCEEDED",
+            "container_state": "STOPPED",
+            "gpu_allocation_job_id": None,
+            "gpu_allocation_uuid": None,
+            "container_key_state": "SUSPENDED_BY_RECYCLE",
+            "data_preserved": True,
+        }
+
+    monkeypatch.setattr(self_service, "call_worker", worker)
+    recycled_lease_id = uuid.uuid4()
+    recycled_lease_expires_at = utcnow() - timedelta(hours=1)
+    recycled_lease_starts_at = recycled_lease_expires_at - timedelta(hours=96)
+    rolled_back = self_service._rollback_restored_resource(
+        payload=payload,
+        worker_result={
+            "gpu_allocation_job_id": 701,
+            "gpu_allocation_uuid": "GPU-11111111-2222-3333-4444-555555555555",
+        },
+        context=context,
+        restore_id=uuid.UUID(payload["restore_request_id"]),
+        recycled_lease_id=recycled_lease_id,
+        recycled_lease_starts_at=recycled_lease_starts_at,
+        recycled_lease_expires_at=recycled_lease_expires_at,
+    )
+    assert rolled_back is True
+    assert captured["operation_type"] == "resource.restore.rollback"
+    recycle = captured["payload"]
+    assert isinstance(recycle, dict)
+    assert recycle["workspace_path"] == "/storage/users/20002"
+    assert recycle["attempted_lease_id"] == lease_id
+    assert recycle["recycle_lease_id"] == str(recycled_lease_id)
+    assert recycle["restore_request_id"] == payload["restore_request_id"]
+    assert recycle["gpu_allocation_job_id"] == 701
+    assert recycle["gpu_allocation_uuid"] == "GPU-11111111-2222-3333-4444-555555555555"
+    assert recycle["attempted_lease_starts_at"] == payload["lease_starts_at"]
+    assert recycle["attempted_lease_expires_at"] == payload["lease_expires_at"]
 
 
 def test_api_rejects_97_hour_renewal_and_restore_requests(

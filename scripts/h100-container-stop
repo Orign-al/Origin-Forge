@@ -16,6 +16,13 @@ h100_install_audit_trap container-stop "${user_name}"
 h100_require_managed_user "${user_name}"
 h100_require_managed_compose "${user_name}"
 
+state_file="/etc/h100-platform/users/${user_name}.state"
+if [[ -f "${state_file}" && ! -L "${state_file}" ]] \
+  && grep -Fxq 'VERSION=4' "${state_file}" \
+  && grep -Fxq 'DEVELOPMENT_PROFILE=GPU_1_8CPU_32GB' "${state_file}"; then
+  h100_fail 'GPU Development must use the allocation-aware stop handler'
+fi
+
 container="$(h100_container_name "${user_name}")"
 docker container inspect "${container}" >/dev/null 2>&1 \
   || h100_fail "container does not exist: ${container}"

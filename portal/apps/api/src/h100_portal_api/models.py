@@ -373,8 +373,12 @@ class PortalComputeResourceRequest(Base):
             name="ck_compute_resource_request_standard_storage",
         ),
         CheckConstraint(
-            "requested_container_profile = 'STANDARD_8CPU_32GB'",
+            "requested_container_profile IN ('STANDARD_8CPU_32GB', 'GPU_1_8CPU_32GB')",
             name="ck_compute_resource_request_standard_container",
+        ),
+        CheckConstraint(
+            "requested_container_profile != 'GPU_1_8CPU_32GB' OR requested_gpu_max = 1",
+            name="ck_compute_resource_request_gpu_profile_entitlement",
         ),
         CheckConstraint(
             "requested_lease_seconds = 345600",
@@ -457,11 +461,18 @@ class PortalProvisionPlan(Base):
         ),
         CheckConstraint("gpu_max BETWEEN 0 AND 1", name="ck_portal_provision_plan_gpu_max"),
         CheckConstraint("storage_bytes = 322122547200", name="ck_provision_plan_storage"),
-        CheckConstraint("container_profile = 'STANDARD_8CPU_32GB'", name="ck_plan_profile"),
+        CheckConstraint(
+            "container_profile IN ('STANDARD_8CPU_32GB', 'GPU_1_8CPU_32GB')",
+            name="ck_plan_profile",
+        ),
         CheckConstraint("container_cpus = 8", name="ck_provision_plan_cpus"),
         CheckConstraint("container_memory_gb = 32", name="ck_provision_plan_memory"),
         CheckConstraint("container_pids_limit = 4096", name="ck_provision_plan_pids"),
-        CheckConstraint("container_gpu = 0", name="ck_provision_plan_container_gpu"),
+        CheckConstraint(
+            "(container_profile = 'STANDARD_8CPU_32GB' AND container_gpu = 0) OR "
+            "(container_profile = 'GPU_1_8CPU_32GB' AND container_gpu = 1 AND gpu_max = 1)",
+            name="ck_provision_plan_container_gpu",
+        ),
         CheckConstraint("lease_seconds = 345600", name="ck_provision_plan_lease"),
         CheckConstraint("lease_state = 'NOT_STARTED'", name="ck_provision_plan_lease_state"),
         CheckConstraint("host_ssh_enabled = false", name="ck_provision_plan_host_ssh"),
@@ -728,6 +739,22 @@ class PortalContainer(Base):
             "owner_managed_user_id = managed_user_id",
             name="ck_portal_container_owner_matches_managed_user",
         ),
+        CheckConstraint(
+            "(development_profile = 'STANDARD_8CPU_32GB' AND gpu_count = 0 "
+            "AND gpu_allocation_job_id IS NULL AND gpu_allocation_uuid IS NULL) OR "
+            "(development_profile = 'GPU_1_8CPU_32GB' AND gpu_count = 1)",
+            name="ck_portal_container_development_profile",
+        ),
+        CheckConstraint(
+            "observed_state != 'RUNNING' OR development_profile = 'STANDARD_8CPU_32GB' OR "
+            "(gpu_allocation_job_id IS NOT NULL AND gpu_allocation_uuid IS NOT NULL)",
+            name="ck_portal_container_running_gpu_allocation",
+        ),
+        CheckConstraint(
+            "(gpu_allocation_job_id IS NULL AND gpu_allocation_uuid IS NULL) OR "
+            "(gpu_allocation_job_id IS NOT NULL AND gpu_allocation_uuid IS NOT NULL)",
+            name="ck_portal_container_gpu_allocation_pair",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -742,6 +769,12 @@ class PortalContainer(Base):
     ssh_port: Mapped[int | None] = mapped_column(Integer, unique=True)
     desired_state: Mapped[str] = mapped_column(String(32), nullable=False)
     observed_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    development_profile: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="STANDARD_8CPU_32GB"
+    )
+    gpu_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    gpu_allocation_job_id: Mapped[int | None] = mapped_column(BigInteger, unique=True)
+    gpu_allocation_uuid: Mapped[str | None] = mapped_column(String(64), unique=True)
     safe_spec: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_rebuilt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

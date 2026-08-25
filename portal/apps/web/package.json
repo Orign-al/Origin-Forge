@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "NEXT_TELEMETRY_DISABLED=1 next dev -H 127.0.0.1 -p 18080",
-    "build": "NEXT_TELEMETRY_DISABLED=1 next build",
+    "build": "NEXT_TELEMETRY_DISABLED=1 next build --webpack",
     "start": "NEXT_TELEMETRY_DISABLED=1 next start -H 127.0.0.1 -p 18080",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",

@@ -358,7 +358,7 @@ def _serve_started_terminal(
             "username": payload["username"],
             "uid": payload["uid"],
             "gid": payload["gid"],
-            "gpu": "NONE",
+            "gpu": payload["expected_gpu"],
             "host_access": "DISABLED",
             "idle_timeout_seconds": TERMINAL_IDLE_TIMEOUT_SECONDS,
             "max_duration_seconds": TERMINAL_MAX_DURATION_SECONDS,

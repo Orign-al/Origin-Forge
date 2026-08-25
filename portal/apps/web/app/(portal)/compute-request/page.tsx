@@ -14,6 +14,7 @@ import {
   ApiError,
   cancelSelfComputeRequest,
   createSelfComputeRequest,
+  type DevelopmentContainerProfile,
   selfComputeRequest,
 } from "../../../lib/api";
 import { randomUuid } from "../../../lib/random-uuid";
@@ -45,14 +46,16 @@ export default function ComputeRequestPage() {
     queryFn: selfComputeRequest,
   });
   const [gpu, setGpu] = useState<0 | 1>(0);
+  const [profile, setProfile] =
+    useState<DevelopmentContainerProfile>("STANDARD_8CPU_32GB");
   const [purpose, setPurpose] = useState("");
   const [note, setNote] = useState("");
   const create = useMutation({
     mutationFn: () =>
       createSelfComputeRequest({
-        requested_gpu_max: gpu,
+        requested_gpu_max: profile === "GPU_1_8CPU_32GB" ? 1 : gpu,
         requested_storage_bytes: 322122547200,
-        requested_container_profile: "STANDARD_8CPU_32GB",
+        requested_container_profile: profile,
         requested_lease_seconds: 345600,
         purpose,
         user_note: note.trim() || null,
@@ -141,7 +144,12 @@ export default function ComputeRequestPage() {
             </div>
             <div className="kv">
               <dt>{t("开发环境")}</dt>
-              <dd>8 CPU / 32GB / GPU NONE</dd>
+              <dd>
+                8 CPU / 32GB / GPU{" "}
+                {current.requested_container_profile === "GPU_1_8CPU_32GB"
+                  ? "1 (Slurm scheduled)"
+                  : "NONE"}
+              </dd>
             </div>
             <div className="kv">
               <dt>{t("首次 Lease")}</dt>
@@ -194,16 +202,39 @@ export default function ComputeRequestPage() {
             </div>
           ) : null}
           <div className="section-grid">
+            <SectionCard title="开发容器 Profile" subtitle="CPU 为默认配置">
+              <label className="form-field" htmlFor="development-profile">
+                <span>Profile</span>
+                <select
+                  id="development-profile"
+                  className="ui-input"
+                  value={profile}
+                  onChange={(event) => {
+                    const next = event.target
+                      .value as DevelopmentContainerProfile;
+                    setProfile(next);
+                    if (next === "GPU_1_8CPU_32GB") setGpu(1);
+                  }}
+                >
+                  <option value="STANDARD_8CPU_32GB">CPU Development</option>
+                  <option value="GPU_1_8CPU_32GB">GPU Development</option>
+                </select>
+              </label>
+              <p className="muted">
+                GPU Development 通过 Slurm 分配 1 张 H100，仅容器运行期间持有。
+              </p>
+            </SectionCard>
             <SectionCard
               title="GPU需求"
-              subtitle="表示 Slurm 最大额度，不独占 GPU"
+              subtitle="Slurm 总额度；GPU Profile 固定为 1"
             >
               <label className="form-field" htmlFor="compute-gpu">
                 <span>{t("GPU 最大数量")}</span>
                 <select
                   id="compute-gpu"
                   className="ui-input"
-                  value={gpu}
+                  value={profile === "GPU_1_8CPU_32GB" ? 1 : gpu}
+                  disabled={profile === "GPU_1_8CPU_32GB"}
                   onChange={(event) =>
                     setGpu(event.target.value === "1" ? 1 : 0)
                   }
@@ -213,7 +244,11 @@ export default function ComputeRequestPage() {
                 </select>
               </label>
               <p className="muted">
-                {t("GPU 任务通过 Portal 作业页面提交，最多 1 张。")}
+                {profile === "GPU_1_8CPU_32GB"
+                  ? t(
+                      "GPU Development 占用该用户唯一 GPU 额度；停止容器后额度返回调度器。",
+                    )
+                  : t("GPU 任务通过 Portal 作业页面提交，最多 1 张。")}
               </p>
             </SectionCard>
             <SectionCard title="标准开发环境" subtitle="规格不可由普通用户修改">
@@ -232,7 +267,11 @@ export default function ComputeRequestPage() {
                 </div>
                 <div className="kv">
                   <dt>Container GPU</dt>
-                  <dd>NONE</dd>
+                  <dd>
+                    {profile === "GPU_1_8CPU_32GB"
+                      ? "1 (Slurm scheduled)"
+                      : "NONE"}
+                  </dd>
                 </div>
               </dl>
             </SectionCard>
