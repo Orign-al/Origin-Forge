@@ -11,7 +11,7 @@ Migration head: `a7b8c9d0e1f2`
 - [x] Ruff, Python formatting, shell syntax, and diff checks pass.
 - [x] API tests pass: 144.
 - [x] Worker tests pass: 174.
-- [x] Runtime/workspace contracts pass: 26.
+- [x] Runtime/workspace contracts pass: 27.
 - [x] Web Vitest passes: 48; ESLint, TypeScript, and Prettier pass.
 - [x] Next production build and owner FAILED-retry Playwright flow pass.
 - [x] PostgreSQL 16 rehearsal passes for `f6 → a7 → f6 → a7` with a
@@ -39,6 +39,25 @@ do not replace the current candidate evidence or authorize live testing.
   workspace inodes remained unchanged.
 - The follow-up candidate must install every root allowlisted manifest script
   and pass the production `script_integrity()` gate before migration.
+
+## Closed deployment attempt 2
+
+- Candidate `e49754df6fe54282ac8da4f0a75a821288c1eb2f` installed successfully and
+  passed the production pre-migration Worker integrity gate `16/16`.
+- Alembic `f6 → a7` and exact-candidate Slurm `gpu-dev`/epilog installation
+  passed. Existing containers migrated to the CPU profile with GPU zero and no
+  allocation; no user lifecycle operation, Slurm job, or GPU process ran.
+- Postflight correctly rejected legacy `origin-pilot` because its private
+  owner-group workspace mode is `0750`, while `h100_require_managed_user`
+  incorrectly required exactly `0700`. The authoritative workspace-alias
+  verifier already accepts both private modes by requiring the other-access
+  bits to be zero.
+- Portal/Worker/expiry were closed again with DB `a7`, empty Slurm/GPU, and all
+  user resources retained. User workspace metadata was not changed to bypass
+  the failing check.
+- The follow-up candidate must make the shared managed-user check consume the
+  same private-mode predicate as workspace alias prepare/verify and retain
+  rejection of any other-user permission bit.
 
 ## Production preflight and rollback point
 

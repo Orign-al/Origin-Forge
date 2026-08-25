@@ -35,6 +35,13 @@ h100_validate_port() {
     || h100_fail 'port must be between 1024 and 65535'
 }
 
+h100_workspace_mode_is_private() {
+  local workspace_path=$1 workspace_mode
+  workspace_mode="$(stat -c '%a' "${workspace_path}")" || return 1
+  [[ "${workspace_mode}" =~ ^[0-7]+$ ]] || return 1
+  (((8#${workspace_mode} & 0007) == 0))
+}
+
 h100_validate_image_ref() {
   local candidate_image=${1:-}
   local image_leaf
@@ -116,7 +123,8 @@ h100_require_managed_user() {
     || h100_fail "managed home is missing: ${managed_username}"
   [[ -d "${managed_workspace}" && ! -L "${managed_workspace}" ]] \
     || h100_fail "managed workspace is missing: ${managed_username}"
-  [[ "$(stat -c '%u:%g:%a' "${managed_workspace}")" == "${managed_uid}:${managed_gid}:700" ]] \
+  [[ "$(stat -c '%u:%g' "${managed_workspace}")" == "${managed_uid}:${managed_gid}" ]] \
+    && h100_workspace_mode_is_private "${managed_workspace}" \
     || h100_fail "managed workspace ownership or mode is invalid: ${managed_username}"
 }
 

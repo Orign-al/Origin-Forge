@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import subprocess
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -142,6 +143,11 @@ def test_workspace_runtime_is_zero_copy_profile_aware_and_alias_aware() -> None:
     assert "== 0:0:700" in alias
     assert '"${user_uid}:${user_gid}"' in alias
     assert "created_workspace_directories" in alias
+    assert "workspace_mode_is_private()" not in alias
+    assert alias.count("h100_workspace_mode_is_private") == 3
+    assert "h100_workspace_mode_is_private()" in common
+    assert "((8#${workspace_mode} & 0007) == 0)" in common
+    assert '"${managed_uid}:${managed_gid}:700"' not in common
     assert "local action=$1" not in common
     assert "local h100_audit_action_value=$1" in common
     assert "local h100_audit_target_value=$2" in common
@@ -164,6 +170,34 @@ def test_workspace_runtime_is_zero_copy_profile_aware_and_alias_aware() -> None:
     assert "WORKSPACE_LAYOUT=LEGACY_BIND_ALIAS" in stage
     assert "h100_require_workspace_alias" in start
     assert delete.index("workspace_alias_tool") < delete.index("rm -rf --one-file-system")
+
+
+def test_common_workspace_privacy_accepts_private_legacy_group_mode(tmp_path: Path) -> None:
+    common = PLATFORM_ROOT / "scripts/h100-platform-common.sh"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+
+    def accepted(mode: int) -> bool:
+        workspace.chmod(mode)
+        result = subprocess.run(
+            [
+                "/bin/bash",
+                "-c",
+                'source "$1"; h100_workspace_mode_is_private "$2"',
+                "workspace-mode-test",
+                str(common),
+                str(workspace),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+
+    assert accepted(0o700)
+    assert accepted(0o750)
+    assert not accepted(0o755)
+    assert not accepted(0o701)
 
 
 def test_runtime_manifest_pins_workspace_execution_artifacts() -> None:

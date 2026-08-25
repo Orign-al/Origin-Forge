@@ -58,7 +58,7 @@ Status: **CANDIDATE TESTS PASS; PRODUCTION DEPLOYMENT/LIVE ACCEPTANCE PENDING**
 | Fixed shell syntax                        | PASS                                    |
 | API pytest                                | PASS — 144                              |
 | Worker pytest                             | PASS — 174                              |
-| Runtime/workspace contracts               | PASS — 26                               |
+| Runtime/workspace contracts               | PASS — 27                               |
 | Web Vitest                                | PASS — 48 across 12 files               |
 | ESLint / TypeScript / Prettier            | PASS                                    |
 | Next.js 16 production build (`--webpack`) | PASS — 26 routes                        |
@@ -105,16 +105,35 @@ The follow-up adds a contract test requiring every root allowlisted manifest
 script to be hash-bound to its source and explicitly installed. A new commit,
 bundle, fresh preflight, and fresh rollback point are required before retry.
 
+The next immutable candidate `e49754df6fe54282ac8da4f0a75a821288c1eb2f`
+then passed source tests, bundle verification, fresh frozen preflight, a new
+root-only rollback point, production runtime installation, Worker integrity
+`16/16`, Alembic `f6 → a7`, and exact Slurm `gpu-dev`/epilog installation.
+Postflight found one fail-closed compatibility defect before live GPU work:
+legacy `origin-pilot` has a private `0750` owner-group workspace, accepted by
+the authoritative alias verifier, while the shared managed-user helper required
+exactly `0700`. Services were closed again; no lifecycle operation, Slurm job,
+GPU process, Lease mutation, or user-data metadata change was used to bypass
+the check. The follow-up centralizes the existing other-bits-zero predicate in
+the shared helper and tests `0700`/`0750` acceptance plus `0755`/`0701`
+rejection.
+
 ## Read-only production evidence
 
-- Installed Git: `ea69317fe72b64c3ef428402dce5036260589f3e`.
-- Installed DB: `f6a7b8c9d0e1`.
-- API, Worker, and Web services are active.
+- Installed source/runtime Git: `e49754df6fe54282ac8da4f0a75a821288c1eb2f`.
+- Installed DB: `a7b8c9d0e1f2`; exact candidate Slurm config is live.
+- API, Worker socket/service, Web, and expiry are fail-closed while the
+  workspace-mode follow-up is prepared; reconcile remains disabled.
+- Slurm queue and Portal active-job/restore/operation sets are empty, the node
+  is idle, and no GPU compute process exists.
 - `gpu-dev-umar` is stopped; its failed restore has
   `CONTAINER_START_FAILED`, no restored Lease, and a suspended container key.
-- Production files match the old baseline hashes, proving the candidate and
-  restore-order fix are not yet deployed.
+- Worker integrity is `16/16`; source/runtime/tree and Slurm hashes match
+  candidate `e49754d`.
 - User data, backing workspace, Compose definition, and container are retained.
+- The root-only rollback point
+  `portal-5a-phase1-pre-e49754d-20260825T130000Z` verifies completely and
+  preserves the prior `ea69317 / f6` release plus the latest business state.
 - Production has one recycled V2 lifecycle (`origin-pilot`), four recycled or
   failed V3 lifecycles, and one active V3 CPU container (`liuyijie`). Candidate
   regression covers the V2-to-V4 restore transition without modifying it
@@ -125,9 +144,10 @@ bundle, fresh preflight, and fresh rollback point are required before retry.
 This report does not represent real H100 or release acceptance. Before Phase 1
 or Phase 2 can be marked PASS:
 
-1. create and record an immutable candidate plus verified production rollback
-   point;
-2. complete production preflight and deploy that exact candidate;
+1. create, bundle, and independently verify the workspace-mode immutable
+   follow-up candidate;
+2. deploy that exact follow-up, require Worker integrity `16/16`, and pass the
+   full static postflight including the legacy `0750` private workspace;
 3. have `umar` retry through the owner UI with a new idempotency key;
 4. execute real GPU Development GPU=1 CUDA/UUID validation;
 5. prove GPU=2 API rejection with no Worker/Slurm side effect;

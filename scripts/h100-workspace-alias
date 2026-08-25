@@ -109,13 +109,6 @@ cleanup_workspace_alias() {
 }
 trap cleanup_workspace_alias EXIT
 
-workspace_mode_is_private() {
-  local target=$1 mode
-  mode="$(stat -c '%a' "${target}")"
-  [[ "${mode}" =~ ^[0-7]+$ ]] || return 1
-  (((8#${mode} & 0007) == 0))
-}
-
 verify_backing() {
   [[ -d "${backing_root}" && ! -L "${backing_root}" \
     && -d "${backing_workspace}" && ! -L "${backing_workspace}" ]] \
@@ -123,8 +116,8 @@ verify_backing() {
   [[ "$(stat -c '%u:%g' "${backing_root}")" == "${user_uid}:${user_gid}" \
     && "$(stat -c '%u:%g' "${backing_workspace}")" == "${user_uid}:${user_gid}" ]] \
     || h100_fail 'authoritative workspace ownership is invalid'
-  workspace_mode_is_private "${backing_root}" \
-    && workspace_mode_is_private "${backing_workspace}" \
+  h100_workspace_mode_is_private "${backing_root}" \
+    && h100_workspace_mode_is_private "${backing_workspace}" \
     || h100_fail 'authoritative workspace is accessible to other users'
   [[ "$(stat -c '%d' "${backing_workspace}")" == "$(stat -c '%d' "${H100_DATA_ROOT}")" ]] \
     || h100_fail 'authoritative workspace is outside the quota filesystem'
@@ -198,7 +191,7 @@ verify_alias() {
     "$(stat -c '%d:%i' "${canonical_workspace}")" ]] \
     || h100_fail 'canonical workspace does not reference the backing inode'
   [[ "$(stat -c '%u:%g' "${canonical_workspace}")" == "${user_uid}:${user_gid}" ]] \
-    && workspace_mode_is_private "${canonical_workspace}" \
+    && h100_workspace_mode_is_private "${canonical_workspace}" \
     || h100_fail 'canonical workspace ownership or mode is invalid'
   observed_options="$(findmnt --noheadings --output OPTIONS --mountpoint "${canonical_workspace}")" \
     || h100_fail 'canonical workspace mount options are unavailable'
