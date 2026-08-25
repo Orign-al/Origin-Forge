@@ -10,8 +10,8 @@ Migration head: `a7b8c9d0e1f2`
 - [ ] Record full candidate commit/tree and confirm a clean worktree.
 - [x] Ruff, Python formatting, shell syntax, and diff checks pass.
 - [x] API tests pass: 144.
-- [x] Worker tests pass: 173.
-- [x] Runtime/workspace contracts pass: 23.
+- [x] Worker tests pass: 174.
+- [x] Runtime/workspace contracts pass: 25.
 - [x] Web Vitest passes: 48; ESLint, TypeScript, and Prettier pass.
 - [x] Next production build and owner FAILED-retry Playwright flow pass.
 - [x] PostgreSQL 16 rehearsal passes for `f6 → a7 → f6 → a7` with a
@@ -36,6 +36,10 @@ do not replace the current candidate evidence or authorize live testing.
 - [ ] Prove the managed-user Slurm queue and GPU Development allocation set are
       empty before scheduler/schema changes.
 - [ ] Confirm no global `/srv/gpu-platform/workspaces` or fstab bind is used.
+- [x] Read-only preflight identified one recycled V2 lifecycle and five V3
+      lifecycles. The candidate proves the V2 owner/key and original expired
+      Lease payload, promotes it atomically to V4 before start, and restores
+      the exact V2 file on failure.
 
 ## Install and postflight
 

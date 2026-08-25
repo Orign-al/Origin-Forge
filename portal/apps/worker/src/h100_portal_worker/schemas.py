@@ -1600,6 +1600,9 @@ def _validated_key_fingerprints(value: object) -> list[str]:
 def _validate_restore(payload: dict[str, Any]) -> dict[str, Any]:
     fields = {
         "restore_request_id",
+        "recycle_lease_id",
+        "recycle_lease_starts_at",
+        "recycle_lease_expires_at",
         "managed_user_id",
         "username",
         "uid",
@@ -1660,6 +1663,31 @@ def _validate_restore(payload: dict[str, Any]) -> dict[str, Any]:
         raise PayloadValidationError(
             "RESTORE_PAYLOAD_REJECTED", "restore Lease duration is invalid"
         )
+    recycle_starts_at = payload.get("recycle_lease_starts_at")
+    recycle_expires_at = payload.get("recycle_lease_expires_at")
+    if (
+        not isinstance(recycle_starts_at, str)
+        or len(recycle_starts_at) > 64
+        or not isinstance(recycle_expires_at, str)
+        or len(recycle_expires_at) > 64
+    ):
+        raise PayloadValidationError("RESTORE_PAYLOAD_REJECTED", "recycled Lease window is invalid")
+    try:
+        parsed_recycle_start = datetime.fromisoformat(recycle_starts_at.replace("Z", "+00:00"))
+        parsed_recycle_expiry = datetime.fromisoformat(recycle_expires_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PayloadValidationError(
+            "RESTORE_PAYLOAD_REJECTED", "recycled Lease window is invalid"
+        ) from exc
+    if (
+        parsed_recycle_start.tzinfo is None
+        or parsed_recycle_expiry.tzinfo is None
+        or not timedelta(seconds=1)
+        <= parsed_recycle_expiry.astimezone(UTC) - parsed_recycle_start.astimezone(UTC)
+        <= timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS)
+        or parsed_recycle_expiry.astimezone(UTC) > datetime.now(UTC)
+    ):
+        raise PayloadValidationError("RESTORE_PAYLOAD_REJECTED", "recycled Lease window is invalid")
     result.update(
         {
             "restore_request_id": _canonical_uuid(
@@ -1673,6 +1701,11 @@ def _validate_restore(payload: dict[str, Any]) -> dict[str, Any]:
             "gpu_allocation_uuid": None,
             "slurm_account": "company",
             "slurm_qos": "general",
+            "recycle_lease_id": _canonical_uuid(
+                payload.get("recycle_lease_id"), "recycled Lease ID"
+            ),
+            "recycle_lease_starts_at": parsed_recycle_start.astimezone(UTC).isoformat(),
+            "recycle_lease_expires_at": parsed_recycle_expiry.astimezone(UTC).isoformat(),
             "lease_id": _canonical_uuid(payload.get("lease_id"), "lease ID"),
             "lease_starts_at": parsed_start.isoformat(),
             "lease_expires_at": parsed_expiry.isoformat(),

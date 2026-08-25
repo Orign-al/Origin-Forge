@@ -36,6 +36,11 @@ Status: **CANDIDATE TESTS PASS; PRODUCTION DEPLOYMENT/LIVE ACCEPTANCE PENDING**
   lifecycle Lease/expiry/profile/GPU allocation. Restore atomically binds the
   new Lease before start and rolls back keys, container, allocation, and prior
   lifecycle on failure.
+- A production V2 lifecycle without embedded Lease coordinates is accepted
+  only for the CPU profile after its owner, UID/GID, Slurm account/QOS, key
+  fingerprints, and API-owned expired recycle Lease window validate. Restore
+  atomically promotes it to V4 with the canonical workspace and new Lease;
+  failure reinstates the exact original V2 bytes.
 - API postcondition/persistence rollback uses a typed
   `resource.restore.rollback` operation that proves the attempted Lease and
   restore request before reinstating the exact prior recycled Lease; it does
@@ -52,8 +57,8 @@ Status: **CANDIDATE TESTS PASS; PRODUCTION DEPLOYMENT/LIVE ACCEPTANCE PENDING**
 | Ruff check / Python format                | PASS                                    |
 | Fixed shell syntax                        | PASS                                    |
 | API pytest                                | PASS — 144                              |
-| Worker pytest                             | PASS — 173                              |
-| Runtime/workspace contracts               | PASS — 23                               |
+| Worker pytest                             | PASS — 174                              |
+| Runtime/workspace contracts               | PASS — 25                               |
 | Web Vitest                                | PASS — 48 across 12 files               |
 | ESLint / TypeScript / Prettier            | PASS                                    |
 | Next.js 16 production build (`--webpack`) | PASS — 26 routes                        |
@@ -88,6 +93,10 @@ test fixtures and was removed after the gate.
 - Production files match the old baseline hashes, proving the candidate and
   restore-order fix are not yet deployed.
 - User data, backing workspace, Compose definition, and container are retained.
+- Production has one recycled V2 lifecycle (`origin-pilot`), four recycled or
+  failed V3 lifecycles, and one active V3 CPU container (`liuyijie`). Candidate
+  regression covers the V2-to-V4 restore transition without modifying it
+  during preflight.
 
 ## Remaining gates
 

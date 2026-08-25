@@ -1487,6 +1487,15 @@ def test_owner_restore_is_idempotent_and_reactivates_all_resources_without_admin
         assert kwargs["requested_by"] == identity.user.normalized_login
         assert kwargs["approved_by"] == identity.user.normalized_login
         assert kwargs["payload"]["expected_key_fingerprints"] == [identity.key.fingerprint_sha256]
+        assert kwargs["payload"]["recycle_lease_id"] == str(identity.lease.id)
+        assert (
+            kwargs["payload"]["recycle_lease_starts_at"]
+            == ensure_utc(identity.lease.starts_at).isoformat()
+        )
+        assert (
+            kwargs["payload"]["recycle_lease_expires_at"]
+            == ensure_utc(identity.lease.expires_at).isoformat()
+        )
         return {
             "status": "SUCCEEDED",
             "request_id": str(uuid.uuid4()),

@@ -5679,6 +5679,8 @@ def _validate_resource_lifecycle_binding(
     lifecycle: dict[str, str],
     payload: dict[str, Any],
     fingerprints: list[str],
+    *,
+    allow_v2_restore: bool = False,
 ) -> None:
     version = lifecycle.get("VERSION")
     expected = {
@@ -5690,12 +5692,13 @@ def _validate_resource_lifecycle_binding(
         "CONTAINER_KEY_FINGERPRINTS": ",".join(fingerprints),
     }
     mismatches = sorted(key for key, value in expected.items() if lifecycle.get(key) != value)
-    if version not in {"3", "4"} or mismatches:
+    supported_version = version in {"3", "4"} or (allow_v2_restore and version == "2")
+    if not supported_version or mismatches:
         raise LifecycleValidationError(
             "RESOURCE_LIFECYCLE_BINDING_REJECTED",
             "managed lifecycle does not match the owner-bound resource",
         )
-    if version == "3":
+    if version in {"2", "3"}:
         if payload["development_profile"] != CPU_DEVELOPMENT_PROFILE:
             raise LifecycleValidationError(
                 "RESOURCE_LIFECYCLE_BINDING_REJECTED",
@@ -5746,6 +5749,32 @@ def _restored_lease_window(payload: dict[str, Any]) -> tuple[datetime, datetime]
             "restore does not carry one current bounded Lease",
         )
     return starts_at, expires_at
+
+
+def _recycled_lease_window(payload: dict[str, Any]) -> tuple[str, datetime, datetime]:
+    try:
+        lease_id = str(uuid.UUID(str(payload["recycle_lease_id"])))
+    except (KeyError, ValueError) as exc:
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED", "recycled Lease ID is invalid"
+        ) from exc
+    if lease_id != str(payload["recycle_lease_id"]):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED", "recycled Lease ID is invalid"
+        )
+    starts_at = _resource_lifecycle_timestamp(
+        str(payload["recycle_lease_starts_at"]), "recycled Lease start"
+    )
+    expires_at = _resource_lifecycle_timestamp(
+        str(payload["recycle_lease_expires_at"]), "recycled Lease expiry"
+    )
+    if not timedelta(seconds=1) <= expires_at - starts_at <= timedelta(
+        seconds=STANDARD_COMPUTE_LEASE_SECONDS
+    ) or expires_at > datetime.now(UTC):
+        raise LifecycleValidationError(
+            "RESOURCE_LIFECYCLE_STATE_REJECTED", "recycled Lease window is invalid"
+        )
+    return lease_id, starts_at, expires_at
 
 
 def _lifecycle_fingerprints(lifecycle: dict[str, str]) -> list[str]:
@@ -5896,27 +5925,55 @@ def _activate_restored_lifecycle(
     """Bind the fixed start scripts to the new restore Lease before runtime start."""
 
     lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
-    _validate_resource_lifecycle_binding(lifecycle, payload, fingerprints)
+    _validate_resource_lifecycle_binding(lifecycle, payload, fingerprints, allow_v2_restore=True)
+    version = lifecycle.get("VERSION")
     status = lifecycle.get("STATUS")
     ssh_state = lifecycle.get("SSH_KEY_STATE")
     lease_state = lifecycle.get("LEASE_STATE")
+    recycle_lease_id, recycle_start, recycle_expiry = _recycled_lease_window(payload)
+    legacy_v2_recycled = (
+        version == "2"
+        and status == "ACTIVE"
+        and ssh_state == "INSTALLED"
+        and not any(
+            lifecycle.get(field)
+            for field in ("LEASE_STATE", "LEASE_ID", "LEASE_START", "LEASE_EXPIRES")
+        )
+    )
     legacy_expired = False
-    if status == "ACTIVE" and ssh_state == "INSTALLED" and lease_state == "ACTIVE":
+    if (
+        version == "3"
+        and status == "ACTIVE"
+        and ssh_state == "INSTALLED"
+        and lease_state == "ACTIVE"
+    ):
         prior_start = _resource_lifecycle_timestamp(
             lifecycle.get("LEASE_START", ""), "prior Lease start"
         )
         prior_expiry = _resource_lifecycle_timestamp(
             lifecycle.get("LEASE_EXPIRES", ""), "prior Lease expiry"
         )
-        legacy_expired = timedelta(seconds=1) <= prior_expiry - prior_start <= timedelta(
-            seconds=STANDARD_COMPUTE_LEASE_SECONDS
-        ) and prior_expiry <= datetime.now(UTC)
+        legacy_expired = (
+            prior_start == recycle_start
+            and prior_expiry == recycle_expiry
+            and lifecycle.get("LEASE_ID", recycle_lease_id) == recycle_lease_id
+        )
     recycled = (
-        status == "RECYCLED"
+        version == "4"
+        and status == "RECYCLED"
         and ssh_state == "SUSPENDED_BY_RECYCLE"
         and lease_state == "RECYCLE_BIN"
+        and lifecycle.get("LEASE_ID") == recycle_lease_id
+        and _resource_lifecycle_timestamp(
+            lifecycle.get("LEASE_START", ""), "recorded recycled Lease start"
+        )
+        == recycle_start
+        and _resource_lifecycle_timestamp(
+            lifecycle.get("LEASE_EXPIRES", ""), "recorded recycled Lease expiry"
+        )
+        == recycle_expiry
     )
-    if not legacy_expired and not recycled:
+    if not legacy_v2_recycled and not legacy_expired and not recycled:
         raise LifecycleValidationError(
             "RESOURCE_LIFECYCLE_STATE_REJECTED",
             "managed lifecycle is not a recoverable expired resource",
@@ -5939,6 +5996,12 @@ def _activate_restored_lifecycle(
     updated = dict(lifecycle)
     updated.update(
         {
+            "VERSION": "4",
+            "DEVELOPMENT_PROFILE": str(payload["development_profile"]),
+            "WORKSPACE_LAYOUT": "LEGACY_BIND_ALIAS",
+            "STORAGE_ROOT": str(PILOT_DATA_ROOT / str(payload["username"])),
+            "BACKING_WORKSPACE": str(PILOT_DATA_ROOT / str(payload["username"]) / "workspace"),
+            "WORKSPACE_PATH": str(payload["workspace_path"]),
             "STATUS": "ACTIVE",
             "SSH_KEY_STATE": "INSTALLED",
             "LEASE_STATE": "ACTIVE",

@@ -3395,6 +3395,7 @@ def test_portal4a_host_revoke_rolls_back_shell_and_key_on_postcondition_failure(
 
 def portal4a_restore_payload() -> dict[str, object]:
     lease_starts_at = datetime.now(UTC)
+    recycle_lease_expires_at = lease_starts_at - timedelta(hours=1)
     return {
         "restore_request_id": str(uuid.uuid4()),
         "managed_user_id": "3b95b4f0-95d9-444a-8f0b-46288195a807",
@@ -3409,6 +3410,9 @@ def portal4a_restore_payload() -> dict[str, object]:
         "gpu_allocation_uuid": None,
         "slurm_account": "company",
         "slurm_qos": "general",
+        "recycle_lease_id": str(uuid.uuid4()),
+        "recycle_lease_starts_at": (recycle_lease_expires_at - timedelta(hours=96)).isoformat(),
+        "recycle_lease_expires_at": recycle_lease_expires_at.isoformat(),
         "lease_id": str(uuid.uuid4()),
         "lease_starts_at": lease_starts_at.isoformat(),
         "lease_expires_at": (lease_starts_at + timedelta(hours=2)).isoformat(),
@@ -3424,6 +3428,9 @@ def portal4a_recycle_payload() -> dict[str, object]:
         "expires_at": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
     }
     payload.pop("restore_request_id")
+    payload.pop("recycle_lease_id")
+    payload.pop("recycle_lease_starts_at")
+    payload.pop("recycle_lease_expires_at")
     payload.pop("lease_starts_at")
     payload.pop("lease_expires_at")
     return payload
@@ -3481,7 +3488,6 @@ def configure_resource_lifecycle_transitions(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def legacy_expired_lifecycle(payload: dict[str, object]) -> dict[str, str]:
-    expired_at = datetime.now(UTC) - timedelta(hours=1)
     return {
         "VERSION": "3",
         "STATUS": "ACTIVE",
@@ -3493,8 +3499,8 @@ def legacy_expired_lifecycle(payload: dict[str, object]) -> dict[str, str]:
         "SSH_KEY_STATE": "INSTALLED",
         "CONTAINER_KEY_FINGERPRINTS": handlers.PORTAL3E_FINAL_KEY_FINGERPRINT,
         "LEASE_STATE": "ACTIVE",
-        "LEASE_START": (expired_at - timedelta(hours=96)).isoformat(),
-        "LEASE_EXPIRES": expired_at.isoformat(),
+        "LEASE_START": str(payload["recycle_lease_starts_at"]),
+        "LEASE_EXPIRES": str(payload["recycle_lease_expires_at"]),
     }
 
 
@@ -3522,6 +3528,10 @@ def test_restore_rebinds_legacy_expired_lifecycle_to_new_lease_before_start(
     assert len(committed) == 1
     restored = committed[0]
     assert restored["STATUS"] == "ACTIVE"
+    assert restored["VERSION"] == "4"
+    assert restored["DEVELOPMENT_PROFILE"] == "STANDARD_8CPU_32GB"
+    assert restored["WORKSPACE_LAYOUT"] == "LEGACY_BIND_ALIAS"
+    assert restored["WORKSPACE_PATH"] == payload["workspace_path"]
     assert restored["SSH_KEY_STATE"] == "INSTALLED"
     assert restored["LEASE_STATE"] == "ACTIVE"
     assert restored["LEASE_ID"] == payload["lease_id"]
@@ -3530,6 +3540,79 @@ def test_restore_rebinds_legacy_expired_lifecycle_to_new_lease_before_start(
     assert restored["RESTORE_REQUEST_ID"] == payload["restore_request_id"]
     assert restored["GPU_ALLOCATION_JOB_ID"] == ""
     assert restored["GPU_ALLOCATION_UUID"] == ""
+
+
+def test_restore_promotes_owner_bound_v2_lifecycle_to_v4_and_rejects_wrong_recycle_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = portal4a_restore_payload()
+    prior = {
+        "VERSION": "2",
+        "STATUS": "ACTIVE",
+        "USERNAME": str(payload["username"]),
+        "UID": str(payload["uid"]),
+        "GID": str(payload["gid"]),
+        "SLURM_ACCOUNT": str(payload["slurm_account"]),
+        "SLURM_QOS": str(payload["slurm_qos"]),
+        "SSH_KEY_STATE": "INSTALLED",
+        "CONTAINER_KEY_FINGERPRINTS": handlers.PORTAL3E_FINAL_KEY_FINGERPRINT,
+    }
+    committed: list[dict[str, str]] = []
+    monkeypatch.setattr(handlers, "_read_managed_lifecycle_state", lambda _username: dict(prior))
+    monkeypatch.setattr(
+        handlers,
+        "_commit_managed_lifecycle_values",
+        lambda _username, values: committed.append(dict(values)),
+    )
+
+    with pytest.raises(handlers.LifecycleValidationError) as generic_rejected:
+        handlers._validate_resource_lifecycle_binding(
+            prior, payload, [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT]
+        )
+    assert generic_rejected.value.code == "RESOURCE_LIFECYCLE_BINDING_REJECTED"
+
+    observed_prior = handlers._activate_restored_lifecycle(
+        payload,
+        [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+        gpu_allocation_job_id=None,
+        gpu_allocation_uuid=None,
+    )
+
+    assert observed_prior == prior
+    assert committed[0]["VERSION"] == "4"
+    assert committed[0]["LEASE_ID"] == payload["lease_id"]
+    assert committed[0]["WORKSPACE_PATH"] == payload["workspace_path"]
+    assert committed[0]["BACKING_WORKSPACE"].endswith("/origin-pilot/workspace")
+
+    ambiguous_v2 = {**prior, "LEASE_ID": str(uuid.uuid4())}
+    monkeypatch.setattr(
+        handlers, "_read_managed_lifecycle_state", lambda _username: dict(ambiguous_v2)
+    )
+    with pytest.raises(handlers.LifecycleValidationError) as ambiguous:
+        handlers._activate_restored_lifecycle(
+            payload,
+            [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+            gpu_allocation_job_id=None,
+            gpu_allocation_uuid=None,
+        )
+    assert ambiguous.value.code == "RESOURCE_LIFECYCLE_STATE_REJECTED"
+
+    tampered = {**payload, "recycle_lease_id": str(uuid.uuid4())}
+    prior_with_lease = {
+        **legacy_expired_lifecycle(payload),
+        "LEASE_ID": str(payload["recycle_lease_id"]),
+    }
+    monkeypatch.setattr(
+        handlers, "_read_managed_lifecycle_state", lambda _username: dict(prior_with_lease)
+    )
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._activate_restored_lifecycle(
+            tampered,
+            [handlers.PORTAL3E_FINAL_KEY_FINGERPRINT],
+            gpu_allocation_job_id=None,
+            gpu_allocation_uuid=None,
+        )
+    assert rejected.value.code == "RESOURCE_LIFECYCLE_STATE_REJECTED"
 
 
 def test_cpu_restore_commits_new_lifecycle_before_container_start(
@@ -3740,6 +3823,20 @@ def test_gpu_restore_and_recycle_payloads_are_exactly_allocation_bound() -> None
     validated_restore = validate_payload("resource.restore", restore)
     assert validated_restore["workspace_path"] == "/storage/users/20001"
     assert validated_restore["gpu_allocation_job_id"] is None
+    assert validated_restore["recycle_lease_id"] == restore["recycle_lease_id"]
+
+    with pytest.raises(ValueError, match="RESTORE_PAYLOAD_REJECTED"):
+        validate_payload(
+            "resource.restore",
+            {
+                **restore,
+                "recycle_lease_expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            },
+        )
+    incomplete_restore = dict(restore)
+    incomplete_restore.pop("recycle_lease_id")
+    with pytest.raises(ValueError, match="RESTORE_PAYLOAD_REJECTED"):
+        validate_payload("resource.restore", incomplete_restore)
 
     allocation_uuid = "GPU-11111111-2222-3333-4444-555555555555"
     recycle = {
