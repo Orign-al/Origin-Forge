@@ -115,6 +115,23 @@ def test_gpu_development_runtime_and_fail_safe_epilog_are_integrity_bound() -> N
     assert epilog_text.index("docker rm --force") < epilog_text.index("create --no-build")
 
 
+def test_installer_publishes_every_root_allowlisted_script_from_the_manifest() -> None:
+    installer = (PORTAL_ROOT / "deploy/scripts/install-runtime.sh").read_text()
+    manifest = json.loads((PORTAL_ROOT / "deploy/worker-scripts.json").read_text())
+    root_scripts = {
+        name: PLATFORM_ROOT / "scripts" / name
+        for name in manifest
+        if name not in {"h100-platform-common", "h100-origin-pilot-acceptance"}
+    }
+
+    assert root_scripts
+    for name, source in root_scripts.items():
+        assert source.is_file(), name
+        assert manifest[name] == hashlib.sha256(source.read_bytes()).hexdigest(), name
+        assert str(source.relative_to(PLATFORM_ROOT)) in installer, name
+        assert f"/usr/local/sbin/{name}" in installer, name
+
+
 def test_portal3f_worker_can_write_only_the_guard_metrics_directory() -> None:
     unit = (PORTAL_ROOT / "deploy/systemd/h100-portal-worker.service").read_text()
 

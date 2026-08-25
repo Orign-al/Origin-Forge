@@ -58,7 +58,7 @@ Status: **CANDIDATE TESTS PASS; PRODUCTION DEPLOYMENT/LIVE ACCEPTANCE PENDING**
 | Fixed shell syntax                        | PASS                                    |
 | API pytest                                | PASS — 144                              |
 | Worker pytest                             | PASS — 174                              |
-| Runtime/workspace contracts               | PASS — 25                               |
+| Runtime/workspace contracts               | PASS — 26                               |
 | Web Vitest                                | PASS — 48 across 12 files               |
 | ESLint / TypeScript / Prettier            | PASS                                    |
 | Next.js 16 production build (`--webpack`) | PASS — 26 routes                        |
@@ -82,6 +82,28 @@ test fixtures and was removed after the gate.
 5. Downgrade `a7 → f6`: PASS; legacy storage root restored and four candidate
    container columns removed.
 6. Re-upgrade `f6 → a7`: PASS.
+
+## Closed production deployment attempt
+
+Candidate `4cdbf7e4560d297f4ce7e645f94c4ac2598d106e` passed the source tests
+but is retired after the production post-install/pre-migration gate found that
+`install-runtime.sh` did not publish three changed hash-pinned scripts:
+`h100-container-create`, `h100-container-rebuild`, and `h100-user-create`.
+Worker integrity failed closed for exactly those three paths.
+
+The attempt had already created and verified the root-only rollback point
+`/srv/gpu-platform/backups/portal-5a-phase1-pre-4cdbf7e-20260825T120000Z`.
+No Alembic migration, Slurm configuration change, user lifecycle operation,
+container action, Lease mutation, or workspace mutation occurred. Rollback
+restored exact source/runtime `ea69317fe72b64c3ef428402dce5036260589f3e`,
+DB `f6a7b8c9d0e1`, the prior local-image manifest, protected scripts/units, and
+the old `14/14` Worker integrity set. API/Worker/Web/expiry, empty Slurm queue,
+idle node, `liuyijie` healthy GPU-less CPU container, stopped `umar`, and
+workspace device/inodes all passed postflight.
+
+The follow-up adds a contract test requiring every root allowlisted manifest
+script to be hash-bound to its source and explicitly installed. A new commit,
+bundle, fresh preflight, and fresh rollback point are required before retry.
 
 ## Read-only production evidence
 

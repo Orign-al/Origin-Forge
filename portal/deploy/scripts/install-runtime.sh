@@ -13,9 +13,16 @@ readonly PORTAL3F_GPU_PROBE_SOURCE="${PLATFORM_DIR}/tests/gpu-device-mapping/gpu
 readonly COMPUTE_STAGE_SOURCE="${PLATFORM_DIR}/scripts/h100-provision-stage"
 readonly PLATFORM_COMMON_SOURCE="${PLATFORM_DIR}/scripts/h100-platform-common.sh"
 readonly WORKSPACE_ALIAS_SOURCE="${PLATFORM_DIR}/scripts/h100-workspace-alias"
+readonly USER_CREATE_SOURCE="${PLATFORM_DIR}/scripts/h100-user-create"
+readonly USER_GPU_ISOLATION_SOURCE="${PLATFORM_DIR}/scripts/h100-user-gpu-isolation"
+readonly CONTAINER_CREATE_SOURCE="${PLATFORM_DIR}/scripts/h100-container-create"
 readonly CONTAINER_START_SOURCE="${PLATFORM_DIR}/scripts/h100-container-start"
 readonly CONTAINER_STOP_SOURCE="${PLATFORM_DIR}/scripts/h100-container-stop"
+readonly CONTAINER_REBUILD_SOURCE="${PLATFORM_DIR}/scripts/h100-container-rebuild"
 readonly CONTAINER_DELETE_SOURCE="${PLATFORM_DIR}/scripts/h100-container-delete"
+readonly CONTAINER_STATUS_SOURCE="${PLATFORM_DIR}/scripts/h100-container-status"
+readonly QUOTA_SHOW_SOURCE="${PLATFORM_DIR}/scripts/h100-quota-show"
+readonly GPU_BYPASS_GUARD_SOURCE="${PLATFORM_DIR}/scripts/h100-gpu-bypass-guard"
 readonly CONTAINER_GPU_RUNTIME_SOURCE="${PLATFORM_DIR}/scripts/h100-container-gpu-runtime"
 readonly GPU_DEVELOPMENT_EPILOG_SOURCE="${PLATFORM_DIR}/scripts/h100-gpu-development-epilog"
 
@@ -42,12 +49,26 @@ done
   || { echo "required deployment input missing: $PLATFORM_COMMON_SOURCE" >&2; exit 1; }
 [[ -f "$WORKSPACE_ALIAS_SOURCE" && ! -L "$WORKSPACE_ALIAS_SOURCE" ]] \
   || { echo "required deployment input missing: $WORKSPACE_ALIAS_SOURCE" >&2; exit 1; }
+[[ -f "$USER_CREATE_SOURCE" && ! -L "$USER_CREATE_SOURCE" ]] \
+  || { echo "required deployment input missing: $USER_CREATE_SOURCE" >&2; exit 1; }
+[[ -f "$USER_GPU_ISOLATION_SOURCE" && ! -L "$USER_GPU_ISOLATION_SOURCE" ]] \
+  || { echo "required deployment input missing: $USER_GPU_ISOLATION_SOURCE" >&2; exit 1; }
+[[ -f "$CONTAINER_CREATE_SOURCE" && ! -L "$CONTAINER_CREATE_SOURCE" ]] \
+  || { echo "required deployment input missing: $CONTAINER_CREATE_SOURCE" >&2; exit 1; }
 [[ -f "$CONTAINER_START_SOURCE" && ! -L "$CONTAINER_START_SOURCE" ]] \
   || { echo "required deployment input missing: $CONTAINER_START_SOURCE" >&2; exit 1; }
 [[ -f "$CONTAINER_STOP_SOURCE" && ! -L "$CONTAINER_STOP_SOURCE" ]] \
   || { echo "required deployment input missing: $CONTAINER_STOP_SOURCE" >&2; exit 1; }
+[[ -f "$CONTAINER_REBUILD_SOURCE" && ! -L "$CONTAINER_REBUILD_SOURCE" ]] \
+  || { echo "required deployment input missing: $CONTAINER_REBUILD_SOURCE" >&2; exit 1; }
 [[ -f "$CONTAINER_DELETE_SOURCE" && ! -L "$CONTAINER_DELETE_SOURCE" ]] \
   || { echo "required deployment input missing: $CONTAINER_DELETE_SOURCE" >&2; exit 1; }
+[[ -f "$CONTAINER_STATUS_SOURCE" && ! -L "$CONTAINER_STATUS_SOURCE" ]] \
+  || { echo "required deployment input missing: $CONTAINER_STATUS_SOURCE" >&2; exit 1; }
+[[ -f "$QUOTA_SHOW_SOURCE" && ! -L "$QUOTA_SHOW_SOURCE" ]] \
+  || { echo "required deployment input missing: $QUOTA_SHOW_SOURCE" >&2; exit 1; }
+[[ -f "$GPU_BYPASS_GUARD_SOURCE" && ! -L "$GPU_BYPASS_GUARD_SOURCE" ]] \
+  || { echo "required deployment input missing: $GPU_BYPASS_GUARD_SOURCE" >&2; exit 1; }
 [[ -f "$CONTAINER_GPU_RUNTIME_SOURCE" && ! -L "$CONTAINER_GPU_RUNTIME_SOURCE" ]] \
   || { echo "required deployment input missing: $CONTAINER_GPU_RUNTIME_SOURCE" >&2; exit 1; }
 [[ -f "$GPU_DEVELOPMENT_EPILOG_SOURCE" && ! -L "$GPU_DEVELOPMENT_EPILOG_SOURCE" ]] \
@@ -109,10 +130,19 @@ install -o root -g gpu-platform-admin -m 0640 \
 install -o root -g gpu-platform-admin -m 0750 \
   "$WORKSPACE_ALIAS_SOURCE" \
   /usr/local/sbin/h100-workspace-alias
+install -o root -g gpu-platform-admin -m 0750 \
+  "$USER_CREATE_SOURCE" \
+  /usr/local/sbin/h100-user-create
+install -o root -g gpu-platform-admin -m 0750 \
+  "$USER_GPU_ISOLATION_SOURCE" \
+  /usr/local/sbin/h100-user-gpu-isolation
 
 # Resource recycle uses this fixed root-owned artifact. Install it before the
 # matching manifest: any interrupted deployment therefore fails closed on an
 # integrity mismatch instead of executing an unbound lifecycle script.
+install -o root -g gpu-platform-admin -m 0750 \
+  "$CONTAINER_CREATE_SOURCE" \
+  /usr/local/sbin/h100-container-create
 install -o root -g gpu-platform-admin -m 0750 \
   "$CONTAINER_START_SOURCE" \
   /usr/local/sbin/h100-container-start
@@ -120,8 +150,20 @@ install -o root -g gpu-platform-admin -m 0750 \
   "$CONTAINER_STOP_SOURCE" \
   /usr/local/sbin/h100-container-stop
 install -o root -g gpu-platform-admin -m 0750 \
+  "$CONTAINER_REBUILD_SOURCE" \
+  /usr/local/sbin/h100-container-rebuild
+install -o root -g gpu-platform-admin -m 0750 \
   "$CONTAINER_DELETE_SOURCE" \
   /usr/local/sbin/h100-container-delete
+install -o root -g gpu-platform-admin -m 0750 \
+  "$CONTAINER_STATUS_SOURCE" \
+  /usr/local/sbin/h100-container-status
+install -o root -g gpu-platform-admin -m 0750 \
+  "$QUOTA_SHOW_SOURCE" \
+  /usr/local/sbin/h100-quota-show
+install -o root -g gpu-platform-admin -m 0750 \
+  "$GPU_BYPASS_GUARD_SOURCE" \
+  /usr/local/sbin/h100-gpu-bypass-guard
 install -o root -g gpu-platform-admin -m 0750 \
   "$CONTAINER_GPU_RUNTIME_SOURCE" \
   /usr/local/sbin/h100-container-gpu-runtime

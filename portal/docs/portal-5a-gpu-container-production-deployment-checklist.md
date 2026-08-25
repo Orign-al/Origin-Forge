@@ -11,7 +11,7 @@ Migration head: `a7b8c9d0e1f2`
 - [x] Ruff, Python formatting, shell syntax, and diff checks pass.
 - [x] API tests pass: 144.
 - [x] Worker tests pass: 174.
-- [x] Runtime/workspace contracts pass: 25.
+- [x] Runtime/workspace contracts pass: 26.
 - [x] Web Vitest passes: 48; ESLint, TypeScript, and Prettier pass.
 - [x] Next production build and owner FAILED-retry Playwright flow pass.
 - [x] PostgreSQL 16 rehearsal passes for `f6 → a7 → f6 → a7` with a
@@ -21,6 +21,24 @@ Migration head: `a7b8c9d0e1f2`
 
 Historical `FAIL_CLOSED` reports document earlier non-deployed attempts. They
 do not replace the current candidate evidence or authorize live testing.
+
+## Closed deployment attempt 1
+
+- Candidate `4cdbf7e4560d297f4ce7e645f94c4ac2598d106e` is retired and must not
+  be deployed again.
+- Preflight and root-only rollback point
+  `portal-5a-phase1-pre-4cdbf7e-20260825T120000Z` passed before installation.
+- The post-install/pre-migration Worker integrity gate rejected three changed
+  scripts that the installer had not published: `h100-container-create`,
+  `h100-container-rebuild`, and `h100-user-create`.
+- No database migration, Slurm change, user lifecycle operation, container
+  start/stop, Lease mutation, or workspace mutation occurred.
+- Exact rollback to Git/runtime `ea69317fe72b64c3ef428402dce5036260589f3e`
+  and DB `f6a7b8c9d0e1` passed; legacy integrity was `14/14`, services reopened,
+  Slurm remained empty/idle, `liuyijie` remained healthy and GPU-less, and
+  workspace inodes remained unchanged.
+- The follow-up candidate must install every root allowlisted manifest script
+  and pass the production `script_integrity()` gate before migration.
 
 ## Production preflight and rollback point
 
