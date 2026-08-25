@@ -9,10 +9,11 @@ Migration head: `a7b8c9d0e1f2`
 
 - [ ] Record full candidate commit/tree and confirm a clean worktree.
 - [x] Ruff, Python formatting, shell syntax, and diff checks pass.
-- [x] API tests pass: 144.
+- [x] API tests pass: 145.
 - [x] Worker tests pass: 174.
 - [x] Runtime/workspace contracts pass: 27.
-- [x] Web Vitest passes: 48; ESLint, TypeScript, and Prettier pass.
+- [x] Web Vitest passes: 52 across 13 files; ESLint, TypeScript, and Prettier
+      pass.
 - [x] Next production build and owner FAILED-retry Playwright flow pass.
 - [x] PostgreSQL 16 rehearsal passes for `f6 → a7 → f6 → a7` with a
       representative workspace/container row.
@@ -59,11 +60,32 @@ do not replace the current candidate evidence or authorize live testing.
   same private-mode predicate as workspace alias prepare/verify and retain
   rejection of any other-user permission bit.
 
+## Installed intermediate candidate
+
+- Candidate `5cc0421243a31f66f34d271db80a89225fd740ba` fixed the private
+  workspace-mode mismatch and passed source/runtime/tree checks, Worker
+  integrity `16/16`, all six workspace aliases, and existing CPU-container
+  security checks after installation.
+- It is not the Phase 1 release candidate: the ordinary-user dashboard,
+  connection, container, and help views still hard-coded GPU `NONE` and stated
+  that development containers never receive a GPU. That contradicts the
+  selectable GPU Development profile.
+- The follow-up exposes the selected profile and only reports an H100 when a
+  running container has a complete Slurm allocation job/UUID binding. A
+  stopped GPU profile remains explicitly GPU-unallocated and is not mislabeled
+  as CPU Development.
+- Production service start commands completed, but the final active/ready/HTTP
+  checks remain unconfirmed because the production approval service returned
+  `503`. No manual container start, database edit, Slurm job, Lease mutation,
+  or administrator impersonation is permitted to bypass that gate.
+
 ## Production preflight and rollback point
 
 - [ ] Freeze new activation, restore, job, terminal, and container operations.
-- [ ] Record installed Git `ea69317fe72b64c3ef428402dce5036260589f3e` and DB
-      `f6a7b8c9d0e1` unless read-only preflight proves otherwise.
+- [ ] Read-only preflight must prove installed Git
+      `5cc0421243a31f66f34d271db80a89225fd740ba`, tree
+      `3bfc1feedc47b5dc013a5104bc8bc1ada50e7861`, and DB `a7b8c9d0e1f2`
+      before any follow-up installation; abort on drift.
 - [ ] Back up and verify PostgreSQL, application release, service units,
       protected scripts/manifest, Slurm config, lifecycle files, Compose,
       `/etc/projects`, `/etc/projid`, and per-user mount units.

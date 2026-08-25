@@ -245,8 +245,8 @@ const EN_US: Record<string, string> = {
   "设置 Container SSH 密钥": "Set up Container SSH Key",
   "Scope 固定为 CONTAINER；私钥只保存在你的电脑":
     "Scope is fixed to CONTAINER; the private key stays only on your computer",
-  "计算资源已经安全 Stage。登记你自己的 ED25519 公钥后，管理员才能在下一阶段激活环境。":
-    "Compute resources have been staged safely. Register your own ED25519 public key so an administrator can activate the environment in the next phase.",
+  "计算资源已经安全 Stage。登记你自己的 ED25519 公钥后，你可以自行确认并激活环境。":
+    "Compute resources have been staged safely. After registering your own ED25519 public key, you can confirm and activate the environment yourself.",
   "当前不能启动容器、打开网页终端或提交作业；Host SSH 始终禁用。":
     "You cannot start the container, open the web terminal, or submit jobs yet. Host SSH remains disabled.",
   申请恢复: "Request Restore",
@@ -267,7 +267,11 @@ const EN_US: Record<string, string> = {
   "{hours}小时 {minutes}分": "{hours}h {minutes}m",
   "Host SSH 已按普通用户策略关闭":
     "Host SSH is disabled by ordinary-user policy",
-  "用于开发，不直接提供GPU": "For development; no direct GPU access",
+  "CPU Development · 无 GPU Device": "CPU Development · no GPU device",
+  "GPU Development · H100 × 1 已由 Slurm 分配":
+    "GPU Development · H100 × 1 allocated by Slurm",
+  "GPU Development · H100 当前未分配":
+    "GPU Development · H100 is not currently allocated",
   GPU任务上限: "GPU Job Limit",
   通过作业页面提交: "Submit through the Jobs page",
   可用空间: "Available Space",
@@ -275,8 +279,12 @@ const EN_US: Record<string, string> = {
   "总配额 {quota}": "Total quota {quota}",
   开始开发: "Start Developing",
   进入自己的长期开发容器: "Open your long-running development container",
-  "在开发容器中编写代码、编译和准备数据。容器不直接分配GPU。":
-    "Write code, compile, and prepare data in the development container. The container has no directly assigned GPU.",
+  "CPU Development 容器用于编写代码、编译和准备数据，不挂载 GPU Device。":
+    "Use the CPU Development container to write code, compile, and prepare data; it has no GPU device mounted.",
+  "启动 GPU Development 容器时，平台将通过 Slurm 分配 1 张 H100。":
+    "When the GPU Development container starts, the platform allocates one H100 through Slurm.",
+  "此 GPU Development 容器已通过 Slurm 分配 1 张 H100，可进行 CUDA 开发与调试。":
+    "This GPU Development container has one H100 allocated through Slurm and is ready for CUDA development and debugging.",
   打开网页终端: "Open Web Terminal",
   查看SSH连接: "View SSH Access",
   提交计算任务: "Submit a Compute Job",
@@ -284,8 +292,8 @@ const EN_US: Record<string, string> = {
   "选择工作区中的脚本，通过Portal提交到Slurm。":
     "Select a script in your workspace and submit it to Slurm through the Portal.",
   自己的长期开发容器: "Your long-running development container",
-  "用于编写代码和开发，不直接提供GPU。":
-    "For coding and development; no direct GPU access.",
+  "CPU Development 默认无 GPU；GPU Development 启动时通过 Slurm 分配 1 张 H100。":
+    "CPU Development has no GPU by default; GPU Development allocates one H100 through Slurm when it starts.",
   认证: "Authentication",
   "用户密钥 Fingerprint": "User Key Fingerprint",
   未安装: "Not installed",
@@ -376,8 +384,8 @@ const EN_US: Record<string, string> = {
   "下一阶段通过资源申请与管理员审批进入 Compute Provisioning。":
     "Next, submit a resource request and obtain administrator approval to enter compute provisioning.",
   "完成 Container SSH 密钥注册": "Complete Container SSH key registration",
-  "计算身份、私有存储、Slurm association 与无 GPU 开发容器已经安全 Stage；Container 保持停止，Lease 尚未启动。":
-    "The compute identity, private storage, Slurm association, and GPU-free development container are safely staged. The container remains stopped and the lease has not started.",
+  "计算身份、私有存储、Slurm association 与所选开发容器已经安全 Stage；Container 保持停止，GPU Development 尚未由 Slurm 分配 H100，Lease 尚未启动。":
+    "The compute identity, private storage, Slurm association, and selected development container are safely staged. The container remains stopped, GPU Development has no H100 allocation from Slurm yet, and the lease has not started.",
   "只登记你自己的 ED25519 公钥，Scope 固定为 CONTAINER。":
     "Register only your own ED25519 public key; scope is fixed to CONTAINER.",
   普通用户计算流程: "Ordinary user compute workflow",
@@ -405,7 +413,7 @@ const EN_US: Record<string, string> = {
   计算环境启用步骤: "Compute environment activation steps",
   "1. SSH 密钥": "1. SSH key",
   "2. 确认资源": "2. Confirm resources",
-  "3. 等待激活": "3. Wait for activation",
+  "3. 自助激活": "3. Self-activate",
   "4. 连接环境": "4. Connect to environment",
   "当前 authorized_keys 为 ABSENT，Shell 为 /usr/sbin/nologin，开发容器为 STOPPED。 登记公钥不会自动 Activate。":
     "authorized_keys is ABSENT, the shell is /usr/sbin/nologin, and the development container is STOPPED. Registering a public key does not automatically activate the environment.",

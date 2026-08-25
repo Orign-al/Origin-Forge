@@ -386,7 +386,7 @@ export function SshKeyEnrollment({
             {t("1. SSH 密钥")}
           </li>
           <li>{t("2. 确认资源")}</li>
-          <li>{t("3. 等待激活")}</li>
+          <li>{t("3. 自助激活")}</li>
           <li>{t("4. 连接环境")}</li>
         </ol>
       )}

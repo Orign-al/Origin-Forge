@@ -48,25 +48,34 @@ Status: **CANDIDATE TESTS PASS; PRODUCTION DEPLOYMENT/LIVE ACCEPTANCE PENDING**
 - A failed recycle item is owner-retryable with a new idempotency key and no
   administrator approval. Browser coverage verifies the button and success
   flow.
+- Ordinary-user dashboard, connection, container, and help views distinguish
+  the default CPU profile, a stopped GPU profile, and a running GPU profile
+  with a complete Slurm allocation. The connection API reports runtime GPU
+  access only when the container is running, the Lease/key/environment gates
+  pass, and the exact Slurm job/UUID pair is present.
+- STAGED users are told to complete owner self-activation after registering
+  their Container key; the UI no longer claims that a second administrator
+  action is required or that every staged development profile is GPU-free.
 
 ## Automated results
 
-| Gate                                      | Result                                  |
-| ----------------------------------------- | --------------------------------------- |
-| `git diff --check`                        | PASS                                    |
-| Ruff check / Python format                | PASS                                    |
-| Fixed shell syntax                        | PASS                                    |
-| API pytest                                | PASS — 144                              |
-| Worker pytest                             | PASS — 174                              |
-| Runtime/workspace contracts               | PASS — 27                               |
-| Web Vitest                                | PASS — 48 across 12 files               |
-| ESLint / TypeScript / Prettier            | PASS                                    |
-| Next.js 16 production build (`--webpack`) | PASS — 26 routes                        |
-| Playwright owner FAILED-retry flow        | PASS — 2 viewports                      |
-| Protected script manifest                 | PASS — every checked-in SHA-256 matches |
+| Gate                                      | Result                                   |
+| ----------------------------------------- | ---------------------------------------- |
+| `git diff --check`                        | PASS                                     |
+| Ruff check / Python format                | PASS                                     |
+| Fixed shell syntax                        | PASS                                     |
+| API pytest                                | PASS — 145                               |
+| Worker pytest                             | PASS — 174                               |
+| Runtime/workspace contracts               | PASS — 27                                |
+| Web Vitest                                | PASS — 52 across 13 files                |
+| ESLint / TypeScript / Prettier            | PASS                                     |
+| Next.js 16 production build (`--webpack`) | PASS — 26 static pages; 29 route entries |
+| Playwright owner FAILED-retry flow        | PASS — 2 viewports                       |
+| Protected script manifest                 | PASS — every checked-in SHA-256 matches  |
 
-Pinned runtimes used: Python 3.14, Node 24.19.0, pnpm-compatible checked-in
-dependencies, Playwright Chromium 1234.
+Pinned runtimes used: Python 3.14, Node 24.19.0, pnpm 11.20.0 with checked-in
+dependencies, Playwright Chromium 1234. The final standalone artifact contains
+the same BUILD_ID in the root and packaged trees and a non-empty server entry.
 
 ## PostgreSQL migration rehearsal
 
@@ -118,18 +127,32 @@ the check. The follow-up centralizes the existing other-bits-zero predicate in
 the shared helper and tests `0700`/`0750` acceptance plus `0755`/`0701`
 rejection.
 
+Candidate `5cc0421243a31f66f34d271db80a89225fd740ba` fixed that
+workspace-mode mismatch and was installed with tree
+`3bfc1feedc47b5dc013a5104bc8bc1ada50e7861`. Source/runtime, Worker integrity
+`16/16`, database `a7b8c9d0e1f2`, exact Slurm configuration, all six workspace
+aliases, and existing CPU-container security invariants passed. It is now
+retired as a release candidate because the ordinary-user Web still hard-coded
+GPU `NONE` and claimed that development containers never receive a GPU. The
+follow-up candidate fixes that product/API visibility defect; it does not alter
+the migration, Worker scripts, Slurm configuration, runtime handlers, or user
+data.
+
 ## Read-only production evidence
 
-- Installed source/runtime Git: `e49754df6fe54282ac8da4f0a75a821288c1eb2f`.
+- Last verified installed source/runtime Git:
+  `5cc0421243a31f66f34d271db80a89225fd740ba`, tree
+  `3bfc1feedc47b5dc013a5104bc8bc1ada50e7861`.
 - Installed DB: `a7b8c9d0e1f2`; exact candidate Slurm config is live.
-- API, Worker socket/service, Web, and expiry are fail-closed while the
-  workspace-mode follow-up is prepared; reconcile remains disabled.
+- API, Worker, Web, and expiry start commands completed, but their final
+  active/ready/HTTP health has not been re-read because the production
+  approval service returned `503`; reconcile remains disabled.
 - Slurm queue and Portal active-job/restore/operation sets are empty, the node
   is idle, and no GPU compute process exists.
 - `gpu-dev-umar` is stopped; its failed restore has
   `CONTAINER_START_FAILED`, no restored Lease, and a suspended container key.
 - Worker integrity is `16/16`; source/runtime/tree and Slurm hashes match
-  candidate `e49754d`.
+  candidate `5cc0421`.
 - User data, backing workspace, Compose definition, and container are retained.
 - The root-only rollback point
   `portal-5a-phase1-pre-e49754d-20260825T130000Z` verifies completely and
@@ -144,11 +167,13 @@ rejection.
 This report does not represent real H100 or release acceptance. Before Phase 1
 or Phase 2 can be marked PASS:
 
-1. create, bundle, and independently verify the workspace-mode immutable
+1. commit, bundle, and independently verify the dynamic GPU visibility
    follow-up candidate;
 2. deploy that exact follow-up, require Worker integrity `16/16`, and pass the
    full static postflight including the legacy `0750` private workspace;
-3. have `umar` retry through the owner UI with a new idempotency key;
+3. after service health is proven, have `umar` retry through the ordinary-user
+   owner UI with a new idempotency key; the historical failed restore is not
+   replayed automatically;
 4. execute real GPU Development GPU=1 CUDA/UUID validation;
 5. prove GPU=2 API rejection with no Worker/Slurm side effect;
 6. run two ordinary users concurrently and prove different UUIDs, reciprocal

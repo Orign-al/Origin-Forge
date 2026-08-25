@@ -329,7 +329,7 @@ export function OrdinaryStagedDashboard({ user }: { user: User }) {
       >
         <p>
           {t(
-            "计算资源已经安全 Stage。登记你自己的 ED25519 公钥后，管理员才能在下一阶段激活环境。",
+            "计算资源已经安全 Stage。登记你自己的 ED25519 公钥后，你可以自行确认并激活环境。",
           )}
         </p>
         <Link className="ui-button ui-button-primary" href="/ssh-keys">
@@ -408,6 +408,11 @@ export function OrdinaryDashboard() {
     return <ErrorBlock message={t("计算环境状态暂时不可用。")} />;
   const environment = query.data.environment;
   const lease = environment.lease;
+  const gpuProfile = environment.container.profile === "GPU_1_8CPU_32GB";
+  const gpuAllocated =
+    gpuProfile &&
+    environment.container.state === "RUNNING" &&
+    environment.container.gpu_allocation_state === "ALLOCATED";
   const warning = lease.active && (lease.remaining_seconds ?? 0) <= 86400;
   const leaseClass = !lease.active
     ? "lease-band lease-expired"
@@ -455,7 +460,15 @@ export function OrdinaryDashboard() {
           <div className="stat-value compact-stat">
             <StatusBadge value={environment.container.state} />
           </div>
-          <div className="stat-detail">{t("用于开发，不直接提供GPU")}</div>
+          <div className="stat-detail">
+            {t(
+              gpuProfile
+                ? gpuAllocated
+                  ? "GPU Development · H100 × 1 已由 Slurm 分配"
+                  : "GPU Development · H100 当前未分配"
+                : "CPU Development · 无 GPU Device",
+            )}
+          </div>
         </Card>
         <Card className="stat-panel">
           <div className="stat-label">{t("GPU任务上限")}</div>
@@ -475,7 +488,13 @@ export function OrdinaryDashboard() {
       <div className="section-grid">
         <SectionCard title="开始开发" subtitle="进入自己的长期开发容器">
           <p>
-            {t("在开发容器中编写代码、编译和准备数据。容器不直接分配GPU。")}
+            {t(
+              gpuProfile
+                ? gpuAllocated
+                  ? "此 GPU Development 容器已通过 Slurm 分配 1 张 H100，可进行 CUDA 开发与调试。"
+                  : "启动 GPU Development 容器时，平台将通过 Slurm 分配 1 张 H100。"
+                : "CPU Development 容器用于编写代码、编译和准备数据，不挂载 GPU Device。",
+            )}
           </p>
           <div className="button-row">
             <Link className="ui-button ui-button-primary" href="/terminal">
@@ -509,6 +528,8 @@ export function OrdinaryConnection() {
   if (query.isError)
     return <ErrorBlock message={t("开发容器连接信息暂时不可用。")} />;
   const connection = query.data.connection;
+  const gpuProfile = connection.profile === "GPU_1_8CPU_32GB";
+  const gpuAllocated = connection.gpu === "SLURM_ALLOCATED_1";
   return (
     <>
       <PageHeading
@@ -522,7 +543,13 @@ export function OrdinaryConnection() {
       />
       <SectionCard
         title="开发容器"
-        subtitle="用于编写代码和开发，不直接提供GPU。"
+        subtitle={t(
+          gpuProfile
+            ? gpuAllocated
+              ? "GPU Development · H100 × 1 已由 Slurm 分配"
+              : "GPU Development · H100 当前未分配"
+            : "CPU Development · 无 GPU Device",
+        )}
       >
         <dl className="kv-grid">
           <div className="kv">
@@ -543,7 +570,11 @@ export function OrdinaryConnection() {
           </div>
           <div className="kv">
             <dt>GPU</dt>
-            <dd>NONE</dd>
+            <dd>
+              {gpuProfile
+                ? `H100 × 1 · ${gpuAllocated ? "SLURM ALLOCATED" : "NOT ALLOCATED"}`
+                : "NONE"}
+            </dd>
           </div>
           <div className="kv">
             <dt>{t("状态")}</dt>
@@ -616,6 +647,11 @@ export function OrdinaryContainer() {
   if (query.isError)
     return <ErrorBlock message={t("开发容器状态暂时不可用。")} />;
   const container = query.data.container;
+  const gpuProfile = container.profile === "GPU_1_8CPU_32GB";
+  const gpuAllocated =
+    gpuProfile &&
+    container.state === "RUNNING" &&
+    container.gpu_allocation_state === "ALLOCATED";
   return (
     <>
       <PageHeading
@@ -623,8 +659,21 @@ export function OrdinaryContainer() {
         description="自己的长期开发环境"
         action={<StatusBadge value={container.state} />}
       />
-      <SectionCard title={container.name} subtitle="GPU计算请通过作业页面提交">
+      <SectionCard
+        title={container.name}
+        subtitle={t(
+          gpuProfile
+            ? gpuAllocated
+              ? "GPU Development · H100 × 1 已由 Slurm 分配"
+              : "GPU Development · H100 当前未分配"
+            : "CPU Development · 无 GPU Device",
+        )}
+      >
         <dl className="kv-grid">
+          <div className="kv">
+            <dt>Profile</dt>
+            <dd>{container.profile}</dd>
+          </div>
           <div className="kv">
             <dt>CPU</dt>
             <dd>{container.cpus}</dd>
@@ -639,7 +688,11 @@ export function OrdinaryContainer() {
           </div>
           <div className="kv">
             <dt>GPU</dt>
-            <dd>NONE</dd>
+            <dd>
+              {gpuProfile
+                ? `H100 × 1 · ${gpuAllocated ? "SLURM ALLOCATED" : "NOT ALLOCATED"}`
+                : "NONE"}
+            </dd>
           </div>
           <div className="kv">
             <dt>{t("用途")}</dt>
@@ -1149,7 +1202,7 @@ export function OrdinaryHelp() {
           <SectionCard title="当前状态">
             <p>
               {t(
-                "计算身份、私有存储、Slurm association 与无 GPU 开发容器已经安全 Stage；Container 保持停止，Lease 尚未启动。",
+                "计算身份、私有存储、Slurm association 与所选开发容器已经安全 Stage；Container 保持停止，GPU Development 尚未由 Slurm 分配 H100，Lease 尚未启动。",
               )}
             </p>
           </SectionCard>
@@ -1168,7 +1221,11 @@ export function OrdinaryHelp() {
       <PageHeading title="帮助" description="普通用户计算流程" />
       <div className="section-grid">
         <SectionCard title="开发容器">
-          <p>{t("用于编写代码和开发，不直接提供GPU。")}</p>
+          <p>
+            {t(
+              "CPU Development 默认无 GPU；GPU Development 启动时通过 Slurm 分配 1 张 H100。",
+            )}
+          </p>
           <Link className="table-link" href="/access">
             {t("查看连接信息")}
           </Link>

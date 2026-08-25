@@ -784,11 +784,25 @@ def self_container_connection(
             PortalSshKey.container_install_state == "INSTALLED",
         )
     )
+    gpu_binding_ready = bool(
+        container.development_profile != "GPU_1_8CPU_32GB"
+        or (
+            container.gpu_count == 1
+            and container.gpu_allocation_job_id is not None
+            and container.gpu_allocation_uuid is not None
+        )
+    )
     available = bool(
         lease.get("active")
         and container.observed_state == "RUNNING"
         and key is not None
         and managed.compute_environment_state == "ACTIVE"
+        and gpu_binding_ready
+    )
+    runtime_gpu = (
+        "SLURM_ALLOCATED_1"
+        if available and container.development_profile == "GPU_1_8CPU_32GB"
+        else "NONE"
     )
     return {
         "status": "OK",
@@ -798,7 +812,8 @@ def self_container_connection(
             "port": container.ssh_port,
             "username": managed.unix_username,
             "authentication": "SSH_PUBLIC_KEY",
-            "gpu": "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1",
+            "profile": container.development_profile,
+            "gpu": runtime_gpu,
             "key_fingerprint": key.fingerprint_sha256 if key else None,
             "command": (
                 f"ssh -i <你的私钥路径> -p {container.ssh_port} "

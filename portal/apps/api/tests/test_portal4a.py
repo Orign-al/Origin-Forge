@@ -1006,6 +1006,33 @@ def test_expired_timestamp_denies_new_access_even_when_database_state_is_active(
     assert renewal.json()["detail"]["code"] == "LEASE_EXPIRED_RESTORE_REQUIRED"
 
 
+def test_container_connection_reports_only_a_live_slurm_gpu_allocation(
+    client,
+    database: Session,
+    origin_headers: dict[str, str],
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(database, development_profile="GPU_1_8CPU_32GB")
+    _login(client, origin_headers, identity.user.normalized_login)
+
+    running = client.get("/api/v1/self/container/connection")
+    assert running.status_code == 200
+    assert running.json()["connection"]["available"] is True
+    assert running.json()["connection"]["profile"] == "GPU_1_8CPU_32GB"
+    assert running.json()["connection"]["gpu"] == "SLURM_ALLOCATED_1"
+
+    identity.container.desired_state = "STOPPED"
+    identity.container.observed_state = "STOPPED"
+    identity.container.gpu_allocation_job_id = None
+    identity.container.gpu_allocation_uuid = None
+    database.commit()
+
+    stopped = client.get("/api/v1/self/container/connection")
+    assert stopped.status_code == 200
+    assert stopped.json()["connection"]["available"] is False
+    assert stopped.json()["connection"]["profile"] == "GPU_1_8CPU_32GB"
+    assert stopped.json()["connection"]["gpu"] == "NONE"
+
+
 def test_failed_gpu_restart_persists_worker_confirmed_allocation_cleanup(
     client,
     database: Session,

@@ -860,7 +860,8 @@ export const selfContainerConnection = () =>
       port: number;
       username: string;
       authentication: string;
-      gpu: "NONE";
+      profile: SelfEnvironment["container"]["profile"];
+      gpu: "NONE" | "SLURM_ALLOCATED_1";
       key_fingerprint: string | null;
       command: string | null;
       vscode: string | null;
