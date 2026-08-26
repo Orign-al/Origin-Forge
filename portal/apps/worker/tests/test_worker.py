@@ -2686,6 +2686,10 @@ def test_portal4a_setpriv_uses_fixed_argv_and_never_shell(
         "LOGNAME": "origin-pilot",
         "SHELL": "/usr/sbin/nologin",
         "WORKSPACE": "/storage/users/20001",
+        "ENROOT_CACHE_PATH": "/storage/users/20001/.portal/enroot/cache",
+        "ENROOT_CONFIG_PATH": "/storage/users/20001/.portal/enroot/config",
+        "ENROOT_DATA_PATH": "/storage/users/20001/.portal/enroot/data",
+        "ENROOT_RUNTIME_PATH": "/storage/users/20001/.portal/enroot/runtime",
     }
 
 

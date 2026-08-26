@@ -8488,13 +8488,19 @@ def _run_as_managed_user(
     if not os.path.exists(setpriv) or any("\x00" in item for item in command):
         return {"ok": False, "error_code": "SETUID_EXECUTION_REJECTED", "stdout": "", "stderr": ""}
     username = str(payload["username"])
+    workspace = str(payload["workspace_path"])
+    enroot_root = f"{workspace}/.portal/enroot"
     managed_env = {
         **FIXED_ENV,
         "HOME": f"/home/{username}",
         "USER": username,
         "LOGNAME": username,
         "SHELL": "/usr/sbin/nologin",
-        "WORKSPACE": str(payload["workspace_path"]),
+        "WORKSPACE": workspace,
+        "ENROOT_CACHE_PATH": f"{enroot_root}/cache",
+        "ENROOT_CONFIG_PATH": f"{enroot_root}/config",
+        "ENROOT_DATA_PATH": f"{enroot_root}/data",
+        "ENROOT_RUNTIME_PATH": f"{enroot_root}/runtime",
     }
     try:
         completed = subprocess.run(
