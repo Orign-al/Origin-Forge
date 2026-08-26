@@ -11,7 +11,7 @@ Group=h100-portal-web
 WorkingDirectory=/opt/h100-portal/apps/web/.next/standalone/apps/web
 Environment=NODE_ENV=production
 Environment=NEXT_TELEMETRY_DISABLED=1
-Environment=HOSTNAME=0.0.0.0
+Environment=HOSTNAME=20.10.10.3
 Environment=PORT=18080
 ExecStart=/opt/node-v24.19.0/bin/node /opt/h100-portal/apps/web/.next/standalone/apps/web/server.js
 SuccessExitStatus=143
@@ -29,9 +29,7 @@ ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_INET
 IPAddressDeny=any
 IPAddressAllow=localhost
-IPAddressAllow=10.10.10.0/24
 IPAddressAllow=20.10.10.0/24
-IPAddressAllow=10.82.36.0/24
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes

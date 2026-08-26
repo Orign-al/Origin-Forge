@@ -18,7 +18,7 @@ readonly PROJECT_MIN=30000
 readonly PROJECT_MAX=39999
 readonly PORT_MIN=22023
 readonly PORT_MAX=22999
-readonly CONTAINER_PUBLISH_HOST=0.0.0.0
+readonly CONTAINER_PUBLISH_HOST=${H100_PUBLIC_ACCESS_IP}
 
 created_group=0
 created_user=0

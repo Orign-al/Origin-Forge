@@ -1583,7 +1583,7 @@ def managed_container_inspect(*, state: str = "STOPPED") -> dict[str, object]:
             "memory_limit_bytes": 32 * 1024**3,
             "pids_limit": 4096,
             "ssh_port": "22023",
-            "ssh_host_ip": "0.0.0.0",  # noqa: S104 -- approved publish contract fixture
+            "ssh_host_ip": "20.10.10.3",
             "privileged": False,
             "network_mode": "bridge",
             "pid_mode": "",
@@ -1751,6 +1751,7 @@ def test_managed_container_start_preconditions_accept_only_exact_safe_container(
         ("ipc_mode", "host"),
         ("gpu", "REQUESTED"),
         ("docker_socket_mounted", True),
+        ("ssh_host_ip", "0.0.0.0"),  # noqa: S104 -- rejected wildcard fixture
         ("ssh_host_ip", "10.82.36.1"),
     ],
 )

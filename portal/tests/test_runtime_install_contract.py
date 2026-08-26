@@ -146,12 +146,12 @@ def test_web_binds_user_ingress_without_exposing_internal_services() -> None:
     environment = (PORTAL_ROOT / "deploy/portal.env.example").read_text()
     installer = (PORTAL_ROOT / "deploy/scripts/install-runtime.sh").read_text()
 
-    assert "Environment=HOSTNAME=0.0.0.0" in service.splitlines()
+    assert "Environment=HOSTNAME=20.10.10.3" in service.splitlines()
     assert "IPAddressDeny=any" in service.splitlines()
     assert "IPAddressAllow=localhost" in service.splitlines()
-    assert "IPAddressAllow=10.10.10.0/24" in service.splitlines()
     assert "IPAddressAllow=20.10.10.0/24" in service.splitlines()
-    assert "IPAddressAllow=10.82.36.0/24" in service.splitlines()
+    assert "IPAddressAllow=10.10.10.0/24" not in service.splitlines()
+    assert "IPAddressAllow=10.82.36.0/24" not in service.splitlines()
     assert "h100-portal-web-tun1.service" not in installer
     assert not (PORTAL_ROOT / "deploy/systemd/h100-portal-web-tun1.service").exists()
     assert "PORTAL_PUBLIC_ACCESS_HOST=20.10.10.3" in environment
@@ -196,11 +196,13 @@ def test_compute_stage_publishes_ssh_on_ipv4_ingress_and_keeps_public_address_se
     manifest = json.loads((PORTAL_ROOT / "deploy/worker-scripts.json").read_text())
     source_text = source.read_text()
     worker_text = worker.read_text()
+    common_text = (PLATFORM_ROOT / "scripts/h100-platform-common.sh").read_text()
 
     assert manifest["h100-provision-stage"] == hashlib.sha256(source.read_bytes()).hexdigest()
-    assert "readonly CONTAINER_PUBLISH_HOST=0.0.0.0" in source_text
+    assert "readonly H100_PUBLIC_ACCESS_IP=20.10.10.3" in common_text
+    assert "readonly CONTAINER_PUBLISH_HOST=${H100_PUBLIC_ACCESS_IP}" in source_text
     assert "host_ip: ${CONTAINER_PUBLISH_HOST}" in source_text
     assert '.HostConfig.PortBindings["22/tcp"][0].HostIp == $host_ip' in source_text
-    assert 'CONTAINER_PUBLISH_HOST = "0.0.0.0"' in worker_text
+    assert "CONTAINER_PUBLISH_HOST = PUBLIC_ACCESS_HOST" in worker_text
     assert 'PUBLIC_ACCESS_HOST = "20.10.10.3"' in worker_text
     assert 'container.get("ssh_host_ip") == CONTAINER_PUBLISH_HOST' in worker_text

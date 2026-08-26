@@ -50,8 +50,8 @@ docker container inspect "${container}" >/dev/null 2>&1 \
 if ss -H -lnt "sport = :${ssh_port}" | grep -q .; then
   h100_fail "SSH port is already in use: ${ssh_port}"
 fi
-ip -br addr | grep -Eq "^[^[:space:]]+[[:space:]]+UP[[:space:]]+.*${H100_MANAGEMENT_IP}/" \
-  || h100_fail "management IP is not active: ${H100_MANAGEMENT_IP}"
+ip -br addr | grep -Eq "^[^[:space:]]+[[:space:]]+UP[[:space:]]+.*${H100_PUBLIC_ACCESS_IP}/" \
+  || h100_fail "EasyTier user ingress IP is not active: ${H100_PUBLIC_ACCESS_IP}"
 if id -nG "${user_name}" | tr ' ' '\n' | grep -qx docker; then
   h100_fail 'managed user must not belong to the host docker group'
 fi
@@ -131,7 +131,7 @@ services:
     ports:
       - target: 22
         published: "${ssh_port}"
-        host_ip: ${H100_MANAGEMENT_IP}
+        host_ip: ${H100_PUBLIC_ACCESS_IP}
         protocol: tcp
     volumes:
       - type: bind
@@ -179,7 +179,7 @@ h100_wait_healthy "${container}" 120 \
   || { docker logs --tail 100 "${container}" >&2 || true; h100_fail 'container did not become healthy'; }
 
 docker inspect "${container}" | jq -e \
-  --arg host_ip "${H100_MANAGEMENT_IP}" \
+  --arg host_ip "${H100_PUBLIC_ACCESS_IP}" \
   --arg host_port "${ssh_port}" \
   --arg workspace "${workspace}" '
     .[0] as $c
@@ -205,7 +205,7 @@ fingerprint="$(ssh-keygen -lf "${host_key_dir}/ssh_host_ed25519_key.pub")"
   printf -- '- User: `%s` (`%s:%s`)\n' "${user_name}" "${user_uid}" "${user_gid}"
   printf -- '- Container: `%s`\n' "${container}"
   printf -- '- Image: `%s`\n' "${image}"
-  printf -- '- SSH: `%s:%s`\n' "${H100_MANAGEMENT_IP}" "${ssh_port}"
+  printf -- '- SSH: `%s:%s`\n' "${H100_PUBLIC_ACCESS_IP}" "${ssh_port}"
   printf -- '- SSH host-key fingerprint: `%s`\n' "${fingerprint}"
   printf -- '- Privileged/host network/host PID/host IPC: disabled\n'
   printf -- '- GPU device request: none\n'
@@ -215,6 +215,6 @@ fingerprint="$(ssh-keygen -lf "${host_key_dir}/ssh_host_ed25519_key.pub")"
 } >"${report_file}"
 
 printf 'CREATED CONTAINER %s ssh=%s:%s\n' \
-  "${container}" "${H100_MANAGEMENT_IP}" "${ssh_port}"
+  "${container}" "${H100_PUBLIC_ACCESS_IP}" "${ssh_port}"
 printf 'SSH host-key fingerprint: %s\n' "${fingerprint}"
 h100_mark_success
