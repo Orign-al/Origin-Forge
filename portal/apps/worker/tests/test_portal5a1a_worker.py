@@ -912,6 +912,21 @@ def test_compute_stage_project_mapping_matches_transactional_script_quota_root()
     assert projid_entry == f"h100_{username}:{project_id}"
 
 
+def test_compute_stage_mount_contract_matches_transactional_script_bind_sources() -> None:
+    payload = stage_payload()
+    username = str(payload["username"])
+    user_root = handlers.PILOT_DATA_ROOT / username
+
+    sources = handlers._compute_stage_expected_mount_sources(payload)
+
+    assert sources == {
+        str(user_root / "home"),
+        str(handlers.workspace_path(int(payload["uid"]))),
+        str(user_root / "shared"),
+        f"/srv/gpu-platform/container-data/{username}/ssh-host-keys",
+    }
+
+
 def test_compute_retry_retained_scan_checks_numeric_identity_and_ssh_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

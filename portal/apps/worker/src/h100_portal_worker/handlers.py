@@ -3295,6 +3295,17 @@ def _compute_project_mapping_entries(payload: dict[str, Any]) -> tuple[str, str]
     )
 
 
+def _compute_stage_expected_mount_sources(payload: dict[str, Any]) -> set[str]:
+    username = str(payload["username"])
+    user_root = PILOT_DATA_ROOT / username
+    return {
+        str(user_root / "home"),
+        str(workspace_path(int(payload["uid"]))),
+        str(user_root / "shared"),
+        f"/srv/gpu-platform/container-data/{username}/ssh-host-keys",
+    }
+
+
 def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
     username = str(payload["username"])
     _compute_stage_state(payload)
@@ -3350,7 +3361,6 @@ def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
             "COMPUTE_STAGE_POSTCONDITION_FAILED", "GPU registry binding is invalid"
         )
 
-    user_root = PILOT_DATA_ROOT / username
     workspace = Path(workspace_path(int(payload["uid"])))
     required_workspace_directories = (
         "projects",
@@ -3435,11 +3445,7 @@ def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
     container = inspected.get("container", {})
     state = container.get("state", {}) if isinstance(container, dict) else {}
     mounts = container.get("mounts", []) if isinstance(container, dict) else []
-    expected_sources = {
-        str(user_root / "home"),
-        str(workspace),
-        f"/srv/gpu-platform/container-data/{username}/ssh-host-keys",
-    }
+    expected_sources = _compute_stage_expected_mount_sources(payload)
     observed_sources = {str(item.get("Source", "")) for item in mounts if isinstance(item, dict)}
     if not (
         inspected.get("status") == "OK"
