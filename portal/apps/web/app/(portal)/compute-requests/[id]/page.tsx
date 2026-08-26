@@ -63,10 +63,14 @@ export default function ComputeRequestDetailPage() {
   const query = useQuery({
     queryKey: ["admin-compute-request", params.id],
     queryFn: () => adminComputeRequest(params.id),
-    refetchInterval: (state) =>
-      state.state.data?.request.lifecycle_state === "PROVISIONING"
-        ? 1500
-        : false,
+    refetchInterval: (state) => {
+      const request = state.state.data?.request;
+      if (request?.lifecycle_state === "PROVISIONING") return 1500;
+      if (request?.status === "FAILED" && request.retry_available !== true) {
+        return 5000;
+      }
+      return false;
+    },
   });
   const current = useQuery({ queryKey: ["me"], queryFn: me, retry: false });
 
@@ -174,6 +178,10 @@ export default function ComputeRequestDetailPage() {
   const lifecycleState = item.lifecycle_state ?? item.status;
   const recentAuthValid = current.data?.recent_auth_valid === true;
   const unknownResources = failureOperation?.unknown_resource_state ?? [];
+  const retainedResources = failureOperation?.resource_residue ?? [];
+  const reviewResources = unknownResources.length
+    ? unknownResources
+    : retainedResources;
   const workflowSteps = lifecycleOperation?.workflow_steps ?? {};
   const provisioning = lifecycleState === "PROVISIONING" || busy;
 
@@ -404,16 +412,20 @@ export default function ComputeRequestDetailPage() {
               role="status"
             >
               <strong>需要人工处理</strong>
-              <p>系统无法权威确定以下资源状态，安全 Reservation 保持占用。</p>
-              {unknownResources.length ? (
+              <p>
+                {unknownResources.length
+                  ? "系统无法权威确定以下资源状态，安全 Reservation 保持占用。"
+                  : retainedResources.length
+                    ? "以下资源仍然存在，安全 Reservation 保持占用。"
+                    : "正在等待 Root Worker 返回最新资源状态，安全 Reservation 保持占用。"}
+              </p>
+              {reviewResources.length ? (
                 <ul>
-                  {unknownResources.map((resource) => (
+                  {reviewResources.map((resource) => (
                     <li key={resource}>{resource}</li>
                   ))}
                 </ul>
-              ) : (
-                <p>等待 Root Worker 返回明确资源状态。</p>
-              )}
+              ) : null}
             </div>
           )}
         </Card>

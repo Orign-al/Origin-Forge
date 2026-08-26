@@ -900,6 +900,18 @@ def test_compute_stage_retained_scan_holds_derived_image_mapping_quota_and_regis
     assert "gpu-registry" in retained
 
 
+def test_compute_stage_project_mapping_matches_transactional_script_quota_root() -> None:
+    payload = stage_payload()
+    username = str(payload["username"])
+    project_id = int(payload["project_id"])
+
+    projects_entry, projid_entry = handlers._compute_project_mapping_entries(payload)
+
+    assert projects_entry == f"{project_id}:{handlers.PILOT_DATA_ROOT / username}"
+    assert projects_entry != f"{project_id}:{handlers.workspace_path(int(payload['uid']))}"
+    assert projid_entry == f"h100_{username}:{project_id}"
+
+
 def test_compute_retry_retained_scan_checks_numeric_identity_and_ssh_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

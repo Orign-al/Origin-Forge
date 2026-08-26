@@ -80,7 +80,11 @@ function currentSession(
 
 function requestFixture(
   status: "REQUESTED" | "PROVISIONING" | "FAILED",
-  options: { retryAvailable?: boolean; unknown?: string[] } = {},
+  options: {
+    retryAvailable?: boolean;
+    unknown?: string[];
+    residue?: string[];
+  } = {},
 ): ComputeResourceRequest {
   const operation = {
     id: OPERATION_ID,
@@ -118,7 +122,7 @@ function requestFixture(
     reconciliation_status: options.retryAvailable
       ? "VERIFIED"
       : "MANUAL_REVIEW",
-    resource_residue: [],
+    resource_residue: options.residue ?? [],
     unknown_resource_state: options.unknown ?? [],
   };
   const plan = {
@@ -340,6 +344,24 @@ describe("simplified Provision administrator workflow", () => {
     expect(
       screen.queryByRole("button", { name: /Reconcile Failed Provision/i }),
     ).not.toBeInTheDocument();
+  });
+
+  it("shows authoritative retained resources instead of reporting Worker uncertainty", async () => {
+    renderPage(
+      requestFixture("FAILED", {
+        retryAvailable: false,
+        residue: ["container", "xfs-project-mapping"],
+      }),
+      currentSession(true),
+    );
+
+    expect(await screen.findByTestId("manual-review")).toBeInTheDocument();
+    expect(
+      screen.getByText("以下资源仍然存在，安全 Reservation 保持占用。"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("container")).toBeInTheDocument();
+    expect(screen.getByText("xfs-project-mapping")).toBeInTheDocument();
+    expect(screen.queryByText(/等待 Root Worker/)).not.toBeInTheDocument();
   });
 
   it("renders simple progress and keeps implementation diagnostics collapsed", async () => {

@@ -3286,6 +3286,15 @@ def _verified_guard_metrics_for_user(username: str, uid: int) -> dict[str, Any]:
     }
 
 
+def _compute_project_mapping_entries(payload: dict[str, Any]) -> tuple[str, str]:
+    username = str(payload["username"])
+    project_id = int(payload["project_id"])
+    return (
+        f"{project_id}:{PILOT_DATA_ROOT / username}",
+        f"h100_{username}:{project_id}",
+    )
+
+
 def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
     username = str(payload["username"])
     _compute_stage_state(payload)
@@ -3379,9 +3388,10 @@ def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
             "COMPUTE_STAGE_POSTCONDITION_FAILED",
             "canonical workspace ownership or mode is invalid",
         )
-    if f"{payload['project_id']}:{workspace}" not in _safe_file_lines(
+    projects_entry, projid_entry = _compute_project_mapping_entries(payload)
+    if projects_entry not in _safe_file_lines(
         PROJECTS_FILE
-    ) or f"h100_{username}:{payload['project_id']}" not in _safe_file_lines(PROJID_FILE):
+    ) or projid_entry not in _safe_file_lines(PROJID_FILE):
         raise LifecycleValidationError(
             "COMPUTE_STAGE_POSTCONDITION_FAILED", "XFS project mapping is missing"
         )
@@ -3573,8 +3583,7 @@ def _compute_stage_retained_resources(payload: dict[str, Any]) -> list[str]:
     elif "no such" not in str(image.get("stderr", "")).casefold():
         retained.add("derived-image-state-unknown")
 
-    projects_entry = f"{payload['project_id']}:{PILOT_DATA_ROOT / username}"
-    projid_entry = f"h100_{username}:{payload['project_id']}"
+    projects_entry, projid_entry = _compute_project_mapping_entries(payload)
     if projects_entry in _safe_file_lines(PROJECTS_FILE) or projid_entry in _safe_file_lines(
         PROJID_FILE
     ):
