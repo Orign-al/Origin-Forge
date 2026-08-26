@@ -117,8 +117,13 @@ cleanup_workspace_alias() {
       if declare -F unmount_worker_alias >/dev/null 2>&1; then
         # h100_fail exits the current shell. Isolate best-effort namespace
         # cleanup so one failed helper cannot abort the remaining host cleanup
-        # in this EXIT trap.
-        ( trap - EXIT; unmount_worker_alias ) >/dev/null 2>&1 || true
+        # in this EXIT trap. Keep host unmount and deferred Worker placeholder
+        # cleanup in that same shell so validated covered-mount state survives.
+        ( trap - EXIT
+          unmount_worker_alias
+          systemctl disable --now "${unit_name}"
+          finalize_worker_covered_alias_placeholder
+        ) >/dev/null 2>&1 || true
       fi
       systemctl disable --now "${unit_name}" >/dev/null 2>&1 || true
       rm -f -- "${unit_path}"
@@ -289,6 +294,104 @@ worker_mount_contract_ready() {
   done
 }
 
+worker_covered_placeholder_identity=
+worker_covered_placeholder_pending=0
+worker_covered_placeholder_pid=
+
+worker_covered_alias_placeholder_ready() {
+  local worker_pid=$1 host_record host_target host_maj_min host_fsroot host_extra
+  local worker_records worker_target worker_maj_min worker_fsroot worker_extra
+  local worker_record_count=0 host_path_identity worker_path_identity
+
+  worker_covered_placeholder_identity=
+
+  host_record="$(findmnt --noheadings --raw --output TARGET,MAJ:MIN,FSROOT \
+    --mountpoint "${canonical_workspace}" 2>/dev/null)" || return 1
+  [[ -n "${host_record}" && "${host_record}" != *$'\n'* ]] || return 1
+  read -r host_target host_maj_min host_fsroot host_extra <<<"${host_record}"
+  [[ "${host_target}" == "${canonical_workspace}" \
+    && "${host_maj_min}" =~ ^[0-9]+:[0-9]+$ \
+    && "${host_fsroot}" == /* \
+    && -z "${host_extra:-}" ]] || return 1
+
+  worker_records="$(worker_namespace_exec "${worker_pid}" \
+    /usr/bin/findmnt --noheadings --raw --output TARGET,MAJ:MIN,FSROOT \
+    --mountpoint "${canonical_workspace}" 2>/dev/null)" || return 1
+  [[ -n "${worker_records}" ]] || return 1
+  while read -r worker_target worker_maj_min worker_fsroot worker_extra; do
+    [[ "${worker_target}" == "${canonical_workspace}" \
+      && "${worker_maj_min}" == "${host_maj_min}" \
+      && "${worker_fsroot}" == "${host_fsroot}" \
+      && -z "${worker_extra:-}" ]] || return 1
+    ((worker_record_count += 1))
+  done <<<"${worker_records}"
+  ((worker_record_count > 0 && worker_record_count <= 8)) || return 1
+
+  host_path_identity="$(stat -c '%d:%i' "${canonical_workspace}")" || return 1
+  worker_path_identity="$(worker_namespace_exec "${worker_pid}" \
+    /usr/bin/stat -c '%d:%i' "${canonical_workspace}")" || return 1
+  [[ "${worker_path_identity}" != "${host_path_identity}" ]] || return 1
+  worker_namespace_exec "${worker_pid}" \
+    /usr/bin/test -d "${canonical_workspace}" || return 1
+  worker_namespace_exec "${worker_pid}" \
+    /usr/bin/test ! -L "${canonical_workspace}" || return 1
+  [[ "$(worker_namespace_exec "${worker_pid}" \
+      /usr/bin/stat -c '%u:%g:%a' "${canonical_workspace}")" == 0:0:700 ]] \
+    || return 1
+  [[ -z "$(worker_namespace_exec "${worker_pid}" \
+      /usr/bin/find "${canonical_workspace}" -mindepth 1 -maxdepth 1 -print -quit)" ]] \
+    || return 1
+  worker_covered_placeholder_identity=${worker_path_identity}
+}
+
+defer_worker_covered_alias_placeholder() {
+  local worker_pid=$1
+  worker_covered_alias_placeholder_ready "${worker_pid}" \
+    || return 1
+  worker_covered_placeholder_pending=1
+  worker_covered_placeholder_pid=${worker_pid}
+}
+
+finalize_worker_covered_alias_placeholder() {
+  local current_worker_pid observed_placeholder_identity
+  ((worker_covered_placeholder_pending == 1)) || return 0
+  if ! current_worker_pid="$(worker_namespace_pid)"; then
+    worker_covered_placeholder_pending=0
+    return 0
+  fi
+  [[ "${current_worker_pid}" == "${worker_covered_placeholder_pid}" ]] \
+    || h100_fail 'Worker mount namespace changed during workspace removal'
+  if worker_namespace_exec "${current_worker_pid}" \
+    /usr/bin/findmnt --noheadings --mountpoint "${canonical_workspace}" \
+    >/dev/null 2>&1; then
+    printf 'WORKSPACE ALIAS FAILURE CODE: WORKER_COVERED_MOUNT_REMAINED\n' >&2
+    h100_fail 'Worker covered workspace mount remained after host removal'
+  fi
+  observed_placeholder_identity="$(worker_namespace_exec "${current_worker_pid}" \
+    /usr/bin/stat -c '%d:%i' "${canonical_workspace}")" \
+    || h100_fail 'Worker workspace placeholder identity became unavailable'
+  worker_namespace_exec "${current_worker_pid}" \
+    /usr/bin/test -d "${canonical_workspace}" \
+    && worker_namespace_exec "${current_worker_pid}" \
+      /usr/bin/test ! -L "${canonical_workspace}" \
+    && [[ "${observed_placeholder_identity}" == "${worker_covered_placeholder_identity}" \
+    && "$(worker_namespace_exec "${current_worker_pid}" \
+      /usr/bin/stat -c '%u:%g:%a' "${canonical_workspace}")" == 0:0:700 \
+    && -z "$(worker_namespace_exec "${current_worker_pid}" \
+      /usr/bin/find "${canonical_workspace}" -mindepth 1 -maxdepth 1 -print -quit)" ]] \
+    || { printf 'WORKSPACE ALIAS FAILURE CODE: WORKER_PLACEHOLDER_CHANGED\n' >&2; \
+      h100_fail 'Worker workspace placeholder changed during removal'; }
+  worker_namespace_exec "${current_worker_pid}" \
+    /usr/bin/rmdir -- "${canonical_workspace}" \
+    || { printf 'WORKSPACE ALIAS FAILURE CODE: WORKER_PLACEHOLDER_REMOVE_FAILED\n' >&2; \
+      h100_fail 'Worker workspace placeholder could not be removed'; }
+  worker_namespace_exec "${current_worker_pid}" \
+    /usr/bin/test ! -e "${canonical_workspace}" \
+    || { printf 'WORKSPACE ALIAS FAILURE CODE: WORKER_PLACEHOLDER_REMAINED\n' >&2; \
+      h100_fail 'Worker workspace placeholder remained reachable'; }
+  worker_covered_placeholder_pending=0
+}
+
 normalize_worker_alias() {
   local worker_pid=$1
   worker_namespace_exec "${worker_pid}" \
@@ -334,6 +437,9 @@ unmount_worker_alias() {
     if ! worker_mount_identity_ready "${worker_pid}"; then
       observed_worker_record="$(worker_visible_mount_record "${worker_pid}" || true)"
       if [[ "${observed_worker_record%% *}" == "${canonical_workspace}" ]]; then
+        if defer_worker_covered_alias_placeholder "${worker_pid}"; then
+          return 0
+        fi
         printf 'WORKSPACE ALIAS FAILURE CODE: WORKER_REMOVE_COLLISION\n' >&2
         h100_fail 'Worker workspace mount removal identity is invalid'
       fi
@@ -464,11 +570,13 @@ case "${action}" in
       || h100_fail 'canonical workspace has dependent submounts'
     unmount_worker_alias
     systemctl disable --now "${unit_name}"
+    finalize_worker_covered_alias_placeholder
     findmnt --noheadings --mountpoint "${canonical_workspace}" >/dev/null 2>&1 \
       && h100_fail 'canonical workspace remained mounted'
-    [[ -z "$(find "${canonical_workspace}" -mindepth 1 -maxdepth 1 -print -quit)" ]] \
-      || h100_fail 'unmounted canonical workspace contains unexpected data'
-    rmdir -- "${canonical_workspace}"
+    if [[ -e "${canonical_workspace}" || -L "${canonical_workspace}" ]]; then
+      verify_unmounted_mountpoint
+      rmdir -- "${canonical_workspace}"
+    fi
     rm -f -- "${unit_path}"
     systemctl daemon-reload
     if worker_pid="$(worker_namespace_pid)"; then

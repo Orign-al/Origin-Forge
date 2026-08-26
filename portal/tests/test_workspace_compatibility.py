@@ -150,6 +150,14 @@ def test_workspace_runtime_is_zero_copy_profile_aware_and_alias_aware() -> None:
     assert 'nsenter --target "${workspace_alias_host_namespace_pid}" --mount' in alias
     assert '--root="/proc/${workspace_alias_host_namespace_pid}/root"' in alias
     assert "WORKSPACE ALIAS FAILURE CODE" in alias
+    assert "TARGET,MAJ:MIN,FSROOT" in alias
+    assert "worker_covered_alias_placeholder_ready" in alias
+    assert "defer_worker_covered_alias_placeholder" in alias
+    assert "finalize_worker_covered_alias_placeholder" in alias
+    assert "WORKER_REMOVE_COLLISION" in alias
+    assert alias.index('systemctl disable --now "${unit_name}"') < alias.index(
+        "finalize_worker_covered_alias_placeholder"
+    )
     assert "H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL" in alias
     assert "workspace_mode_is_private()" not in alias
     assert alias.count("h100_workspace_mode_is_private") == 4

@@ -160,9 +160,34 @@ case "${1:-}" in
     mount -o "${mount_options}" "${mount_what}" "${mount_where}"
     if [[ -f /run/rehearsal-worker-pid ]]; then
       worker_pid="$(</run/rehearsal-worker-pid)"
+      worker_storage_park=/run/rehearsal-worker-storage-park
+      nsenter --target "${worker_pid}" --mount \
+        --root="/proc/${worker_pid}/root" \
+        --wd="/proc/${worker_pid}/cwd" -- \
+        install -d -o root -g root -m 0700 "${worker_storage_park}"
+      nsenter --target "${worker_pid}" --mount \
+        --root="/proc/${worker_pid}/root" \
+        --wd="/proc/${worker_pid}/cwd" -- \
+        mount --move /storage/users "${worker_storage_park}"
+      nsenter --target "${worker_pid}" --mount \
+        --root="/proc/${worker_pid}/root" \
+        --wd="/proc/${worker_pid}/cwd" -- \
+        mount --bind "${mount_what}" "${mount_where}"
+      nsenter --target "${worker_pid}" --mount \
+        --root="/proc/${worker_pid}/root" \
+        --wd="/proc/${worker_pid}/cwd" -- \
+        mount --move "${worker_storage_park}" /storage/users
+      nsenter --target "${worker_pid}" --mount \
+        --root="/proc/${worker_pid}/root" \
+        --wd="/proc/${worker_pid}/cwd" -- \
+        rmdir -- "${worker_storage_park}"
       # systemd's production ReadWritePaths namespace receives two propagated
       # bind records before the Host security remount. Recreate that exact
       # shadowing shape deterministically without touching the outer host.
+      nsenter --target "${worker_pid}" --mount \
+        --root="/proc/${worker_pid}/root" \
+        --wd="/proc/${worker_pid}/cwd" -- \
+        install -d -o root -g root -m 0700 "${mount_where}"
       for _ in 1 2; do
         nsenter --target "${worker_pid}" --mount \
           --root="/proc/${worker_pid}/root" \
@@ -187,6 +212,35 @@ case "${1:-}" in
     if findmnt --noheadings --mountpoint "${mount_where}" >/dev/null 2>&1; then
       umount "${mount_where}"
     fi
+    if [[ -f /run/rehearsal-worker-pid ]]; then
+      worker_pid="$(</run/rehearsal-worker-pid)"
+      worker_storage_park=/run/rehearsal-worker-storage-park
+      nsenter --target "${worker_pid}" --mount \
+        --root="/proc/${worker_pid}/root" \
+        --wd="/proc/${worker_pid}/cwd" -- \
+        install -d -o root -g root -m 0700 "${worker_storage_park}"
+      nsenter --target "${worker_pid}" --mount \
+        --root="/proc/${worker_pid}/root" \
+        --wd="/proc/${worker_pid}/cwd" -- \
+        mount --move /storage/users "${worker_storage_park}"
+      if nsenter --target "${worker_pid}" --mount \
+        --root="/proc/${worker_pid}/root" \
+        --wd="/proc/${worker_pid}/cwd" -- \
+        findmnt --noheadings --mountpoint "${mount_where}" >/dev/null 2>&1; then
+        nsenter --target "${worker_pid}" --mount \
+          --root="/proc/${worker_pid}/root" \
+          --wd="/proc/${worker_pid}/cwd" -- \
+          umount "${mount_where}"
+      fi
+      nsenter --target "${worker_pid}" --mount \
+        --root="/proc/${worker_pid}/root" \
+        --wd="/proc/${worker_pid}/cwd" -- \
+        mount --move "${worker_storage_park}" /storage/users
+      nsenter --target "${worker_pid}" --mount \
+        --root="/proc/${worker_pid}/root" \
+        --wd="/proc/${worker_pid}/cwd" -- \
+        rmdir -- "${worker_storage_park}"
+    fi
     rm -f -- "/etc/systemd/system/multi-user.target.wants/${unit_name}"
     ;;
   *)
@@ -209,9 +263,21 @@ if [[ -f /run/rehearsal-findmnt-delay && "$*" == *"--mountpoint /storage/users/2
   fi
   rm -f -- /run/rehearsal-findmnt-delay
 fi
-exec /usr/bin/findmnt "$@"
+if [[ -f /run/rehearsal-covered-target && "$*" == *"--target /storage/users/29991"* ]]; then
+  translated_arguments=()
+  for argument in "$@"; do
+    if [[ "${argument}" == --target ]]; then
+      translated_arguments+=(--mountpoint)
+    else
+      translated_arguments+=("${argument}")
+    fi
+  done
+  exec /rehearsal/bin/findmnt.real "${translated_arguments[@]}"
+fi
+exec /rehearsal/bin/findmnt.real "$@"
 EOF
 chmod 0755 "${namespace_root}/rehearsal/bin/findmnt"
+install -m 0755 /usr/bin/findmnt "${namespace_root}/rehearsal/bin/findmnt.real"
 
 cat >"${namespace_root}/rehearsal/run.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -251,6 +317,10 @@ rehearsal_diagnostics() {
     stat "${canonical}" "${unit}" >&2 || true
     printf '%s\n' '--- injected failure ---' >&2
     cat /rehearsal/propagated-failure.stderr >&2 || true
+    printf '%s\n' '--- collision recovery ---' >&2
+    cat /rehearsal/nonempty.stderr >&2 || true
+    cat /rehearsal/nonempty-recovery.stderr >&2 || true
+    cat /rehearsal/covered-target-state >&2 || true
   fi
   exit "${diagnostic_status}"
 }
@@ -291,12 +361,16 @@ REHEARSAL_DELAY_FINDMNT=1 "${alias_tool}" prepare \
 [[ "$(grep -c 'action=workspace-alias.*outcome=SUCCESS rc=0' "${audit_log}")" == 6 ]]
 remove_required_directories
 
-# Reproduce the production Worker namespace: ReadWritePaths creates a recursive
-# bind over /storage/users. The mock systemctl above injects the two propagated
-# pre-remount aliases, so prepare must normalize the visible top layer.
+# Reproduce the production Worker namespace: systemd's private writable layer
+# resolves an empty placeholder while mountinfo retains the host alias below
+# it. The mock systemctl above moves this private layer aside only while it
+# simulates propagation of the host mount event.
+touch /run/rehearsal-covered-target
 unshare --mount --propagation unchanged /bin/bash -c '
   set -euo pipefail
-  mount --rbind /storage/users /storage/users
+  mount -t tmpfs -o rw,nosuid,nodev,mode=0711 worker-storage /storage/users
+  mount --make-private /storage/users
+  mount --bind /rehearsal/bin/findmnt /usr/bin/findmnt
   printf "%s\n" "$$" >/run/rehearsal-worker-pid
   touch /run/rehearsal-worker-ready
   exec /bin/sleep 300
@@ -308,6 +382,10 @@ for _ in {1..50}; do
 done
 [[ -f /run/rehearsal-worker-ready && -f /run/rehearsal-worker-pid ]]
 worker_namespace_pid="$(</run/rehearsal-worker-pid)"
+nsenter --target "${worker_namespace_pid}" --mount \
+  --root="/proc/${worker_namespace_pid}/root" \
+  --wd="/proc/${worker_namespace_pid}/cwd" -- \
+  test ! -e "${canonical}"
 id "${rehearsal_user}" >/dev/null
 nsenter --target "${rehearsal_host_pid}" --mount \
   --root="/proc/${rehearsal_host_pid}/root" \
@@ -368,10 +446,50 @@ done
 H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL=1 \
   H100_WORKSPACE_ALIAS_REHEARSAL_HOST_PID="${rehearsal_host_pid}" \
   "${alias_tool}" verify "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}"
+# Once the visible alias layers are gone, a non-empty private placeholder must
+# remain a collision even though every covered record has the approved source.
+for _ in {1..8}; do
+  if [[ "$(nsenter --target "${worker_namespace_pid}" --mount \
+      --root="/proc/${worker_namespace_pid}/root" \
+      --wd="/proc/${worker_namespace_pid}/cwd" -- \
+      stat -c '%d:%i' "${canonical}")" != \
+    "$(stat -c '%d:%i' "${backing}")" ]]; then
+    break
+  fi
+  nsenter --target "${worker_namespace_pid}" --mount \
+    --root="/proc/${worker_namespace_pid}/root" \
+    --wd="/proc/${worker_namespace_pid}/cwd" -- \
+    umount "${canonical}"
+done
+nsenter --target "${worker_namespace_pid}" --mount \
+  --root="/proc/${worker_namespace_pid}/root" \
+  --wd="/proc/${worker_namespace_pid}/cwd" -- \
+  /usr/bin/findmnt --noheadings --raw --output TARGET,VFS-OPTIONS \
+  --target "${canonical}" >/rehearsal/covered-target-state
+grep -Fq "${canonical} " /rehearsal/covered-target-state
+nsenter --target "${worker_namespace_pid}" --mount \
+  --root="/proc/${worker_namespace_pid}/root" \
+  --wd="/proc/${worker_namespace_pid}/cwd" -- \
+  touch "${canonical}/unexpected-entry"
+if H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL=1 \
+  H100_WORKSPACE_ALIAS_REHEARSAL_HOST_PID="${rehearsal_host_pid}" \
+  "${alias_tool}" remove "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}" \
+    --confirm-remove "${rehearsal_user}" \
+    >/rehearsal/nonempty.stdout 2>/rehearsal/nonempty.stderr; then
+  fail 'non-empty Worker placeholder unexpectedly passed removal'
+fi
+grep -Fq 'WORKER_REMOVE_COLLISION' /rehearsal/nonempty.stderr
+findmnt --noheadings --mountpoint "${canonical}" >/dev/null
+[[ -f "${unit}" ]]
+nsenter --target "${worker_namespace_pid}" --mount \
+  --root="/proc/${worker_namespace_pid}/root" \
+  --wd="/proc/${worker_namespace_pid}/cwd" -- \
+  rm -- "${canonical}/unexpected-entry"
 H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL=1 \
   H100_WORKSPACE_ALIAS_REHEARSAL_HOST_PID="${rehearsal_host_pid}" \
   "${alias_tool}" remove "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}" \
-    --confirm-remove "${rehearsal_user}"
+    --confirm-remove "${rehearsal_user}" \
+    >/rehearsal/nonempty-recovery.stdout 2>/rehearsal/nonempty-recovery.stderr
 nsenter --target "${worker_namespace_pid}" --mount \
   --root="/proc/${worker_namespace_pid}/root" \
   --wd="/proc/${worker_namespace_pid}/cwd" -- \
@@ -380,6 +498,58 @@ kill "${worker_launcher_pid}"
 wait "${worker_launcher_pid}" || true
 rm -f -- /run/rehearsal-worker-pid /run/rehearsal-worker-ready
 [[ "$(grep -c 'action=workspace-alias.*outcome=SUCCESS rc=0' "${audit_log}")" == 9 ]]
+remove_required_directories
+
+# A covered record from any other filesystem/root remains fail closed even
+# when its visible placeholder is root-owned, mode 0700, and empty.
+install -d -o root -g root -m 0700 \
+  "${canonical}" /rehearsal/foreign-workspace
+unshare --mount --propagation unchanged /bin/bash -c '
+  set -euo pipefail
+  mount -t tmpfs -o rw,nosuid,nodev,mode=0711 worker-storage /storage/users
+  mount --make-private /storage/users
+  install -d -o root -g root -m 0700 /run/rehearsal-worker-storage-park
+  mount --move /storage/users /run/rehearsal-worker-storage-park
+  mount --bind /rehearsal/foreign-workspace /storage/users/29991
+  mount --move /run/rehearsal-worker-storage-park /storage/users
+  rmdir -- /run/rehearsal-worker-storage-park
+  mount --bind /rehearsal/bin/findmnt /usr/bin/findmnt
+  printf "%s\n" "$$" >/run/rehearsal-worker-pid
+  touch /run/rehearsal-worker-ready
+  exec /bin/sleep 300
+' &
+foreign_worker_launcher_pid=$!
+for _ in {1..50}; do
+  [[ -f /run/rehearsal-worker-ready ]] && break
+  sleep 0.1
+done
+[[ -f /run/rehearsal-worker-ready && -f /run/rehearsal-worker-pid ]]
+foreign_worker_namespace_pid="$(</run/rehearsal-worker-pid)"
+H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL=1 \
+  H100_WORKSPACE_ALIAS_REHEARSAL_HOST_PID="${rehearsal_host_pid}" \
+  "${alias_tool}" prepare "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}"
+if H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL=1 \
+  H100_WORKSPACE_ALIAS_REHEARSAL_HOST_PID="${rehearsal_host_pid}" \
+  "${alias_tool}" remove "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}" \
+    --confirm-remove "${rehearsal_user}" \
+    >/rehearsal/foreign.stdout 2>/rehearsal/foreign.stderr; then
+  fail 'foreign covered Worker mount unexpectedly passed removal'
+fi
+grep -Fq 'WORKER_REMOVE_COLLISION' /rehearsal/foreign.stderr
+findmnt --noheadings --mountpoint "${canonical}" >/dev/null
+[[ -f "${unit}" ]]
+kill "${foreign_worker_launcher_pid}"
+wait "${foreign_worker_launcher_pid}" || true
+rm -f -- \
+  /run/rehearsal-covered-target \
+  /run/rehearsal-worker-pid \
+  /run/rehearsal-worker-ready
+"${alias_tool}" remove "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}" \
+  --confirm-remove "${rehearsal_user}"
+[[ ! -e "${canonical}" && ! -e "${unit}" ]]
+rmdir -- /rehearsal/foreign-workspace
+[[ "$(grep -c 'action=workspace-alias.*outcome=SUCCESS rc=0' "${audit_log}")" == 11 ]]
+[[ "$(grep -c 'action=workspace-alias.*outcome=FAILED rc=1' "${audit_log}")" == 3 ]]
 remove_required_directories
 
 # Preserve pre-existing job metadata while forcing a post-mount validation
@@ -415,12 +585,12 @@ fi
 grep -Fq 'workspace identity differs from NSS' /rehearsal/mismatch.stderr
 [[ "$(wc -l <"${audit_log}")" == "${audit_lines_before_mismatch}" ]]
 [[ ! -e "${canonical}" && ! -e "${unit}" ]]
-[[ "$(grep -c 'action=workspace-alias.*outcome=FAILED rc=1' "${audit_log}")" == 2 ]]
+[[ "$(grep -c 'action=workspace-alias.*outcome=FAILED rc=1' "${audit_log}")" == 4 ]]
 
 printf 'owner_parent=%s owner_alias=%s\n' \
   "$(stat -c '%u:%g:%a' /storage/users)" "${rehearsal_uid}:${rehearsal_gid}"
-printf 'audit_success=9 audit_failure=2 cleanup=PASS uid_mismatch=PASS\n'
-printf 'systemd_unit_verify=PASS bind_inode=PASS mount_options=rw,nosuid,nodev convergence=PASS worker_namespace=PASS propagation_normalization=PASS\n'
+printf 'audit_success=11 audit_failure=4 cleanup=PASS uid_mismatch=PASS\n'
+printf 'systemd_unit_verify=PASS bind_inode=PASS mount_options=rw,nosuid,nodev convergence=PASS worker_namespace=PASS propagation_normalization=PASS covered_same_source_removal=PASS covered_collision_rejection=PASS\n'
 EOF
 chmod 0755 "${namespace_root}/rehearsal/run.sh"
 
