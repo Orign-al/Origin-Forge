@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import Select
 
 from h100_portal_api.audit import record_audit
 from h100_portal_api.database import SessionLocal
@@ -416,29 +417,34 @@ def reconcile_plan(
     return ReconciliationResult("VERIFIED", True, plan.id, failed_stage.id, verification)
 
 
+def _pending_plan_query(*, limit: int) -> Select[tuple[uuid.UUID]]:
+    held_reservation = (
+        select(PortalResourceReservation.id)
+        .where(
+            PortalResourceReservation.plan_id == PortalProvisionPlan.id,
+            PortalResourceReservation.state == "FAILED_HOLD",
+        )
+        .exists()
+    )
+    return (
+        select(PortalProvisionPlan.id)
+        .join(
+            PortalComputeResourceRequest,
+            PortalComputeResourceRequest.id == PortalProvisionPlan.request_id,
+        )
+        .where(
+            PortalProvisionPlan.state == "FAILED",
+            PortalComputeResourceRequest.status == "FAILED",
+            held_reservation,
+        )
+        .order_by(PortalProvisionPlan.created_at, PortalProvisionPlan.id)
+        .limit(limit)
+    )
+
+
 def pending_plan_ids(db: Session, *, limit: int = 32) -> list[uuid.UUID]:
     """Select only failed attempts whose allocator holds still require convergence."""
-    return list(
-        db.scalars(
-            select(PortalProvisionPlan.id)
-            .join(
-                PortalComputeResourceRequest,
-                PortalComputeResourceRequest.id == PortalProvisionPlan.request_id,
-            )
-            .join(
-                PortalResourceReservation,
-                PortalResourceReservation.plan_id == PortalProvisionPlan.id,
-            )
-            .where(
-                PortalProvisionPlan.state == "FAILED",
-                PortalComputeResourceRequest.status == "FAILED",
-                PortalResourceReservation.state == "FAILED_HOLD",
-            )
-            .distinct()
-            .order_by(PortalProvisionPlan.created_at)
-            .limit(limit)
-        ).all()
-    )
+    return list(db.scalars(_pending_plan_query(limit=limit)).all())
 
 
 def process_pending(*, limit: int = 32) -> tuple[int, int, int]:

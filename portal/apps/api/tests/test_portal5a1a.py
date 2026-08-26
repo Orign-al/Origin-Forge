@@ -23,7 +23,11 @@ from h100_portal_api.models import (
     ensure_utc,
     utcnow,
 )
-from h100_portal_api.provision_reconciliation import pending_plan_ids, reconcile_plan
+from h100_portal_api.provision_reconciliation import (
+    _pending_plan_query,
+    pending_plan_ids,
+    reconcile_plan,
+)
 from h100_portal_api.rbac import has_permission
 from h100_portal_api.routes.compute_requests import (
     _active_reservations,
@@ -44,6 +48,7 @@ from h100_portal_api.schemas import (
 from h100_portal_api.security import hash_password
 from h100_portal_api.worker_client import WorkerClientError
 from sqlalchemy import func, select
+from sqlalchemy.dialects import postgresql
 
 PASSWORD = "A long Portal compute request passphrase 2026"
 STANDARD_REQUEST = {
@@ -54,6 +59,14 @@ STANDARD_REQUEST = {
     "purpose": "多用户平台验收",
     "user_note": None,
 }
+
+
+def test_pending_reconciliation_query_is_postgresql_safe() -> None:
+    compiled = str(_pending_plan_query(limit=32).compile(dialect=postgresql.dialect()))
+
+    assert " DISTINCT " not in f" {compiled.upper()} "
+    assert "EXISTS (" in compiled.upper()
+    assert "ORDER BY portal_provision_plans.created_at, portal_provision_plans.id" in compiled
 
 
 def test_immutable_first_failure_evidence_is_view_only_and_exactly_bound() -> None:
