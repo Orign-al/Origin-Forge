@@ -631,6 +631,60 @@ def test_compute_stage_failure_classification_is_structured_and_zero_residue_bou
     assert result["retained_resources"] == []
 
 
+def test_compute_stage_workspace_alias_failure_is_safe_and_structured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = stage_payload()
+    monkeypatch.setattr(handlers, "script_integrity", stage_integrity)
+    monkeypatch.setattr(
+        handlers,
+        "_compute_provision_dry_run",
+        lambda _payload, **_kwargs: {"dry_run_status": "READY_FOR_PROVISION"},
+    )
+    monkeypatch.setattr(handlers, "_compute_stage_retained_resources", lambda _payload: [])
+    stderr = "\n".join(
+        [
+            "WORKSPACE ALIAS FAILURE CODE: TARGET_UNAVAILABLE",
+            "COMPUTE STAGE FAILURE CODE: PRIVATE_STORAGE_FAILED",
+            "COMPUTE STAGE FIRST FAILED STEP: PRIVATE_STORAGE",
+            "COMPUTE STAGE LAST SUCCESSFUL STEP: GPU_POLICY",
+            "COMPUTE STAGE SIDE EFFECT CLASSIFICATION: PARTIAL_ROLLED_BACK",
+        ]
+    )
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda _argv, timeout, **_kwargs: {
+            "ok": False,
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": stderr,
+        },
+    )
+
+    result = handlers.handle(request("compute.provision.stage", payload, dry_run=False))
+
+    assert result["status"] == "ERROR"
+    assert result["stage_failure_code"] == "PRIVATE_STORAGE_FAILED"
+    assert result["workspace_alias_failure_code"] == "TARGET_UNAVAILABLE"
+    assert result["error"]["message"] == (
+        "workspace alias validation failed closed (TARGET_UNAVAILABLE)"
+    )
+    assert payload["username"] not in result["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "WORKSPACE ALIAS FAILURE CODE: lowercase",
+        "WORKSPACE ALIAS FAILURE CODE: TARGET-UNAVAILABLE",
+        "prefix WORKSPACE ALIAS FAILURE CODE: TARGET_UNAVAILABLE",
+    ],
+)
+def test_workspace_alias_failure_marker_rejects_unstructured_text(marker: str) -> None:
+    assert handlers._workspace_alias_failure_marker(marker) is None
+
+
 def test_compute_stage_idempotency_binding_fails_before_side_effects() -> None:
     payload = stage_payload()
     unbound = request("compute.provision.stage", payload, dry_run=False).model_copy(

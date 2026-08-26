@@ -73,8 +73,6 @@ host_key_root="${H100_DATA_ROOT}/container-data/${user_name}"
   || h100_fail 'user data path validation failed'
 [[ "${user_root}" == /srv/gpu-platform/users/"${user_name}" ]] \
   || h100_fail 'user data path escaped approved root'
-[[ ! -L "${workspace_root}" && "$(realpath -e "${workspace_root}")" == "${workspace_root}" ]] \
-  || h100_fail 'workspace path validation failed'
 [[ "${workspace_root}" == /storage/users/"${user_uid}" ]] \
   || h100_fail 'workspace path escaped approved root'
 [[ ! -L "${host_key_root}" && "$(realpath -e "${host_key_root}")" == "${host_key_root}" ]] \
@@ -88,14 +86,11 @@ project_id="$(awk -F: -v name="${project_name}" '$1 == name {print $2}' /etc/pro
 grep -Fxq "${project_id}:${workspace_root}" /etc/projects \
   || h100_fail 'project path mapping is invalid'
 
-if findmnt --noheadings --mountpoint "${workspace_root}" >/dev/null 2>&1; then
-  [[ -x "${workspace_alias_tool}" && ! -L "${workspace_alias_tool}" ]] \
-    || h100_fail 'workspace alias removal handler is unavailable'
-  "${workspace_alias_tool}" remove "${user_name}" "${user_uid}" "$(id -g "${user_name}")" \
-    --confirm-remove "${user_name}"
-elif [[ -e "${workspace_root}" || -L "${workspace_root}" ]]; then
-  h100_fail 'unmounted canonical workspace collision requires review'
-fi
+[[ -x "${workspace_alias_tool}" && ! -L "${workspace_alias_tool}" ]] \
+  || h100_fail 'workspace alias removal handler is unavailable'
+"${workspace_alias_tool}" verify "${user_name}" "${user_uid}" "$(id -g "${user_name}")"
+"${workspace_alias_tool}" remove "${user_name}" "${user_uid}" "$(id -g "${user_name}")" \
+  --confirm-remove "${user_name}"
 
 stamp="$(date +%Y%m%d-%H%M%S-%N)"
 backup_dir="${H100_PLATFORM_ROOT}/backups/container-delete-${user_name}-${stamp}"

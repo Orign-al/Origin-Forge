@@ -399,6 +399,7 @@ def _safe_operation_view(operation: PortalOperation | None) -> dict[str, Any] | 
         "retained_resources": evidence.get("retained_resources"),
         "rollback_steps": evidence.get("rollback_steps"),
         "stage_failure_code": evidence.get("stage_failure_code"),
+        "workspace_alias_failure_code": evidence.get("workspace_alias_failure_code"),
         "workflow_steps": _workflow_steps(operation),
         "deployment_version": payload.get("deployment_version"),
         "canonical_execution_contract": payload.get("canonical_execution_contract"),
@@ -3358,6 +3359,11 @@ def provision_reserved_compute_environment(
             "stage_failure_code": str(
                 worker.get("stage_failure_code", "FIXED_STAGE_SCRIPT_FAILED")
             )[:128],
+            "workspace_alias_failure_code": (
+                str(worker["workspace_alias_failure_code"])[:128]
+                if worker.get("workspace_alias_failure_code")
+                else None
+            ),
             "automatic_reconciliation": verification.evidence(),
         }
         for reservation in reservations:

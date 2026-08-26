@@ -31,9 +31,6 @@ readonly user_uid="$(id -u "${user_name}")"
 readonly workspace="/storage/users/${user_uid}"
 readonly state_file="/etc/h100-platform/users/${user_name}.state"
 
-[[ -d "${workspace}" && ! -L "${workspace}" ]] || h100_fail 'canonical workspace is unavailable'
-[[ "$(stat -c '%u:%g:%a' "${workspace}")" == "${user_uid}:$(id -g "${user_name}"):700" ]] \
-  || h100_fail 'canonical workspace ownership or mode is invalid'
 h100_require_workspace_alias "${user_name}"
 
 lifecycle_value() {

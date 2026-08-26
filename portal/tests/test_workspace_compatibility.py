@@ -145,6 +145,12 @@ def test_workspace_runtime_is_zero_copy_profile_aware_and_alias_aware() -> None:
     assert "created_workspace_directories" in alias
     assert "wait_for_mount_contract" in alias
     assert "canonical workspace mount contract did not converge" in alias
+    assert "h100-portal-worker\\.service" in alias
+    assert "workspace_alias_host_namespace_pid=1" in alias
+    assert 'nsenter --target "${workspace_alias_host_namespace_pid}" --mount' in alias
+    assert '--root="/proc/${workspace_alias_host_namespace_pid}/root"' in alias
+    assert "WORKSPACE ALIAS FAILURE CODE" in alias
+    assert "H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL" in alias
     assert "workspace_mode_is_private()" not in alias
     assert alias.count("h100_workspace_mode_is_private") == 4
     assert "h100_workspace_mode_is_private()" in common
@@ -171,6 +177,9 @@ def test_workspace_runtime_is_zero_copy_profile_aware_and_alias_aware() -> None:
     assert "VERSION=4" in stage
     assert "WORKSPACE_LAYOUT=LEGACY_BIND_ALIAS" in stage
     assert "h100_require_workspace_alias" in start
+    assert '"${H100_WORKSPACE_ALIAS_TOOL}" verify' in common
+    assert 'isolation_marker_two="${backing_workspace}' in stage
+    assert "stat -c '%d:%i' \"${workspace_root}\"" not in stage
     assert delete.index("workspace_alias_tool") < delete.index("rm -rf --one-file-system")
 
 

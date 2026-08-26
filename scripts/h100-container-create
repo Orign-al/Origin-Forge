@@ -42,10 +42,7 @@ user_uid="$(id -u "${user_name}")"
 user_gid="$(id -g "${user_name}")"
 workspace="${H100_WORKSPACE_ROOT}/${user_uid}"
 
-[[ -d "${workspace}" && ! -L "${workspace}" ]] \
-  || h100_fail 'canonical workspace is unavailable'
-[[ "$(stat -c '%u:%g:%a' "${workspace}")" == "${user_uid}:${user_gid}:700" ]] \
-  || h100_fail 'canonical workspace ownership or mode is invalid'
+h100_require_workspace_alias "${user_name}"
 
 [[ ! -e "${compose_file}" ]] || h100_fail 'managed Compose file already exists'
 docker container inspect "${container}" >/dev/null 2>&1 \

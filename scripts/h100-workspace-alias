@@ -1,12 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ProtectSystem=strict gives the root Worker a private mount namespace.  Its
+# ReadWritePaths=/storage/users bind contains the aliases that existed when the
+# Worker started, but host mounts created later by PID 1 are hidden behind that
+# bind.  Only this integrity-pinned root script is allowed to cross that
+# boundary, and only when it is running as a Worker child.
+readonly WORKSPACE_ALIAS_INSTALLED_PATH=/usr/local/sbin/h100-workspace-alias
+workspace_alias_worker_context=0
+workspace_alias_host_namespace_pid=1
+if grep -Eq '(^|/)h100-portal-worker\.service($|/)' /proc/self/cgroup 2>/dev/null; then
+  workspace_alias_worker_context=1
+elif [[ "${H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL:-0}" == 1 \
+  && -f /rehearsal/enable-worker-namespace-rehearsal \
+  && ! -L /rehearsal/enable-worker-namespace-rehearsal \
+  && "$(stat -c '%u:%g:%a' /rehearsal/enable-worker-namespace-rehearsal)" == 0:0:600 ]]; then
+  workspace_alias_worker_context=1
+  if [[ "${H100_WORKSPACE_ALIAS_REHEARSAL_HOST_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+    workspace_alias_host_namespace_pid="${H100_WORKSPACE_ALIAS_REHEARSAL_HOST_PID}"
+  fi
+fi
+if [[ "${EUID}" == 0 \
+  && "${workspace_alias_worker_context}" == 1 \
+  && -r /proc/self/cgroup \
+  && -e /proc/self/ns/mnt \
+  && -e "/proc/${workspace_alias_host_namespace_pid}/ns/mnt" \
+  && "$(readlink /proc/self/ns/mnt)" != \
+    "$(readlink "/proc/${workspace_alias_host_namespace_pid}/ns/mnt")" ]]; then
+  [[ "$0" == "${WORKSPACE_ALIAS_INSTALLED_PATH}" \
+    && -x "${WORKSPACE_ALIAS_INSTALLED_PATH}" \
+    && ! -L "${WORKSPACE_ALIAS_INSTALLED_PATH}" \
+    && "$(stat -c '%u' "/proc/${workspace_alias_host_namespace_pid}")" == 0 ]] \
+    || { printf 'ERROR: workspace alias host namespace entry is invalid\n' >&2; exit 1; }
+  exec /usr/bin/nsenter --target "${workspace_alias_host_namespace_pid}" --mount \
+    --root="/proc/${workspace_alias_host_namespace_pid}/root" \
+    --wd="/proc/${workspace_alias_host_namespace_pid}/cwd" -- \
+    "${WORKSPACE_ALIAS_INSTALLED_PATH}" "$@"
+fi
+unset workspace_alias_worker_context workspace_alias_host_namespace_pid
+
 source /usr/local/lib/h100-platform/h100-platform-common.sh
 
 readonly UNIT_ROOT=/etc/systemd/system
 readonly STORAGE_ROOT=/storage
 readonly UID_MIN=20000
 readonly UID_MAX=60000
+readonly WORKER_SERVICE=h100-portal-worker.service
 
 usage() {
   printf '%s\n' \
@@ -75,6 +114,9 @@ cleanup_workspace_alias() {
   local exit_status=$?
   if ((exit_status != 0)); then
     if ((installed_unit == 1)); then
+      if declare -F unmount_worker_alias >/dev/null 2>&1; then
+        unmount_worker_alias >/dev/null 2>&1 || true
+      fi
       systemctl disable --now "${unit_name}" >/dev/null 2>&1 || true
       rm -f -- "${unit_path}"
       systemctl daemon-reload >/dev/null 2>&1 || true
@@ -176,21 +218,125 @@ WantedBy=multi-user.target
 EOF
 }
 
-mount_contract_ready() {
-  local observed_target observed_options option
-  observed_target="$(findmnt --noheadings --raw --output TARGET \
+worker_namespace_pid() {
+  local observed_pid
+  observed_pid="$(systemctl show --property MainPID --value "${WORKER_SERVICE}")" \
+    || h100_fail 'Worker mount namespace identity is unavailable'
+  [[ "${observed_pid}" =~ ^[0-9]+$ ]] \
+    || h100_fail 'Worker mount namespace PID is invalid'
+  if [[ "${observed_pid}" == 0 ]]; then
+    return 1
+  fi
+  [[ -e "/proc/${observed_pid}/ns/mnt" \
+    && -r "/proc/${observed_pid}/cgroup" \
+    && "$(stat -c '%u' "/proc/${observed_pid}")" == 0 ]] \
+    || h100_fail 'Worker mount namespace process is unavailable'
+  grep -Eq '(^|/)h100-portal-worker\.service($|/)' "/proc/${observed_pid}/cgroup" \
+    || { [[ "${H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL:-0}" == 1 \
+      && -f /rehearsal/enable-worker-namespace-rehearsal ]] \
+      || h100_fail 'Worker mount namespace cgroup is invalid'; }
+  printf '%s\n' "${observed_pid}"
+}
+
+worker_namespace_exec() {
+  local worker_pid=$1
+  shift
+  /usr/bin/nsenter --target "${worker_pid}" --mount \
+    --root="/proc/${worker_pid}/root" \
+    --wd="/proc/${worker_pid}/cwd" -- "$@"
+}
+
+worker_mount_contract_ready() {
+  local worker_pid=$1 observed_target observed_options worker_mode option
+  observed_target="$(worker_namespace_exec "${worker_pid}" \
+    /usr/bin/findmnt --first-only --noheadings --raw --output TARGET \
     --mountpoint "${canonical_workspace}" 2>/dev/null)" || return 1
   [[ "${observed_target}" == "${canonical_workspace}" ]] || return 1
-  [[ "$(stat -c '%d:%i' "${backing_workspace}")" == \
-    "$(stat -c '%d:%i' "${canonical_workspace}")" ]] || return 1
-  [[ "$(stat -c '%u:%g' "${canonical_workspace}")" == "${user_uid}:${user_gid}" ]] \
-    && h100_workspace_mode_is_private "${canonical_workspace}" \
-    || return 1
-  observed_options="$(findmnt --noheadings --raw --output OPTIONS \
+  [[ "$(worker_namespace_exec "${worker_pid}" \
+      /usr/bin/stat -c '%d:%i' "${backing_workspace}")" == \
+    "$(worker_namespace_exec "${worker_pid}" \
+      /usr/bin/stat -c '%d:%i' "${canonical_workspace}")" ]] || return 1
+  [[ "$(worker_namespace_exec "${worker_pid}" \
+      /usr/bin/stat -c '%u:%g' "${canonical_workspace}")" == \
+    "${user_uid}:${user_gid}" ]] || return 1
+  worker_mode="$(worker_namespace_exec "${worker_pid}" \
+    /usr/bin/stat -c '%a' "${canonical_workspace}")" || return 1
+  [[ "${worker_mode}" =~ ^[0-7]+$ ]] || return 1
+  (((8#${worker_mode} & 0007) == 0)) || return 1
+  observed_options="$(worker_namespace_exec "${worker_pid}" \
+    /usr/bin/findmnt --first-only --noheadings --raw --output OPTIONS \
     --mountpoint "${canonical_workspace}" 2>/dev/null)" || return 1
   for option in rw nosuid nodev; do
     tr ',' '\n' <<<"${observed_options}" | grep -Fxq "${option}" || return 1
   done
+}
+
+sync_worker_alias() {
+  local worker_pid
+  if ! worker_pid="$(worker_namespace_pid)"; then
+    return 0
+  fi
+  worker_mount_contract_ready "${worker_pid}" && return 0
+  if worker_namespace_exec "${worker_pid}" \
+    /usr/bin/findmnt --noheadings --mountpoint "${canonical_workspace}" \
+    >/dev/null 2>&1; then
+    h100_fail 'Worker workspace mount collision is invalid'
+  fi
+  worker_namespace_exec "${worker_pid}" \
+    /usr/bin/mount -o bind,rw,nosuid,nodev \
+    "${backing_workspace}" "${canonical_workspace}"
+  worker_mount_contract_ready "${worker_pid}" \
+    || h100_fail 'Worker workspace mount contract is invalid'
+}
+
+unmount_worker_alias() {
+  local worker_pid attempt
+  if ! worker_pid="$(worker_namespace_pid)"; then
+    return 0
+  fi
+  if worker_namespace_exec "${worker_pid}" \
+    /usr/bin/findmnt --noheadings --mountpoint "${canonical_workspace}" \
+    >/dev/null 2>&1; then
+    worker_mount_contract_ready "${worker_pid}" \
+      || h100_fail 'Worker workspace mount removal contract is invalid'
+  fi
+  for attempt in {1..8}; do
+    if ! worker_namespace_exec "${worker_pid}" \
+      /usr/bin/findmnt --noheadings --mountpoint "${canonical_workspace}" \
+      >/dev/null 2>&1; then
+      return 0
+    fi
+    worker_namespace_exec "${worker_pid}" \
+      /usr/bin/umount "${canonical_workspace}" \
+      || h100_fail 'Worker workspace mount could not be removed'
+  done
+  h100_fail 'Worker workspace mount remained after bounded removal'
+}
+
+mount_contract_failure=NOT_CHECKED
+
+mount_contract_ready() {
+  local observed_target observed_options option
+  observed_target="$(findmnt --noheadings --raw --output TARGET \
+    --mountpoint "${canonical_workspace}" 2>/dev/null)" \
+    || { mount_contract_failure=TARGET_UNAVAILABLE; return 1; }
+  [[ "${observed_target}" == "${canonical_workspace}" ]] \
+    || { mount_contract_failure=TARGET_MISMATCH; return 1; }
+  [[ "$(stat -c '%d:%i' "${backing_workspace}")" == \
+    "$(stat -c '%d:%i' "${canonical_workspace}")" ]] \
+    || { mount_contract_failure=BACKING_INODE_MISMATCH; return 1; }
+  [[ "$(stat -c '%u:%g' "${canonical_workspace}")" == "${user_uid}:${user_gid}" ]] \
+    || { mount_contract_failure=OWNER_MISMATCH; return 1; }
+  h100_workspace_mode_is_private "${canonical_workspace}" \
+    || { mount_contract_failure=MODE_NOT_PRIVATE; return 1; }
+  observed_options="$(findmnt --noheadings --raw --output OPTIONS \
+    --mountpoint "${canonical_workspace}" 2>/dev/null)" \
+    || { mount_contract_failure=OPTIONS_UNAVAILABLE; return 1; }
+  for option in rw nosuid nodev; do
+    tr ',' '\n' <<<"${observed_options}" | grep -Fxq "${option}" \
+      || { mount_contract_failure="OPTION_${option^^}_MISSING"; return 1; }
+  done
+  mount_contract_failure=NONE
 }
 
 wait_for_mount_contract() {
@@ -199,6 +345,7 @@ wait_for_mount_contract() {
     mount_contract_ready && return 0
     sleep 0.1
   done
+  printf 'WORKSPACE ALIAS FAILURE CODE: %s\n' "${mount_contract_failure}" >&2
   h100_fail 'canonical workspace mount contract did not converge'
 }
 
@@ -246,6 +393,7 @@ case "${action}" in
       created_mountpoint=1
     elif findmnt --noheadings --mountpoint "${canonical_workspace}" >/dev/null 2>&1; then
       verify_alias
+      sync_worker_alias
       h100_mark_success
       printf 'WORKSPACE ALIAS READY user=%s uid=%s\n' "${user_name}" "${user_uid}"
       exit 0
@@ -266,6 +414,7 @@ case "${action}" in
     systemctl enable --now "${unit_name}"
     wait_for_mount_contract
     verify_alias
+    sync_worker_alias
     ;;
   verify)
     (($# == 4)) || h100_fail 'verify does not accept removal confirmation fields'
@@ -278,6 +427,7 @@ case "${action}" in
     verify_alias
     [[ "$(findmnt --noheadings --output TARGET --submounts "${canonical_workspace}" | wc -l)" == 1 ]] \
       || h100_fail 'canonical workspace has dependent submounts'
+    unmount_worker_alias
     systemctl disable --now "${unit_name}"
     findmnt --noheadings --mountpoint "${canonical_workspace}" >/dev/null 2>&1 \
       && h100_fail 'canonical workspace remained mounted'
@@ -286,6 +436,12 @@ case "${action}" in
     rmdir -- "${canonical_workspace}"
     rm -f -- "${unit_path}"
     systemctl daemon-reload
+    if worker_pid="$(worker_namespace_pid)"; then
+      ! worker_namespace_exec "${worker_pid}" \
+        /usr/bin/findmnt --noheadings --mountpoint "${canonical_workspace}" \
+        >/dev/null 2>&1 \
+        || h100_fail 'Worker workspace mount remained after host removal'
+    fi
     verify_backing
     ;;
   *)

@@ -73,7 +73,6 @@ usage() {
 
 fail() {
   printf 'COMPUTE STAGE ERROR: %s\n' "$*" >&2
-  printf 'COMPUTE STAGE FAILURE CODE: %s_FAILED\n' "${current_step}" >&2
   exit 1
 }
 
@@ -304,6 +303,7 @@ on_exit() {
   local rc=$?
   trap - EXIT
   if ((rc != 0)); then
+    printf 'COMPUTE STAGE FAILURE CODE: %s_FAILED\n' "${current_step}" >&2
     printf 'COMPUTE STAGE FIRST FAILED STEP: %s\n' "${current_step}" >&2
     printf 'COMPUTE STAGE LAST SUCCESSFUL STEP: %s\n' "${last_successful_step}" >&2
     if ((committed == 0 && transaction_started == 1)); then
@@ -532,9 +532,6 @@ install -d -o "${uid}" -g "${gid}" -m 0700 \
 "${WORKSPACE_ALIAS_TOOL}" prepare "${username}" "${uid}" "${gid}"
 created_workspace_alias=1
 "${WORKSPACE_ALIAS_TOOL}" verify "${username}" "${uid}" "${gid}"
-[[ "$(stat -c '%d:%i' "${backing_workspace}")" == \
-  "$(stat -c '%d:%i' "${workspace_root}")" ]] \
-  || fail 'canonical workspace alias differs from the authoritative backing'
 install -d -o root -g root -m 0700 \
   "${CONTAINER_DATA_ROOT}/${username}" \
   "${CONTAINER_DATA_ROOT}/${username}/ssh-host-keys"
@@ -552,7 +549,7 @@ origin_root="${H100_DATA_ROOT}/users/origin-pilot"
   || fail 'origin-pilot identity baseline differs from production policy'
 [[ -d "${origin_root}/workspace" ]] || fail 'origin-pilot private workspace is unavailable'
 isolation_marker_one="${origin_root}/workspace/.portal-stage-isolation-${plan_id}"
-isolation_marker_two="${workspace_root}/.portal-stage-isolation-${plan_id}"
+isolation_marker_two="${backing_workspace}/.portal-stage-isolation-${plan_id}"
 [[ ! -e "${isolation_marker_one}" && ! -e "${isolation_marker_two}" ]] \
   || fail 'isolation marker collision'
 install -o "${origin_uid}" -g "${origin_gid}" -m 0600 /dev/null "${isolation_marker_one}"

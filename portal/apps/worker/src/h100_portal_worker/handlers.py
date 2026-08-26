@@ -3653,6 +3653,22 @@ def _stage_evidence_marker(stderr: str, label: str) -> str | None:
     return None
 
 
+def _workspace_alias_failure_marker(stderr: str) -> str | None:
+    pattern = re.compile(r"^WORKSPACE ALIAS FAILURE CODE: ([A-Z0-9_]+)$")
+    for line in stderr.splitlines():
+        match = pattern.fullmatch(line.strip())
+        if match:
+            return match.group(1)
+    return None
+
+
+def _compute_stage_safe_failure_message(evidence: dict[str, Any]) -> str:
+    alias_failure = evidence.get("workspace_alias_failure_code")
+    if alias_failure:
+        return f"workspace alias validation failed closed ({alias_failure})"
+    return "transactional compute Stage script failed"
+
+
 def _stage_rollback_steps(stderr: str) -> dict[str, str]:
     pattern = re.compile(
         r"^COMPUTE STAGE ROLLBACK STEP: "
@@ -3674,6 +3690,7 @@ def _compute_stage_failure_evidence(
     first_failed_step = _stage_evidence_marker(stderr, "FIRST FAILED STEP")
     last_successful_step = _stage_evidence_marker(stderr, "LAST SUCCESSFUL STEP")
     stage_failure_code = _stage_evidence_marker(stderr, "FAILURE CODE")
+    workspace_alias_failure_code = _workspace_alias_failure_marker(stderr)
     unknown_resources = any("unknown" in item for item in retained)
     execution_error = str(execution.get("error_code", ""))
     if unknown_resources or execution_error in {
@@ -3702,6 +3719,7 @@ def _compute_stage_failure_evidence(
         "retained_resources": retained,
         "rollback_steps": _stage_rollback_steps(stderr),
         "stage_failure_code": stage_failure_code or "FIXED_STAGE_SCRIPT_FAILED",
+        "workspace_alias_failure_code": workspace_alias_failure_code,
     }
 
 
@@ -3926,7 +3944,7 @@ def _execute_compute_provision_stage(
             "status": "ERROR",
             "error": {
                 "code": str(execution.get("error_code", "COMPUTE_STAGE_FAILED"))[:64],
-                "message": "transactional compute Stage script failed",
+                "message": _compute_stage_safe_failure_message(evidence),
                 "exit_code": execution.get("exit_code"),
             },
             **evidence,

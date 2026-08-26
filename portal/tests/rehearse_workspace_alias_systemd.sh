@@ -92,6 +92,8 @@ install -m 0640 "${candidate_root}/scripts/h100-platform-common.sh" \
 install -m 0750 "${candidate_root}/scripts/h100-workspace-alias" \
   "${namespace_root}/usr/local/sbin/h100-workspace-alias"
 install -m 0660 /dev/null "${namespace_root}/var/log/h100-platform-audit.log"
+install -m 0600 /dev/null \
+  "${namespace_root}/rehearsal/enable-worker-namespace-rehearsal"
 chown -R "${rehearsal_uid}:${rehearsal_gid}" \
   "${namespace_root}/srv/gpu-platform/users/${rehearsal_user}"
 chmod 0700 \
@@ -129,6 +131,15 @@ unit_field() {
 }
 
 case "${1:-}" in
+  show)
+    [[ "$*" == *"--property MainPID"* \
+      && "$*" == *"--value h100-portal-worker.service"* ]] || exit 64
+    if [[ -f /run/rehearsal-worker-pid ]]; then
+      cat /run/rehearsal-worker-pid
+    else
+      printf '0\n'
+    fi
+    ;;
   daemon-reload)
     shopt -s nullglob
     units=(/etc/systemd/system/storage-users-*.mount)
@@ -202,6 +213,7 @@ readonly backing=/srv/gpu-platform/users/workspace-rehearsal/workspace
 readonly canonical=/storage/users/29991
 readonly unit=/etc/systemd/system/storage-users-29991.mount
 readonly audit_log=/var/log/h100-platform-audit.log
+readonly rehearsal_host_pid=$$
 readonly -a required_directories=(
   projects datasets outputs .portal .portal/job-scripts .portal/jobs
   .portal/templates .portal/logs .portal/runtime
@@ -265,6 +277,62 @@ REHEARSAL_DELAY_FINDMNT=1 "${alias_tool}" prepare \
 [[ "$(grep -c 'action=workspace-alias.*outcome=SUCCESS rc=0' "${audit_log}")" == 6 ]]
 remove_required_directories
 
+# Reproduce the production Worker namespace: a recursive writable bind of
+# /storage/users captures the pre-existing children and hides a later host
+# mount.  Keep that namespace alive so prepare can enter PID 1's namespace for
+# the host mount and then mirror the exact bind into the Worker namespace.
+unshare --mount --propagation unchanged /bin/bash -c '
+  set -euo pipefail
+  mount --rbind /storage/users /storage/users
+  printf "%s\n" "$$" >/run/rehearsal-worker-pid
+  touch /run/rehearsal-worker-ready
+  exec /bin/sleep 300
+' &
+worker_launcher_pid=$!
+for _ in {1..50}; do
+  [[ -f /run/rehearsal-worker-ready ]] && break
+  sleep 0.1
+done
+[[ -f /run/rehearsal-worker-ready && -f /run/rehearsal-worker-pid ]]
+worker_namespace_pid="$(</run/rehearsal-worker-pid)"
+id "${rehearsal_user}" >/dev/null
+nsenter --target "${rehearsal_host_pid}" --mount \
+  --root="/proc/${rehearsal_host_pid}/root" \
+  --wd="/proc/${rehearsal_host_pid}/cwd" -- \
+  id "${rehearsal_user}" >/dev/null
+nsenter --target "${worker_namespace_pid}" --mount -- \
+  nsenter --target "${rehearsal_host_pid}" --mount \
+    --root="/proc/${rehearsal_host_pid}/root" \
+    --wd="/proc/${rehearsal_host_pid}/cwd" -- \
+    id "${rehearsal_user}" >/dev/null
+H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL=1 \
+  H100_WORKSPACE_ALIAS_REHEARSAL_HOST_PID="${rehearsal_host_pid}" \
+  nsenter --target "${worker_namespace_pid}" --mount \
+    --root="/proc/${worker_namespace_pid}/root" \
+    --wd="/proc/${worker_namespace_pid}/cwd" -- \
+  "${alias_tool}" prepare "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}"
+findmnt --noheadings --mountpoint "${canonical}" >/dev/null
+nsenter --target "${worker_namespace_pid}" --mount \
+  --root="/proc/${worker_namespace_pid}/root" \
+  --wd="/proc/${worker_namespace_pid}/cwd" -- \
+  findmnt --noheadings --mountpoint "${canonical}" >/dev/null
+H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL=1 \
+  H100_WORKSPACE_ALIAS_REHEARSAL_HOST_PID="${rehearsal_host_pid}" \
+  "${alias_tool}" verify "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}"
+H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL=1 \
+  H100_WORKSPACE_ALIAS_REHEARSAL_HOST_PID="${rehearsal_host_pid}" \
+  "${alias_tool}" remove "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}" \
+    --confirm-remove "${rehearsal_user}"
+! nsenter --target "${worker_namespace_pid}" --mount \
+  --root="/proc/${worker_namespace_pid}/root" \
+  --wd="/proc/${worker_namespace_pid}/cwd" -- \
+  findmnt --noheadings --mountpoint "${canonical}" >/dev/null 2>&1
+kill "${worker_launcher_pid}"
+wait "${worker_launcher_pid}" || true
+rm -f -- /run/rehearsal-worker-pid /run/rehearsal-worker-ready
+[[ "$(grep -c 'action=workspace-alias.*outcome=SUCCESS rc=0' "${audit_log}")" == 9 ]]
+remove_required_directories
+
 # Preserve pre-existing job metadata while forcing a post-mount validation
 # failure. Cleanup must remove only directories created by this attempt.
 install -d -o "${rehearsal_uid}" -g "${rehearsal_gid}" -m 0700 \
@@ -301,8 +369,8 @@ grep -Fq 'workspace identity differs from NSS' /rehearsal/mismatch.stderr
 
 printf 'owner_parent=%s owner_alias=%s\n' \
   "$(stat -c '%u:%g:%a' /storage/users)" "${rehearsal_uid}:${rehearsal_gid}"
-printf 'audit_success=6 audit_failure=1 cleanup=PASS uid_mismatch=PASS\n'
-printf 'systemd_unit_verify=PASS bind_inode=PASS mount_options=rw,nosuid,nodev convergence=PASS\n'
+printf 'audit_success=9 audit_failure=1 cleanup=PASS uid_mismatch=PASS\n'
+printf 'systemd_unit_verify=PASS bind_inode=PASS mount_options=rw,nosuid,nodev convergence=PASS worker_namespace=PASS\n'
 EOF
 chmod 0755 "${namespace_root}/rehearsal/run.sh"
 

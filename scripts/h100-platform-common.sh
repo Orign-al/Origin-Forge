@@ -11,6 +11,7 @@ readonly H100_AUDIT_LOG=/var/log/h100-platform-audit.log
 readonly H100_LOCK_FILE=/run/lock/h100-platform.lock
 readonly H100_GPU_ISOLATION_REGISTRY=/etc/h100-platform/gpu-isolated-users
 readonly H100_GPU_ISOLATION_TOOL=/usr/local/sbin/h100-user-gpu-isolation
+readonly H100_WORKSPACE_ALIAS_TOOL=/usr/local/sbin/h100-workspace-alias
 
 h100_fail() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -113,45 +114,31 @@ h100_compose_file() {
 
 h100_require_managed_user() {
   local managed_username=$1
-  local managed_uid managed_gid managed_workspace
+  local managed_uid managed_gid managed_backing
   getent passwd "${managed_username}" >/dev/null \
     || h100_fail "host user does not exist: ${managed_username}"
   managed_uid="$(id -u "${managed_username}")"
   managed_gid="$(id -g "${managed_username}")"
-  managed_workspace="${H100_WORKSPACE_ROOT}/${managed_uid}"
+  managed_backing="${H100_DATA_ROOT}/users/${managed_username}/workspace"
   [[ -d "${H100_DATA_ROOT}/users/${managed_username}/home" ]] \
     || h100_fail "managed home is missing: ${managed_username}"
-  [[ -d "${managed_workspace}" && ! -L "${managed_workspace}" ]] \
-    || h100_fail "managed workspace is missing: ${managed_username}"
-  [[ "$(stat -c '%u:%g' "${managed_workspace}")" == "${managed_uid}:${managed_gid}" ]] \
-    && h100_workspace_mode_is_private "${managed_workspace}" \
+  [[ -d "${managed_backing}" && ! -L "${managed_backing}" ]] \
+    || h100_fail "managed workspace backing is missing: ${managed_username}"
+  [[ "$(stat -c '%u:%g' "${managed_backing}")" == "${managed_uid}:${managed_gid}" ]] \
+    && h100_workspace_mode_is_private "${managed_backing}" \
     || h100_fail "managed workspace ownership or mode is invalid: ${managed_username}"
+  h100_require_workspace_alias "${managed_username}"
 }
 
 h100_require_workspace_alias() {
-  local managed_username=$1 managed_uid managed_gid backing_workspace canonical_workspace options
+  local managed_username=$1 managed_uid managed_gid
   managed_uid="$(id -u "${managed_username}")"
   managed_gid="$(id -g "${managed_username}")"
-  backing_workspace="${H100_DATA_ROOT}/users/${managed_username}/workspace"
-  canonical_workspace="${H100_WORKSPACE_ROOT}/${managed_uid}"
-  [[ -d "${backing_workspace}" && ! -L "${backing_workspace}" ]] \
-    || h100_fail "authoritative workspace is missing: ${managed_username}"
-  [[ -d "${canonical_workspace}" && ! -L "${canonical_workspace}" ]] \
-    || h100_fail "canonical workspace alias is missing: ${managed_username}"
-  findmnt --noheadings --mountpoint "${canonical_workspace}" >/dev/null 2>&1 \
-    || h100_fail "canonical workspace alias is not mounted: ${managed_username}"
-  [[ "$(stat -c '%u:%g' "${backing_workspace}")" == "${managed_uid}:${managed_gid}" \
-    && "$(stat -c '%u:%g' "${canonical_workspace}")" == "${managed_uid}:${managed_gid}" ]] \
-    || h100_fail "workspace ownership is invalid: ${managed_username}"
-  [[ "$(stat -c '%d:%i' "${backing_workspace}")" == \
-    "$(stat -c '%d:%i' "${canonical_workspace}")" ]] \
-    || h100_fail "canonical workspace is not the authoritative bind alias: ${managed_username}"
-  options="$(findmnt --noheadings --output OPTIONS --mountpoint "${canonical_workspace}")" \
-    || h100_fail "canonical workspace mount options are unavailable: ${managed_username}"
-  for option in rw nosuid nodev; do
-    tr ',' '\n' <<<"${options}" | grep -Fxq "${option}" \
-      || h100_fail "canonical workspace mount option is missing: ${option}"
-  done
+  [[ -x "${H100_WORKSPACE_ALIAS_TOOL}" && ! -L "${H100_WORKSPACE_ALIAS_TOOL}" ]] \
+    || h100_fail "workspace alias verifier is unavailable: ${managed_username}"
+  "${H100_WORKSPACE_ALIAS_TOOL}" verify \
+    "${managed_username}" "${managed_uid}" "${managed_gid}" >/dev/null \
+    || h100_fail "canonical workspace alias verification failed: ${managed_username}"
 }
 
 h100_require_pilot_gpu_isolation_if_managed() {

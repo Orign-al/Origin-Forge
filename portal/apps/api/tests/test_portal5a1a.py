@@ -86,6 +86,30 @@ def test_immutable_first_failure_evidence_is_view_only_and_exactly_bound() -> No
     assert unbound["first_failed_step"] is None
 
 
+def test_workspace_alias_failure_code_is_exposed_from_safe_evidence_only() -> None:
+    operation = PortalOperation(
+        id=uuid.uuid4(),
+        operation_type="compute.provision.stage",
+        target_type="compute_resource_request",
+        target_id=str(uuid.uuid4()),
+        error_code="COMPUTE_STAGE_FAILED",
+        rollback_status="ROLLED_BACK",
+        result_summary="Compute Stage failed closed",
+        dry_run_result={
+            "safe_error_message": ("workspace alias validation failed closed (TARGET_UNAVAILABLE)"),
+            "workspace_alias_failure_code": "TARGET_UNAVAILABLE",
+        },
+    )
+
+    view = _safe_operation_view(operation)
+
+    assert view is not None
+    assert view["workspace_alias_failure_code"] == "TARGET_UNAVAILABLE"
+    assert view["safe_root_cause"] == (
+        "workspace alias validation failed closed (TARGET_UNAVAILABLE)"
+    )
+
+
 def account(database, *, login: str, role: str = "user") -> PortalUser:  # type: ignore[no-untyped-def]
     selected_role = database.scalar(select(PortalRole).where(PortalRole.name == role))
     user = PortalUser(
@@ -1099,6 +1123,7 @@ def test_first_stage_gate_failure_records_no_side_effect_and_preserves_approval(
             "first_failed_step": "EXPLICIT_STAGE_CONFIRMATION_GATE",
             "failed_handler": "h100-provision-stage",
             "retained_resources": [],
+            "workspace_alias_failure_code": "TARGET_UNAVAILABLE",
         }
 
     monkeypatch.setattr("h100_portal_api.routes.compute_requests.call_worker", gate_failure)
@@ -1153,6 +1178,7 @@ def test_first_stage_gate_failure_records_no_side_effect_and_preserves_approval(
     assert operation.dry_run_result is not None
     assert operation.dry_run_result["side_effect_classification"] == "NO_SIDE_EFFECT"
     assert operation.dry_run_result["first_failed_step"] == "EXPLICIT_STAGE_CONFIRMATION_GATE"
+    assert operation.dry_run_result["workspace_alias_failure_code"] == "TARGET_UNAVAILABLE"
     assert all(assert_zero_compute_side_effects(database, user.id).values())
     assert (
         database.scalar(
