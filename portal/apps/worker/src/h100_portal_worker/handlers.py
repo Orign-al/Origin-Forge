@@ -8494,6 +8494,7 @@ def _run_as_managed_user(
         "USER": username,
         "LOGNAME": username,
         "SHELL": "/usr/sbin/nologin",
+        "ENROOT_LOGIN_SHELL": "no",
         "WORKSPACE": str(payload["workspace_path"]),
     }
     try:

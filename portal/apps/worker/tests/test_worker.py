@@ -2686,6 +2686,7 @@ def test_portal4a_setpriv_uses_fixed_argv_and_never_shell(
         "USER": "origin-pilot",
         "LOGNAME": "origin-pilot",
         "SHELL": "/usr/sbin/nologin",
+        "ENROOT_LOGIN_SHELL": "no",
         "WORKSPACE": "/storage/users/20001",
     }
 
