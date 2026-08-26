@@ -828,6 +828,14 @@ def test_compute_stage_retained_scan_holds_derived_image_mapping_quota_and_regis
                 "stdout": f"#{project_id} 0 0 314572800 00 [--------]\n",
                 "stderr": "",
             }
+        if binary == "scontrol":
+            return {
+                "ok": True,
+                "stdout": json.dumps(
+                    {"nodes": [{"name": "sagsh100server", "state": ["IDLE"], "reason": ""}]}
+                ),
+                "stderr": "",
+            }
         raise AssertionError((binary, args, timeout))
 
     monkeypatch.setattr(handlers, "run_fixed", fixed)
@@ -859,6 +867,14 @@ def test_compute_retry_retained_scan_checks_numeric_identity_and_ssh_port(
             return {"ok": False, "stdout": "", "stderr": "No such object"}
         if binary == "xfs_quota":
             return {"ok": True, "stdout": "", "stderr": ""}
+        if binary == "scontrol":
+            return {
+                "ok": True,
+                "stdout": json.dumps(
+                    {"nodes": [{"name": "sagsh100server", "state": ["IDLE"], "reason": ""}]}
+                ),
+                "stderr": "",
+            }
         raise AssertionError((binary, timeout))
 
     monkeypatch.setattr(handlers, "run_fixed", fixed)
@@ -870,3 +886,49 @@ def test_compute_retry_retained_scan_checks_numeric_identity_and_ssh_port(
         "gid-ownership",
         "ssh-port-allocation",
     }.issubset(retained)
+
+
+def test_compute_retry_retained_scan_blocks_target_guard_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = stage_payload()
+    monkeypatch.setattr(handlers.Path, "exists", lambda _path: False)
+    monkeypatch.setattr(handlers.Path, "is_symlink", lambda _path: False)
+    monkeypatch.setattr(handlers, "_safe_file_lines", lambda _path: [])
+    monkeypatch.setattr(handlers, "_registry_entries", lambda: [])
+    monkeypatch.setattr(handlers, "_assoc_exists", lambda _username: False)
+    monkeypatch.setattr(handlers, "_ownership_conflict", lambda _number: ("PASS", None))
+    monkeypatch.setattr(handlers, "_used_ssh_ports", lambda: (set(), True))
+    monkeypatch.setattr(handlers.pwd, "getpwnam", lambda _username: (_ for _ in ()).throw(KeyError))
+    monkeypatch.setattr(handlers.grp, "getgrnam", lambda _username: (_ for _ in ()).throw(KeyError))
+    monkeypatch.setattr(handlers.pwd, "getpwuid", lambda _uid: (_ for _ in ()).throw(KeyError))
+    monkeypatch.setattr(handlers.grp, "getgrgid", lambda _gid: (_ for _ in ()).throw(KeyError))
+
+    def fixed(binary: str, _args: list[str], timeout: float = 20.0):  # type: ignore[no-untyped-def]
+        if binary == "docker":
+            return {"ok": False, "stdout": "", "stderr": "No such object"}
+        if binary == "xfs_quota":
+            return {"ok": True, "stdout": "", "stderr": ""}
+        if binary == "scontrol":
+            return {
+                "ok": True,
+                "stdout": json.dumps(
+                    {
+                        "nodes": [
+                            {
+                                "name": "sagsh100server",
+                                "state": ["IDLE", "DRAIN"],
+                                "reason": f"GPU bypass guard failure: policy-{payload['uid']}",
+                            }
+                        ]
+                    }
+                ),
+                "stderr": "",
+            }
+        raise AssertionError((binary, timeout))
+
+    monkeypatch.setattr(handlers, "run_fixed", fixed)
+
+    retained = handlers._compute_stage_retained_resources(payload)
+
+    assert "slurm-node-drain" in retained

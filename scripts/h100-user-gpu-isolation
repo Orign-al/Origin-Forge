@@ -5,6 +5,7 @@ readonly CONFIG_DIR=/etc/h100-platform
 readonly REGISTRY_FILE=${CONFIG_DIR}/gpu-isolated-users
 readonly DROPIN_NAME=50-h100-gpu-isolation.conf
 readonly LOCK_FILE=/run/lock/h100-user-gpu-isolation.lock
+readonly GUARD_LOCK_FILE=/run/lock/h100-gpu-bypass-guard.lock
 readonly AUDIT_LOG=/var/log/h100-platform-audit.log
 readonly BACKUP_ROOT=/srv/gpu-platform/platform/backups
 readonly PILOT_UID_MIN=20000
@@ -428,6 +429,8 @@ shift
 install -d -o root -g root -m 0755 /run/lock
 exec 9>"${LOCK_FILE}"
 flock -x 9
+exec 8>"${GUARD_LOCK_FILE}"
+flock -x 8
 
 case "${ACTION}" in
   list)

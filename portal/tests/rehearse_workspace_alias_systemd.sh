@@ -147,6 +147,9 @@ case "${1:-}" in
     mount_options="$(unit_field Options "${unit_path}")"
     [[ -d "${mount_what}" && -d "${mount_where}" ]]
     mount -o "${mount_options}" "${mount_what}" "${mount_where}"
+    if [[ "${REHEARSAL_DELAY_FINDMNT:-0}" == 1 ]]; then
+      printf '2\n' >/run/rehearsal-findmnt-delay
+    fi
     install -d -m 0755 /etc/systemd/system/multi-user.target.wants
     ln -s "../${unit_name}" "/etc/systemd/system/multi-user.target.wants/${unit_name}"
     if [[ "${REHEARSAL_FAIL_AFTER_MOUNT:-0}" == 1 ]]; then
@@ -170,6 +173,22 @@ case "${1:-}" in
 esac
 EOF
 chmod 0755 "${namespace_root}/rehearsal/bin/systemctl"
+
+cat >"${namespace_root}/rehearsal/bin/findmnt" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -f /run/rehearsal-findmnt-delay && "$*" == *"--mountpoint /storage/users/29991"* ]]; then
+  remaining="$(< /run/rehearsal-findmnt-delay)"
+  if ((remaining > 0)); then
+    printf '%s\n' "$((remaining - 1))" >/run/rehearsal-findmnt-delay
+    exit 1
+  fi
+  rm -f -- /run/rehearsal-findmnt-delay
+fi
+exec /usr/bin/findmnt "$@"
+EOF
+chmod 0755 "${namespace_root}/rehearsal/bin/findmnt"
 
 cat >"${namespace_root}/rehearsal/run.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -236,6 +255,16 @@ done
 [[ "$(grep -c 'action=workspace-alias.*outcome=SUCCESS rc=0' "${audit_log}")" == 3 ]]
 remove_required_directories
 
+# A newly mounted unit can become visible to findmnt just after systemctl has
+# reported success. The bounded convergence check must absorb that transition.
+REHEARSAL_DELAY_FINDMNT=1 "${alias_tool}" prepare \
+  "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}"
+"${alias_tool}" verify "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}"
+"${alias_tool}" remove "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}" \
+  --confirm-remove "${rehearsal_user}"
+[[ "$(grep -c 'action=workspace-alias.*outcome=SUCCESS rc=0' "${audit_log}")" == 6 ]]
+remove_required_directories
+
 # Preserve pre-existing job metadata while forcing a post-mount validation
 # failure. Cleanup must remove only directories created by this attempt.
 install -d -o "${rehearsal_uid}" -g "${rehearsal_gid}" -m 0700 \
@@ -272,8 +301,8 @@ grep -Fq 'workspace identity differs from NSS' /rehearsal/mismatch.stderr
 
 printf 'owner_parent=%s owner_alias=%s\n' \
   "$(stat -c '%u:%g:%a' /storage/users)" "${rehearsal_uid}:${rehearsal_gid}"
-printf 'audit_success=3 audit_failure=1 cleanup=PASS uid_mismatch=PASS\n'
-printf 'systemd_unit_verify=PASS bind_inode=PASS mount_options=rw,nosuid,nodev\n'
+printf 'audit_success=6 audit_failure=1 cleanup=PASS uid_mismatch=PASS\n'
+printf 'systemd_unit_verify=PASS bind_inode=PASS mount_options=rw,nosuid,nodev convergence=PASS\n'
 EOF
 chmod 0755 "${namespace_root}/rehearsal/run.sh"
 

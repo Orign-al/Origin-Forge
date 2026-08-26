@@ -176,6 +176,32 @@ WantedBy=multi-user.target
 EOF
 }
 
+mount_contract_ready() {
+  local observed_target observed_options option
+  observed_target="$(findmnt --noheadings --raw --output TARGET \
+    --mountpoint "${canonical_workspace}" 2>/dev/null)" || return 1
+  [[ "${observed_target}" == "${canonical_workspace}" ]] || return 1
+  [[ "$(stat -c '%d:%i' "${backing_workspace}")" == \
+    "$(stat -c '%d:%i' "${canonical_workspace}")" ]] || return 1
+  [[ "$(stat -c '%u:%g' "${canonical_workspace}")" == "${user_uid}:${user_gid}" ]] \
+    && h100_workspace_mode_is_private "${canonical_workspace}" \
+    || return 1
+  observed_options="$(findmnt --noheadings --raw --output OPTIONS \
+    --mountpoint "${canonical_workspace}" 2>/dev/null)" || return 1
+  for option in rw nosuid nodev; do
+    tr ',' '\n' <<<"${observed_options}" | grep -Fxq "${option}" || return 1
+  done
+}
+
+wait_for_mount_contract() {
+  local attempt
+  for attempt in {1..50}; do
+    mount_contract_ready && return 0
+    sleep 0.1
+  done
+  h100_fail 'canonical workspace mount contract did not converge'
+}
+
 verify_alias() {
   local observed_target observed_options
   verify_backing
@@ -238,6 +264,7 @@ case "${action}" in
     installed_unit=1
     systemctl daemon-reload
     systemctl enable --now "${unit_name}"
+    wait_for_mount_contract
     verify_alias
     ;;
   verify)

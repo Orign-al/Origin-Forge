@@ -143,8 +143,10 @@ def test_workspace_runtime_is_zero_copy_profile_aware_and_alias_aware() -> None:
     assert "== 0:0:700" in alias
     assert '"${user_uid}:${user_gid}"' in alias
     assert "created_workspace_directories" in alias
+    assert "wait_for_mount_contract" in alias
+    assert "canonical workspace mount contract did not converge" in alias
     assert "workspace_mode_is_private()" not in alias
-    assert alias.count("h100_workspace_mode_is_private") == 3
+    assert alias.count("h100_workspace_mode_is_private") == 4
     assert "h100_workspace_mode_is_private()" in common
     assert "((8#${workspace_mode} & 0007) == 0)" in common
     assert '"${managed_uid}:${managed_gid}:700"' not in common
@@ -170,6 +172,17 @@ def test_workspace_runtime_is_zero_copy_profile_aware_and_alias_aware() -> None:
     assert "WORKSPACE_LAYOUT=LEGACY_BIND_ALIAS" in stage
     assert "h100_require_workspace_alias" in start
     assert delete.index("workspace_alias_tool") < delete.index("rm -rf --one-file-system")
+
+
+def test_gpu_policy_mutations_share_the_guard_lock() -> None:
+    isolation = (PLATFORM_ROOT / "scripts/h100-user-gpu-isolation").read_text()
+    guard = (PLATFORM_ROOT / "scripts/h100-gpu-bypass-guard").read_text()
+
+    assert "GUARD_LOCK_FILE=/run/lock/h100-gpu-bypass-guard.lock" in isolation
+    assert "LOCK_FILE=/run/lock/h100-gpu-bypass-guard.lock" in guard
+    assert 'exec 8>"${GUARD_LOCK_FILE}"' in isolation
+    assert "flock -x 8" in isolation
+    assert isolation.index("flock -x 8") < isolation.index('case "${ACTION}" in')
 
 
 def test_common_workspace_privacy_accepts_private_legacy_group_mode(tmp_path: Path) -> None:

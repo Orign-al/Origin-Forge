@@ -3601,6 +3601,20 @@ def _compute_stage_retained_resources(payload: dict[str, Any]) -> list[str]:
     ]
     if registry_matches:
         retained.add("gpu-registry")
+
+    node = slurm_node()
+    if node.get("status") != "OK":
+        retained.add("slurm-node-state-unknown")
+    else:
+        expected_reason = f"GPU bypass guard failure: policy-{payload['uid']}"
+        for item in node.get("nodes", []):
+            if not isinstance(item, dict):
+                retained.add("slurm-node-state-unknown")
+                continue
+            state = str(item.get("state", "")).upper()
+            reason = str(item.get("reason", ""))
+            if "DRAIN" in state and reason.startswith(expected_reason):
+                retained.add("slurm-node-drain")
     return sorted(retained)
 
 

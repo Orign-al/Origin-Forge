@@ -1,7 +1,7 @@
 {
   "h100-platform-common": "f68f6b77ec352c90e11420778ae1e77c0ac29efcee2a0e15ac627a8fdf72b701",
   "h100-provision-stage": "527df1d379e56736e8d311b3724b3b61826ac8ead1e42fb81e3d96d750401e54",
-  "h100-workspace-alias": "e7a7cd82a17a02a351e38313f74e8b5991a36decc0505a5ff9c56f90ed814ec1",
+  "h100-workspace-alias": "97d59f2b4d6afc56874cfd4463f40841ed74bb191f6a60d8ac8c9f9239c5dfa6",
   "h100-container-create": "7ca04a3e661018bc0f56e184d450d2a15dbbb3d57f59bac7029f5d1a93cb0827",
   "h100-container-delete": "7fc82f3a343fa2cf1c966ce5b79d280519b9855accb56dd555f7e8b3406d4ca0",
   "h100-container-rebuild": "95ed7815db213ecfaf735d7bd3d7b59a05c9726c6e8895df86f500e875dcbc99",
@@ -14,5 +14,5 @@
   "h100-origin-pilot-acceptance": "7435b53558b6c36d1cf30a8513c0b4aff4ca2cdc65b99f2d716c16a283f65866",
   "h100-quota-show": "2cbf32484357a8db284af1b7f0072a73bf5c3e4eb36b303085c81f4e45b2e483",
   "h100-user-create": "e3905db83016ea0a11a3b3bc07c83548aba125aef143ad0198d68136c53cbf60",
-  "h100-user-gpu-isolation": "d1b14bea04aa25e536a8972a959fe5da5c8e1c7e8a79b1acc5031279795f7b8c"
+  "h100-user-gpu-isolation": "bdd9cf7a88d7ea9d98b22fc422137a48ea2e4225f1ef0dcd7575d2065ec72f45"
 }
