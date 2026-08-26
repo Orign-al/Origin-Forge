@@ -2653,7 +2653,12 @@ def test_portal4a_setpriv_uses_fixed_argv_and_never_shell(
     monkeypatch.setattr(handlers.os.path, "exists", lambda _path: True)
     monkeypatch.setattr(handlers.subprocess, "run", completed)
     result = handlers._run_as_managed_user(
-        {"username": "origin-pilot", "uid": 20001, "gid": 20001},
+        {
+            "username": "origin-pilot",
+            "uid": 20001,
+            "gid": 20001,
+            "workspace_path": "/storage/users/20001",
+        },
         ["/usr/bin/sbatch", "--parsable", "/proc/self/fd/9"],
         timeout=30,
         pass_fds=(9,),
@@ -2680,6 +2685,7 @@ def test_portal4a_setpriv_uses_fixed_argv_and_never_shell(
         "USER": "origin-pilot",
         "LOGNAME": "origin-pilot",
         "SHELL": "/usr/sbin/nologin",
+        "WORKSPACE": "/storage/users/20001",
     }
 
 
@@ -2757,6 +2763,8 @@ def test_portal4a_gpu_job_mounts_only_owned_root_and_disables_host_home(
     assert "--gres=gpu:h100:1" in argv
     assert "--deadline=2026-08-14T05:24:55" in argv
     assert not any(".083442" in item for item in argv)
+    assert "--export=ALL" in argv
+    assert not any("WORKSPACE=" in item for item in argv)
     assert f"--container-image={payload['image_ref']}" in argv
     assert "--no-container-mount-home" in argv
     assert f"--container-mounts={workspace}:{workspace},{workspace}:/workspace" in argv
@@ -2833,7 +2841,8 @@ def test_gpu_development_submit_uses_exact_one_gpu_and_fixed_sleep(
     assert "--partition=gpu-dev" in argv
     assert not any("gpu:2" in item for item in argv)
     assert not any(item.startswith("--time=") or item.startswith("--deadline=") for item in argv)
-    assert f"--export=ALL,WORKSPACE={payload['workspace_path']}" in argv
+    assert "--export=ALL" in argv
+    assert not any("WORKSPACE=" in item for item in argv)
     assert f"--chdir={payload['workspace_path']}" in argv
     assert f"--comment=h100-gpu-dev:{payload['managed_user_id']}:{payload['lease_id']}" in argv
     assert argv[-1] == "--wrap=/usr/bin/sleep infinity"

@@ -8494,6 +8494,7 @@ def _run_as_managed_user(
         "USER": username,
         "LOGNAME": username,
         "SHELL": "/usr/sbin/nologin",
+        "WORKSPACE": str(payload["workspace_path"]),
     }
     try:
         completed = subprocess.run(
@@ -8558,7 +8559,7 @@ def _managed_sbatch_argv(
         f"--mem={payload['memory_mb']}M",
         f"--time={_slurm_time(int(payload['time_limit_seconds']))}",
         f"--deadline={deadline}",
-        f"--export=ALL,WORKSPACE={payload['workspace_path']}",
+        "--export=ALL",
         f"--chdir={workdir}",
         f"--output={stdout}",
         f"--error={stderr}",
@@ -9027,7 +9028,7 @@ def _submit_gpu_development_allocation(payload: dict[str, Any]) -> tuple[int, st
         "--mem=32768M",
         "--gres=gpu:h100:1",
         f"--chdir={workspace}",
-        f"--export=ALL,WORKSPACE={workspace}",
+        "--export=ALL",
         f"--comment=h100-gpu-dev:{payload['managed_user_id']}:{payload['lease_id']}",
         f"--output={workspace}/outputs/.gpu-development-%j.out",
         f"--error={workspace}/outputs/.gpu-development-%j.err",
