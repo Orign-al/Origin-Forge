@@ -2653,7 +2653,7 @@ def test_portal4a_setpriv_uses_fixed_argv_and_never_shell(
     monkeypatch.setattr(handlers.os.path, "exists", lambda _path: True)
     monkeypatch.setattr(handlers.subprocess, "run", completed)
     result = handlers._run_as_managed_user(
-        {"uid": 20001, "gid": 20001},
+        {"username": "origin-pilot", "uid": 20001, "gid": 20001},
         ["/usr/bin/sbatch", "--parsable", "/proc/self/fd/9"],
         timeout=30,
         pass_fds=(9,),
@@ -2674,6 +2674,13 @@ def test_portal4a_setpriv_uses_fixed_argv_and_never_shell(
     ]
     assert captured["shell"] is False
     assert captured["pass_fds"] == (9,)
+    assert captured["env"] == {
+        **handlers.FIXED_ENV,
+        "HOME": "/home/origin-pilot",
+        "USER": "origin-pilot",
+        "LOGNAME": "origin-pilot",
+        "SHELL": "/usr/sbin/nologin",
+    }
 
 
 def test_job_script_is_staged_then_only_fixed_sbatch_runs_as_target_user(

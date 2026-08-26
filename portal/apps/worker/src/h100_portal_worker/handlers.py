@@ -8487,6 +8487,14 @@ def _run_as_managed_user(
     setpriv = BINARIES["setpriv"]
     if not os.path.exists(setpriv) or any("\x00" in item for item in command):
         return {"ok": False, "error_code": "SETUID_EXECUTION_REJECTED", "stdout": "", "stderr": ""}
+    username = str(payload["username"])
+    managed_env = {
+        **FIXED_ENV,
+        "HOME": f"/home/{username}",
+        "USER": username,
+        "LOGNAME": username,
+        "SHELL": "/usr/sbin/nologin",
+    }
     try:
         completed = subprocess.run(
             [
@@ -8501,7 +8509,7 @@ def _run_as_managed_user(
                 *command,
             ],
             cwd="/",
-            env=FIXED_ENV,
+            env=managed_env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
