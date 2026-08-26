@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import socket
+import stat
 import struct
 import subprocess
 import threading
@@ -2686,11 +2687,46 @@ def test_portal4a_setpriv_uses_fixed_argv_and_never_shell(
         "LOGNAME": "origin-pilot",
         "SHELL": "/usr/sbin/nologin",
         "WORKSPACE": "/storage/users/20001",
-        "ENROOT_CACHE_PATH": "/storage/users/20001/.portal/enroot/cache",
-        "ENROOT_CONFIG_PATH": "/storage/users/20001/.portal/enroot/config",
-        "ENROOT_DATA_PATH": "/storage/users/20001/.portal/enroot/data",
-        "ENROOT_RUNTIME_PATH": "/storage/users/20001/.portal/enroot/runtime",
     }
+
+
+def test_managed_enroot_directories_are_exact_uid_owned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    enroot_root = tmp_path / "enroot"
+    enroot_root.mkdir(mode=0o755)
+    for category in ("cache", "data", "runtime"):
+        (enroot_root / category).mkdir(mode=0o711)
+    monkeypatch.setattr(handlers, "ENROOT_ROOT", enroot_root)
+    payload = managed_job_payload(username="root", uid=os.getuid())
+    payload["gid"] = os.getgid()
+
+    handlers._ensure_managed_enroot_directories(payload)
+    handlers._ensure_managed_enroot_directories(payload)
+
+    for category in ("cache", "data", "runtime"):
+        metadata = (enroot_root / category / str(os.getuid())).stat()
+        assert metadata.st_uid == os.getuid()
+        assert metadata.st_gid == os.getgid()
+        assert stat.S_IMODE(metadata.st_mode) == 0o700
+
+
+def test_managed_enroot_directory_rejects_symlink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    enroot_root = tmp_path / "enroot"
+    enroot_root.mkdir(mode=0o755)
+    for category in ("cache", "data", "runtime"):
+        (enroot_root / category).mkdir(mode=0o711)
+    (enroot_root / "cache" / str(os.getuid())).symlink_to(tmp_path)
+    monkeypatch.setattr(handlers, "ENROOT_ROOT", enroot_root)
+    payload = managed_job_payload(username="root", uid=os.getuid())
+    payload["gid"] = os.getgid()
+
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._ensure_managed_enroot_directories(payload)
+
+    assert rejected.value.code == "ENROOT_STORAGE_REJECTED"
 
 
 def test_job_script_is_staged_then_only_fixed_sbatch_runs_as_target_user(
@@ -2700,12 +2736,21 @@ def test_job_script_is_staged_then_only_fixed_sbatch_runs_as_target_user(
         "self.job.submit",
         managed_job_payload(username="origin-pilot2", uid=20002),
     )
+    payload["image_ref"] = (
+        "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
+        "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
+    )
     output_parent = Path(str(payload["workspace_path"])) / "outputs"
     workdir = Path(str(payload["workspace_path"])) / "projects"
     staged = tmp_path / "staged-job.sh"
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(handlers, "_managed_slurm_security_preflight", lambda _payload: None)
+    monkeypatch.setattr(
+        handlers,
+        "_ensure_managed_enroot_directories",
+        lambda bound_payload: captured.update(enroot_payload=bound_payload),
+    )
     monkeypatch.setattr(
         handlers,
         "_managed_user_path",
@@ -2740,6 +2785,7 @@ def test_job_script_is_staged_then_only_fixed_sbatch_runs_as_target_user(
     assert result["status"] == "SUCCEEDED"
     assert captured["content"] == payload["script_content"].encode()
     assert captured["payload"]["uid"] == captured["payload"]["gid"] == 20002
+    assert captured["enroot_payload"] is payload
     command = captured["command"]
     assert command[0] == "/usr/bin/sbatch"
     assert command[-1].startswith("/proc/self/fd/")

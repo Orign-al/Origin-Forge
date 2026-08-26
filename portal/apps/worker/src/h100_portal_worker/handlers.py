@@ -8488,19 +8488,13 @@ def _run_as_managed_user(
     if not os.path.exists(setpriv) or any("\x00" in item for item in command):
         return {"ok": False, "error_code": "SETUID_EXECUTION_REJECTED", "stdout": "", "stderr": ""}
     username = str(payload["username"])
-    workspace = str(payload["workspace_path"])
-    enroot_root = f"{workspace}/.portal/enroot"
     managed_env = {
         **FIXED_ENV,
         "HOME": f"/home/{username}",
         "USER": username,
         "LOGNAME": username,
         "SHELL": "/usr/sbin/nologin",
-        "WORKSPACE": workspace,
-        "ENROOT_CACHE_PATH": f"{enroot_root}/cache",
-        "ENROOT_CONFIG_PATH": f"{enroot_root}/config",
-        "ENROOT_DATA_PATH": f"{enroot_root}/data",
-        "ENROOT_RUNTIME_PATH": f"{enroot_root}/runtime",
+        "WORKSPACE": str(payload["workspace_path"]),
     }
     try:
         completed = subprocess.run(
@@ -8539,6 +8533,77 @@ def _run_as_managed_user(
         "stdout": _truncate(completed.stdout),
         "stderr": _truncate(completed.stderr),
     }
+
+
+def _ensure_managed_enroot_directories(payload: dict[str, Any]) -> None:
+    uid = int(payload["uid"])
+    gid = int(payload["gid"])
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    root_descriptor: int | None = None
+    try:
+        root_descriptor = os.open(
+            ENROOT_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow
+        )
+        root_metadata = os.fstat(root_descriptor)
+        if root_metadata.st_uid != 0 or root_metadata.st_gid != 0 or root_metadata.st_mode & 0o022:
+            raise LifecycleValidationError(
+                "ENROOT_STORAGE_REJECTED", "Enroot storage root metadata is invalid"
+            )
+        for category in ("cache", "data", "runtime"):
+            parent_descriptor = os.open(
+                category,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow,
+                dir_fd=root_descriptor,
+            )
+            try:
+                parent_metadata = os.fstat(parent_descriptor)
+                if (
+                    parent_metadata.st_uid != 0
+                    or parent_metadata.st_gid != 0
+                    or parent_metadata.st_mode & 0o022
+                ):
+                    raise LifecycleValidationError(
+                        "ENROOT_STORAGE_REJECTED", "Enroot storage parent metadata is invalid"
+                    )
+                try:
+                    user_descriptor = os.open(
+                        str(uid),
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow,
+                        dir_fd=parent_descriptor,
+                    )
+                except FileNotFoundError:
+                    os.mkdir(str(uid), mode=0o700, dir_fd=parent_descriptor)
+                    user_descriptor = os.open(
+                        str(uid),
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow,
+                        dir_fd=parent_descriptor,
+                    )
+                    os.fchown(user_descriptor, uid, gid)
+                    os.fchmod(user_descriptor, 0o700)
+                try:
+                    user_metadata = os.fstat(user_descriptor)
+                    if (
+                        user_metadata.st_uid != uid
+                        or user_metadata.st_gid != gid
+                        or stat.S_IMODE(user_metadata.st_mode) != 0o700
+                    ):
+                        raise LifecycleValidationError(
+                            "ENROOT_USER_STORAGE_REJECTED",
+                            "managed Enroot directory metadata is invalid",
+                        )
+                finally:
+                    os.close(user_descriptor)
+            finally:
+                os.close(parent_descriptor)
+    except LifecycleValidationError:
+        raise
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "ENROOT_STORAGE_REJECTED", "managed Enroot directories cannot be opened safely"
+        ) from exc
+    finally:
+        if root_descriptor is not None:
+            os.close(root_descriptor)
 
 
 def _managed_sbatch_argv(
@@ -8589,6 +8654,8 @@ def _execute_self_job_submit(request: WorkerRequest, payload: dict[str, Any]) ->
     staged_descriptor: int | None = None
     try:
         _managed_slurm_security_preflight(payload)
+        if payload.get("image_ref"):
+            _ensure_managed_enroot_directories(payload)
         uid = int(payload["uid"])
         gid = int(payload["gid"])
         root = Path(str(payload["workspace_path"]))
