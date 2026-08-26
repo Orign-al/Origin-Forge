@@ -115,7 +115,10 @@ cleanup_workspace_alias() {
   if ((exit_status != 0)); then
     if ((installed_unit == 1)); then
       if declare -F unmount_worker_alias >/dev/null 2>&1; then
-        unmount_worker_alias >/dev/null 2>&1 || true
+        # h100_fail exits the current shell. Isolate best-effort namespace
+        # cleanup so one failed helper cannot abort the remaining host cleanup
+        # in this EXIT trap.
+        ( trap - EXIT; unmount_worker_alias ) >/dev/null 2>&1 || true
       fi
       systemctl disable --now "${unit_name}" >/dev/null 2>&1 || true
       rm -f -- "${unit_path}"
@@ -246,11 +249,22 @@ worker_namespace_exec() {
     --wd="/proc/${worker_pid}/cwd" -- "$@"
 }
 
-worker_mount_contract_ready() {
-  local worker_pid=$1 observed_target observed_options worker_mode option
-  observed_target="$(worker_namespace_exec "${worker_pid}" \
-    /usr/bin/findmnt --first-only --noheadings --raw --output TARGET \
-    --mountpoint "${canonical_workspace}" 2>/dev/null)" || return 1
+worker_visible_mount_record() {
+  local worker_pid=$1
+  # ProtectSystem= and ReadWritePaths= can leave more than one record at the
+  # same pathname. findmnt orders the shadowing tree from the covered record
+  # to the visible record; the final --target row is reached by path lookup.
+  # --first-only would select the hidden pre-ReadWritePaths record.
+  worker_namespace_exec "${worker_pid}" \
+    /usr/bin/findmnt --noheadings --raw --output TARGET,VFS-OPTIONS \
+    --target "${canonical_workspace}" 2>/dev/null \
+    | /usr/bin/tail -n 1
+}
+
+worker_mount_identity_ready() {
+  local worker_pid=$1 observed_record observed_target worker_mode
+  observed_record="$(worker_visible_mount_record "${worker_pid}")" || return 1
+  observed_target="${observed_record%% *}"
   [[ "${observed_target}" == "${canonical_workspace}" ]] || return 1
   [[ "$(worker_namespace_exec "${worker_pid}" \
       /usr/bin/stat -c '%d:%i' "${backing_workspace}")" == \
@@ -263,49 +277,70 @@ worker_mount_contract_ready() {
     /usr/bin/stat -c '%a' "${canonical_workspace}")" || return 1
   [[ "${worker_mode}" =~ ^[0-7]+$ ]] || return 1
   (((8#${worker_mode} & 0007) == 0)) || return 1
-  observed_options="$(worker_namespace_exec "${worker_pid}" \
-    /usr/bin/findmnt --first-only --noheadings --raw --output OPTIONS \
-    --mountpoint "${canonical_workspace}" 2>/dev/null)" || return 1
+}
+
+worker_mount_contract_ready() {
+  local worker_pid=$1 observed_record observed_options option
+  worker_mount_identity_ready "${worker_pid}" || return 1
+  observed_record="$(worker_visible_mount_record "${worker_pid}")" || return 1
+  observed_options="${observed_record#* }"
   for option in rw nosuid nodev; do
     tr ',' '\n' <<<"${observed_options}" | grep -Fxq "${option}" || return 1
   done
 }
 
+normalize_worker_alias() {
+  local worker_pid=$1
+  worker_namespace_exec "${worker_pid}" \
+    /usr/bin/mount -o remount,bind,rw,nosuid,nodev \
+    "${canonical_workspace}" "${canonical_workspace}" \
+    || { printf 'WORKSPACE ALIAS FAILURE CODE: WORKER_REMOUNT_FAILED\n' >&2; \
+      h100_fail 'Worker workspace mount security normalization failed'; }
+  worker_mount_contract_ready "${worker_pid}" \
+    || { printf 'WORKSPACE ALIAS FAILURE CODE: WORKER_MOUNT_CONTRACT_INVALID\n' >&2; \
+      h100_fail 'Worker workspace mount contract is invalid'; }
+}
+
 sync_worker_alias() {
-  local worker_pid
+  local worker_pid observed_worker_record
   if ! worker_pid="$(worker_namespace_pid)"; then
     return 0
   fi
   worker_mount_contract_ready "${worker_pid}" && return 0
-  if worker_namespace_exec "${worker_pid}" \
-    /usr/bin/findmnt --noheadings --mountpoint "${canonical_workspace}" \
-    >/dev/null 2>&1; then
+  if worker_mount_identity_ready "${worker_pid}"; then
+    # Bind creation propagates before mount(8)'s security remount. The exact
+    # backing can therefore be visible while nosuid/nodev are still absent.
+    normalize_worker_alias "${worker_pid}"
+    return 0
+  fi
+  observed_worker_record="$(worker_visible_mount_record "${worker_pid}" || true)"
+  if [[ "${observed_worker_record%% *}" == "${canonical_workspace}" ]]; then
+    printf 'WORKSPACE ALIAS FAILURE CODE: WORKER_MOUNT_COLLISION\n' >&2
     h100_fail 'Worker workspace mount collision is invalid'
   fi
   worker_namespace_exec "${worker_pid}" \
-    /usr/bin/mount -o bind,rw,nosuid,nodev \
-    "${backing_workspace}" "${canonical_workspace}"
-  worker_mount_contract_ready "${worker_pid}" \
-    || h100_fail 'Worker workspace mount contract is invalid'
+    /usr/bin/mount --bind "${backing_workspace}" "${canonical_workspace}" \
+    || { printf 'WORKSPACE ALIAS FAILURE CODE: WORKER_BIND_FAILED\n' >&2; \
+      h100_fail 'Worker workspace bind could not be created'; }
+  normalize_worker_alias "${worker_pid}"
 }
 
 unmount_worker_alias() {
-  local worker_pid attempt
+  local worker_pid attempt observed_worker_record
   if ! worker_pid="$(worker_namespace_pid)"; then
     return 0
   fi
-  if worker_namespace_exec "${worker_pid}" \
-    /usr/bin/findmnt --noheadings --mountpoint "${canonical_workspace}" \
-    >/dev/null 2>&1; then
-    worker_mount_contract_ready "${worker_pid}" \
-      || h100_fail 'Worker workspace mount removal contract is invalid'
-  fi
   for attempt in {1..8}; do
-    if ! worker_namespace_exec "${worker_pid}" \
-      /usr/bin/findmnt --noheadings --mountpoint "${canonical_workspace}" \
-      >/dev/null 2>&1; then
+    if ! worker_mount_identity_ready "${worker_pid}"; then
+      observed_worker_record="$(worker_visible_mount_record "${worker_pid}" || true)"
+      if [[ "${observed_worker_record%% *}" == "${canonical_workspace}" ]]; then
+        printf 'WORKSPACE ALIAS FAILURE CODE: WORKER_REMOVE_COLLISION\n' >&2
+        h100_fail 'Worker workspace mount removal identity is invalid'
+      fi
       return 0
     fi
+    worker_mount_contract_ready "${worker_pid}" \
+      || normalize_worker_alias "${worker_pid}"
     worker_namespace_exec "${worker_pid}" \
       /usr/bin/umount "${canonical_workspace}" \
       || h100_fail 'Worker workspace mount could not be removed'
@@ -437,10 +472,9 @@ case "${action}" in
     rm -f -- "${unit_path}"
     systemctl daemon-reload
     if worker_pid="$(worker_namespace_pid)"; then
-      ! worker_namespace_exec "${worker_pid}" \
-        /usr/bin/findmnt --noheadings --mountpoint "${canonical_workspace}" \
-        >/dev/null 2>&1 \
-        || h100_fail 'Worker workspace mount remained after host removal'
+      worker_namespace_exec "${worker_pid}" \
+        /usr/bin/test ! -e "${canonical_workspace}" \
+        || h100_fail 'Worker workspace path remained reachable after host removal'
     fi
     verify_backing
     ;;

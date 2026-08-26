@@ -158,6 +158,18 @@ case "${1:-}" in
     mount_options="$(unit_field Options "${unit_path}")"
     [[ -d "${mount_what}" && -d "${mount_where}" ]]
     mount -o "${mount_options}" "${mount_what}" "${mount_where}"
+    if [[ -f /run/rehearsal-worker-pid ]]; then
+      worker_pid="$(</run/rehearsal-worker-pid)"
+      # systemd's production ReadWritePaths namespace receives two propagated
+      # bind records before the Host security remount. Recreate that exact
+      # shadowing shape deterministically without touching the outer host.
+      for _ in 1 2; do
+        nsenter --target "${worker_pid}" --mount \
+          --root="/proc/${worker_pid}/root" \
+          --wd="/proc/${worker_pid}/cwd" -- \
+          mount --bind "${mount_what}" "${mount_where}"
+      done
+    fi
     if [[ "${REHEARSAL_DELAY_FINDMNT:-0}" == 1 ]]; then
       printf '2\n' >/run/rehearsal-findmnt-delay
     fi
@@ -237,6 +249,8 @@ rehearsal_diagnostics() {
     printf '%s\n' '--- canonical state ---' >&2
     findmnt --noheadings --mountpoint "${canonical}" >&2 || true
     stat "${canonical}" "${unit}" >&2 || true
+    printf '%s\n' '--- injected failure ---' >&2
+    cat /rehearsal/propagated-failure.stderr >&2 || true
   fi
   exit "${diagnostic_status}"
 }
@@ -277,10 +291,9 @@ REHEARSAL_DELAY_FINDMNT=1 "${alias_tool}" prepare \
 [[ "$(grep -c 'action=workspace-alias.*outcome=SUCCESS rc=0' "${audit_log}")" == 6 ]]
 remove_required_directories
 
-# Reproduce the production Worker namespace: a recursive writable bind of
-# /storage/users captures the pre-existing children and hides a later host
-# mount.  Keep that namespace alive so prepare can enter PID 1's namespace for
-# the host mount and then mirror the exact bind into the Worker namespace.
+# Reproduce the production Worker namespace: ReadWritePaths creates a recursive
+# bind over /storage/users. The mock systemctl above injects the two propagated
+# pre-remount aliases, so prepare must normalize the visible top layer.
 unshare --mount --propagation unchanged /bin/bash -c '
   set -euo pipefail
   mount --rbind /storage/users /storage/users
@@ -305,6 +318,31 @@ nsenter --target "${worker_namespace_pid}" --mount -- \
     --root="/proc/${rehearsal_host_pid}/root" \
     --wd="/proc/${rehearsal_host_pid}/cwd" -- \
     id "${rehearsal_user}" >/dev/null
+
+# Force verify_alias to fail after the host mount has propagated. Even if
+# Worker alias cleanup itself exits, the outer EXIT trap must still disable the
+# host unit and remove the mountpoint/unit.
+if H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL=1 \
+  H100_WORKSPACE_ALIAS_REHEARSAL_HOST_PID="${rehearsal_host_pid}" \
+  REHEARSAL_FAIL_AFTER_MOUNT=1 \
+  nsenter --target "${worker_namespace_pid}" --mount \
+    --root="/proc/${worker_namespace_pid}/root" \
+    --wd="/proc/${worker_namespace_pid}/cwd" -- \
+  "${alias_tool}" prepare "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}" \
+  >/rehearsal/propagated-failure.stdout 2>/rehearsal/propagated-failure.stderr; then
+  fail 'propagated post-mount validation failure unexpectedly succeeded'
+fi
+grep -Fq 'workspace mount unit metadata is invalid' \
+  /rehearsal/propagated-failure.stderr
+! findmnt --noheadings --mountpoint "${canonical}" >/dev/null 2>&1
+nsenter --target "${worker_namespace_pid}" --mount \
+  --root="/proc/${worker_namespace_pid}/root" \
+  --wd="/proc/${worker_namespace_pid}/cwd" -- \
+  test ! -e "${canonical}"
+[[ ! -e "${canonical}" && ! -e "${unit}" ]]
+[[ "$(grep -c 'action=workspace-alias.*outcome=FAILED rc=1' "${audit_log}")" == 1 ]]
+remove_required_directories
+
 H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL=1 \
   H100_WORKSPACE_ALIAS_REHEARSAL_HOST_PID="${rehearsal_host_pid}" \
   nsenter --target "${worker_namespace_pid}" --mount \
@@ -316,6 +354,17 @@ nsenter --target "${worker_namespace_pid}" --mount \
   --root="/proc/${worker_namespace_pid}/root" \
   --wd="/proc/${worker_namespace_pid}/cwd" -- \
   findmnt --noheadings --mountpoint "${canonical}" >/dev/null
+worker_mount_records="$(nsenter --target "${worker_namespace_pid}" --mount \
+  --root="/proc/${worker_namespace_pid}/root" \
+  --wd="/proc/${worker_namespace_pid}/cwd" -- \
+  findmnt --noheadings --raw --output TARGET,VFS-OPTIONS \
+  --mountpoint "${canonical}")"
+(("$(wc -l <<<"${worker_mount_records}")" >= 2))
+visible_worker_options="${worker_mount_records##*$'\n'}"
+visible_worker_options="${visible_worker_options#* }"
+for option in rw nosuid nodev; do
+  tr ',' '\n' <<<"${visible_worker_options}" | grep -Fxq "${option}"
+done
 H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL=1 \
   H100_WORKSPACE_ALIAS_REHEARSAL_HOST_PID="${rehearsal_host_pid}" \
   "${alias_tool}" verify "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}"
@@ -323,10 +372,10 @@ H100_WORKSPACE_ALIAS_NAMESPACE_REHEARSAL=1 \
   H100_WORKSPACE_ALIAS_REHEARSAL_HOST_PID="${rehearsal_host_pid}" \
   "${alias_tool}" remove "${rehearsal_user}" "${rehearsal_uid}" "${rehearsal_gid}" \
     --confirm-remove "${rehearsal_user}"
-! nsenter --target "${worker_namespace_pid}" --mount \
+nsenter --target "${worker_namespace_pid}" --mount \
   --root="/proc/${worker_namespace_pid}/root" \
   --wd="/proc/${worker_namespace_pid}/cwd" -- \
-  findmnt --noheadings --mountpoint "${canonical}" >/dev/null 2>&1
+  test ! -e "${canonical}"
 kill "${worker_launcher_pid}"
 wait "${worker_launcher_pid}" || true
 rm -f -- /run/rehearsal-worker-pid /run/rehearsal-worker-ready
@@ -366,11 +415,12 @@ fi
 grep -Fq 'workspace identity differs from NSS' /rehearsal/mismatch.stderr
 [[ "$(wc -l <"${audit_log}")" == "${audit_lines_before_mismatch}" ]]
 [[ ! -e "${canonical}" && ! -e "${unit}" ]]
+[[ "$(grep -c 'action=workspace-alias.*outcome=FAILED rc=1' "${audit_log}")" == 2 ]]
 
 printf 'owner_parent=%s owner_alias=%s\n' \
   "$(stat -c '%u:%g:%a' /storage/users)" "${rehearsal_uid}:${rehearsal_gid}"
-printf 'audit_success=9 audit_failure=1 cleanup=PASS uid_mismatch=PASS\n'
-printf 'systemd_unit_verify=PASS bind_inode=PASS mount_options=rw,nosuid,nodev convergence=PASS worker_namespace=PASS\n'
+printf 'audit_success=9 audit_failure=2 cleanup=PASS uid_mismatch=PASS\n'
+printf 'systemd_unit_verify=PASS bind_inode=PASS mount_options=rw,nosuid,nodev convergence=PASS worker_namespace=PASS propagation_normalization=PASS\n'
 EOF
 chmod 0755 "${namespace_root}/rehearsal/run.sh"
 
