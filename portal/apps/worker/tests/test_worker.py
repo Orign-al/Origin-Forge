@@ -3071,7 +3071,7 @@ def test_gpu_development_partition_must_be_non_default_and_infinite(
         if args == ["show", "config"]:
             return {
                 "ok": True,
-                "stdout": "Epilog                = /usr/local/sbin/h100-gpu-development-epilog\n",
+                "stdout": "Epilog[0]             = /usr/local/sbin/h100-gpu-development-epilog\n",
             }
         return {
             "ok": True,

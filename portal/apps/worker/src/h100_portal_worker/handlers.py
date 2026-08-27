@@ -9075,7 +9075,7 @@ def _gpu_development_partition_preflight() -> None:
         or re.search(r"(?:^|\s)MaxTime=(?:INFINITE|UNLIMITED)(?:\s|$)", line) is None
         or not configuration.get("ok")
         or re.search(
-            r"(?:^|\n)Epilog\s*=\s*/usr/local/sbin/h100-gpu-development-epilog(?:\s|$)",
+            r"(?:^|\n)Epilog(?:\[0\])?\s*=\s*/usr/local/sbin/h100-gpu-development-epilog(?:\s|$)",
             configuration_text,
         )
         is None
