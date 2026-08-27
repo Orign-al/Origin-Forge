@@ -1373,6 +1373,190 @@ def test_worker_discard_requires_binding_and_is_idempotent(
     assert list(controlled_staging.iterdir()) == []
 
 
+def active_key_sync_payload() -> dict[str, object]:
+    current_record = str(uuid.uuid4())
+    target_record = str(uuid.uuid4())
+    return {
+        "sync_operation_id": str(uuid.uuid4()),
+        "managed_user_id": str(uuid.uuid4()),
+        "owner_login": "ordinary-user",
+        "username": "ordinary-user",
+        "uid": 20009,
+        "gid": 20009,
+        "ssh_port": 22031,
+        "container_name": "gpu-dev-ordinary-user",
+        "workspace_path": "/storage/users/20009",
+        "development_profile": "STANDARD_8CPU_32GB",
+        "slurm_account": "company",
+        "slurm_qos": "general",
+        "lease_id": str(uuid.uuid4()),
+        "lease_expires_at": (datetime.now(UTC) + timedelta(hours=24)).isoformat(),
+        "gpu_allocation_job_id": None,
+        "gpu_allocation_uuid": None,
+        "current_ssh_key_record_ids": [current_record],
+        "current_ssh_key_fingerprints": ["SHA256:currentOwnerKey"],
+        "ssh_key_record_ids": [current_record, target_record],
+        "ssh_key_fingerprints": ["SHA256:currentOwnerKey", "SHA256:newOwnerKey"],
+        "deployment_version": "SOURCE_WORKTREE",
+    }
+
+
+def test_active_key_sync_payload_requires_append_only_owner_binding() -> None:
+    payload = active_key_sync_payload()
+    assert validate_payload("ssh_key.sync_active_container", payload) == payload
+    with pytest.raises(ValueError, match="must append"):
+        validate_payload(
+            "ssh_key.sync_active_container",
+            {
+                **payload,
+                "ssh_key_record_ids": list(reversed(payload["ssh_key_record_ids"])),
+                "ssh_key_fingerprints": list(reversed(payload["ssh_key_fingerprints"])),
+            },
+        )
+    with pytest.raises(ValueError, match="resource binding"):
+        validate_payload(
+            "ssh_key.sync_active_container", {**payload, "owner_login": "another-user"}
+        )
+
+
+def test_active_key_sync_updates_key_file_and_lifecycle_together(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = active_key_sync_payload()
+    gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
+    payload.update(
+        {
+            "development_profile": "GPU_1_8CPU_32GB",
+            "gpu_allocation_job_id": 124,
+            "gpu_allocation_uuid": gpu_uuid,
+        }
+    )
+    current = list(payload["current_ssh_key_fingerprints"])
+    target = list(payload["ssh_key_fingerprints"])
+    key_state = {"fingerprints": current}
+    lifecycle = {
+        "STATUS": "ACTIVE",
+        "CONTAINER_KEY_FINGERPRINTS": ",".join(current),
+    }
+    monkeypatch.setattr(handlers, "_activation_runtime_binding", lambda _payload: None)
+    monkeypatch.setattr(
+        handlers,
+        "_active_container_sync_records",
+        lambda _payload: (
+            [{"record_id": "current"}],
+            [{"record_id": "current"}, {"record_id": "new"}],
+        ),
+    )
+    monkeypatch.setattr(
+        handlers, "_active_container_sync_lifecycle", lambda _payload: dict(lifecycle)
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_installed_key_fingerprints",
+        lambda *_args: list(key_state["fingerprints"]),
+    )
+    monkeypatch.setattr(handlers, "_activation_account_preflight", lambda _payload: None)
+    monkeypatch.setattr(
+        handlers, "_managed_container_security", lambda *_args, **_kwargs: {"safe": True}
+    )
+    gpu_bindings: list[tuple[int, str]] = []
+
+    def gpu_binding(_payload, job_id):  # type: ignore[no-untyped-def]
+        gpu_bindings.append((job_id, gpu_uuid))
+        return gpu_uuid
+
+    monkeypatch.setattr(handlers, "_gpu_allocation_binding", gpu_binding)
+
+    def replace(_payload, _records, expected, desired):  # type: ignore[no-untyped-def]
+        assert key_state["fingerprints"] in (expected, desired)
+        key_state["fingerprints"] = list(desired)
+        return True
+
+    def commit(_username, values):  # type: ignore[no-untyped-def]
+        lifecycle.clear()
+        lifecycle.update(values)
+
+    monkeypatch.setattr(handlers, "_replace_active_container_keys", replace)
+    monkeypatch.setattr(handlers, "_commit_managed_lifecycle_values", commit)
+    result = handle(
+        request(
+            "ssh_key.sync_active_container",
+            payload,
+            requested_by="ordinary-user",
+            approved_by="ordinary-user",
+            idempotency_key=f"ssh-key-sync:{payload['sync_operation_id']}",
+        )
+    )
+    assert result["status"] == "SUCCEEDED"
+    assert result["container_key_fingerprints"] == target
+    assert key_state["fingerprints"] == target
+    assert lifecycle["CONTAINER_KEY_FINGERPRINTS"] == ",".join(target)
+    assert gpu_bindings == [(124, gpu_uuid)]
+
+
+def test_active_key_sync_restores_previous_keys_when_lifecycle_commit_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = active_key_sync_payload()
+    current = list(payload["current_ssh_key_fingerprints"])
+    key_state = {"fingerprints": current}
+    original_lifecycle = {
+        "STATUS": "ACTIVE",
+        "CONTAINER_KEY_FINGERPRINTS": ",".join(current),
+    }
+    monkeypatch.setattr(handlers, "_activation_runtime_binding", lambda _payload: None)
+    monkeypatch.setattr(
+        handlers,
+        "_active_container_sync_records",
+        lambda _payload: (
+            [{"record_id": "current"}],
+            [{"record_id": "current"}, {"record_id": "new"}],
+        ),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_active_container_sync_lifecycle",
+        lambda _payload: dict(original_lifecycle),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_installed_key_fingerprints",
+        lambda *_args: list(key_state["fingerprints"]),
+    )
+    monkeypatch.setattr(handlers, "_activation_account_preflight", lambda _payload: None)
+    monkeypatch.setattr(
+        handlers, "_managed_container_security", lambda *_args, **_kwargs: {"safe": True}
+    )
+
+    def replace(_payload, _records, _expected, desired):  # type: ignore[no-untyped-def]
+        key_state["fingerprints"] = list(desired)
+        return True
+
+    commits = {"count": 0}
+
+    def commit(_username, _values):  # type: ignore[no-untyped-def]
+        commits["count"] += 1
+        if commits["count"] == 1:
+            raise handlers.LifecycleValidationError(
+                "TEST_LIFECYCLE_WRITE_FAILED", "fixture commit failure"
+            )
+
+    monkeypatch.setattr(handlers, "_replace_active_container_keys", replace)
+    monkeypatch.setattr(handlers, "_commit_managed_lifecycle_values", commit)
+    result = handle(
+        request(
+            "ssh_key.sync_active_container",
+            payload,
+            requested_by="ordinary-user",
+            approved_by="ordinary-user",
+            idempotency_key=f"ssh-key-sync:{payload['sync_operation_id']}",
+        )
+    )
+    assert result["status"] == "ERROR"
+    assert result["rollback_status"] == "ROLLED_BACK"
+    assert key_state["fingerprints"] == current
+
+
 @pytest.mark.parametrize("unsafe_kind", ["symlink", "writable", "oversized"])
 def test_worker_rejects_unsafe_staging_file(
     controlled_staging: Path,

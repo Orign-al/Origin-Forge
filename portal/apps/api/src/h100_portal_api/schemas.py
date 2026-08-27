@@ -102,6 +102,10 @@ class ComputeResourceRequestCancel(ApiModel):
     idempotency_key: uuid.UUID
 
 
+class SshKeySyncRequest(ApiModel):
+    idempotency_key: uuid.UUID
+
+
 class ComputeResourceReviewRequest(ApiModel):
     decision: Literal["APPROVE", "REJECT"]
     review_note: str | None = Field(default=None, max_length=1000)

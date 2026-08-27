@@ -42,6 +42,20 @@ const EN_US: Record<string, string> = {
   存储: "Storage",
   SSH密钥: "SSH Keys",
   "SSH 密钥": "SSH Keys",
+  安装新增密钥: "Install new keys",
+  "正在安装…": "Installing…",
+  "SSH 公钥已验证并安装到运行中的开发容器；私钥未发送到服务器。":
+    "The SSH public key was validated and installed in the running development container. The private key was not sent to the server.",
+  "SSH 公钥已验证并安装到运行中的开发容器；平台没有接收私钥。":
+    "The SSH public key was validated and installed in the running development container. The platform did not receive the private key.",
+  "SSH 公钥已验证，但安装到运行中容器失败；请点击重试安装。":
+    "The SSH public key was validated, but installation in the running container failed. Select retry installation.",
+  "新增 SSH 公钥已安装到运行中的开发容器。":
+    "The new SSH public key was installed in the running development container.",
+  "SSH 公钥安装失败；原有可用密钥保持不变。":
+    "SSH public-key installation failed. The previously working keys remain unchanged.",
+  "新增公钥已验证但尚未安装。同步只会原子更新你自己的运行中开发容器，不会启用宿主 SSH。":
+    "The new public key is validated but not installed. Synchronization atomically updates only your own running development container and does not enable host SSH.",
   回收站: "Recycle Bin",
   账号与安全: "Account & Security",
   账号安全: "Account Security",

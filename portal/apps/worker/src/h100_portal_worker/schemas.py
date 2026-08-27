@@ -66,6 +66,7 @@ KNOWN_WRITES = {
     "ssh_key.revoke",
     "ssh_key.prepare",
     "ssh_key.discard",
+    "ssh_key.sync_active_container",
     "self.job.submit",
     "self.job.cancel",
     "lease.expire",
@@ -1054,6 +1055,157 @@ def _validate_ssh_key_discard(payload: dict[str, Any]) -> dict[str, Any]:
         "record_id": _canonical_uuid(payload.get("record_id"), "SSH key record ID"),
         "operation_id": _canonical_uuid(payload.get("operation_id"), "operation ID"),
         "content_sha256": content_sha256,
+    }
+
+
+def _validate_ssh_key_sync_active_container(payload: dict[str, Any]) -> dict[str, Any]:
+    fields = {
+        "sync_operation_id",
+        "managed_user_id",
+        "owner_login",
+        "username",
+        "uid",
+        "gid",
+        "ssh_port",
+        "container_name",
+        "workspace_path",
+        "development_profile",
+        "slurm_account",
+        "slurm_qos",
+        "lease_id",
+        "lease_expires_at",
+        "gpu_allocation_job_id",
+        "gpu_allocation_uuid",
+        "current_ssh_key_record_ids",
+        "current_ssh_key_fingerprints",
+        "ssh_key_record_ids",
+        "ssh_key_fingerprints",
+        "deployment_version",
+    }
+    if set(payload) != fields or set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+        raise PayloadValidationError(
+            "SSH_KEY_SYNC_PAYLOAD_REJECTED",
+            "active Container SSH key sync fields are incomplete",
+        )
+    username = payload.get("username")
+    owner_login = payload.get("owner_login")
+    uid = payload.get("uid")
+    gid = payload.get("gid")
+    ssh_port = payload.get("ssh_port")
+    profile = payload.get("development_profile")
+    if (
+        not isinstance(username, str)
+        or SAFE_USERNAME.fullmatch(username) is None
+        or username in {"root", "origin-al", "codexops", "nobody"}
+        or owner_login != username
+        or not isinstance(uid, int)
+        or isinstance(uid, bool)
+        or not PILOT_UID_MIN <= uid <= PILOT_UID_MAX
+        or not isinstance(gid, int)
+        or isinstance(gid, bool)
+        or not PILOT_UID_MIN <= gid <= PILOT_UID_MAX
+        or not isinstance(ssh_port, int)
+        or isinstance(ssh_port, bool)
+        or not PILOT_SSH_PORT_MIN <= ssh_port <= PILOT_SSH_PORT_MAX
+        or profile not in DEVELOPMENT_PROFILES
+        or payload.get("container_name") != f"gpu-dev-{username}"
+        or payload.get("workspace_path") != str(workspace_path(uid))
+        or payload.get("slurm_account") != "company"
+        or payload.get("slurm_qos") != "general"
+    ):
+        raise PayloadValidationError(
+            "SSH_KEY_SYNC_RESOURCE_BINDING_REJECTED",
+            "active Container SSH key sync resource binding is invalid",
+        )
+
+    def key_set(prefix: str) -> tuple[list[str], list[str]]:
+        record_ids = payload.get(f"{prefix}ssh_key_record_ids")
+        fingerprints = payload.get(f"{prefix}ssh_key_fingerprints")
+        if (
+            not isinstance(record_ids, list)
+            or not 1 <= len(record_ids) <= 5
+            or not isinstance(fingerprints, list)
+            or len(fingerprints) != len(record_ids)
+            or any(
+                not isinstance(item, str) or re.fullmatch(r"SHA256:[A-Za-z0-9+/]+", item) is None
+                for item in fingerprints
+            )
+        ):
+            raise PayloadValidationError(
+                "SSH_KEY_SYNC_KEY_BINDING_REJECTED",
+                "active Container SSH key bindings are invalid",
+            )
+        canonical = [_canonical_uuid(item, "SSH key record ID") for item in record_ids]
+        if len(set(canonical)) != len(canonical) or len(set(fingerprints)) != len(fingerprints):
+            raise PayloadValidationError(
+                "SSH_KEY_SYNC_KEY_BINDING_REJECTED",
+                "active Container SSH key bindings contain duplicates",
+            )
+        return canonical, list(fingerprints)
+
+    current_ids, current_fingerprints = key_set("current_")
+    target_ids, target_fingerprints = key_set("")
+    if (
+        len(target_ids) <= len(current_ids)
+        or target_ids[: len(current_ids)] != current_ids
+        or target_fingerprints[: len(current_fingerprints)] != current_fingerprints
+    ):
+        raise PayloadValidationError(
+            "SSH_KEY_SYNC_KEY_BINDING_REJECTED",
+            "active Container SSH key sync must append owner-approved keys",
+        )
+    gpu_job_id = payload.get("gpu_allocation_job_id")
+    gpu_uuid = payload.get("gpu_allocation_uuid")
+    gpu_bound = (
+        isinstance(gpu_job_id, int)
+        and not isinstance(gpu_job_id, bool)
+        and gpu_job_id > 0
+        and isinstance(gpu_uuid, str)
+        and re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", gpu_uuid) is not None
+    )
+    if (profile == GPU_DEVELOPMENT_PROFILE) != gpu_bound or (
+        profile == CPU_DEVELOPMENT_PROFILE and (gpu_job_id is not None or gpu_uuid is not None)
+    ):
+        raise PayloadValidationError(
+            "SSH_KEY_SYNC_GPU_BINDING_REJECTED",
+            "active Container GPU allocation binding is invalid",
+        )
+    lease_expires_at = payload.get("lease_expires_at")
+    if not isinstance(lease_expires_at, str) or len(lease_expires_at) > 64:
+        raise PayloadValidationError(
+            "SSH_KEY_SYNC_LEASE_BINDING_REJECTED", "active Lease expiry is invalid"
+        )
+    version = payload.get("deployment_version")
+    if not isinstance(version, str) or (
+        version != "SOURCE_WORKTREE" and re.fullmatch(r"[0-9a-f]{40}", version) is None
+    ):
+        raise PayloadValidationError(
+            "SSH_KEY_SYNC_RUNTIME_BINDING_REJECTED", "deployment version is invalid"
+        )
+    return {
+        "sync_operation_id": _canonical_uuid(
+            payload.get("sync_operation_id"), "SSH key sync operation ID"
+        ),
+        "managed_user_id": _canonical_uuid(payload.get("managed_user_id"), "managed user ID"),
+        "owner_login": username,
+        "username": username,
+        "uid": uid,
+        "gid": gid,
+        "ssh_port": ssh_port,
+        "container_name": f"gpu-dev-{username}",
+        "workspace_path": str(workspace_path(uid)),
+        "development_profile": profile,
+        "slurm_account": "company",
+        "slurm_qos": "general",
+        "lease_id": _canonical_uuid(payload.get("lease_id"), "Lease ID"),
+        "lease_expires_at": lease_expires_at,
+        "gpu_allocation_job_id": gpu_job_id,
+        "gpu_allocation_uuid": gpu_uuid,
+        "current_ssh_key_record_ids": current_ids,
+        "current_ssh_key_fingerprints": current_fingerprints,
+        "ssh_key_record_ids": target_ids,
+        "ssh_key_fingerprints": target_fingerprints,
+        "deployment_version": version,
     }
 
 
@@ -2080,6 +2232,8 @@ def validate_payload(
         return _validate_ssh_key_prepare(payload)
     if operation_type == "ssh_key.discard":
         return _validate_ssh_key_discard(payload)
+    if operation_type == "ssh_key.sync_active_container":
+        return _validate_ssh_key_sync_active_container(payload)
     if operation_type == "container.start":
         return _validate_container_start(payload)
     if operation_type in {"user.ssh_client_validation.record", "user.pilot.acceptance"}:

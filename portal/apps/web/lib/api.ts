@@ -571,6 +571,20 @@ export const enrollSshKey = (
     method: "POST",
     body: JSON.stringify(payload),
   });
+export const syncActiveContainerSshKeys = (
+  userId: string,
+  payload: { idempotency_key: string },
+) =>
+  apiFetch<{
+    status: "INSTALLED";
+    operation_id: string;
+    container_state: "RUNNING";
+    key_fingerprints: string[];
+    idempotent_replay: boolean;
+  }>(`/users/${encodeURIComponent(userId)}/ssh-keys/sync`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 export const activateSelfCompute = (payload: { idempotency_key: string }) =>
   apiFetch<SelfComputeActivationResult>("/self/compute/activate", {
     method: "POST",

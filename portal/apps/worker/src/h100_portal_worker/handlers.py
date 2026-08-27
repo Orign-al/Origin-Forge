@@ -2089,6 +2089,298 @@ def _discard_ssh_key_record(request: WorkerRequest, payload: dict[str, Any]) -> 
         return {"status": "ERROR", "error": {"code": code, "message": str(exc)[:255]}}
 
 
+def _active_container_sync_records(
+    payload: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    records = validate_approved_ssh_key_records(list(payload["ssh_key_record_ids"]))
+    fingerprints = [str(record["fingerprint_sha256"]) for record in records]
+    current_count = len(payload["current_ssh_key_record_ids"])
+    if (
+        [str(record["record_id"]) for record in records] != payload["ssh_key_record_ids"]
+        or fingerprints != payload["ssh_key_fingerprints"]
+        or [str(record["record_id"]) for record in records[:current_count]]
+        != payload["current_ssh_key_record_ids"]
+        or fingerprints[:current_count] != payload["current_ssh_key_fingerprints"]
+        or any(record["managed_user_id"] != payload["managed_user_id"] for record in records)
+        or any(record["username"] not in {None, payload["username"]} for record in records)
+        or any(record["scope"] != "CONTAINER" for record in records)
+    ):
+        raise LifecycleValidationError(
+            "SSH_KEY_SYNC_RECORD_BINDING_REJECTED",
+            "active Container SSH key records differ from the owner-approved target set",
+        )
+    return records[:current_count], records
+
+
+def _replace_active_container_keys(
+    payload: dict[str, Any],
+    records: list[dict[str, Any]],
+    expected_fingerprints: list[str],
+    target_fingerprints: list[str],
+) -> bool:
+    path = PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys"
+    observed = _installed_key_fingerprints(path, int(payload["uid"]), int(payload["gid"]))
+    if observed == target_fingerprints:
+        return False
+    if observed != expected_fingerprints:
+        raise LifecycleValidationError(
+            "SSH_KEY_SYNC_CURRENT_SET_CHANGED",
+            "Container authorized_keys differs from the Portal-installed key set",
+        )
+    content = _activation_key_content(records)
+    directory = _open_container_ssh_directory(payload)
+    temporary = f".authorized_keys.sync.{payload['sync_operation_id']}.{secrets.token_hex(8)}.tmp"
+    descriptor: int | None = None
+    try:
+        fcntl.flock(directory, fcntl.LOCK_EX)
+        observed = _installed_key_fingerprints(path, int(payload["uid"]), int(payload["gid"]))
+        if observed == target_fingerprints:
+            return False
+        if observed != expected_fingerprints:
+            raise LifecycleValidationError(
+                "SSH_KEY_SYNC_CURRENT_SET_CHANGED",
+                "Container authorized_keys changed before the atomic replacement",
+            )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=directory)
+        os.fchmod(descriptor, 0o600)
+        os.fchown(descriptor, int(payload["uid"]), int(payload["gid"]))
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError("short authorized_keys sync write")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary, "authorized_keys", src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
+    except LifecycleValidationError:
+        raise
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "SSH_KEY_SYNC_WRITE_FAILED",
+            "Container authorized_keys could not be replaced atomically",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        with suppress(FileNotFoundError, OSError):
+            os.unlink(temporary, dir_fd=directory)
+        os.close(directory)
+    if (
+        _installed_key_fingerprints(path, int(payload["uid"]), int(payload["gid"]))
+        != target_fingerprints
+    ):
+        raise LifecycleValidationError(
+            "SSH_KEY_SYNC_POSTCONDITION_FAILED",
+            "Container authorized_keys verification failed after replacement",
+        )
+    return True
+
+
+def _active_container_sync_lifecycle(payload: dict[str, Any]) -> dict[str, str]:
+    lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+    expected = {
+        "VERSION": "4",
+        "STATUS": "ACTIVE",
+        "USERNAME": str(payload["username"]),
+        "UID": str(payload["uid"]),
+        "GID": str(payload["gid"]),
+        "SSH_PORT": str(payload["ssh_port"]),
+        "DEVELOPMENT_PROFILE": str(payload["development_profile"]),
+        "WORKSPACE_PATH": str(payload["workspace_path"]),
+        "SLURM_ACCOUNT": str(payload["slurm_account"]),
+        "SLURM_QOS": str(payload["slurm_qos"]),
+        "SSH_KEY_STATE": "INSTALLED",
+        "LEASE_ID": str(payload["lease_id"]),
+        "LEASE_STATE": "ACTIVE",
+        "LEASE_EXPIRES": str(payload["lease_expires_at"]),
+        "GPU_ALLOCATION_JOB_ID": (
+            str(payload["gpu_allocation_job_id"])
+            if payload["gpu_allocation_job_id"] is not None
+            else ""
+        ),
+        "GPU_ALLOCATION_UUID": str(payload["gpu_allocation_uuid"] or ""),
+    }
+    mismatches = sorted(key for key, value in expected.items() if lifecycle.get(key) != value)
+    if mismatches:
+        raise LifecycleValidationError(
+            "SSH_KEY_SYNC_LIFECYCLE_REJECTED",
+            f"active lifecycle differs from the Portal binding: {','.join(mismatches)}",
+        )
+    expires_at = _activation_timestamp(lifecycle["LEASE_EXPIRES"], "Lease expiry")
+    if expires_at <= datetime.now(UTC):
+        raise LifecycleValidationError(
+            "SSH_KEY_SYNC_LEASE_EXPIRED", "Container key sync requires a live Lease"
+        )
+    return lifecycle
+
+
+def _execute_active_container_key_sync(
+    request: WorkerRequest, payload: dict[str, Any]
+) -> dict[str, Any]:
+    expected_key = f"ssh-key-sync:{payload['sync_operation_id']}"
+    if (
+        request.requested_by != payload["owner_login"]
+        or request.approved_by != payload["owner_login"]
+        or request.idempotency_key != expected_key
+    ):
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "SSH_KEY_SYNC_OWNER_BINDING_REJECTED",
+                "message": "active Container key sync is not bound to its authenticated owner",
+            },
+            "rollback_status": "NOT_REQUIRED",
+        }
+    transition_started = False
+    original_lifecycle: dict[str, str] | None = None
+    current_records: list[dict[str, Any]] = []
+    target_records: list[dict[str, Any]] = []
+    current_fingerprints = list(payload["current_ssh_key_fingerprints"])
+    target_fingerprints = list(payload["ssh_key_fingerprints"])
+    try:
+        _activation_runtime_binding(payload)
+        current_records, target_records = _active_container_sync_records(payload)
+        original_lifecycle = _active_container_sync_lifecycle(payload)
+        lifecycle_fingerprints = original_lifecycle.get("CONTAINER_KEY_FINGERPRINTS", "").split(",")
+        observed_fingerprints = _installed_key_fingerprints(
+            PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys",
+            int(payload["uid"]),
+            int(payload["gid"]),
+        )
+        if (
+            lifecycle_fingerprints == target_fingerprints
+            and observed_fingerprints == target_fingerprints
+        ):
+            _activation_account_preflight(payload)
+            _managed_container_security(
+                {**payload, "name": payload["container_name"]}, require_running=True
+            )
+            if payload["gpu_allocation_job_id"] is not None and (
+                _gpu_allocation_binding(payload, int(payload["gpu_allocation_job_id"]))
+                != payload["gpu_allocation_uuid"]
+            ):
+                raise LifecycleValidationError(
+                    "SSH_KEY_SYNC_GPU_BINDING_REJECTED",
+                    "live Slurm GPU allocation differs from the running Container",
+                )
+            return {
+                "status": "SUCCEEDED",
+                "handler": "ssh_key.sync_active_container",
+                "sync_operation_id": payload["sync_operation_id"],
+                "managed_user_id": payload["managed_user_id"],
+                "username": payload["username"],
+                "container_name": payload["container_name"],
+                "container_state": "RUNNING",
+                "container_key_fingerprints": target_fingerprints,
+                "host_authorized_keys": "ABSENT",
+                "rollback_status": "NOT_REQUIRED",
+                "idempotent_replay": True,
+            }
+        if lifecycle_fingerprints != current_fingerprints or tuple(observed_fingerprints) not in {
+            tuple(current_fingerprints),
+            tuple(target_fingerprints),
+        }:
+            raise LifecycleValidationError(
+                "SSH_KEY_SYNC_CURRENT_SET_CHANGED",
+                "active lifecycle or Container key set changed before synchronization",
+            )
+        transition_started = observed_fingerprints == target_fingerprints
+        _activation_account_preflight(payload)
+        _managed_container_security(
+            {**payload, "name": payload["container_name"]}, require_running=True
+        )
+        if payload["gpu_allocation_job_id"] is not None and (
+            _gpu_allocation_binding(payload, int(payload["gpu_allocation_job_id"]))
+            != payload["gpu_allocation_uuid"]
+        ):
+            raise LifecycleValidationError(
+                "SSH_KEY_SYNC_GPU_BINDING_REJECTED",
+                "live Slurm GPU allocation differs from the running Container",
+            )
+        if observed_fingerprints == current_fingerprints:
+            transition_started = True
+            _replace_active_container_keys(
+                payload, target_records, current_fingerprints, target_fingerprints
+            )
+        updated_lifecycle = dict(original_lifecycle)
+        updated_lifecycle["CONTAINER_KEY_FINGERPRINTS"] = ",".join(target_fingerprints)
+        updated_lifecycle["SSH_KEY_SYNC_OPERATION_ID"] = str(payload["sync_operation_id"])
+        _commit_managed_lifecycle_values(str(payload["username"]), updated_lifecycle)
+        verified_lifecycle = _active_container_sync_lifecycle(payload)
+        if (
+            verified_lifecycle.get("CONTAINER_KEY_FINGERPRINTS", "").split(",")
+            != target_fingerprints
+        ):
+            raise LifecycleValidationError(
+                "SSH_KEY_SYNC_POSTCONDITION_FAILED",
+                "lifecycle state did not commit the synchronized key set",
+            )
+        _managed_container_security(
+            {**payload, "name": payload["container_name"]}, require_running=True
+        )
+        if (
+            _installed_key_fingerprints(
+                PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys",
+                int(payload["uid"]),
+                int(payload["gid"]),
+            )
+            != target_fingerprints
+        ):
+            raise LifecycleValidationError(
+                "SSH_KEY_SYNC_POSTCONDITION_FAILED",
+                "running Container does not expose the synchronized key set",
+            )
+        return {
+            "status": "SUCCEEDED",
+            "handler": "ssh_key.sync_active_container",
+            "sync_operation_id": payload["sync_operation_id"],
+            "managed_user_id": payload["managed_user_id"],
+            "username": payload["username"],
+            "container_name": payload["container_name"],
+            "container_state": "RUNNING",
+            "container_key_fingerprints": target_fingerprints,
+            "host_authorized_keys": "ABSENT",
+            "rollback_status": "NOT_REQUIRED",
+            "idempotent_replay": False,
+        }
+    except (LifecycleValidationError, OSError) as exc:
+        rollback_status = "NOT_REQUIRED"
+        if transition_started and original_lifecycle is not None and current_records:
+            try:
+                _replace_active_container_keys(
+                    payload, current_records, target_fingerprints, current_fingerprints
+                )
+                _commit_managed_lifecycle_values(str(payload["username"]), original_lifecycle)
+                if (
+                    _installed_key_fingerprints(
+                        PILOT_DATA_ROOT / str(payload["username"]) / "home/.ssh/authorized_keys",
+                        int(payload["uid"]),
+                        int(payload["gid"]),
+                    )
+                    != current_fingerprints
+                ):
+                    raise LifecycleValidationError(
+                        "SSH_KEY_SYNC_ROLLBACK_FAILED", "previous key set was not restored"
+                    )
+                rollback_status = "ROLLED_BACK"
+            except LifecycleValidationError, OSError:
+                rollback_status = "REQUIRES_MANUAL_REVIEW"
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": getattr(exc, "code", "SSH_KEY_SYNC_FAILED"),
+                "message": str(exc)[:512],
+            },
+            "rollback_status": rollback_status,
+        }
+
+
 def build_user_stage_argv(payload: dict[str, Any]) -> list[str]:
     """Build the fixed future real-write argv; no public-key option exists."""
     return [
@@ -10448,6 +10740,8 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
                 return _prepare_ssh_key_record(request, payload)
             if request.operation_type == "ssh_key.discard":
                 return _discard_ssh_key_record(request, payload)
+            if request.operation_type == "ssh_key.sync_active_container":
+                return _execute_active_container_key_sync(request, payload)
             if request.operation_type == "container.start" and set(payload) != {"name"}:
                 return _execute_managed_container_start(request, payload)
             return {

@@ -8,6 +8,7 @@ import {
   activateSelfCompute,
   ApiError,
   enrollSshKey,
+  syncActiveContainerSshKeys,
   sshKeys,
   type SshKeyRecord,
 } from "../lib/api";
@@ -139,6 +140,7 @@ export function SshKeyEnrollment({
   const [importConfirmed, setImportConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [activating, setActivating] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const keysQuery = useQuery({
@@ -152,6 +154,9 @@ export function SshKeyEnrollment({
   );
   const validContainerKeys = validKeys.filter(
     (key) => key.scope === "CONTAINER",
+  );
+  const pendingContainerKeys = validContainerKeys.filter(
+    (key) => key.state === "VALIDATED",
   );
 
   function resetFlow(nextMode: EnrollmentMode) {
@@ -244,6 +249,7 @@ export function SshKeyEnrollment({
     if (!generated || !privateDownloaded || !privateSaved) return;
     setBusy(true);
     setError(null);
+    let enrolled = false;
     try {
       await enrollSshKey(userId, {
         key_type: generated.keyType,
@@ -254,19 +260,36 @@ export function SshKeyEnrollment({
         client_fingerprint_sha256: generated.fingerprintSha256,
         confirmed_private_key_saved: true,
       });
+      enrolled = true;
+      if (containerOnly && computeState === "ACTIVE") {
+        await syncActiveContainerSshKeys(userId, {
+          idempotency_key: randomUuid(),
+        });
+      }
       setGenerated(null);
       setPrivateSaved(false);
       setPrivateDownloaded(false);
       setMode("idle");
       setMessage(
-        t("SSH 公钥已验证；私钥未发送到服务器，authorized_keys 尚未安装。"),
+        containerOnly && computeState === "ACTIVE"
+          ? t("SSH 公钥已验证并安装到运行中的开发容器；私钥未发送到服务器。")
+          : t("SSH 公钥已验证；私钥未发送到服务器，authorized_keys 尚未安装。"),
       );
       await refreshAfterEnrollment();
     } catch (caught) {
+      if (enrolled) {
+        setGenerated(null);
+        setPrivateSaved(false);
+        setPrivateDownloaded(false);
+        setMode("idle");
+        await refreshAfterEnrollment();
+      }
       setError(
         caught instanceof ApiError
           ? `${caught.code}: ${t(caught.message)}`
-          : t("SSH 公钥登记失败"),
+          : enrolled
+            ? t("SSH 公钥已验证，但安装到运行中容器失败；请点击重试安装。")
+            : t("SSH 公钥登记失败"),
       );
     } finally {
       setBusy(false);
@@ -277,6 +300,7 @@ export function SshKeyEnrollment({
     if (!imported || !importConfirmed) return;
     setBusy(true);
     setError(null);
+    let enrolled = false;
     try {
       await enrollSshKey(userId, {
         key_type: imported.keyType as
@@ -288,21 +312,66 @@ export function SshKeyEnrollment({
         client_fingerprint_sha256: imported.fingerprintSha256,
         confirmed_public_key: true,
       });
+      enrolled = true;
+      if (containerOnly && computeState === "ACTIVE") {
+        await syncActiveContainerSshKeys(userId, {
+          idempotency_key: randomUuid(),
+        });
+      }
       setImportText("");
       setImported(null);
       setImportConfirmed(false);
       setMode("idle");
       setMessage(
-        t("SSH 公钥已验证；平台没有接收私钥，authorized_keys 尚未安装。"),
+        containerOnly && computeState === "ACTIVE"
+          ? t("SSH 公钥已验证并安装到运行中的开发容器；平台没有接收私钥。")
+          : t("SSH 公钥已验证；平台没有接收私钥，authorized_keys 尚未安装。"),
       );
+      await refreshAfterEnrollment();
+    } catch (caught) {
+      if (enrolled) {
+        setImportText("");
+        setImported(null);
+        setImportConfirmed(false);
+        setMode("idle");
+        await refreshAfterEnrollment();
+      }
+      setError(
+        caught instanceof ApiError
+          ? `${caught.code}: ${t(caught.message)}`
+          : enrolled
+            ? t("SSH 公钥已验证，但安装到运行中容器失败；请点击重试安装。")
+            : t("SSH 公钥登记失败"),
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function syncPendingContainerKeys() {
+    if (
+      !containerOnly ||
+      computeState !== "ACTIVE" ||
+      !pendingContainerKeys.length
+    )
+      return;
+    setBusy(true);
+    setSyncing(true);
+    setError(null);
+    try {
+      await syncActiveContainerSshKeys(userId, {
+        idempotency_key: randomUuid(),
+      });
+      setMessage(t("新增 SSH 公钥已安装到运行中的开发容器。"));
       await refreshAfterEnrollment();
     } catch (caught) {
       setError(
         caught instanceof ApiError
           ? `${caught.code}: ${t(caught.message)}`
-          : t("SSH 公钥登记失败"),
+          : t("SSH 公钥安装失败；原有可用密钥保持不变。"),
       );
     } finally {
+      setSyncing(false);
       setBusy(false);
     }
   }
@@ -413,6 +482,29 @@ export function SshKeyEnrollment({
         <div className="error-box">{t("SSH Key 记录暂时不可用。")}</div>
       ) : null}
       <KeyTable keys={keys} />
+
+      {containerOnly &&
+      computeState === "ACTIVE" &&
+      pendingContainerKeys.length > 0 ? (
+        <section className="activate-compute" data-testid="active-key-sync">
+          <div>
+            <h3>{t("安装新增密钥")}</h3>
+            <p className="muted">
+              {t(
+                "新增公钥已验证但尚未安装。同步只会原子更新你自己的运行中开发容器，不会启用宿主 SSH。",
+              )}
+            </p>
+          </div>
+          <Button
+            tone="primary"
+            type="button"
+            disabled={busy}
+            onClick={() => void syncPendingContainerKeys()}
+          >
+            {syncing ? t("正在安装…") : t("安装新增密钥")}
+          </Button>
+        </section>
+      ) : null}
 
       {mode === "idle" ? (
         <div className="ssh-enrollment-empty">

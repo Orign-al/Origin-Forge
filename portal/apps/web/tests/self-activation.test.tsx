@@ -12,6 +12,7 @@ import { SshKeyEnrollment } from "../components/SshKeyEnrollment";
 import {
   activateSelfCompute,
   enrollSshKey,
+  syncActiveContainerSshKeys,
   sshKeys,
   type SelfComputeActivationResult,
   type SshKeyList,
@@ -27,6 +28,7 @@ vi.mock("../lib/api", async (importOriginal) => {
     ...actual,
     activateSelfCompute: vi.fn(),
     enrollSshKey: vi.fn(),
+    syncActiveContainerSshKeys: vi.fn(),
     sshKeys: vi.fn(),
   };
 });
@@ -216,6 +218,13 @@ describe("owner-bound Container activation", () => {
 
   it("does not offer activation once the environment is ACTIVE", async () => {
     vi.mocked(sshKeys).mockResolvedValue(keyList());
+    vi.mocked(syncActiveContainerSshKeys).mockResolvedValue({
+      status: "INSTALLED",
+      operation_id: "10000000-0000-4000-8000-000000000005",
+      container_state: "RUNNING",
+      key_fingerprints: ["SHA256:owner-container-key"],
+      idempotent_replay: false,
+    });
     renderEnrollment({ computeState: "ACTIVE" });
 
     expect(
@@ -224,5 +233,15 @@ describe("owner-bound Container activation", () => {
     expect(
       screen.queryByRole("button", { name: "激活计算环境" }),
     ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "安装新增密钥" }));
+    await waitFor(() =>
+      expect(syncActiveContainerSshKeys).toHaveBeenCalledWith(USER_ID, {
+        idempotency_key: "10000000-0000-4000-8000-000000000004",
+      }),
+    );
+    expect(
+      await screen.findByText("新增 SSH 公钥已安装到运行中的开发容器。"),
+    ).toBeInTheDocument();
   });
 });

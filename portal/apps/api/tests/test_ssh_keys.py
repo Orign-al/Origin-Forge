@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from fastapi import Request
+from h100_portal_api.auth import AuthContext
 from h100_portal_api.enums import (
     AccountState,
     OnboardingState,
@@ -12,8 +14,10 @@ from h100_portal_api.enums import (
     PasswordState,
     RiskLevel,
 )
+from h100_portal_api.lease_service import create_lease
 from h100_portal_api.models import (
     PortalAuditEvent,
+    PortalContainer,
     PortalManagedUser,
     PortalOperation,
     PortalPasswordCredential,
@@ -23,6 +27,7 @@ from h100_portal_api.models import (
     utcnow,
 )
 from h100_portal_api.routes import ssh_keys as ssh_key_routes
+from h100_portal_api.schemas import SshKeySyncRequest
 from h100_portal_api.security import hash_password
 from h100_portal_api.ssh_keys import validate_ssh_public_key
 from sqlalchemy import select
@@ -644,3 +649,140 @@ def test_five_active_keys_enforce_limit_before_worker(
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "SSH_KEY_LIMIT_REACHED"
+
+
+def test_active_owner_syncs_new_container_key_through_worker(
+    database: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    user, managed = _staged_user(
+        database,
+        login="active-key-owner",
+        unix_username="active-key-owner",
+        uid=20009,
+        gid=20009,
+        project_id=30009,
+        container_port=22031,
+    )
+    user.resource_onboarding_state = OnboardingState.ACTIVE
+    managed.onboarding_state = OnboardingState.ACTIVE
+    managed.compute_environment_state = "ACTIVE"
+    managed.host_access_state = "DISABLED_BY_PLATFORM_POLICY"
+    managed.ssh_key_state = "INSTALLED"
+    managed.ssh_key_count = 2
+    managed.compute_activated_at = utcnow()
+    first = _existing_record(
+        database,
+        user=user,
+        managed=managed,
+        fingerprint="SHA256:activeOwnerCurrentKey",
+        state="INSTALLED",
+    )
+    first.scope = "CONTAINER"
+    first.host_install_state = "NOT_INSTALLED"
+    first.container_install_state = "INSTALLED"
+    second = _existing_record(
+        database,
+        user=user,
+        managed=managed,
+        fingerprint="SHA256:activeOwnerNewKey",
+        state="VALIDATED",
+    )
+    second.scope = "CONTAINER"
+    second.host_install_state = "NOT_INSTALLED"
+    second.container_install_state = "NOT_INSTALLED"
+    container = PortalContainer(
+        managed_user_id=managed.id,
+        owner_managed_user_id=managed.id,
+        name=managed.container_name,
+        image_digest="sha256:" + "a" * 64,
+        ssh_port=managed.container_port,
+        desired_state="RUNNING",
+        observed_state="RUNNING",
+        development_profile="STANDARD_8CPU_32GB",
+        gpu_count=0,
+        safe_spec={
+            "gpu": "NONE",
+            "privileged": False,
+            "host_network": False,
+            "host_pid": False,
+            "host_ipc": False,
+            "docker_socket": False,
+        },
+    )
+    lease = create_lease(
+        managed_user_id=managed.id,
+        starts_at=utcnow(),
+        duration_seconds=96 * 60 * 60,
+        gpu_count=0,
+        approved_by=user.id,
+        state="ACTIVE",
+    )
+    database.add_all([container, lease])
+    database.commit()
+    observed: dict[str, object] = {"worker_calls": 0}
+
+    def worker(operation: str, *, payload: dict[str, object], **_kwargs: object):  # type: ignore[no-untyped-def]
+        observed["worker_calls"] = int(observed["worker_calls"]) + 1
+        observed["operation"] = operation
+        observed["payload"] = payload
+        return {
+            "status": "SUCCEEDED",
+            "handler": "ssh_key.sync_active_container",
+            "sync_operation_id": payload["sync_operation_id"],
+            "managed_user_id": str(managed.id),
+            "username": managed.unix_username,
+            "container_name": container.name,
+            "container_state": "RUNNING",
+            "container_key_fingerprints": payload["ssh_key_fingerprints"],
+            "host_authorized_keys": "ABSENT",
+            "rollback_status": "NOT_REQUIRED",
+            "idempotent_replay": False,
+            "worker_request_id": "active-key-sync-worker-test",
+        }
+
+    monkeypatch.setattr(ssh_key_routes, "call_worker", worker)
+    monkeypatch.setattr(ssh_key_routes, "require_session_csrf", lambda *_args: None)
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": f"/api/v1/users/{user.id}/ssh-keys/sync",
+            "headers": [(b"user-agent", b"pytest")],
+            "client": ("127.0.0.1", 12345),
+            "server": ("127.0.0.1", 18080),
+            "scheme": "http",
+            "query_string": b"",
+        }
+    )
+    sync_request = SshKeySyncRequest(idempotency_key=uuid.uuid4())
+    response = ssh_key_routes.sync_active_container_ssh_keys(
+        str(user.id),
+        sync_request,
+        request,
+        AuthContext(user, None, ""),
+        database,
+    )
+    assert response["status"] == "INSTALLED"
+    assert observed["operation"] == "ssh_key.sync_active_container"
+    payload = observed["payload"]
+    assert isinstance(payload, dict)
+    assert payload["owner_login"] == "active-key-owner"
+    assert payload["current_ssh_key_record_ids"] == [str(first.id)]
+    assert payload["ssh_key_record_ids"] == [str(first.id), str(second.id)]
+    database.expire_all()
+    installed = database.get(PortalSshKey, second.id)
+    assert installed is not None
+    assert installed.state == "INSTALLED"
+    assert installed.container_install_state == "INSTALLED"
+    assert installed.host_install_state == "NOT_INSTALLED"
+    replay = ssh_key_routes.sync_active_container_ssh_keys(
+        str(user.id),
+        sync_request,
+        request,
+        AuthContext(user, None, ""),
+        database,
+    )
+    assert replay["status"] == "INSTALLED"
+    assert replay["idempotent_replay"] is True
+    assert observed["worker_calls"] == 1
