@@ -10,6 +10,7 @@ import os
 import pwd
 import re
 import secrets
+import shlex
 import stat
 import struct
 import subprocess
@@ -9160,7 +9161,7 @@ def _gpu_allocation_terminal_binding(payload: dict[str, Any], job_id: int) -> No
             "-P",
             "-j",
             str(job_id),
-            "--format=JobIDRaw,User,Account,QOS,Partition,State,ReqTRES,AllocTRES,Comment",
+            "--format=JobIDRaw,JobName,User,Account,QOS,Partition,State,ReqTRES,AllocTRES,Comment,SubmitLine",
         ],
         timeout=15,
     )
@@ -9168,7 +9169,7 @@ def _gpu_allocation_terminal_binding(payload: dict[str, Any], job_id: int) -> No
     if accounting.get("ok"):
         for raw_line in str(accounting.get("stdout", "")).splitlines():
             fields = raw_line.rstrip("\n").split("|")
-            if len(fields) == 10 and fields[-1] == "" and fields[0] == str(job_id):
+            if len(fields) == 12 and fields[-1] == "" and fields[0] == str(job_id):
                 rows.append(fields[:-1])
     if len(rows) != 1:
         raise LifecycleValidationError(
@@ -9177,6 +9178,7 @@ def _gpu_allocation_terminal_binding(payload: dict[str, Any], job_id: int) -> No
         )
     (
         _job_id,
+        job_name,
         owner,
         account,
         qos,
@@ -9185,6 +9187,7 @@ def _gpu_allocation_terminal_binding(payload: dict[str, Any], job_id: int) -> No
         requested_tres,
         allocated_tres,
         comment,
+        submit_line,
     ) = rows[0]
     lease_prefix = f"h100-gpu-dev:{payload['managed_user_id']}:"
     lease_suffix = comment.removeprefix(lease_prefix)
@@ -9193,15 +9196,55 @@ def _gpu_allocation_terminal_binding(payload: dict[str, Any], job_id: int) -> No
         comment_is_bound = (
             comment.startswith(lease_prefix) and str(uuid.UUID(lease_suffix)) == lease_suffix
         )
-    typed_gpu = re.compile(r"(?:^|,)gres/gpu:h100=1(?:,|$)")
+    try:
+        submit_args = shlex.split(submit_line)
+    except ValueError:
+        submit_args = []
+    submit_comment_is_bound = False
+    for argument in submit_args:
+        if not argument.startswith(f"--comment={lease_prefix}"):
+            continue
+        submit_lease = argument.removeprefix(f"--comment={lease_prefix}")
+        with suppress(ValueError):
+            submit_comment_is_bound = str(uuid.UUID(submit_lease)) == submit_lease
+    required_submit_args = {
+        "--parsable",
+        f"--account={payload['slurm_account']}",
+        f"--qos={payload['slurm_qos']}",
+        "--partition=gpu-dev",
+        f"--job-name=portal-gpu-dev-{payload['uid']}",
+        "--cpus-per-task=8",
+        "--mem=32768M",
+        "--gres=gpu:h100:1",
+        f"--chdir={payload['workspace_path']}",
+        "--export=ALL",
+    }
+    submit_is_bound = bool(
+        submit_args
+        and submit_args[0] == BINARIES["sbatch"]
+        and submit_comment_is_bound
+        and required_submit_args.issubset(set(submit_args[1:]))
+    )
+    # AccountingStoreJobComment is not enabled on every supported Slurm
+    # installation.  In that configuration sacct leaves Comment empty while
+    # retaining the immutable SubmitLine.  Accept only that exact fallback;
+    # a non-empty but different Comment remains a hard ownership failure.
+    terminal_comment_is_bound = comment_is_bound if comment else submit_is_bound
+    one_gpu = re.compile(r"(?:^|,)gres/gpu(?::h100)?=1(?:,|$)")
+    typed_one_gpu = re.compile(r"(?:^|,)gres/gpu:h100=1(?:,|$)")
+    submission_contract_is_bound = submit_is_bound or (
+        comment_is_bound and typed_one_gpu.search(requested_tres) is not None
+    )
     if (
-        owner != payload["username"]
+        job_name != f"portal-gpu-dev-{payload['uid']}"
+        or owner != payload["username"]
         or account != payload["slurm_account"]
         or qos != payload["slurm_qos"]
         or partition != "gpu-dev"
-        or not comment_is_bound
-        or typed_gpu.search(requested_tres) is None
-        or typed_gpu.search(allocated_tres) is None
+        or not terminal_comment_is_bound
+        or not submission_contract_is_bound
+        or one_gpu.search(requested_tres) is None
+        or one_gpu.search(allocated_tres) is None
     ):
         raise LifecycleValidationError(
             "GPU_ALLOCATION_OWNERSHIP_REJECTED",

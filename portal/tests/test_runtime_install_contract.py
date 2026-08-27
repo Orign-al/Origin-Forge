@@ -106,6 +106,9 @@ def test_gpu_development_runtime_and_fail_safe_epilog_are_integrity_bound() -> N
 
     runtime_text = runtime.read_text()
     epilog_text = epilog.read_text()
+    assert "ACTIVATING or ACTIVE state" in runtime_text
+    assert "Lease must remain NOT_STARTED during activation" in runtime_text
+    assert "Lease timestamps started before activation succeeded" in runtime_text
     assert (
         runtime_text.index("h100_acquire_lock")
         < runtime_text.index("validate_live_slurm_allocation")

@@ -42,20 +42,19 @@ lifecycle_value() {
 }
 
 validate_gpu_lifecycle() {
-  local lease_start lease_expires lease_start_epoch lease_expires_epoch now_epoch
+  local lifecycle_status lease_state lease_start lease_expires
+  local lease_start_epoch lease_expires_epoch now_epoch
   [[ -f "${state_file}" && ! -L "${state_file}" ]] \
     || h100_fail 'GPU Development lifecycle state is unavailable'
   [[ "$(stat -c '%U:%G:%a' "${state_file}")" == 'root:gpu-platform-admin:640' ]] \
     || h100_fail 'GPU Development lifecycle state metadata is invalid'
   [[ "$(lifecycle_value VERSION)" == 4 \
-    && "$(lifecycle_value STATUS)" == ACTIVE \
     && "$(lifecycle_value USERNAME)" == "${user_name}" \
     && "$(lifecycle_value UID)" == "${user_uid}" \
     && "$(lifecycle_value GID)" == "$(id -g "${user_name}")" \
     && "$(lifecycle_value DEVELOPMENT_PROFILE)" == GPU_1_8CPU_32GB \
     && "$(lifecycle_value WORKSPACE_PATH)" == "${workspace}" \
-    && "$(lifecycle_value SSH_KEY_STATE)" == INSTALLED \
-    && "$(lifecycle_value LEASE_STATE)" == ACTIVE ]] \
+    && "$(lifecycle_value SSH_KEY_STATE)" == INSTALLED ]] \
     || h100_fail 'GPU Development lifecycle owner or profile binding changed'
   [[ "$(lifecycle_value LEASE_ID)" =~ \
     ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] \
@@ -63,7 +62,23 @@ validate_gpu_lifecycle() {
   [[ "$(lifecycle_value GPU_ALLOCATION_JOB_ID)" == "${slurm_job_id}" \
     && "$(lifecycle_value GPU_ALLOCATION_UUID)" == "${gpu_uuid}" ]] \
     || h100_fail 'GPU Development lifecycle allocation binding changed'
-  if [[ "${action}" == start ]]; then
+
+  lifecycle_status="$(lifecycle_value STATUS)"
+  lease_state="$(lifecycle_value LEASE_STATE)"
+  [[ "${lifecycle_status}" == ACTIVATING || "${lifecycle_status}" == ACTIVE ]] \
+    || h100_fail 'GPU Development Container start requires ACTIVATING or ACTIVE state'
+  if [[ "${lifecycle_status}" == ACTIVATING ]]; then
+    [[ "$(lifecycle_value ACTIVATION_OPERATION_ID)" =~ \
+      ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] \
+      || h100_fail 'GPU Development activation operation binding is invalid'
+    [[ "${lease_state}" == NOT_STARTED ]] \
+      || h100_fail 'GPU Development Lease must remain NOT_STARTED during activation'
+    [[ -z "$(lifecycle_value LEASE_START)" \
+      && -z "$(lifecycle_value LEASE_EXPIRES)" ]] \
+      || h100_fail 'GPU Development Lease timestamps started before activation succeeded'
+  elif [[ "${action}" == start ]]; then
+    [[ "${lease_state}" == ACTIVE ]] \
+      || h100_fail 'GPU Development Container start requires an active Lease'
     lease_start="$(lifecycle_value LEASE_START)"
     lease_expires="$(lifecycle_value LEASE_EXPIRES)"
     lease_start_epoch="$(date -u -d "${lease_start}" +%s 2>/dev/null)" \

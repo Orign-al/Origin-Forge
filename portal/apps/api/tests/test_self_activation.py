@@ -652,6 +652,104 @@ def test_activation_failure_rolls_back_and_does_not_start_lease(
     assert operation.rollback_status == "ROLLED_BACK"
 
 
+def test_owner_retry_reconciles_unresolved_activation_before_new_worker_activation(
+    client: Any,
+    database: Session,
+    origin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _staged_activation(
+        database,
+        login="gpu-reconciliation-user",
+        username="gpu-reconciliation-user",
+        uid=20013,
+        development_profile="GPU_1_8CPU_32GB",
+    )
+    headers = _login(client, origin_headers, target.user.normalized_login)
+    calls: list[tuple[str, str]] = []
+    first_activation = True
+    first_rollback = True
+
+    def worker(operation: str, **kwargs: Any) -> dict[str, Any]:
+        nonlocal first_activation, first_rollback
+        payload = kwargs["payload"]
+        calls.append((operation, str(payload["activation_operation_id"])))
+        if operation == "compute.activate.self.rollback":
+            if first_rollback:
+                first_rollback = False
+                return {
+                    "status": "ERROR",
+                    "error": {"code": "GPU_ALLOCATION_TERMINAL_UNPROVEN"},
+                    "rollback_status": "REQUIRES_MANUAL_REVIEW",
+                }
+            return {
+                "status": "SUCCEEDED",
+                "handler": operation,
+                "activation_operation_id": payload["activation_operation_id"],
+                "managed_user_id": payload["managed_user_id"],
+                "username": payload["username"],
+                "container_state": "STOPPED",
+                "host_authorized_keys": "ABSENT",
+                "container_authorized_keys": "ABSENT",
+                "lease_state": "NOT_STARTED",
+                "rollback_status": "ROLLED_BACK",
+            }
+        if first_activation:
+            first_activation = False
+            return {
+                "status": "ERROR",
+                "error": {"code": "CONTAINER_START_FAILED", "message": "safe failure"},
+                "rollback_status": "REQUIRES_MANUAL_REVIEW",
+            }
+        return _worker_success([])(operation, **kwargs)
+
+    monkeypatch.setattr(activation_routes, "call_worker", worker)
+
+    failed_response = _activate(client, headers)
+    assert failed_response.status_code == 409
+    assert failed_response.json()["detail"]["code"] == "CONTAINER_START_FAILED"
+    database.expire_all()
+    failed = database.scalar(
+        select(PortalOperation).where(
+            PortalOperation.operation_type == "compute.activate.self",
+            PortalOperation.status == OperationStatus.FAILED,
+        )
+    )
+    container = database.get(PortalContainer, target.container.id)
+    assert failed is not None and failed.rollback_status == "UNKNOWN"
+    assert container is not None and container.observed_state == "UNKNOWN"
+
+    recovered_response = _activate(client, headers)
+    assert recovered_response.status_code == 200
+    assert recovered_response.json()["status"] == "ACTIVE"
+    assert [call[0] for call in calls] == [
+        "compute.activate.self",
+        "compute.activate.self.rollback",
+        "compute.activate.self.rollback",
+        "compute.activate.self",
+    ]
+    assert calls[2][1] == str(failed.id)
+    assert calls[3][1] != str(failed.id)
+
+    database.expire_all()
+    assert database.get(PortalOperation, failed.id).rollback_status == "ROLLED_BACK"
+    succeeded = database.scalar(
+        select(PortalOperation).where(
+            PortalOperation.operation_type == "compute.activate.self",
+            PortalOperation.status == OperationStatus.SUCCEEDED,
+        )
+    )
+    container = database.get(PortalContainer, target.container.id)
+    assert succeeded is not None
+    assert container is not None and container.observed_state == "RUNNING"
+    audit = database.scalar(
+        select(PortalAuditEvent).where(
+            PortalAuditEvent.event_type == "COMPUTE_SELF_ACTIVATION_RECONCILED"
+        )
+    )
+    assert audit is not None and audit.actor == target.user.normalized_login
+
+
 def test_preflight_failure_with_no_worker_mutation_does_not_run_redundant_rollback(
     client: Any,
     database: Session,

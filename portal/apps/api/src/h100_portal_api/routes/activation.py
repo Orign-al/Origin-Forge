@@ -373,6 +373,156 @@ def _rollback_worker(
         }
 
 
+def _reconcile_prior_failed_activation(
+    db: Session,
+    request: Request,
+    context: AuthContext,
+    managed: PortalManagedUser,
+) -> PortalManagedUser:
+    """Retry one unresolved owner-bound rollback through the formal Portal path."""
+
+    failed = db.scalar(
+        select(PortalOperation)
+        .where(
+            PortalOperation.owner_managed_user_id == managed.id,
+            PortalOperation.operation_type == "compute.activate.self",
+            PortalOperation.status == OperationStatus.FAILED,
+            PortalOperation.rollback_status.notin_({"NOT_REQUIRED", "ROLLED_BACK"}),
+        )
+        .order_by(PortalOperation.created_at.desc())
+        .with_for_update()
+    )
+    if failed is None:
+        return managed
+    payload = failed.validated_payload if isinstance(failed.validated_payload, dict) else {}
+    if (
+        payload.get("activation_operation_id") != str(failed.id)
+        or payload.get("managed_user_id") != str(managed.id)
+        or payload.get("portal_account_id") != str(context.user.id)
+        or payload.get("owner_login") != context.user.normalized_login
+        or payload.get("username") != managed.unix_username
+        or payload.get("container_name") != managed.container_name
+    ):
+        raise _error(
+            409,
+            "ACTIVATION_RECONCILIATION_BINDING_REJECTED",
+            "上次激活记录无法安全绑定到当前账号",
+        )
+
+    failed_id = failed.id
+    managed_id = managed.id
+    # Release the owner row lock before the bounded Root Worker request.  The
+    # rollback idempotency key remains bound to the original failed operation.
+    db.commit()
+    rollback = _rollback_worker(context, failed, dict(payload))
+
+    managed = db.scalar(
+        select(PortalManagedUser)
+        .where(
+            PortalManagedUser.id == managed_id,
+            PortalManagedUser.portal_user_id == context.user.id,
+        )
+        .with_for_update()
+    )
+    recovered = db.scalar(
+        select(PortalOperation).where(PortalOperation.id == failed_id).with_for_update()
+    )
+    if managed is None or recovered is None:
+        db.rollback()
+        raise _error(
+            409,
+            "ACTIVATION_RECONCILIATION_STATE_CHANGED",
+            "激活回滚期间账号状态发生变化",
+        )
+    if recovered.rollback_status in {"NOT_REQUIRED", "ROLLED_BACK"}:
+        return managed
+
+    rollback_ok = (
+        rollback.get("status") == "SUCCEEDED"
+        and rollback.get("handler") == "compute.activate.self.rollback"
+        and rollback.get("activation_operation_id") == str(failed_id)
+        and rollback.get("managed_user_id") == str(managed_id)
+        and rollback.get("username") == managed.unix_username
+        and rollback.get("container_state") == "STOPPED"
+        and rollback.get("host_authorized_keys") == "ABSENT"
+        and rollback.get("container_authorized_keys") == "ABSENT"
+        and rollback.get("lease_state") == "NOT_STARTED"
+        and rollback.get("rollback_status") == "ROLLED_BACK"
+    )
+    if not rollback_ok:
+        recovered.rollback_status = "REQUIRES_MANUAL_REVIEW"
+        db.add(
+            PortalOperationEvent(
+                operation_id=recovered.id,
+                from_status=OperationStatus.FAILED,
+                to_status=OperationStatus.FAILED,
+                safe_message="Owner retry could not prove activation rollback",
+                created_at=utcnow(),
+            )
+        )
+        db.commit()
+        raise _error(
+            409,
+            "ACTIVATION_RECONCILIATION_REQUIRED",
+            "上次激活尚未完成安全回滚；Lease 未启动",
+        )
+
+    container = db.scalar(
+        select(PortalContainer)
+        .where(PortalContainer.owner_managed_user_id == managed_id)
+        .with_for_update()
+    )
+    if container is None:
+        recovered.rollback_status = "REQUIRES_MANUAL_REVIEW"
+        db.commit()
+        raise _error(
+            409,
+            "ACTIVATION_RECONCILIATION_STATE_CHANGED",
+            "激活回滚后容器记录不完整",
+        )
+    recovered.rollback_status = "ROLLED_BACK"
+    container.desired_state = "STOPPED"
+    container.observed_state = "STOPPED"
+    container.gpu_allocation_job_id = None
+    container.gpu_allocation_uuid = None
+    db.add(
+        PortalOperationEvent(
+            operation_id=recovered.id,
+            from_status=OperationStatus.FAILED,
+            to_status=OperationStatus.FAILED,
+            safe_message="Owner retry proved prior activation rollback",
+            created_at=utcnow(),
+        )
+    )
+    _audit(
+        db,
+        request,
+        context,
+        event_type="COMPUTE_SELF_ACTIVATION_RECONCILED",
+        operation_id=recovered.id,
+        managed_user_id=managed_id,
+        result="SUCCESS",
+        metadata={
+            "rollback_result": "ROLLED_BACK",
+            "lease_started": False,
+            "host_access": "DISABLED",
+        },
+    )
+    db.commit()
+    relocked = db.scalar(
+        select(PortalManagedUser)
+        .where(
+            PortalManagedUser.id == managed_id,
+            PortalManagedUser.portal_user_id == context.user.id,
+        )
+        .with_for_update()
+    )
+    if relocked is None:
+        db.rollback()
+        raise _error(409, "MANAGED_IDENTITY_NOT_FOUND", "当前账号没有受管计算身份")
+    return relocked
+
+
 def _record_failure(
     db: Session,
     request: Request,
@@ -516,6 +666,7 @@ def activate_self_compute(
         raise _error(409, "IDEMPOTENCY_CONFLICT", "幂等键已用于其他操作")
     execute_operation = False
     if operation is None:
+        managed = _reconcile_prior_failed_activation(db, request, context, managed)
         in_flight = db.scalar(
             select(PortalOperation).where(
                 PortalOperation.owner_managed_user_id == managed.id,

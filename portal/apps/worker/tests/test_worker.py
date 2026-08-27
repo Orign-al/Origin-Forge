@@ -2926,10 +2926,11 @@ def test_gpu_allocation_cancel_accepts_only_owner_bound_terminal_replay(
         return {
             "ok": True,
             "stdout": (
-                f"{job_id}|{owner}|company|general|gpu-dev|CANCELLED by 0|"
+                f"{job_id}|portal-gpu-dev-{payload['uid']}|{owner}|company|general|"
+                "gpu-dev|CANCELLED by 0|"
                 "billing=8,cpu=8,gres/gpu:h100=1|"
                 "billing=8,cpu=8,gres/gpu:h100=1|"
-                f"h100-gpu-dev:{payload['managed_user_id']}:{lease_id}|\n"
+                f"h100-gpu-dev:{payload['managed_user_id']}:{lease_id}||\n"
             ),
         }
 
@@ -2962,10 +2963,11 @@ def test_gpu_allocation_cancel_waits_for_accounting_terminal_proof(
         return {
             "ok": True,
             "stdout": (
-                f"{job_id}|{payload['username']}|company|general|gpu-dev|{state}|"
+                f"{job_id}|portal-gpu-dev-{payload['uid']}|{payload['username']}|"
+                f"company|general|gpu-dev|{state}|"
                 "billing=8,cpu=8,gres/gpu:h100=1|"
                 "billing=8,cpu=8,gres/gpu:h100=1|"
-                f"h100-gpu-dev:{payload['managed_user_id']}:{payload['lease_id']}|\n"
+                f"h100-gpu-dev:{payload['managed_user_id']}:{payload['lease_id']}||\n"
             ),
         }
 
@@ -2974,6 +2976,52 @@ def test_gpu_allocation_cancel_waits_for_accounting_terminal_proof(
 
     handlers._cancel_gpu_development_allocation(payload, job_id)
     assert cancelled == [job_id]
+
+
+def test_gpu_allocation_terminal_accepts_slurm_submit_line_when_comment_is_not_stored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = managed_container_lifecycle_payload(development_profile="GPU_1_8CPU_32GB")
+    job_id = 701
+    submit_line = " ".join(
+        [
+            "/usr/bin/sbatch",
+            "--parsable",
+            f"--account={payload['slurm_account']}",
+            f"--qos={payload['slurm_qos']}",
+            "--partition=gpu-dev",
+            f"--job-name=portal-gpu-dev-{payload['uid']}",
+            "--cpus-per-task=8",
+            "--mem=32768M",
+            "--gres=gpu:h100:1",
+            f"--chdir={payload['workspace_path']}",
+            "--export=ALL",
+            f"--comment=h100-gpu-dev:{payload['managed_user_id']}:{payload['lease_id']}",
+            "--wrap=/usr/bin/sleep infinity",
+        ]
+    )
+
+    monkeypatch.setattr(
+        handlers,
+        "run_fixed",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "stdout": (
+                f"{job_id}|portal-gpu-dev-{payload['uid']}|{payload['username']}|"
+                "company|general|gpu-dev|CANCELLED by 20001|"
+                "billing=8,cpu=8,gres/gpu=1,mem=32G,node=1|"
+                "billing=8,cpu=8,gres/gpu=1,mem=32G,node=1||"
+                f"{submit_line}|\n"
+            ),
+        },
+    )
+
+    handlers._gpu_allocation_terminal_binding(payload, job_id)
+
+    mismatched = {**payload, "uid": int(payload["uid"]) + 1}
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._gpu_allocation_terminal_binding(mismatched, job_id)
+    assert rejected.value.code == "GPU_ALLOCATION_OWNERSHIP_REJECTED"
 
 
 def test_container_lifecycle_rejects_incomplete_or_oversized_lease_window() -> None:
