@@ -109,6 +109,8 @@ def test_gpu_development_runtime_and_fail_safe_epilog_are_integrity_bound() -> N
     assert "ACTIVATING or ACTIVE state" in runtime_text
     assert "Lease must remain NOT_STARTED during activation" in runtime_text
     assert "Lease timestamps started before activation succeeded" in runtime_text
+    assert '-v expected_index="${gpu_indexes[0]}"' in runtime_text
+    assert "-v index=" not in runtime_text
     assert (
         runtime_text.index("h100_acquire_lock")
         < runtime_text.index("validate_live_slurm_allocation")

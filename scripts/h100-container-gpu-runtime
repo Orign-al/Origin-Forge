@@ -122,8 +122,8 @@ validate_live_slurm_allocation() {
     || h100_fail 'assigned Slurm allocation does not hold exactly one GPU'
   allocated_uuid="$(
     nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits \
-      | awk -F, -v index="${gpu_indexes[0]}" '
-          $1 ~ "^[[:space:]]*" index "[[:space:]]*$" {
+      | awk -F, -v expected_index="${gpu_indexes[0]}" '
+          $1 ~ "^[[:space:]]*" expected_index "[[:space:]]*$" {
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2
           }
         '
