@@ -9169,8 +9169,8 @@ def _gpu_allocation_terminal_binding(payload: dict[str, Any], job_id: int) -> No
     if accounting.get("ok"):
         for raw_line in str(accounting.get("stdout", "")).splitlines():
             fields = raw_line.rstrip("\n").split("|")
-            if len(fields) == 12 and fields[-1] == "" and fields[0] == str(job_id):
-                rows.append(fields[:-1])
+            if len(fields) == 11 and fields[0] == str(job_id):
+                rows.append(fields)
     if len(rows) != 1:
         raise LifecycleValidationError(
             "GPU_ALLOCATION_TERMINAL_UNPROVEN",

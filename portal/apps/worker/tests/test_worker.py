@@ -2930,7 +2930,7 @@ def test_gpu_allocation_cancel_accepts_only_owner_bound_terminal_replay(
                 "gpu-dev|CANCELLED by 0|"
                 "billing=8,cpu=8,gres/gpu:h100=1|"
                 "billing=8,cpu=8,gres/gpu:h100=1|"
-                f"h100-gpu-dev:{payload['managed_user_id']}:{lease_id}||\n"
+                f"h100-gpu-dev:{payload['managed_user_id']}:{lease_id}|\n"
             ),
         }
 
@@ -2967,7 +2967,7 @@ def test_gpu_allocation_cancel_waits_for_accounting_terminal_proof(
                 f"company|general|gpu-dev|{state}|"
                 "billing=8,cpu=8,gres/gpu:h100=1|"
                 "billing=8,cpu=8,gres/gpu:h100=1|"
-                f"h100-gpu-dev:{payload['managed_user_id']}:{payload['lease_id']}||\n"
+                f"h100-gpu-dev:{payload['managed_user_id']}:{payload['lease_id']}|\n"
             ),
         }
 
@@ -3011,7 +3011,7 @@ def test_gpu_allocation_terminal_accepts_slurm_submit_line_when_comment_is_not_s
                 "company|general|gpu-dev|CANCELLED by 20001|"
                 "billing=8,cpu=8,gres/gpu=1,mem=32G,node=1|"
                 "billing=8,cpu=8,gres/gpu=1,mem=32G,node=1||"
-                f"{submit_line}|\n"
+                f"{submit_line}\n"
             ),
         },
     )
