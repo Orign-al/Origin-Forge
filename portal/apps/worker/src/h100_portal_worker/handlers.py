@@ -9788,8 +9788,425 @@ def _managed_container_security(
     return container
 
 
-def _execute_managed_container_lifecycle(
+def _profile_upgrade_container_payload(
+    payload: dict[str, Any], development_profile: str
+) -> dict[str, Any]:
+    return {
+        **payload,
+        "development_profile": development_profile,
+        "gpu_allocation_job_id": None,
+        "gpu_allocation_uuid": None,
+    }
+
+
+def _profile_upgrade_lifecycle_preflight(
+    payload: dict[str, Any], *, allow_migrated: bool = False
+) -> tuple[dict[str, str], dict[str, Any]]:
+    username = str(payload["username"])
+    lifecycle = _read_managed_lifecycle_state(username)
+    fingerprints = _lifecycle_fingerprints(lifecycle)
+    if sorted(fingerprints) != payload["expected_key_fingerprints"]:
+        raise LifecycleValidationError(
+            "GPU_PROFILE_UPGRADE_KEY_REJECTED",
+            "managed lifecycle key binding differs from Portal",
+        )
+    migrated = (
+        lifecycle.get("VERSION") == "4"
+        and lifecycle.get("DEVELOPMENT_PROFILE") == GPU_DEVELOPMENT_PROFILE
+        and lifecycle.get("PROFILE_UPGRADE_OPERATION_ID") == payload["operation_id"]
+        and not lifecycle.get("GPU_ALLOCATION_JOB_ID")
+        and not lifecycle.get("GPU_ALLOCATION_UUID")
+    )
+    profile = GPU_DEVELOPMENT_PROFILE if migrated else CPU_DEVELOPMENT_PROFILE
+    if migrated and not allow_migrated:
+        raise LifecycleValidationError(
+            "GPU_PROFILE_UPGRADE_ALREADY_APPLIED",
+            "managed lifecycle is already upgraded by this operation",
+        )
+    _validate_resource_lifecycle_binding(
+        lifecycle,
+        _profile_upgrade_container_payload(payload, profile),
+        fingerprints,
+        allow_v2_restore=not migrated,
+    )
+    environment_state = payload["compute_environment_state"]
+    active_key = PILOT_DATA_ROOT / username / "home/.ssh/authorized_keys"
+    suspended_key = active_key.with_name("authorized_keys.portal-recycle")
+    key_path = active_key if environment_state == "ACTIVE" else suspended_key
+    if (
+        not key_path.exists()
+        or key_path.is_symlink()
+        or (environment_state == "ACTIVE" and suspended_key.exists())
+        or (environment_state == "RECYCLED" and active_key.exists())
+        or sorted(_installed_key_fingerprints(key_path, int(payload["uid"]), int(payload["gid"])))
+        != payload["expected_key_fingerprints"]
+    ):
+        raise LifecycleValidationError(
+            "GPU_PROFILE_UPGRADE_KEY_REJECTED",
+            "container SSH authorization is not in the expected lifecycle state",
+        )
+    lease_start = _resource_lifecycle_timestamp(
+        str(payload["lease_starts_at"]), "upgrade Lease start"
+    )
+    lease_expiry = _resource_lifecycle_timestamp(
+        str(payload["lease_expires_at"]), "upgrade Lease expiry"
+    )
+    if environment_state == "ACTIVE":
+        expected_active = {
+            "VERSION": "4",
+            "STATUS": "ACTIVE",
+            "SSH_KEY_STATE": "INSTALLED",
+            "LEASE_STATE": "ACTIVE",
+            "LEASE_ID": str(payload["lease_id"]),
+            "LEASE_START": lease_start.isoformat(),
+            "LEASE_EXPIRES": lease_expiry.isoformat(),
+        }
+        if any(lifecycle.get(key) != value for key, value in expected_active.items()):
+            raise LifecycleValidationError(
+                "GPU_PROFILE_UPGRADE_LIFECYCLE_REJECTED",
+                "active lifecycle does not match its current Portal Lease",
+            )
+    else:
+        version = lifecycle.get("VERSION")
+        legacy_v2 = (
+            version == "2"
+            and lifecycle.get("STATUS") == "ACTIVE"
+            and lifecycle.get("SSH_KEY_STATE") == "INSTALLED"
+        )
+        legacy_v3 = (
+            version == "3"
+            and lifecycle.get("STATUS") in {"ACTIVE", "RECYCLED"}
+            and lifecycle.get("SSH_KEY_STATE") in {"INSTALLED", "SUSPENDED_BY_RECYCLE"}
+            and (
+                not lifecycle.get("LEASE_START")
+                or _resource_lifecycle_timestamp(
+                    lifecycle.get("LEASE_START", ""), "legacy Lease start"
+                )
+                == lease_start
+            )
+            and (
+                not lifecycle.get("LEASE_EXPIRES")
+                or _resource_lifecycle_timestamp(
+                    lifecycle.get("LEASE_EXPIRES", ""), "legacy Lease expiry"
+                )
+                == lease_expiry
+            )
+            and lifecycle.get("LEASE_ID", str(payload["lease_id"])) == str(payload["lease_id"])
+        )
+        recycled_v4 = (
+            version == "4"
+            and lifecycle.get("STATUS") == "RECYCLED"
+            and lifecycle.get("SSH_KEY_STATE") == "SUSPENDED_BY_RECYCLE"
+            and lifecycle.get("LEASE_STATE") == "RECYCLE_BIN"
+            and lifecycle.get("LEASE_ID") == str(payload["lease_id"])
+            and _resource_lifecycle_timestamp(
+                lifecycle.get("LEASE_START", ""), "recycled Lease start"
+            )
+            == lease_start
+            and _resource_lifecycle_timestamp(
+                lifecycle.get("LEASE_EXPIRES", ""), "recycled Lease expiry"
+            )
+            == lease_expiry
+        )
+        if not (legacy_v2 or legacy_v3 or recycled_v4):
+            raise LifecycleValidationError(
+                "GPU_PROFILE_UPGRADE_LIFECYCLE_REJECTED",
+                "recycled lifecycle is not a recoverable Portal resource",
+            )
+    container = _managed_container_security(
+        _profile_upgrade_container_payload(payload, profile), require_running=None
+    )
+    observed_running = bool(container.get("state", {}).get("Running"))
+    expected_running = False if migrated else payload["expected_container_state"] == "RUNNING"
+    if observed_running is not expected_running or (
+        environment_state == "RECYCLED" and observed_running
+    ):
+        raise LifecycleValidationError(
+            "GPU_PROFILE_UPGRADE_CONTAINER_STATE_REJECTED",
+            "managed container state changed after Portal preflight",
+        )
+    return lifecycle, container
+
+
+def _profile_upgrade_backup(payload: dict[str, Any], lifecycle: dict[str, str]) -> tuple[Path, str]:
+    backup_dir = PLATFORM_BACKUP_ROOT / f"gpu-profile-upgrade-{payload['operation_id']}"
+    backup_path = backup_dir / f"{payload['username']}.state"
+    content = "".join(f"{key}={value}\n" for key, value in lifecycle.items()).encode("ascii")
+    digest = hashlib.sha256(content).hexdigest()
+    try:
+        backup_dir.mkdir(mode=0o700, parents=False, exist_ok=True)
+        metadata = backup_dir.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise OSError("unsafe profile upgrade backup directory")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(backup_path, flags, 0o600)
+        except FileExistsError:
+            existing = backup_path.read_bytes()
+            if existing != content:
+                raise OSError("profile upgrade backup conflict") from None
+        else:
+            try:
+                os.fchmod(descriptor, 0o600)
+                os.fchown(descriptor, 0, 0)
+                offset = 0
+                while offset < len(content):
+                    written = os.write(descriptor, content[offset:])
+                    if written <= 0:
+                        raise OSError("short profile upgrade backup write")
+                    offset += written
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "GPU_PROFILE_UPGRADE_BACKUP_FAILED",
+            "managed lifecycle rollback point could not be created",
+        ) from exc
+    return backup_path, digest
+
+
+def _gpu_profile_upgrade_values(
+    payload: dict[str, Any], lifecycle: dict[str, str]
+) -> dict[str, str]:
+    updated = dict(lifecycle)
+    updated.update(
+        {
+            "VERSION": "4",
+            "DEVELOPMENT_PROFILE": GPU_DEVELOPMENT_PROFILE,
+            "WORKSPACE_LAYOUT": "LEGACY_BIND_ALIAS",
+            "STORAGE_ROOT": str(PILOT_DATA_ROOT / str(payload["username"])),
+            "BACKING_WORKSPACE": str(PILOT_DATA_ROOT / str(payload["username"]) / "workspace"),
+            "WORKSPACE_PATH": str(payload["workspace_path"]),
+            "GPU_ALLOCATION_JOB_ID": "",
+            "GPU_ALLOCATION_UUID": "",
+            "PROFILE_UPGRADE_OPERATION_ID": str(payload["operation_id"]),
+            "PROFILE_UPGRADE_FROM": CPU_DEVELOPMENT_PROFILE,
+        }
+    )
+    if payload["compute_environment_state"] == "RECYCLED":
+        updated.update(
+            {
+                "STATUS": "RECYCLED",
+                "SSH_KEY_STATE": "SUSPENDED_BY_RECYCLE",
+                "LEASE_STATE": "RECYCLE_BIN",
+                "LEASE_ID": str(payload["lease_id"]),
+                "LEASE_START": str(payload["lease_starts_at"]),
+                "LEASE_EXPIRES": str(payload["lease_expires_at"]),
+                "RESTORE_REQUEST_ID": "",
+            }
+        )
+    return updated
+
+
+def _gpu_profile_upgrade_preflight(payload: dict[str, Any]) -> dict[str, Any]:
+    lifecycle, container = _profile_upgrade_lifecycle_preflight(payload, allow_migrated=True)
+    migrated = lifecycle.get("DEVELOPMENT_PROFILE") == GPU_DEVELOPMENT_PROFILE
+    return {
+        "status": "DRY_RUN",
+        "handler": "container.profile.upgrade_gpu",
+        "execution_enabled": False,
+        "upgrade_status": "ALREADY_APPLIED" if migrated else "READY",
+        "username": payload["username"],
+        "source_profile": CPU_DEVELOPMENT_PROFILE,
+        "target_profile": GPU_DEVELOPMENT_PROFILE,
+        "container_state": "RUNNING" if container.get("state", {}).get("Running") else "STOPPED",
+        "workspace_path": payload["workspace_path"],
+        "gpu_allocation": "NONE",
+    }
+
+
+def _execute_gpu_profile_upgrade(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    stopped = False
+    lifecycle_committed = False
+    backup_path: Path | None = None
+    backup_sha256: str | None = None
+    try:
+        if request.requested_by != "origin-al" or request.approved_by != "origin-al":
+            raise LifecycleValidationError(
+                "GPU_PROFILE_UPGRADE_APPROVAL_REJECTED",
+                "GPU profile upgrade requires the platform owner",
+            )
+        lifecycle, container = _profile_upgrade_lifecycle_preflight(payload, allow_migrated=True)
+        if lifecycle.get("DEVELOPMENT_PROFILE") == GPU_DEVELOPMENT_PROFILE:
+            backup_path = (
+                PLATFORM_BACKUP_ROOT
+                / f"gpu-profile-upgrade-{payload['operation_id']}"
+                / f"{payload['username']}.state"
+            )
+            if not backup_path.is_file():
+                raise LifecycleValidationError(
+                    "GPU_PROFILE_UPGRADE_BACKUP_FAILED",
+                    "idempotent upgrade rollback point is unavailable",
+                )
+            backup_sha256 = hashlib.sha256(backup_path.read_bytes()).hexdigest()
+            return {
+                "status": "SUCCEEDED",
+                "handler": request.operation_type,
+                "username": payload["username"],
+                "development_profile": GPU_DEVELOPMENT_PROFILE,
+                "container_state": "STOPPED",
+                "gpu_allocation_job_id": None,
+                "gpu_allocation_uuid": None,
+                "was_running": payload["expected_container_state"] == "RUNNING",
+                "backup_path": str(backup_path),
+                "backup_sha256": backup_sha256,
+                "idempotent_replay": True,
+            }
+        backup_path, backup_sha256 = _profile_upgrade_backup(payload, lifecycle)
+        was_running = bool(container.get("state", {}).get("Running"))
+        integrity = script_integrity()
+        if not all(
+            integrity.get(name, {}).get("integrity_ok", False)
+            for name in ("h100-container-stop", "h100-container-start")
+        ):
+            raise LifecycleValidationError(
+                "SCRIPT_INTEGRITY_FAILED", "container lifecycle script integrity failed"
+            )
+        if was_running:
+            result = run_allowlisted_script(
+                [SCRIPT_ALLOWLIST["h100-container-stop"], str(payload["username"])],
+                timeout=90,
+            )
+            if not result.get("ok"):
+                raise LifecycleValidationError(
+                    "GPU_PROFILE_UPGRADE_STOP_FAILED", "CPU container could not be stopped"
+                )
+            stopped = True
+        _commit_managed_lifecycle_values(
+            str(payload["username"]), _gpu_profile_upgrade_values(payload, lifecycle)
+        )
+        lifecycle_committed = True
+        migrated, _ = _profile_upgrade_lifecycle_preflight(
+            {**payload, "expected_container_state": "STOPPED"}, allow_migrated=True
+        )
+        if migrated.get("DEVELOPMENT_PROFILE") != GPU_DEVELOPMENT_PROFILE:
+            raise LifecycleValidationError(
+                "GPU_PROFILE_UPGRADE_POSTCONDITION_FAILED",
+                "managed lifecycle did not reach the GPU profile",
+            )
+        return {
+            "status": "SUCCEEDED",
+            "handler": request.operation_type,
+            "username": payload["username"],
+            "development_profile": GPU_DEVELOPMENT_PROFILE,
+            "container_state": "STOPPED",
+            "gpu_allocation_job_id": None,
+            "gpu_allocation_uuid": None,
+            "was_running": was_running,
+            "backup_path": str(backup_path),
+            "backup_sha256": backup_sha256,
+            "idempotent_replay": False,
+        }
+    except LifecycleValidationError as exc:
+        rollback_errors: list[str] = []
+        if lifecycle_committed and backup_path is not None:
+            try:
+                content = backup_path.read_text(encoding="ascii")
+                restored = dict(line.split("=", 1) for line in content.splitlines() if "=" in line)
+                _commit_managed_lifecycle_values(str(payload["username"]), restored)
+            except OSError, ValueError, LifecycleValidationError:
+                rollback_errors.append("lifecycle")
+        if stopped and not rollback_errors:
+            restarted = run_allowlisted_script(
+                [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])],
+                timeout=150,
+            )
+            if not restarted.get("ok"):
+                rollback_errors.append("container")
+        return {
+            "status": "ERROR",
+            "rollback_status": "ROLLBACK_FAILED" if rollback_errors else "ROLLED_BACK",
+            "unknown_resource_state": rollback_errors,
+            "error": {"code": exc.code, "message": str(exc)},
+        }
+
+
+def _execute_gpu_profile_upgrade_rollback(
     request: WorkerRequest, payload: dict[str, Any]
+) -> dict[str, Any]:
+    try:
+        if request.requested_by != "origin-al" or request.approved_by != "origin-al":
+            raise LifecycleValidationError(
+                "GPU_PROFILE_UPGRADE_APPROVAL_REJECTED",
+                "GPU profile rollback requires the platform owner",
+            )
+        backup_path = (
+            PLATFORM_BACKUP_ROOT
+            / f"gpu-profile-upgrade-{payload['operation_id']}"
+            / f"{payload['username']}.state"
+        )
+        content = backup_path.read_bytes()
+        if hashlib.sha256(content).hexdigest() != payload["backup_sha256"]:
+            raise LifecycleValidationError(
+                "GPU_PROFILE_UPGRADE_BACKUP_REJECTED", "rollback point integrity changed"
+            )
+        lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+        if lifecycle.get("DEVELOPMENT_PROFILE") == CPU_DEVELOPMENT_PROFILE:
+            return {
+                "status": "SUCCEEDED",
+                "handler": request.operation_type,
+                "development_profile": CPU_DEVELOPMENT_PROFILE,
+                "container_state": payload["expected_container_state"],
+                "idempotent_replay": True,
+            }
+        if (
+            lifecycle.get("DEVELOPMENT_PROFILE") != GPU_DEVELOPMENT_PROFILE
+            or lifecycle.get("PROFILE_UPGRADE_OPERATION_ID") != payload["operation_id"]
+        ):
+            raise LifecycleValidationError(
+                "GPU_PROFILE_UPGRADE_ROLLBACK_REJECTED",
+                "current lifecycle is not owned by this upgrade",
+            )
+        _managed_container_security(
+            _profile_upgrade_container_payload(payload, GPU_DEVELOPMENT_PROFILE),
+            require_running=False,
+        )
+        restored = dict(line.split("=", 1) for line in content.decode("ascii").splitlines())
+        _commit_managed_lifecycle_values(str(payload["username"]), restored)
+        if payload["was_running"]:
+            restarted = run_allowlisted_script(
+                [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])],
+                timeout=150,
+            )
+            if not restarted.get("ok"):
+                raise LifecycleValidationError(
+                    "GPU_PROFILE_UPGRADE_ROLLBACK_FAILED",
+                    "CPU container could not be restarted after rollback",
+                )
+        _managed_container_security(
+            _profile_upgrade_container_payload(payload, CPU_DEVELOPMENT_PROFILE),
+            require_running=payload["was_running"],
+        )
+        return {
+            "status": "SUCCEEDED",
+            "handler": request.operation_type,
+            "development_profile": CPU_DEVELOPMENT_PROFILE,
+            "container_state": "RUNNING" if payload["was_running"] else "STOPPED",
+            "idempotent_replay": False,
+        }
+    except (OSError, UnicodeDecodeError, ValueError, LifecycleValidationError) as exc:
+        code = getattr(exc, "code", "GPU_PROFILE_UPGRADE_ROLLBACK_FAILED")
+        return {
+            "status": "ERROR",
+            "rollback_status": "ROLLBACK_FAILED",
+            "error": {"code": code, "message": str(exc)},
+        }
+
+
+def _execute_managed_container_lifecycle(
+    request: WorkerRequest,
+    payload: dict[str, Any],
+    *,
+    action_override: str | None = None,
+    owner_required: bool = True,
 ) -> dict[str, Any]:
     new_allocation = False
     start_invoked = False
@@ -9797,12 +10214,19 @@ def _execute_managed_container_lifecycle(
     allocation_job_id = payload.get("gpu_allocation_job_id")
     allocation_uuid = payload.get("gpu_allocation_uuid")
     try:
-        if request.requested_by != payload["username"]:
+        if owner_required and request.requested_by != payload["username"]:
             raise LifecycleValidationError(
                 "RESOURCE_OWNERSHIP_REJECTED",
                 "user-level operation actor does not own the target resource",
             )
-        action = request.operation_type.rsplit(".", 1)[-1]
+        if not owner_required and (
+            request.requested_by != "origin-al" or request.approved_by != "origin-al"
+        ):
+            raise LifecycleValidationError(
+                "GPU_PROFILE_UPGRADE_APPROVAL_REJECTED",
+                "post-upgrade start requires the platform owner",
+            )
+        action = action_override or request.operation_type.rsplit(".", 1)[-1]
         if action in {"start", "restart"} and payload.get("lease_id") is None:
             raise LifecycleValidationError(
                 "CONTAINER_OPERATION_DENIED_LEASE_INACTIVE", "active lease binding is required"
@@ -10637,6 +11061,20 @@ def _execute_host_access_revoke(request: WorkerRequest, payload: dict[str, Any])
 
 
 def dry_run_plan(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
+    if request.operation_type == "container.profile.upgrade_gpu":
+        return _gpu_profile_upgrade_preflight(payload)
+    if request.operation_type in {
+        "container.profile.upgrade_gpu.rollback",
+        "container.start_after_profile_upgrade",
+        "container.stop_after_profile_upgrade",
+    }:
+        return {
+            "status": "ERROR",
+            "error": {
+                "code": "GPU_PROFILE_UPGRADE_DRY_RUN_REJECTED",
+                "message": "rollback and post-upgrade start require a committed upgrade",
+            },
+        }
     if request.operation_type == "compute.provision.plan":
         return _compute_provision_plan(payload)
     if request.operation_type == "compute.provision.dry_run":
@@ -10752,6 +11190,24 @@ def handle(request: WorkerRequest) -> dict[str, Any]:
         }
     if request.operation_type in KNOWN_WRITES:
         if not request.dry_run:
+            if request.operation_type == "container.profile.upgrade_gpu":
+                return _execute_gpu_profile_upgrade(request, payload)
+            if request.operation_type == "container.profile.upgrade_gpu.rollback":
+                return _execute_gpu_profile_upgrade_rollback(request, payload)
+            if request.operation_type == "container.start_after_profile_upgrade":
+                return _execute_managed_container_lifecycle(
+                    request,
+                    payload,
+                    action_override="start",
+                    owner_required=False,
+                )
+            if request.operation_type == "container.stop_after_profile_upgrade":
+                return _execute_managed_container_lifecycle(
+                    request,
+                    payload,
+                    action_override="stop",
+                    owner_required=False,
+                )
             if request.operation_type == "compute.activate.self":
                 return _execute_self_compute_activation(request, payload)
             if request.operation_type == "compute.activate.self.rollback":

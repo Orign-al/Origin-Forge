@@ -56,6 +56,10 @@ KNOWN_WRITES = {
     "container.start",
     "container.stop",
     "container.restart",
+    "container.profile.upgrade_gpu",
+    "container.profile.upgrade_gpu.rollback",
+    "container.start_after_profile_upgrade",
+    "container.stop_after_profile_upgrade",
     "container.rebuild",
     "slurm.drain",
     "slurm.resume",
@@ -1642,6 +1646,114 @@ def _validate_container_lifecycle(
     return result
 
 
+def _validate_gpu_profile_upgrade(
+    payload: dict[str, Any], *, rollback: bool = False
+) -> dict[str, Any]:
+    fields = {
+        "operation_id",
+        "managed_user_id",
+        "username",
+        "uid",
+        "gid",
+        "name",
+        "workspace_path",
+        "compute_environment_state",
+        "expected_container_state",
+        "lease_id",
+        "lease_starts_at",
+        "lease_expires_at",
+        "slurm_account",
+        "slurm_qos",
+        "expected_key_fingerprints",
+    }
+    if rollback:
+        fields |= {"backup_sha256", "was_running"}
+    if set(payload) != fields or set(payload) & FORBIDDEN_SECRET_OR_COMMAND_FIELDS:
+        raise PayloadValidationError(
+            "GPU_PROFILE_UPGRADE_PAYLOAD_REJECTED",
+            "GPU profile upgrade fields are invalid",
+        )
+    result = _managed_identity(payload)
+    expected_name = f"gpu-dev-{result['username']}"
+    environment_state = payload.get("compute_environment_state")
+    container_state = payload.get("expected_container_state")
+    if (
+        payload.get("name") != expected_name
+        or payload.get("workspace_path") != str(workspace_path(result["uid"]))
+        or environment_state not in {"ACTIVE", "RECYCLED"}
+        or container_state not in {"RUNNING", "STOPPED"}
+        or (environment_state == "RECYCLED" and container_state != "STOPPED")
+        or payload.get("slurm_account") != "company"
+        or payload.get("slurm_qos") != "general"
+    ):
+        raise PayloadValidationError(
+            "GPU_PROFILE_UPGRADE_TARGET_REJECTED",
+            "GPU profile upgrade target is invalid",
+        )
+    starts_at = payload.get("lease_starts_at")
+    expires_at = payload.get("lease_expires_at")
+    if not isinstance(starts_at, str) or not isinstance(expires_at, str):
+        raise PayloadValidationError(
+            "GPU_PROFILE_UPGRADE_LEASE_REJECTED", "upgrade Lease window is invalid"
+        )
+    try:
+        parsed_start = datetime.fromisoformat(starts_at.replace("Z", "+00:00"))
+        parsed_expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PayloadValidationError(
+            "GPU_PROFILE_UPGRADE_LEASE_REJECTED", "upgrade Lease window is invalid"
+        ) from exc
+    if (
+        parsed_start.tzinfo is None
+        or parsed_expiry.tzinfo is None
+        or not timedelta(seconds=1)
+        <= parsed_expiry - parsed_start
+        <= timedelta(seconds=STANDARD_COMPUTE_LEASE_SECONDS)
+    ):
+        raise PayloadValidationError(
+            "GPU_PROFILE_UPGRADE_LEASE_REJECTED", "upgrade Lease window is invalid"
+        )
+    if environment_state == "ACTIVE" and parsed_expiry.astimezone(UTC) <= datetime.now(UTC):
+        raise PayloadValidationError(
+            "GPU_PROFILE_UPGRADE_LEASE_REJECTED", "active upgrade Lease has expired"
+        )
+    if environment_state == "RECYCLED" and parsed_expiry.astimezone(UTC) > datetime.now(UTC):
+        raise PayloadValidationError(
+            "GPU_PROFILE_UPGRADE_LEASE_REJECTED", "recycled upgrade Lease has not expired"
+        )
+    result.update(
+        {
+            "operation_id": _canonical_uuid(payload.get("operation_id"), "operation ID"),
+            "name": expected_name,
+            "workspace_path": str(workspace_path(result["uid"])),
+            "compute_environment_state": environment_state,
+            "expected_container_state": container_state,
+            "lease_id": _canonical_uuid(payload.get("lease_id"), "lease ID"),
+            "lease_starts_at": parsed_start.astimezone(UTC).isoformat(),
+            "lease_expires_at": parsed_expiry.astimezone(UTC).isoformat(),
+            "slurm_account": "company",
+            "slurm_qos": "general",
+            "expected_key_fingerprints": _validated_key_fingerprints(
+                payload.get("expected_key_fingerprints")
+            ),
+        }
+    )
+    if rollback:
+        backup_sha256 = payload.get("backup_sha256")
+        was_running = payload.get("was_running")
+        if (
+            not isinstance(backup_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", backup_sha256) is None
+            or not isinstance(was_running, bool)
+        ):
+            raise PayloadValidationError(
+                "GPU_PROFILE_UPGRADE_ROLLBACK_REJECTED",
+                "GPU profile rollback evidence is invalid",
+            )
+        result.update({"backup_sha256": backup_sha256, "was_running": was_running})
+    return result
+
+
 def _validate_container_terminal(payload: dict[str, Any]) -> dict[str, Any]:
     fields = {
         "managed_user_id",
@@ -2211,6 +2323,14 @@ def validate_payload(
         return _validate_container_lifecycle(
             payload, require_active_lease=operation_type != "container.stop"
         )
+    if operation_type == "container.profile.upgrade_gpu":
+        return _validate_gpu_profile_upgrade(payload)
+    if operation_type == "container.profile.upgrade_gpu.rollback":
+        return _validate_gpu_profile_upgrade(payload, rollback=True)
+    if operation_type == "container.start_after_profile_upgrade":
+        return _validate_container_lifecycle(payload, require_active_lease=True)
+    if operation_type == "container.stop_after_profile_upgrade":
+        return _validate_container_lifecycle(payload, require_active_lease=False)
     if operation_type in {"resource.restore", "self.resource.restore"}:
         return _validate_restore(payload)
     if operation_type == "resource.restore.rollback":

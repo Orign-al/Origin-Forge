@@ -50,6 +50,102 @@ def request(
     )
 
 
+def gpu_profile_upgrade_payload() -> dict[str, object]:
+    now = datetime.now(UTC)
+    return {
+        "operation_id": str(uuid.uuid4()),
+        "managed_user_id": str(uuid.uuid4()),
+        "username": "ordinary-user",
+        "uid": 20011,
+        "gid": 20011,
+        "name": "gpu-dev-ordinary-user",
+        "workspace_path": "/storage/users/20011",
+        "compute_environment_state": "ACTIVE",
+        "expected_container_state": "RUNNING",
+        "lease_id": str(uuid.uuid4()),
+        "lease_starts_at": now.isoformat(),
+        "lease_expires_at": (now + timedelta(hours=96)).isoformat(),
+        "slurm_account": "company",
+        "slurm_qos": "general",
+        "expected_key_fingerprints": ["SHA256:AbCdEf0123456789+/"],
+    }
+
+
+def test_gpu_profile_upgrade_payload_is_exact_and_owner_approved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = gpu_profile_upgrade_payload()
+    validated = validate_payload("container.profile.upgrade_gpu", payload)
+    assert validated["username"] == "ordinary-user"
+    assert validated["compute_environment_state"] == "ACTIVE"
+    with pytest.raises(ValueError, match="GPU_PROFILE_UPGRADE_PAYLOAD_REJECTED"):
+        validate_payload("container.profile.upgrade_gpu", {**payload, "command": "docker run"})
+
+    lifecycle = {
+        "VERSION": "4",
+        "USERNAME": "ordinary-user",
+        "DEVELOPMENT_PROFILE": "STANDARD_8CPU_32GB",
+    }
+    migrated_lifecycle = {
+        **lifecycle,
+        "DEVELOPMENT_PROFILE": "GPU_1_8CPU_32GB",
+        "PROFILE_UPGRADE_OPERATION_ID": str(payload["operation_id"]),
+    }
+    preflights = iter(
+        [
+            (lifecycle, {"state": {"Running": True}}),
+            (migrated_lifecycle, {"state": {"Running": False}}),
+        ]
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_profile_upgrade_lifecycle_preflight",
+        lambda _payload, allow_migrated=False: next(preflights),
+    )
+    backup = tmp_path / "ordinary-user.state"
+    backup.write_text("VERSION=4\nUSERNAME=ordinary-user\n", encoding="ascii")
+    monkeypatch.setattr(
+        handlers,
+        "_profile_upgrade_backup",
+        lambda _payload, _lifecycle: (backup, "a" * 64),
+    )
+    committed: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        handlers,
+        "_commit_managed_lifecycle_values",
+        lambda _username, values: committed.append(values),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {
+            "h100-container-stop": {"integrity_ok": True},
+            "h100-container-start": {"integrity_ok": True},
+        },
+    )
+    executed: list[list[str]] = []
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda argv, timeout: executed.append(argv) or {"ok": True},
+    )
+    result = handle(
+        request(
+            "container.profile.upgrade_gpu",
+            payload,
+            requested_by="origin-al",
+            approved_by="origin-al",
+            idempotency_key="gpu-profile-upgrade-test-v1",
+        )
+    )
+    assert result["status"] == "SUCCEEDED"
+    assert result["development_profile"] == "GPU_1_8CPU_32GB"
+    assert result["container_state"] == "STOPPED"
+    assert result["gpu_allocation_job_id"] is None
+    assert executed == [[handlers.SCRIPT_ALLOWLIST["h100-container-stop"], "ordinary-user"]]
+    assert committed[0]["DEVELOPMENT_PROFILE"] == "GPU_1_8CPU_32GB"
+
+
 def test_protocol_round_trip_and_size_limit() -> None:
     framed = encode_frame({"status": "OK", "value": 1})
     assert decode_frame(framed)["value"] == 1

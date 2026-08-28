@@ -7,8 +7,12 @@ from datetime import timedelta
 from typing import Any, cast
 
 import httpx
-from h100_portal_contracts.workspace import workspace_path
-from sqlalchemy import select, update
+from h100_portal_contracts.workspace import (
+    CPU_DEVELOPMENT_PROFILE,
+    GPU_DEVELOPMENT_PROFILE,
+    workspace_path,
+)
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -48,6 +52,7 @@ from h100_portal_api.models import (
     PortalSshKey,
     PortalStorageResource,
     PortalUser,
+    ensure_utc,
     utcnow,
 )
 from h100_portal_api.rbac import PERMISSIONS
@@ -93,6 +98,7 @@ from h100_portal_api.routes.operations import (
     validate_portal3g_production_pilot_plan,
     validate_portal3g_production_pilot_result,
 )
+from h100_portal_api.runtime_identity import deployment_version
 from h100_portal_api.security import (
     digest_secret,
     hash_password,
@@ -131,6 +137,7 @@ PORTAL4A_APPROVED_IMAGE = (
     "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
     "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
 )
+GPU_PROFILE_UPGRADE_APPROVAL = "将现有Portal普通用户容器全部升级为GPU Development Container"
 
 
 def ensure_roles(db: Session) -> None:
@@ -2718,6 +2725,629 @@ def portal4a_revoke_origin_pilot_host_access(approval_text: str) -> int:
     return 0
 
 
+def _gpu_upgrade_operation_payload(
+    managed: PortalManagedUser,
+    container: PortalContainer,
+    lease: PortalComputeLease,
+    operation_id: uuid.UUID,
+    fingerprints: list[str],
+) -> dict[str, Any]:
+    return {
+        "operation_id": str(operation_id),
+        "managed_user_id": str(managed.id),
+        "username": managed.unix_username,
+        "uid": managed.uid,
+        "gid": managed.gid,
+        "name": container.name,
+        "workspace_path": str(workspace_path(managed.uid)),
+        "compute_environment_state": managed.compute_environment_state,
+        "expected_container_state": container.observed_state,
+        "lease_id": str(lease.id),
+        "lease_starts_at": ensure_utc(lease.starts_at).isoformat(),
+        "lease_expires_at": ensure_utc(lease.expires_at).isoformat(),
+        "slurm_account": managed.slurm_account,
+        "slurm_qos": managed.slurm_qos,
+        "expected_key_fingerprints": fingerprints,
+    }
+
+
+def _gpu_upgrade_lifecycle_payload(
+    managed: PortalManagedUser,
+    container: PortalContainer,
+    lease: PortalComputeLease,
+) -> dict[str, Any]:
+    return {
+        "managed_user_id": str(managed.id),
+        "username": managed.unix_username,
+        "uid": managed.uid,
+        "gid": managed.gid,
+        "name": container.name,
+        "workspace_path": str(workspace_path(managed.uid)),
+        "development_profile": GPU_DEVELOPMENT_PROFILE,
+        "container_gpu": 1,
+        "gpu_allocation_job_id": container.gpu_allocation_job_id,
+        "gpu_allocation_uuid": container.gpu_allocation_uuid,
+        "slurm_account": managed.slurm_account,
+        "slurm_qos": managed.slurm_qos,
+        "lease_id": str(lease.id),
+        "lease_starts_at": ensure_utc(lease.starts_at).isoformat(),
+        "lease_expires_at": ensure_utc(lease.expires_at).isoformat(),
+        "expected_gpu": "SLURM_ALLOCATED_1",
+    }
+
+
+def _gpu_upgrade_keys(db: Session, managed_id: uuid.UUID, state: str) -> list[str]:
+    expected_state = "INSTALLED" if state == "ACTIVE" else "SUSPENDED_BY_RECYCLE"
+    return sorted(
+        db.scalars(
+            select(PortalSshKey.fingerprint_sha256).where(
+                PortalSshKey.owner_managed_user_id == managed_id,
+                PortalSshKey.active.is_(True),
+                PortalSshKey.scope == "CONTAINER",
+                PortalSshKey.container_install_state == expected_state,
+            )
+        ).all()
+    )
+
+
+def _gpu_upgrade_current_lease(
+    db: Session, managed: PortalManagedUser
+) -> PortalComputeLease | None:
+    state = "ACTIVE" if managed.compute_environment_state == "ACTIVE" else "RECYCLE_BIN"
+    return db.scalar(
+        select(PortalComputeLease)
+        .where(
+            PortalComputeLease.owner_managed_user_id == managed.id,
+            PortalComputeLease.state == state,
+        )
+        .order_by(PortalComputeLease.created_at.desc())
+        .limit(1)
+    )
+
+
+def _record_gpu_upgrade_event(
+    db: Session,
+    operation: PortalOperation,
+    from_status: str | None,
+    to_status: OperationStatus,
+    message: str,
+) -> None:
+    db.add(
+        PortalOperationEvent(
+            operation_id=operation.id,
+            from_status=from_status,
+            to_status=to_status.value,
+            safe_message=message,
+        )
+    )
+
+
+def _rollback_completed_gpu_upgrades(migrated: list[dict[str, Any]]) -> list[str]:
+    failures: list[str] = []
+    with SessionLocal() as db:
+        for target in reversed(migrated):
+            username = str(target["managed"].unix_username)
+            container = db.get(PortalContainer, target["container"].id)
+            if container is None:
+                failures.append(username)
+                continue
+            if container.gpu_allocation_job_id is not None:
+                lifecycle_payload = {
+                    "managed_user_id": target["payload"]["managed_user_id"],
+                    "username": username,
+                    "uid": target["payload"]["uid"],
+                    "gid": target["payload"]["gid"],
+                    "name": container.name,
+                    "workspace_path": target["payload"]["workspace_path"],
+                    "development_profile": GPU_DEVELOPMENT_PROFILE,
+                    "container_gpu": 1,
+                    "gpu_allocation_job_id": container.gpu_allocation_job_id,
+                    "gpu_allocation_uuid": container.gpu_allocation_uuid,
+                    "slurm_account": target["payload"]["slurm_account"],
+                    "slurm_qos": target["payload"]["slurm_qos"],
+                    "lease_id": target["payload"]["lease_id"],
+                    "lease_starts_at": target["payload"]["lease_starts_at"],
+                    "lease_expires_at": target["payload"]["lease_expires_at"],
+                    "expected_gpu": "SLURM_ALLOCATED_1",
+                }
+                try:
+                    stopped = call_worker(
+                        "container.stop_after_profile_upgrade",
+                        payload=lifecycle_payload,
+                        requested_by="origin-al",
+                        approved_by="origin-al",
+                        idempotency_key=f"gpu-profile-upgrade-stop:{target['operation_id']}",
+                        dry_run=False,
+                        timeout_seconds=240,
+                    )
+                except WorkerClientError:
+                    failures.append(username)
+                    continue
+                if (
+                    stopped.get("status") != "SUCCEEDED"
+                    or stopped.get("container_state") != "STOPPED"
+                    or stopped.get("gpu_allocation_job_id") is not None
+                    or stopped.get("gpu_allocation_uuid") is not None
+                ):
+                    failures.append(username)
+                    continue
+                container.desired_state = "STOPPED"
+                container.observed_state = "STOPPED"
+                container.gpu_allocation_job_id = None
+                container.gpu_allocation_uuid = None
+                db.commit()
+            rollback_payload = {
+                **target["payload"],
+                "backup_sha256": target["backup_sha256"],
+                "was_running": target["was_running"],
+            }
+            try:
+                result = call_worker(
+                    "container.profile.upgrade_gpu.rollback",
+                    payload=rollback_payload,
+                    requested_by="origin-al",
+                    approved_by="origin-al",
+                    idempotency_key=f"gpu-profile-upgrade-rollback:{target['operation_id']}",
+                    dry_run=False,
+                    timeout_seconds=240,
+                )
+            except WorkerClientError:
+                failures.append(username)
+                continue
+            if (
+                result.get("status") != "SUCCEEDED"
+                or result.get("development_profile") != CPU_DEVELOPMENT_PROFILE
+            ):
+                failures.append(username)
+                continue
+            operation = db.get(PortalOperation, target["operation_id"])
+            if operation is None:
+                failures.append(username)
+                continue
+            container.development_profile = CPU_DEVELOPMENT_PROFILE
+            container.gpu_count = 0
+            container.gpu_allocation_job_id = None
+            container.gpu_allocation_uuid = None
+            container.desired_state = "RUNNING" if target["was_running"] else "STOPPED"
+            container.observed_state = container.desired_state
+            container.safe_spec = target["original_safe_spec"]
+            operation.status = OperationStatus.ROLLED_BACK
+            operation.rollback_status = "ROLLED_BACK"
+            operation.finished_at = utcnow()
+            _record_gpu_upgrade_event(
+                db,
+                operation,
+                OperationStatus.SUCCEEDED.value,
+                OperationStatus.ROLLED_BACK,
+                "batch failure restored the original CPU profile and runtime state",
+            )
+            db.commit()
+    return failures
+
+
+def upgrade_all_containers_to_gpu(approval_text: str) -> int:
+    if approval_text != GPU_PROFILE_UPGRADE_APPROVAL:
+        print("GPU PROFILE UPGRADE BLOCKED — approval text mismatch", file=sys.stderr)
+        return 2
+    migrated: list[dict[str, Any]] = []
+    started_users: list[str] = []
+    stopped_capacity: list[str] = []
+    try:
+        with SessionLocal() as db:
+            owner = db.scalar(
+                select(PortalUser)
+                .join(PortalUser.roles)
+                .where(
+                    PortalUser.normalized_login == "origin-al",
+                    PortalRole.name == "platform_owner",
+                )
+            )
+            if owner is None:
+                raise RuntimeError("active platform owner is unavailable")
+            active_operations = int(
+                db.scalar(
+                    select(func.count(PortalOperation.id)).where(
+                        PortalOperation.status.in_(
+                            {
+                                OperationStatus.PENDING_APPROVAL,
+                                OperationStatus.APPROVED,
+                                OperationStatus.RUNNING,
+                            }
+                        )
+                    )
+                )
+                or 0
+            )
+            if active_operations:
+                raise RuntimeError("another Portal operation is active")
+            rows = db.execute(
+                select(PortalManagedUser, PortalContainer)
+                .join(
+                    PortalContainer,
+                    PortalContainer.owner_managed_user_id == PortalManagedUser.id,
+                )
+                .join(PortalUser, PortalUser.id == PortalManagedUser.portal_user_id)
+                .join(PortalUser.roles)
+                .where(PortalRole.name == "user")
+                .order_by(PortalManagedUser.unix_username)
+            ).all()
+            if not rows:
+                raise RuntimeError("no ordinary-user containers were found")
+            targets: list[dict[str, Any]] = []
+            for managed, container in rows:
+                if container.development_profile == GPU_DEVELOPMENT_PROFILE:
+                    continue
+                if (
+                    container.development_profile != CPU_DEVELOPMENT_PROFILE
+                    or container.gpu_count != 0
+                    or container.gpu_allocation_job_id is not None
+                    or container.gpu_allocation_uuid is not None
+                    or managed.compute_environment_state not in {"ACTIVE", "RECYCLED"}
+                    or container.observed_state not in {"RUNNING", "STOPPED"}
+                    or container.desired_state != container.observed_state
+                    or (
+                        managed.compute_environment_state == "RECYCLED"
+                        and container.observed_state != "STOPPED"
+                    )
+                    or managed.slurm_account != "company"
+                    or managed.slurm_qos != "general"
+                ):
+                    raise RuntimeError(
+                        f"{managed.unix_username} is outside the controlled migration baseline"
+                    )
+                lease = _gpu_upgrade_current_lease(db, managed)
+                fingerprints = _gpu_upgrade_keys(db, managed.id, managed.compute_environment_state)
+                if lease is None or lease.gpu_count != 1 or not fingerprints:
+                    raise RuntimeError(
+                        f"{managed.unix_username} Lease or key binding is incomplete"
+                    )
+                if (
+                    managed.compute_environment_state == "ACTIVE"
+                    and ensure_utc(lease.expires_at) <= utcnow()
+                ):
+                    raise RuntimeError(f"{managed.unix_username} active Lease has expired")
+                targets.append(
+                    {
+                        "managed": managed,
+                        "container": container,
+                        "lease": lease,
+                        "fingerprints": fingerprints,
+                        "was_running": container.observed_state == "RUNNING",
+                        "original_safe_spec": dict(container.safe_spec),
+                    }
+                )
+            # Complete every authoritative Root Worker preflight before the
+            # first container is stopped.  DRAFT operations are audit records,
+            # not host mutations, and make a rejected batch safe to retry.
+            for target in targets:
+                managed = target["managed"]
+                container = target["container"]
+                lease = target["lease"]
+                key = f"gpu-profile-upgrade:{managed.id}:v1"
+                operation = db.scalar(
+                    select(PortalOperation).where(
+                        PortalOperation.requested_by == owner.id,
+                        PortalOperation.idempotency_key == key,
+                    )
+                )
+                if operation is None:
+                    operation = PortalOperation(
+                        operation_type="container.profile.upgrade_gpu",
+                        target_type="container",
+                        target_id=container.name,
+                        requested_by=owner.id,
+                        owner_managed_user_id=managed.id,
+                        approved_by=owner.id,
+                        request_summary="将普通用户开发容器升级为一张H100的GPU Development Profile",
+                        validated_payload={},
+                        idempotency_key=key,
+                        risk_level=RiskLevel.HIGH,
+                        status=OperationStatus.DRAFT,
+                        approved_at=utcnow(),
+                        related_git_commit=deployment_version(),
+                    )
+                    db.add(operation)
+                    db.flush()
+                if operation.status not in {OperationStatus.DRAFT, OperationStatus.FAILED}:
+                    raise RuntimeError(
+                        f"{managed.unix_username} has a conflicting prior upgrade operation"
+                    )
+                payload = _gpu_upgrade_operation_payload(
+                    managed, container, lease, operation.id, target["fingerprints"]
+                )
+                preflight = call_worker(
+                    "container.profile.upgrade_gpu",
+                    payload=payload,
+                    requested_by="origin-al",
+                    approved_by="origin-al",
+                    idempotency_key=f"{key}:batch-preflight",
+                    dry_run=True,
+                    timeout_seconds=90,
+                )
+                operation.validated_payload = payload
+                operation.dry_run_result = cast(dict[str, Any], safe_metadata(preflight))
+                if preflight.get("status") != "DRY_RUN" or preflight.get("upgrade_status") not in {
+                    "READY",
+                    "ALREADY_APPLIED",
+                }:
+                    operation.status = OperationStatus.FAILED
+                    operation.error_code = str(
+                        preflight.get("error", {}).get("code", "GPU_UPGRADE_PREFLIGHT_FAILED")
+                    )[:64]
+                    operation.finished_at = utcnow()
+                    db.commit()
+                    raise RuntimeError(f"{managed.unix_username} Worker preflight failed")
+                operation.status = OperationStatus.DRAFT
+                operation.error_code = None
+                operation.finished_at = None
+                target.update({"operation_id": operation.id, "payload": payload})
+                db.commit()
+            for target in targets:
+                managed = target["managed"]
+                container = target["container"]
+                lease = target["lease"]
+                key = f"gpu-profile-upgrade:{managed.id}:v1"
+                operation = db.scalar(
+                    select(PortalOperation).where(
+                        PortalOperation.requested_by == owner.id,
+                        PortalOperation.idempotency_key == key,
+                    )
+                )
+                if operation is None:
+                    operation = PortalOperation(
+                        operation_type="container.profile.upgrade_gpu",
+                        target_type="container",
+                        target_id=container.name,
+                        requested_by=owner.id,
+                        owner_managed_user_id=managed.id,
+                        approved_by=owner.id,
+                        request_summary="将普通用户开发容器升级为一张H100的GPU Development Profile",
+                        validated_payload={},
+                        idempotency_key=key,
+                        risk_level=RiskLevel.HIGH,
+                        status=OperationStatus.DRAFT,
+                        approved_at=utcnow(),
+                        related_git_commit=deployment_version(),
+                    )
+                    db.add(operation)
+                    db.flush()
+                payload = _gpu_upgrade_operation_payload(
+                    managed, container, lease, operation.id, target["fingerprints"]
+                )
+                operation.validated_payload = payload
+                preflight = call_worker(
+                    "container.profile.upgrade_gpu",
+                    payload=payload,
+                    requested_by="origin-al",
+                    approved_by="origin-al",
+                    idempotency_key=f"{key}:dry-run",
+                    dry_run=True,
+                    timeout_seconds=90,
+                )
+                if preflight.get("status") != "DRY_RUN" or preflight.get("upgrade_status") not in {
+                    "READY",
+                    "ALREADY_APPLIED",
+                }:
+                    operation.status = OperationStatus.FAILED
+                    operation.error_code = str(
+                        preflight.get("error", {}).get("code", "GPU_UPGRADE_PREFLIGHT_FAILED")
+                    )[:64]
+                    operation.finished_at = utcnow()
+                    operation.dry_run_result = cast(dict[str, Any], safe_metadata(preflight))
+                    db.commit()
+                    raise RuntimeError(f"{managed.unix_username} Worker preflight failed")
+                operation.dry_run_result = cast(dict[str, Any], safe_metadata(preflight))
+                operation.status = OperationStatus.RUNNING
+                operation.started_at = utcnow()
+                _record_gpu_upgrade_event(
+                    db,
+                    operation,
+                    OperationStatus.DRAFT.value,
+                    OperationStatus.RUNNING,
+                    "GPU profile upgrade preflight passed",
+                )
+                db.commit()
+                result = call_worker(
+                    "container.profile.upgrade_gpu",
+                    payload=payload,
+                    requested_by="origin-al",
+                    approved_by="origin-al",
+                    idempotency_key=key,
+                    dry_run=False,
+                    timeout_seconds=240,
+                )
+                if (
+                    result.get("status") != "SUCCEEDED"
+                    or result.get("development_profile") != GPU_DEVELOPMENT_PROFILE
+                    or result.get("container_state") != "STOPPED"
+                    or result.get("gpu_allocation_job_id") is not None
+                    or result.get("gpu_allocation_uuid") is not None
+                ):
+                    operation = db.get(PortalOperation, operation.id)
+                    assert operation is not None
+                    operation.status = OperationStatus.FAILED
+                    operation.error_code = str(
+                        result.get("error", {}).get("code", "GPU_PROFILE_UPGRADE_FAILED")
+                    )[:64]
+                    operation.rollback_status = str(result.get("rollback_status", "UNKNOWN"))[:32]
+                    operation.finished_at = utcnow()
+                    db.commit()
+                    raise RuntimeError(f"{managed.unix_username} Worker upgrade failed")
+                container = db.get(PortalContainer, container.id)
+                operation = db.get(PortalOperation, operation.id)
+                assert container is not None and operation is not None
+                safe_spec = dict(container.safe_spec)
+                safe_spec.update(
+                    {
+                        "gpu": "SLURM_ALLOCATED_1",
+                        "development_profile": GPU_DEVELOPMENT_PROFILE,
+                    }
+                )
+                container.development_profile = GPU_DEVELOPMENT_PROFILE
+                container.gpu_count = 1
+                container.gpu_allocation_job_id = None
+                container.gpu_allocation_uuid = None
+                container.desired_state = "STOPPED"
+                container.observed_state = "STOPPED"
+                container.safe_spec = safe_spec
+                operation.status = OperationStatus.SUCCEEDED
+                operation.finished_at = utcnow()
+                operation.worker_execution_id = str(result.get("request_id", ""))[:64] or None
+                operation.result_summary = (
+                    "GPU Development Profile applied; allocation deferred to Slurm start"
+                )
+                _record_gpu_upgrade_event(
+                    db,
+                    operation,
+                    OperationStatus.RUNNING.value,
+                    OperationStatus.SUCCEEDED,
+                    "GPU profile committed; container safely stopped without GPU allocation",
+                )
+                record_audit(
+                    db,
+                    event_type="CONTAINER_GPU_PROFILE_UPGRADED",
+                    actor="origin-al",
+                    actor_role="platform_owner",
+                    source_ip="local-console",
+                    user_agent="h100-portal-admin",
+                    object_type="container",
+                    object_id=container.name,
+                    metadata={
+                        "source_profile": CPU_DEVELOPMENT_PROFILE,
+                        "target_profile": GPU_DEVELOPMENT_PROFILE,
+                        "workspace_preserved": True,
+                        "ssh_port_preserved": True,
+                        "lease_preserved": True,
+                        "gpu_allocation": "DEFERRED_TO_SLURM_START",
+                    },
+                    operation_id=operation.id,
+                )
+                target.update(
+                    {
+                        "operation_id": operation.id,
+                        "payload": payload,
+                        "backup_sha256": result["backup_sha256"],
+                    }
+                )
+                migrated.append(target)
+                db.commit()
+
+            gpu_inventory = call_worker(
+                "gpu.list",
+                payload={},
+                requested_by="origin-al",
+                approved_by=None,
+                idempotency_key="gpu-profile-upgrade-inventory-v1",
+                dry_run=False,
+                timeout_seconds=30,
+            )
+            total_gpu = int(gpu_inventory.get("count", 0))
+            allocated_gpu = int(
+                db.scalar(
+                    select(func.count(PortalContainer.id)).where(
+                        PortalContainer.gpu_allocation_job_id.is_not(None)
+                    )
+                )
+                or 0
+            )
+            available = max(0, total_gpu - allocated_gpu)
+            restart_targets = sorted(
+                (
+                    target
+                    for target in migrated
+                    if target["was_running"]
+                    and target["managed"].compute_environment_state == "ACTIVE"
+                ),
+                key=lambda target: (
+                    ensure_utc(target["lease"].expires_at),
+                    target["managed"].unix_username,
+                ),
+            )
+            for target in restart_targets:
+                username = target["managed"].unix_username
+                if len(started_users) >= available:
+                    stopped_capacity.append(username)
+                    continue
+                container = db.get(PortalContainer, target["container"].id)
+                managed = db.get(PortalManagedUser, target["managed"].id)
+                lease = db.get(PortalComputeLease, target["lease"].id)
+                assert container is not None and managed is not None and lease is not None
+                lifecycle_payload = _gpu_upgrade_lifecycle_payload(managed, container, lease)
+                start_key = f"gpu-profile-upgrade-start:{managed.id}:v1"
+                start_operation = PortalOperation(
+                    operation_type="container.start_after_profile_upgrade",
+                    target_type="container",
+                    target_id=container.name,
+                    requested_by=owner.id,
+                    owner_managed_user_id=managed.id,
+                    approved_by=owner.id,
+                    request_summary="升级后通过Slurm启动一张H100的GPU Development Container",
+                    validated_payload=lifecycle_payload,
+                    idempotency_key=start_key,
+                    risk_level=RiskLevel.HIGH,
+                    status=OperationStatus.RUNNING,
+                    approved_at=utcnow(),
+                    started_at=utcnow(),
+                    related_git_commit=deployment_version(),
+                )
+                db.add(start_operation)
+                db.commit()
+                result = call_worker(
+                    "container.start_after_profile_upgrade",
+                    payload=lifecycle_payload,
+                    requested_by="origin-al",
+                    approved_by="origin-al",
+                    idempotency_key=start_key,
+                    dry_run=False,
+                    timeout_seconds=240,
+                )
+                persisted_start_operation = db.get(PortalOperation, start_operation.id)
+                container = db.get(PortalContainer, container.id)
+                assert persisted_start_operation is not None and container is not None
+                start_operation = persisted_start_operation
+                if (
+                    result.get("status") == "SUCCEEDED"
+                    and result.get("container_state") == "RUNNING"
+                    and isinstance(result.get("gpu_allocation_job_id"), int)
+                    and isinstance(result.get("gpu_allocation_uuid"), str)
+                ):
+                    container.desired_state = "RUNNING"
+                    container.observed_state = "RUNNING"
+                    container.gpu_allocation_job_id = result["gpu_allocation_job_id"]
+                    container.gpu_allocation_uuid = result["gpu_allocation_uuid"]
+                    start_operation.status = OperationStatus.SUCCEEDED
+                    start_operation.finished_at = utcnow()
+                    start_operation.result_summary = (
+                        "one exact H100 allocated by Slurm and bound by UUID"
+                    )
+                    started_users.append(username)
+                else:
+                    start_operation.status = OperationStatus.FAILED
+                    start_operation.finished_at = utcnow()
+                    start_operation.error_code = str(
+                        result.get("error", {}).get("code", "GPU_PROFILE_START_FAILED")
+                    )[:64]
+                    stopped_capacity.append(username)
+                db.commit()
+            print(f"deployment_version={deployment_version()}")
+            print(f"ordinary_user_containers={len(rows)}")
+            print(f"newly_upgraded={len(migrated)}")
+            print(f"gpu_profile_total={len(rows)}")
+            print(f"running_after_upgrade={','.join(started_users) or 'NONE'}")
+            print(f"stopped_for_capacity={','.join(stopped_capacity) or 'NONE'}")
+            print("result=PASS")
+            return 0
+    except (RuntimeError, SQLAlchemyError, WorkerClientError) as exc:
+        rollback_failures = _rollback_completed_gpu_upgrades(migrated) if migrated else []
+        suffix = (
+            f"; rollback unresolved={','.join(rollback_failures)}"
+            if rollback_failures
+            else "; rollback=ROLLED_BACK"
+        )
+        print(f"GPU PROFILE UPGRADE FAIL_CLOSED — {exc}{suffix}", file=sys.stderr)
+        return 2
+
+
 def create_delegated_test_session(target_login: str, scopes: list[str], ttl_seconds: int) -> int:
     """Issue one credential from the local privileged acceptance control plane."""
 
@@ -2795,6 +3425,8 @@ def main() -> int:
     portal4a_credential.add_argument("--base-url", default="http://20.10.10.3:18080")
     portal4a_revoke = subparsers.add_parser("portal4a-revoke-origin-pilot-host-access")
     portal4a_revoke.add_argument("--approval-text", required=True)
+    gpu_upgrade = subparsers.add_parser("upgrade-all-containers-to-gpu")
+    gpu_upgrade.add_argument("--approval-text", required=True)
     delegated = subparsers.add_parser("create-delegated-test-session")
     delegated.add_argument("--target", required=True)
     delegated.add_argument(
@@ -2835,6 +3467,8 @@ def main() -> int:
         return portal4a_issue_origin_pilot_test_login(args.base_url)
     if args.command == "portal4a-revoke-origin-pilot-host-access":
         return portal4a_revoke_origin_pilot_host_access(args.approval_text)
+    if args.command == "upgrade-all-containers-to-gpu":
+        return upgrade_all_containers_to_gpu(args.approval_text)
     if args.command == "create-delegated-test-session":
         return create_delegated_test_session(args.target, args.scope, args.ttl_seconds)
     return 2
