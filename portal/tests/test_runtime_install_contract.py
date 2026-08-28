@@ -111,6 +111,12 @@ def test_gpu_development_runtime_and_fail_safe_epilog_are_integrity_bound() -> N
     assert "Lease timestamps started before activation succeeded" in runtime_text
     assert '-v expected_index="${gpu_indexes[0]}"' in runtime_text
     assert "-v index=" not in runtime_text
+    assert "remove_gpu_container_fail_closed" in runtime_text
+    assert 'expected_cgroup="/system.slice/docker-${container_id}.scope"' in runtime_text
+    assert 'observed_cgroup="$(awk' in runtime_text
+    assert "printf '1\\n' >\"${cgroup_dir}/cgroup.kill\"" in runtime_text
+    assert runtime_text.index("docker rm --force") < runtime_text.index("cgroup.kill")
+    assert runtime_text.index("cgroup.kill") < runtime_text.index("create --no-build")
     assert (
         runtime_text.index("h100_acquire_lock")
         < runtime_text.index("validate_live_slurm_allocation")

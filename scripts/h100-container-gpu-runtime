@@ -133,13 +133,69 @@ validate_live_slurm_allocation() {
     || h100_fail 'assigned Slurm GPU identity changed before container start'
 }
 
+remove_gpu_container_fail_closed() {
+  local container_id container_pid observed_cgroup expected_cgroup cgroup_dir
+  local populated=1
+
+  if docker rm --force "${container}" >/dev/null; then
+    return 0
+  fi
+
+  # A failed Docker kill can leave hundreds of stuck healthcheck exec tasks
+  # inside the exact container cgroup.  Re-resolve every immutable coordinate
+  # before using the cgroup v2 atomic kill interface; never derive a writable
+  # cgroup path from user input.
+  docker inspect "${container}" | jq -e \
+    --arg job "${slurm_job_id}" --arg uuid "${gpu_uuid}" '
+      .[0].State.Running == true
+      and .[0].Config.Labels["h100.dev.gpu-allocation-job"] == $job
+      and .[0].Config.Labels["h100.dev.gpu-uuid"] == $uuid
+    ' >/dev/null || h100_fail 'failed GPU container identity changed before cgroup cleanup'
+  container_id="$(docker inspect --format '{{.Id}}' "${container}")"
+  container_pid="$(docker inspect --format '{{.State.Pid}}' "${container}")"
+  [[ "${container_id}" =~ ^[0-9a-f]{64}$ \
+    && "${container_pid}" =~ ^[1-9][0-9]*$ ]] \
+    || h100_fail 'failed GPU container runtime coordinates are invalid'
+  expected_cgroup="/system.slice/docker-${container_id}.scope"
+  observed_cgroup="$(awk -F: '$1 == "0" {print $3}' "/proc/${container_pid}/cgroup")"
+  [[ "${observed_cgroup}" == "${expected_cgroup}" ]] \
+    || h100_fail 'failed GPU container cgroup binding changed'
+  cgroup_dir="/sys/fs/cgroup${expected_cgroup}"
+  [[ -d "${cgroup_dir}" && ! -L "${cgroup_dir}" \
+    && -f "${cgroup_dir}/cgroup.kill" && ! -L "${cgroup_dir}/cgroup.kill" \
+    && -r "${cgroup_dir}/cgroup.events" && ! -L "${cgroup_dir}/cgroup.events" \
+    && "$(stat -c '%u:%g' "${cgroup_dir}")" == 0:0 \
+    && "$(stat -c '%u:%g' "${cgroup_dir}/cgroup.kill")" == 0:0 ]] \
+    || h100_fail 'failed GPU container cgroup kill interface is unsafe'
+
+  printf '1\n' >"${cgroup_dir}/cgroup.kill"
+  for _attempt in $(seq 1 80); do
+    if [[ ! -e "${cgroup_dir}/cgroup.events" ]]; then
+      populated=0
+      break
+    fi
+    populated="$(awk '$1 == "populated" {print $2}' "${cgroup_dir}/cgroup.events")"
+    [[ "${populated}" == 0 ]] && break
+    sleep 0.25
+  done
+  [[ "${populated}" == 0 ]] \
+    || h100_fail 'failed GPU container cgroup did not become empty'
+  if docker container inspect "${container}" >/dev/null 2>&1; then
+    docker rm --force "${container}" >/dev/null \
+      || h100_fail 'GPU container removal failed after exact cgroup cleanup'
+  fi
+  docker container inspect "${container}" >/dev/null 2>&1 \
+    && h100_fail 'GPU container still exists after exact cgroup cleanup'
+  printf 'GPU CONTAINER CGROUP CLEANUP %s id=%s\n' "${container}" "${container_id}"
+}
+
 if [[ "${action}" == stop ]]; then
   docker inspect "${container}" | jq -e \
     --arg job "${slurm_job_id}" --arg uuid "${gpu_uuid}" '
       .[0].Config.Labels["h100.dev.gpu-allocation-job"] == $job
       and .[0].Config.Labels["h100.dev.gpu-uuid"] == $uuid
     ' >/dev/null || h100_fail 'running GPU container allocation binding changed'
-  docker rm --force "${container}" >/dev/null
+  remove_gpu_container_fail_closed
   docker compose --project-directory "${config_dir}" --file "${compose_file}" \
     create --no-build
   docker inspect "${container}" | jq -e '
