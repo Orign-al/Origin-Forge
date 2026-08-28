@@ -205,9 +205,37 @@ def test_compute_stage_publishes_ssh_on_ipv4_ingress_and_keeps_public_address_se
 
     assert manifest["h100-provision-stage"] == hashlib.sha256(source.read_bytes()).hexdigest()
     assert "readonly H100_PUBLIC_ACCESS_IP=20.10.10.3" in common_text
+    assert "readonly H100_LEGACY_PUBLIC_ACCESS_IP=10.10.10.220" in common_text
+    assert "readonly -a H100_CONTAINER_PUBLISH_IPS=(" in common_text
     assert "readonly CONTAINER_PUBLISH_HOST=${H100_PUBLIC_ACCESS_IP}" in source_text
+    assert "readonly CONTAINER_LEGACY_PUBLISH_HOST=${H100_LEGACY_PUBLIC_ACCESS_IP}" in source_text
     assert "host_ip: ${CONTAINER_PUBLISH_HOST}" in source_text
-    assert '.HostConfig.PortBindings["22/tcp"][0].HostIp == $host_ip' in source_text
+    assert "host_ip: ${CONTAINER_LEGACY_PUBLISH_HOST}" in source_text
+    assert "map([.HostIp, .HostPort]) | sort" in source_text
     assert "CONTAINER_PUBLISH_HOST = PUBLIC_ACCESS_HOST" in worker_text
     assert 'PUBLIC_ACCESS_HOST = "20.10.10.3"' in worker_text
-    assert 'container.get("ssh_host_ip") == CONTAINER_PUBLISH_HOST' in worker_text
+    assert 'LEGACY_PUBLIC_ACCESS_HOST = "10.10.10.220"' in worker_text
+    assert (
+        "CONTAINER_PUBLISH_HOSTS = (PUBLIC_ACCESS_HOST, LEGACY_PUBLIC_ACCESS_HOST)" in worker_text
+    )
+    assert "_container_ssh_ingress_matches(" in worker_text
+
+
+def test_legacy_easytier_ingress_and_compose_reconciliation_are_installed() -> None:
+    installer = (PORTAL_ROOT / "deploy/scripts/install-runtime.sh").read_text()
+    ingress = (PLATFORM_ROOT / "scripts/h100-easytier-legacy-ingress").read_text()
+    reconcile = (PLATFORM_ROOT / "scripts/h100-reconcile-dual-easytier-ingress").read_text()
+    unit = (PORTAL_ROOT / "deploy/systemd/h100-easytier-legacy-ingress.service").read_text()
+
+    assert '-i "${LEGACY_INTERFACE}"' in ingress
+    assert "${H100_LEGACY_PUBLIC_ACCESS_IP}/32" in ingress
+    assert "22023:22999" in ingress
+    assert '--to-destination "${H100_PUBLIC_ACCESS_IP}"' in ingress
+    assert "10.82.36.1" not in ingress
+    assert "docker compose" in reconcile
+    assert "H100_LEGACY_PUBLIC_ACCESS_IP" in reconcile
+    assert "config --format json" in reconcile
+    assert "/usr/local/sbin/h100-easytier-legacy-ingress" in installer
+    assert "/usr/local/sbin/h100-reconcile-dual-easytier-ingress" in installer
+    assert "h100-easytier-legacy-ingress.service" in installer
+    assert "ExecStart=/usr/local/sbin/h100-easytier-legacy-ingress apply" in unit

@@ -8,6 +8,11 @@ readonly H100_DATA_ROOT=/srv/gpu-platform
 readonly H100_WORKSPACE_ROOT=/storage/users
 readonly H100_MANAGEMENT_IP=10.82.36.1
 readonly H100_PUBLIC_ACCESS_IP=20.10.10.3
+readonly H100_LEGACY_PUBLIC_ACCESS_IP=10.10.10.220
+readonly -a H100_CONTAINER_PUBLISH_IPS=(
+  "${H100_PUBLIC_ACCESS_IP}"
+  "${H100_LEGACY_PUBLIC_ACCESS_IP}"
+)
 readonly H100_AUDIT_LOG=/var/log/h100-platform-audit.log
 readonly H100_LOCK_FILE=/run/lock/h100-platform.lock
 readonly H100_GPU_ISOLATION_REGISTRY=/etc/h100-platform/gpu-isolated-users

@@ -19,6 +19,7 @@ readonly PROJECT_MAX=39999
 readonly PORT_MIN=22023
 readonly PORT_MAX=22999
 readonly CONTAINER_PUBLISH_HOST=${H100_PUBLIC_ACCESS_IP}
+readonly CONTAINER_LEGACY_PUBLISH_HOST=${H100_LEGACY_PUBLIC_ACCESS_IP}
 
 created_group=0
 created_user=0
@@ -621,6 +622,10 @@ services:
         published: "${ssh_port}"
         host_ip: ${CONTAINER_PUBLISH_HOST}
         protocol: tcp
+      - target: 22
+        published: "${ssh_port}"
+        host_ip: ${CONTAINER_LEGACY_PUBLISH_HOST}
+        protocol: tcp
     volumes:
       - {type: bind, source: ${user_root}/home, target: /home/${username}, bind: {propagation: rprivate}}
       - {type: bind, source: ${workspace_root}, target: /workspace, bind: {propagation: rprivate}}
@@ -643,6 +648,7 @@ created_container=1
   || fail 'container is not staged in created state'
 docker inspect "${container_name}" | jq -e \
   --arg host_ip "${CONTAINER_PUBLISH_HOST}" \
+  --arg legacy_host_ip "${CONTAINER_LEGACY_PUBLISH_HOST}" \
   --arg port "${ssh_port}" \
   --arg workspace "${workspace_root}" \
   '.[0].HostConfig.Privileged == false
@@ -656,8 +662,9 @@ docker inspect "${container_name}" | jq -e \
    and .[0].HostConfig.NanoCpus == 8000000000
    and .[0].HostConfig.Memory == 34359738368
    and .[0].HostConfig.PidsLimit == 4096
-   and .[0].HostConfig.PortBindings["22/tcp"][0].HostIp == $host_ip
-   and .[0].HostConfig.PortBindings["22/tcp"][0].HostPort == $port
+   and (((.[0].HostConfig.PortBindings["22/tcp"] // [])
+     | map([.HostIp, .HostPort]) | sort)
+     == ([[$host_ip, $port], [$legacy_host_ip, $port]] | sort))
    and ((.[0].Mounts // []) | map(.Destination) | index("/var/run/docker.sock") | not)
    and ((.[0].Mounts // []) | map(.Destination) | index("/run/munge") | not)
    and ((.[0].Mounts // []) | map(.Source) | index("/") | not)

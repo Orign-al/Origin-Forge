@@ -25,6 +25,8 @@ readonly QUOTA_SHOW_SOURCE="${PLATFORM_DIR}/scripts/h100-quota-show"
 readonly GPU_BYPASS_GUARD_SOURCE="${PLATFORM_DIR}/scripts/h100-gpu-bypass-guard"
 readonly CONTAINER_GPU_RUNTIME_SOURCE="${PLATFORM_DIR}/scripts/h100-container-gpu-runtime"
 readonly GPU_DEVELOPMENT_EPILOG_SOURCE="${PLATFORM_DIR}/scripts/h100-gpu-development-epilog"
+readonly EASYTIER_LEGACY_INGRESS_SOURCE="${PLATFORM_DIR}/scripts/h100-easytier-legacy-ingress"
+readonly EASYTIER_DUAL_RECONCILE_SOURCE="${PLATFORM_DIR}/scripts/h100-reconcile-dual-easytier-ingress"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "install-runtime.sh must run as root" >&2
@@ -73,6 +75,10 @@ done
   || { echo "required deployment input missing: $CONTAINER_GPU_RUNTIME_SOURCE" >&2; exit 1; }
 [[ -f "$GPU_DEVELOPMENT_EPILOG_SOURCE" && ! -L "$GPU_DEVELOPMENT_EPILOG_SOURCE" ]] \
   || { echo "required deployment input missing: $GPU_DEVELOPMENT_EPILOG_SOURCE" >&2; exit 1; }
+[[ -f "$EASYTIER_LEGACY_INGRESS_SOURCE" && ! -L "$EASYTIER_LEGACY_INGRESS_SOURCE" ]] \
+  || { echo "required deployment input missing: $EASYTIER_LEGACY_INGRESS_SOURCE" >&2; exit 1; }
+[[ -f "$EASYTIER_DUAL_RECONCILE_SOURCE" && ! -L "$EASYTIER_DUAL_RECONCILE_SOURCE" ]] \
+  || { echo "required deployment input missing: $EASYTIER_DUAL_RECONCILE_SOURCE" >&2; exit 1; }
 
 rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
   --exclude=/node_modules/ \
@@ -170,6 +176,12 @@ install -o root -g gpu-platform-admin -m 0750 \
 install -o root -g root -m 0750 \
   "$GPU_DEVELOPMENT_EPILOG_SOURCE" \
   /usr/local/sbin/h100-gpu-development-epilog
+install -o root -g root -m 0750 \
+  "$EASYTIER_LEGACY_INGRESS_SOURCE" \
+  /usr/local/sbin/h100-easytier-legacy-ingress
+install -o root -g root -m 0750 \
+  "$EASYTIER_DUAL_RECONCILE_SOURCE" \
+  /usr/local/sbin/h100-reconcile-dual-easytier-ingress
 
 install -o root -g root -m 0640 \
   "$SOURCE_DIR/deploy/worker-scripts.json" \
@@ -198,7 +210,8 @@ for unit in \
   h100-portal-lease-expiry.service \
   h100-portal-lease-expiry.timer \
   h100-portal-provision-reconcile.service \
-  h100-portal-provision-reconcile.timer; do
+  h100-portal-provision-reconcile.timer \
+  h100-easytier-legacy-ingress.service; do
   install -o root -g root -m 0644 "$SOURCE_DIR/deploy/systemd/$unit" "$UNIT_DIR/$unit"
 done
 

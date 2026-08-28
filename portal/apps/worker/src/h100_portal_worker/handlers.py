@@ -150,7 +150,9 @@ PILOT_USERNAME = "origin-pilot"
 MANAGEMENT_USERNAME = "origin-al"
 MANAGEMENT_IP = "10.82.36.1"
 PUBLIC_ACCESS_HOST = "20.10.10.3"
+LEGACY_PUBLIC_ACCESS_HOST = "10.10.10.220"
 CONTAINER_PUBLISH_HOST = PUBLIC_ACCESS_HOST
+CONTAINER_PUBLISH_HOSTS = (PUBLIC_ACCESS_HOST, LEGACY_PUBLIC_ACCESS_HOST)
 SSH_REPRESENTATIVE_CLIENT_IP = "10.20.18.10"
 SSH_REPRESENTATIVE_HOST = "sagsh100server"
 GPU_DROPIN_NAME = "50-h100-gpu-isolation.conf"
@@ -857,12 +859,19 @@ def containers_inspect(payload: dict[str, Any]) -> dict[str, Any]:
     image_descriptor = item.get("ImageManifestDescriptor") or {}
     port_bindings = host_config.get("PortBindings") or {}
     ssh_ports = port_bindings.get("22/tcp") or []
-    ssh_port = (
-        ssh_ports[0].get("HostPort") if ssh_ports and isinstance(ssh_ports[0], dict) else None
+    ssh_bindings = [
+        {"host_ip": binding.get("HostIp"), "host_port": binding.get("HostPort")}
+        for binding in ssh_ports
+        if isinstance(binding, dict)
+        and isinstance(binding.get("HostIp"), str)
+        and isinstance(binding.get("HostPort"), str)
+    ]
+    primary_ssh_binding = next(
+        (binding for binding in ssh_bindings if binding["host_ip"] == CONTAINER_PUBLISH_HOST),
+        ssh_bindings[0] if ssh_bindings else {},
     )
-    ssh_host_ip = (
-        ssh_ports[0].get("HostIp") if ssh_ports and isinstance(ssh_ports[0], dict) else None
-    )
+    ssh_port = primary_ssh_binding.get("host_port")
+    ssh_host_ip = primary_ssh_binding.get("host_ip")
     labels_value = config.get("Labels")
     labels: dict[str, Any] = labels_value if isinstance(labels_value, dict) else {}
     safe_labels = {
@@ -923,6 +932,8 @@ def containers_inspect(payload: dict[str, Any]) -> dict[str, Any]:
             "pids_limit": pids_limit,
             "ssh_port": ssh_port,
             "ssh_host_ip": ssh_host_ip,
+            "ssh_host_ips": [binding["host_ip"] for binding in ssh_bindings],
+            "ssh_bindings": ssh_bindings,
             "privileged": host_config.get("Privileged"),
             "network_mode": host_config.get("NetworkMode"),
             "pid_mode": host_config.get("PidMode"),
@@ -941,6 +952,44 @@ def containers_inspect(payload: dict[str, Any]) -> dict[str, Any]:
             "ports": network.get("Ports"),
         },
     }
+
+
+def _container_ssh_ingress_matches(
+    container: dict[str, Any], expected_port: int, *, require_all: bool
+) -> bool:
+    raw_bindings = container.get("ssh_bindings")
+    if not isinstance(raw_bindings, list):
+        return False
+    observed: list[tuple[str, str]] = []
+    for binding in raw_bindings:
+        if not isinstance(binding, dict):
+            return False
+        host_ip = binding.get("host_ip")
+        host_port = binding.get("host_port")
+        if not isinstance(host_ip, str) or not isinstance(host_port, str):
+            return False
+        observed.append((host_ip, host_port))
+    expected = {(host_ip, str(expected_port)) for host_ip in CONTAINER_PUBLISH_HOSTS}
+    observed_set = set(observed)
+    primary = (CONTAINER_PUBLISH_HOST, str(expected_port))
+    return bool(
+        len(observed) == len(observed_set)
+        and primary in observed_set
+        and observed_set <= expected
+        and (not require_all or observed_set == expected)
+        and container.get("ssh_port") == str(expected_port)
+        and container.get("ssh_host_ip") == CONTAINER_PUBLISH_HOST
+    )
+
+
+def _container_ssh_ingress_is_managed(container: dict[str, Any], *, require_all: bool) -> bool:
+    raw_port = container.get("ssh_port")
+    return bool(
+        isinstance(raw_port, str)
+        and raw_port.isdigit()
+        and PILOT_SSH_PORT_MIN <= int(raw_port) <= PILOT_SSH_PORT_MAX
+        and _container_ssh_ingress_matches(container, int(raw_port), require_all=require_all)
+    )
 
 
 def storage_summary() -> dict[str, Any]:
@@ -3748,8 +3797,7 @@ def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
         and container.get("cpu_limit") == 8.0
         and container.get("memory_limit_bytes") == 32 * 1024**3
         and container.get("pids_limit") == 4096
-        and container.get("ssh_port") == str(payload["ssh_port"])
-        and container.get("ssh_host_ip") == CONTAINER_PUBLISH_HOST
+        and _container_ssh_ingress_matches(container, int(payload["ssh_port"]), require_all=True)
         and container.get("privileged") is False
         and container.get("network_mode") != "host"
         and container.get("pid_mode") != "host"
@@ -5015,8 +5063,7 @@ def _stage_postcondition_summary(payload: dict[str, Any]) -> dict[str, Any]:
         and container.get("cpu_limit") == float(payload["cpus"])
         and container.get("memory_limit_bytes") == payload["memory_gb"] * 1024**3
         and container.get("pids_limit") == payload["pids_limit"]
-        and container.get("ssh_port") == str(payload["ssh_port"])
-        and container.get("ssh_host_ip") == CONTAINER_PUBLISH_HOST
+        and _container_ssh_ingress_matches(container, int(payload["ssh_port"]), require_all=True)
         and container.get("privileged") is False
         and container.get("network_mode") != "host"
         and container.get("pid_mode") != "host"
@@ -5529,8 +5576,9 @@ def _verify_managed_container_start_preconditions(payload: dict[str, Any]) -> di
         and container.get("cpu_limit") == float(APPROVED_STAGE_PAYLOAD["cpus"])
         and container.get("memory_limit_bytes") == APPROVED_STAGE_PAYLOAD["memory_gb"] * 1024**3
         and container.get("pids_limit") == APPROVED_STAGE_PAYLOAD["pids_limit"]
-        and container.get("ssh_port") == str(APPROVED_STAGE_PAYLOAD["ssh_port"])
-        and container.get("ssh_host_ip") == CONTAINER_PUBLISH_HOST
+        and _container_ssh_ingress_matches(
+            container, int(APPROVED_STAGE_PAYLOAD["ssh_port"]), require_all=False
+        )
         and container.get("privileged") is False
         and container.get("network_mode") != "host"
         and container.get("pid_mode") != "host"
@@ -6733,8 +6781,7 @@ def _activation_container_security(
         and container.get("cpu_limit") == 8.0
         and container.get("memory_limit_bytes") == 32 * 1024**3
         and container.get("pids_limit") == 4096
-        and container.get("ssh_port") == str(payload["ssh_port"])
-        and container.get("ssh_host_ip") == CONTAINER_PUBLISH_HOST
+        and _container_ssh_ingress_matches(container, int(payload["ssh_port"]), require_all=False)
         and container.get("privileged") is False
         and container.get("network_mode") != "host"
         and container.get("pid_mode") != "host"
@@ -7326,8 +7373,14 @@ def _approved_container_listener() -> dict[str, Any]:
     )
     lines = [line.split() for line in str(result.get("stdout", "")).splitlines() if line.strip()]
     local_endpoints = [fields[3] for fields in lines if len(fields) >= 5]
-    expected = f"{CONTAINER_PUBLISH_HOST}:{APPROVED_STAGE_PAYLOAD['ssh_port']}"
-    if not result.get("ok") or local_endpoints != [expected]:
+    allowed = {f"{host}:{APPROVED_STAGE_PAYLOAD['ssh_port']}" for host in CONTAINER_PUBLISH_HOSTS}
+    primary = f"{CONTAINER_PUBLISH_HOST}:{APPROVED_STAGE_PAYLOAD['ssh_port']}"
+    if (
+        not result.get("ok")
+        or len(local_endpoints) != len(set(local_endpoints))
+        or primary not in local_endpoints
+        or not set(local_endpoints) <= allowed
+    ):
         raise LifecycleValidationError(
             "CONTAINER_SSH_LISTENER_FAILED", "container SSH listener differs from approval"
         )
@@ -7555,8 +7608,9 @@ def _activate_postcondition_summary(
         and container.get("cpu_limit") == float(APPROVED_STAGE_PAYLOAD["cpus"])
         and container.get("memory_limit_bytes") == APPROVED_STAGE_PAYLOAD["memory_gb"] * 1024**3
         and container.get("pids_limit") == APPROVED_STAGE_PAYLOAD["pids_limit"]
-        and container.get("ssh_port") == str(APPROVED_STAGE_PAYLOAD["ssh_port"])
-        and container.get("ssh_host_ip") == CONTAINER_PUBLISH_HOST
+        and _container_ssh_ingress_matches(
+            container, int(APPROVED_STAGE_PAYLOAD["ssh_port"]), require_all=False
+        )
         and container.get("privileged") is False
         and container.get("network_mode") != "host"
         and container.get("pid_mode") != "host"
@@ -9692,6 +9746,7 @@ def _managed_container_security(
     if not (
         inspected.get("status") == "OK"
         and container.get("owner") == payload["username"]
+        and _container_ssh_ingress_is_managed(container, require_all=False)
         and safe_labels.get("h100.dev.uid") == str(payload["uid"])
         and safe_labels.get("h100.dev.gid") == str(payload["gid"])
         and container.get("privileged") is False

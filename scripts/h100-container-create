@@ -50,8 +50,10 @@ docker container inspect "${container}" >/dev/null 2>&1 \
 if ss -H -lnt "sport = :${ssh_port}" | grep -q .; then
   h100_fail "SSH port is already in use: ${ssh_port}"
 fi
-ip -br addr | grep -Eq "^[^[:space:]]+[[:space:]]+UP[[:space:]]+.*${H100_PUBLIC_ACCESS_IP}/" \
-  || h100_fail "EasyTier user ingress IP is not active: ${H100_PUBLIC_ACCESS_IP}"
+for ingress_ip in "${H100_CONTAINER_PUBLISH_IPS[@]}"; do
+  ip -br addr | grep -Eq "^[^[:space:]]+[[:space:]]+(UP|UNKNOWN)[[:space:]]+.*${ingress_ip}/" \
+    || h100_fail "EasyTier user ingress IP is not active: ${ingress_ip}"
+done
 if id -nG "${user_name}" | tr ' ' '\n' | grep -qx docker; then
   h100_fail 'managed user must not belong to the host docker group'
 fi
@@ -133,6 +135,10 @@ services:
         published: "${ssh_port}"
         host_ip: ${H100_PUBLIC_ACCESS_IP}
         protocol: tcp
+      - target: 22
+        published: "${ssh_port}"
+        host_ip: ${H100_LEGACY_PUBLIC_ACCESS_IP}
+        protocol: tcp
     volumes:
       - type: bind
         source: ${H100_DATA_ROOT}/users/${user_name}/home
@@ -180,6 +186,7 @@ h100_wait_healthy "${container}" 120 \
 
 docker inspect "${container}" | jq -e \
   --arg host_ip "${H100_PUBLIC_ACCESS_IP}" \
+  --arg legacy_host_ip "${H100_LEGACY_PUBLIC_ACCESS_IP}" \
   --arg host_port "${ssh_port}" \
   --arg workspace "${workspace}" '
     .[0] as $c
@@ -192,8 +199,9 @@ docker inspect "${container}" | jq -e \
     and $c.HostConfig.NanoCpus == 8000000000
     and $c.HostConfig.Memory == 34359738368
     and $c.HostConfig.PidsLimit == 4096
-    and $c.HostConfig.PortBindings["22/tcp"][0].HostIp == $host_ip
-    and $c.HostConfig.PortBindings["22/tcp"][0].HostPort == $host_port
+    and ((($c.HostConfig.PortBindings["22/tcp"] // [])
+      | map([.HostIp, .HostPort]) | sort)
+      == ([[$host_ip, $host_port], [$legacy_host_ip, $host_port]] | sort))
     and (($c.Mounts // []) | map(select(.Source == $workspace and .Destination == "/workspace" and .RW == true)) | length == 1)
     and (($c.Mounts // []) | map(.Destination) | index("/var/run/docker.sock") | not)
     and (($c.Mounts // []) | map(.Source) | index("/") | not)
@@ -205,7 +213,9 @@ fingerprint="$(ssh-keygen -lf "${host_key_dir}/ssh_host_ed25519_key.pub")"
   printf -- '- User: `%s` (`%s:%s`)\n' "${user_name}" "${user_uid}" "${user_gid}"
   printf -- '- Container: `%s`\n' "${container}"
   printf -- '- Image: `%s`\n' "${image}"
-  printf -- '- SSH: `%s:%s`\n' "${H100_PUBLIC_ACCESS_IP}" "${ssh_port}"
+  printf -- '- SSH (primary): `%s:%s`\n' "${H100_PUBLIC_ACCESS_IP}" "${ssh_port}"
+  printf -- '- SSH (legacy EasyTier): `%s:%s`\n' \
+    "${H100_LEGACY_PUBLIC_ACCESS_IP}" "${ssh_port}"
   printf -- '- SSH host-key fingerprint: `%s`\n' "${fingerprint}"
   printf -- '- Privileged/host network/host PID/host IPC: disabled\n'
   printf -- '- GPU device request: none\n'
@@ -214,7 +224,8 @@ fingerprint="$(ssh-keygen -lf "${host_key_dir}/ssh_host_ed25519_key.pub")"
   printf -- '- Compose: `%s`\n' "${compose_file}"
 } >"${report_file}"
 
-printf 'CREATED CONTAINER %s ssh=%s:%s\n' \
-  "${container}" "${H100_PUBLIC_ACCESS_IP}" "${ssh_port}"
+printf 'CREATED CONTAINER %s ssh=%s:%s legacy_ssh=%s:%s\n' \
+  "${container}" "${H100_PUBLIC_ACCESS_IP}" "${ssh_port}" \
+  "${H100_LEGACY_PUBLIC_ACCESS_IP}" "${ssh_port}"
 printf 'SSH host-key fingerprint: %s\n' "${fingerprint}"
 h100_mark_success

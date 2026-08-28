@@ -1,0 +1,14 @@
+[Unit]
+Description=H100 legacy EasyTier container SSH ingress
+Requires=easytier@home.service docker.service
+After=network-online.target easytier@home.service docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/h100-easytier-legacy-ingress apply
+ExecStartPost=/usr/local/sbin/h100-easytier-legacy-ingress check
+ExecStop=/usr/local/sbin/h100-easytier-legacy-ingress remove
+
+[Install]
+WantedBy=multi-user.target

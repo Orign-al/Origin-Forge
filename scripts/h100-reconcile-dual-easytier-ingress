@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /usr/local/lib/h100-platform/h100-platform-common.sh
+
+usage() {
+  printf 'Usage: h100-reconcile-dual-easytier-ingress {--check|--apply}\n'
+}
+
+if (($# != 1)) || [[ "$1" != --check && "$1" != --apply ]]; then
+  usage >&2
+  exit 2
+fi
+
+readonly mode=$1
+readonly compose_root="${H100_PLATFORM_ROOT}/config/dev-containers"
+h100_require_root
+h100_acquire_lock
+
+temp_dir="$(mktemp -d /tmp/h100-dual-easytier-ingress.XXXXXX)"
+backup_dir=
+committed=0
+changed=0
+checked=0
+declare -a installed_users=()
+
+cleanup_reconcile() {
+  local rc=$?
+  set +e
+  if ((rc != 0 && committed == 0)) && [[ -n "${backup_dir}" ]]; then
+    for user_name in "${installed_users[@]}"; do
+      install -o root -g gpu-platform-admin -m 0640 \
+        "${backup_dir}/${user_name}/compose.yml" \
+        "${compose_root}/${user_name}/compose.yml"
+    done
+  fi
+  case "${temp_dir}" in
+    /tmp/h100-dual-easytier-ingress.*) rm -rf -- "${temp_dir}" ;;
+  esac
+  h100_audit reconcile-dual-easytier-ingress platform \
+    "$([[ ${rc} -eq 0 ]] && printf SUCCESS || printf FAILED)" "${rc}"
+  exit "${rc}"
+}
+trap cleanup_reconcile EXIT
+
+shopt -s nullglob
+compose_files=("${compose_root}"/*/compose.yml)
+((${#compose_files[@]} > 0)) || h100_fail 'no managed Compose definitions were found'
+
+for compose_file in "${compose_files[@]}"; do
+  user_name="$(basename "$(dirname "${compose_file}")")"
+  h100_validate_username "${user_name}"
+  [[ -f "${compose_file}" && ! -L "${compose_file}" ]] \
+    || h100_fail "unsafe managed Compose definition: ${user_name}"
+  canonical="${temp_dir}/${user_name}.canonical.json"
+  candidate="${temp_dir}/${user_name}.candidate.json"
+  docker compose --project-directory "${compose_root}/${user_name}" \
+    --file "${compose_file}" config --format json >"${canonical}"
+  primary_count="$(jq -r --arg primary "${H100_PUBLIC_ACCESS_IP}" '
+    [.services.dev.ports[]?
+      | select((.target | tostring) == "22" and .host_ip == $primary)]
+    | length
+  ' "${canonical}")"
+  if [[ "${primary_count}" == 0 ]]; then
+    continue
+  fi
+  [[ "${primary_count}" == 1 ]] \
+    || h100_fail "primary EasyTier SSH binding is ambiguous: ${user_name}"
+  jq -e --arg primary "${H100_PUBLIC_ACCESS_IP}" \
+    --arg legacy "${H100_LEGACY_PUBLIC_ACCESS_IP}" '
+      [.services.dev.ports[]? | select((.target | tostring) == "22")] as $ssh
+      | ($ssh | map(.published | tostring) | unique | length) == 1
+      and ($ssh
+        | map(select(.host_ip != $primary and .host_ip != $legacy))
+        | length) == 0
+    ' "${canonical}" >/dev/null \
+    || h100_fail "managed SSH bindings contain an unapproved address: ${user_name}"
+  jq --arg primary "${H100_PUBLIC_ACCESS_IP}" \
+    --arg legacy "${H100_LEGACY_PUBLIC_ACCESS_IP}" '
+      (.services.dev.ports
+        | map(select((.target | tostring) == "22" and .host_ip == $primary))[0]) as $primary_binding
+      | .services.dev.ports = (
+          [.services.dev.ports[]
+            | select(((.target | tostring) == "22" and .host_ip == $legacy) | not)]
+          + [($primary_binding | .host_ip = $legacy)]
+        )
+    ' "${canonical}" >"${candidate}"
+  docker compose --project-directory "${compose_root}/${user_name}" \
+    --file "${candidate}" config --quiet
+  checked=$((checked + 1))
+  if jq -e --arg primary "${H100_PUBLIC_ACCESS_IP}" \
+    --arg legacy "${H100_LEGACY_PUBLIC_ACCESS_IP}" '
+      [.services.dev.ports[]?
+        | select((.target | tostring) == "22")
+        | [.host_ip, (.published | tostring)]] as $ssh
+      | ($ssh | length) == 2
+      and ($ssh | map(.[1]) | unique | length) == 1
+      and ($ssh | map(.[0]) | sort) == ([$primary, $legacy] | sort)
+    ' "${canonical}" >/dev/null; then
+    continue
+  fi
+  if [[ "${mode}" == --check ]]; then
+    h100_fail "legacy EasyTier SSH binding is missing: ${user_name}"
+  fi
+  if [[ -z "${backup_dir}" ]]; then
+    backup_dir="$(mktemp -d "${H100_PLATFORM_ROOT}/backups/dual-easytier-ingress.XXXXXX")"
+    chown root:gpu-platform-admin "${backup_dir}"
+    chmod 0750 "${backup_dir}"
+  fi
+  install -d -o root -g gpu-platform-admin -m 0750 "${backup_dir}/${user_name}"
+  install -o root -g gpu-platform-admin -m 0640 \
+    "${compose_file}" "${backup_dir}/${user_name}/compose.yml"
+  install -o root -g gpu-platform-admin -m 0640 "${candidate}" "${compose_file}"
+  installed_users+=("${user_name}")
+  changed=$((changed + 1))
+done
+
+for user_name in "${installed_users[@]}"; do
+  docker compose --project-directory "${compose_root}/${user_name}" \
+    --file "${compose_root}/${user_name}/compose.yml" config --quiet
+done
+committed=1
+printf 'DUAL EASYTIER COMPOSE RECONCILIATION PASS checked=%s changed=%s backup=%s\n' \
+  "${checked}" "${changed}" "${backup_dir:-NOT_REQUIRED}"

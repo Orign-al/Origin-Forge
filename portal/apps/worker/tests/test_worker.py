@@ -1768,6 +1768,11 @@ def managed_container_inspect(*, state: str = "STOPPED") -> dict[str, object]:
             "pids_limit": 4096,
             "ssh_port": "22023",
             "ssh_host_ip": "20.10.10.3",
+            "ssh_host_ips": ["20.10.10.3", "10.10.10.220"],
+            "ssh_bindings": [
+                {"host_ip": "20.10.10.3", "host_port": "22023"},
+                {"host_ip": "10.10.10.220", "host_port": "22023"},
+            ],
             "privileged": False,
             "network_mode": "bridge",
             "pid_mode": "",
@@ -1923,6 +1928,27 @@ def test_managed_container_start_preconditions_accept_only_exact_safe_container(
         managed_container_start_payload()
     )
     assert result["container"]["gpu"] == "NONE"
+
+
+def test_container_ssh_ingress_requires_exact_dual_binding_for_new_stage() -> None:
+    container = managed_container_inspect()["container"]
+    assert isinstance(container, dict)
+    assert handlers._container_ssh_ingress_matches(container, 22023, require_all=True)
+
+    container["ssh_bindings"] = [container["ssh_bindings"][0]]
+    container["ssh_host_ips"] = ["20.10.10.3"]
+    assert handlers._container_ssh_ingress_matches(container, 22023, require_all=False)
+    assert not handlers._container_ssh_ingress_matches(container, 22023, require_all=True)
+
+
+def test_container_ssh_ingress_rejects_management_or_wildcard_bindings() -> None:
+    for unsafe_host in ("10.82.36.1", "0.0.0.0"):  # noqa: S104
+        container = managed_container_inspect()["container"]
+        assert isinstance(container, dict)
+        bindings = container["ssh_bindings"]
+        assert isinstance(bindings, list)
+        bindings.append({"host_ip": unsafe_host, "host_port": "22023"})
+        assert not handlers._container_ssh_ingress_matches(container, 22023, require_all=False)
 
 
 @pytest.mark.parametrize(
