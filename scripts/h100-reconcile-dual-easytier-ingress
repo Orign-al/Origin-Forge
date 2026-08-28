@@ -12,7 +12,7 @@ if (($# != 1)) || [[ "$1" != --check && "$1" != --apply ]]; then
   exit 2
 fi
 
-readonly mode=$1
+readonly reconcile_mode=$1
 readonly compose_root="${H100_PLATFORM_ROOT}/config/dev-containers"
 h100_require_root
 h100_acquire_lock
@@ -99,7 +99,7 @@ for compose_file in "${compose_files[@]}"; do
     ' "${canonical}" >/dev/null; then
     continue
   fi
-  if [[ "${mode}" == --check ]]; then
+  if [[ "${reconcile_mode}" == --check ]]; then
     h100_fail "legacy EasyTier SSH binding is missing: ${user_name}"
   fi
   if [[ -z "${backup_dir}" ]]; then
