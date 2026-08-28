@@ -9638,12 +9638,30 @@ def _cancel_gpu_development_allocation(payload: dict[str, Any], job_id: int) -> 
     )
 
 
+def _managed_workspace_mode_is_safe(metadata: os.stat_result, *, username: str, gid: int) -> bool:
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode == 0o700:
+        return True
+    if mode != 0o750:
+        return False
+    try:
+        workspace_group = grp.getgrgid(gid)
+    except KeyError:
+        return False
+    return (
+        workspace_group.gr_name == username
+        and all(member == username for member in workspace_group.gr_mem)
+        and all(account.pw_name == username for account in pwd.getpwall() if account.pw_gid == gid)
+    )
+
+
 def _managed_container_security(
     payload: dict[str, Any], *, require_running: bool | None
 ) -> dict[str, Any]:
     account = _managed_account(payload)
+    username = str(payload["username"])
     workspace = Path(str(payload["workspace_path"]))
-    backing_workspace = PILOT_DATA_ROOT / str(payload["username"]) / "workspace"
+    backing_workspace = PILOT_DATA_ROOT / username / "workspace"
     try:
         workspace_metadata = workspace.lstat()
     except OSError as exc:
@@ -9656,7 +9674,9 @@ def _managed_container_security(
         or stat.S_ISLNK(workspace_metadata.st_mode)
         or workspace_metadata.st_uid != account.pw_uid
         or workspace_metadata.st_gid != account.pw_gid
-        or stat.S_IMODE(workspace_metadata.st_mode) != 0o700
+        or not _managed_workspace_mode_is_safe(
+            workspace_metadata, username=username, gid=account.pw_gid
+        )
     ):
         raise LifecycleValidationError(
             "WORKSPACE_BINDING_REJECTED", "canonical workspace ownership or mode is invalid"
@@ -9720,7 +9740,9 @@ def _managed_container_security(
                 and not stat.S_ISLNK(backing_metadata.st_mode)
                 and backing_metadata.st_uid == account.pw_uid
                 and backing_metadata.st_gid == account.pw_gid
-                and stat.S_IMODE(backing_metadata.st_mode) == 0o700
+                and _managed_workspace_mode_is_safe(
+                    backing_metadata, username=username, gid=account.pw_gid
+                )
                 and (workspace_metadata.st_dev, workspace_metadata.st_ino)
                 == (backing_metadata.st_dev, backing_metadata.st_ino)
             )

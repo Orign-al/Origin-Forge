@@ -3578,6 +3578,103 @@ def test_cpu_container_security_accepts_legacy_backing_mount_only_for_same_inode
     assert rejected.value.code == "CONTAINER_SECURITY_REJECTED"
 
 
+def test_cpu_container_security_accepts_legacy_0750_private_primary_group_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    uid = os.getuid()
+    gid = os.getgid()
+    canonical = tmp_path / "canonical" / str(uid)
+    backing = tmp_path / "users" / "origin-pilot" / "workspace"
+    canonical.mkdir(parents=True, mode=0o750)
+    backing.mkdir(parents=True, mode=0o750)
+    canonical.chmod(0o750)
+    backing.chmod(0o750)
+    inspected = managed_container_inspect(state="STOPPED")
+    container = inspected["container"]
+    assert isinstance(container, dict)
+    container["safe_labels"] = {
+        "h100.dev.user": "origin-pilot",
+        "h100.dev.uid": str(uid),
+        "h100.dev.gid": str(gid),
+    }
+    container["devices"] = []
+    container["device_cgroup_rules"] = []
+    container["cap_add"] = []
+    mounts = container["mounts"]
+    assert isinstance(mounts, list)
+    for mount in mounts:
+        if not isinstance(mount, dict):
+            continue
+        source = str(mount.get("Source", ""))
+        if mount.get("Destination") == "/workspace":
+            mount["Source"] = str(backing)
+        elif source == "/srv/gpu-platform/users/origin-pilot/home":
+            mount["Source"] = str(tmp_path / "users/origin-pilot/home")
+        elif source == "/srv/gpu-platform/users/origin-pilot/shared":
+            mount["Source"] = str(tmp_path / "users/origin-pilot/shared")
+    payload = {
+        **managed_container_lifecycle_payload(),
+        "uid": uid,
+        "gid": gid,
+        "workspace_path": str(canonical),
+    }
+    monkeypatch.setattr(handlers, "PILOT_DATA_ROOT", tmp_path / "users")
+    monkeypatch.setattr(
+        handlers,
+        "_managed_account",
+        lambda _payload: SimpleNamespace(pw_uid=uid, pw_gid=gid),
+    )
+    monkeypatch.setattr(handlers, "workspace_path", lambda _uid: canonical)
+    monkeypatch.setattr(handlers, "containers_inspect", lambda _payload: inspected)
+    original_lstat = Path.lstat
+    canonical_metadata = canonical.lstat()
+
+    def same_inode_lstat(path: Path):
+        if path == backing:
+            return canonical_metadata
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", same_inode_lstat)
+    monkeypatch.setattr(
+        handlers.grp,
+        "getgrgid",
+        lambda _gid: SimpleNamespace(gr_name="origin-pilot", gr_mem=[]),
+    )
+    monkeypatch.setattr(
+        handlers.pwd,
+        "getpwall",
+        lambda: [SimpleNamespace(pw_name="origin-pilot", pw_gid=gid)],
+    )
+
+    handlers._managed_container_security(payload, require_running=False)
+
+    monkeypatch.setattr(
+        handlers.grp,
+        "getgrgid",
+        lambda _gid: SimpleNamespace(gr_name="shared-users", gr_mem=[]),
+    )
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._managed_container_security(payload, require_running=False)
+    assert rejected.value.code == "WORKSPACE_BINDING_REJECTED"
+
+    monkeypatch.setattr(
+        handlers.grp,
+        "getgrgid",
+        lambda _gid: SimpleNamespace(gr_name="origin-pilot", gr_mem=[]),
+    )
+    monkeypatch.setattr(
+        handlers.pwd,
+        "getpwall",
+        lambda: [
+            SimpleNamespace(pw_name="origin-pilot", pw_gid=gid),
+            SimpleNamespace(pw_name="other-user", pw_gid=gid),
+        ],
+    )
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._managed_container_security(payload, require_running=False)
+    assert rejected.value.code == "WORKSPACE_BINDING_REJECTED"
+
+
 def test_gpu_container_security_requires_one_uuid_and_no_host_escape(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
