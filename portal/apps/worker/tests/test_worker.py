@@ -3802,6 +3802,62 @@ def test_gpu_stop_removes_container_before_allocation_cancel(
     assert result["gpu_allocation_uuid"] is None
 
 
+def test_stopped_legacy_gpu_definition_is_removed_before_allocation_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = 701
+    gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
+    payload = {
+        **managed_container_lifecycle_payload(development_profile="GPU_1_8CPU_32GB"),
+        "gpu_allocation_job_id": job_id,
+        "gpu_allocation_uuid": gpu_uuid,
+        "lease_id": None,
+        "lease_starts_at": None,
+        "lease_expires_at": None,
+    }
+    inspections = iter(({"state": {"Running": False}}, {"state": {"Running": False}}))
+    security_options: list[bool] = []
+
+    def security(_payload, **kwargs):  # type: ignore[no-untyped-def]
+        security_options.append(bool(kwargs.get("allow_stopped_gpu_runtime")))
+        return next(inspections)
+
+    monkeypatch.setattr(handlers, "_managed_container_security", security)
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {
+            "h100-container-stop": {"integrity_ok": True},
+            "h100-container-gpu-runtime": {"integrity_ok": True},
+        },
+    )
+    monkeypatch.setattr(handlers, "_gpu_allocation_binding", lambda *_args: gpu_uuid)
+    events: list[str] = []
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: events.append("definition-removed") or {"ok": True},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_cancel_gpu_development_allocation",
+        lambda *_args, **_kwargs: events.append("allocation-cancelled"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_clear_active_gpu_lifecycle_binding",
+        lambda *_args, **_kwargs: events.append("lifecycle-cleared"),
+    )
+
+    result = handlers._execute_managed_container_lifecycle(
+        request("container.stop", requested_by="origin-pilot"), payload
+    )
+
+    assert result["status"] == "SUCCEEDED"
+    assert security_options == [True, False]
+    assert events == ["definition-removed", "allocation-cancelled", "lifecycle-cleared"]
+
+
 def test_portal4a_host_revoke_rolls_back_shell_and_key_on_postcondition_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
