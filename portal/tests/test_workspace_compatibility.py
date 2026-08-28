@@ -178,6 +178,11 @@ def test_workspace_runtime_is_zero_copy_profile_aware_and_alias_aware() -> None:
     assert "cuInit(0)" in gpu_runtime
     assert "count.value != 1" in gpu_runtime
     assert "cuCtxCreate_v2" in gpu_runtime
+    assert 'backing_workspace="/srv/gpu-platform/users/${user_name}/workspace"' in gpu_runtime
+    assert ".Source == $workspace or .Source == $backing_workspace" in gpu_runtime
+    assert gpu_runtime.index("h100_require_workspace_alias") < gpu_runtime.index(
+        ".Source == $workspace or .Source == $backing_workspace"
+    )
     assert "runtime: nvidia" not in stage
     assert "driver: nvidia" not in stage
     assert "DeviceRequests" in stage

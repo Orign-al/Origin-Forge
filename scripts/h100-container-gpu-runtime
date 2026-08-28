@@ -29,6 +29,7 @@ readonly config_dir="$(h100_config_dir "${user_name}")"
 readonly compose_file="$(h100_compose_file "${user_name}")"
 readonly user_uid="$(id -u "${user_name}")"
 readonly workspace="/storage/users/${user_uid}"
+readonly backing_workspace="/srv/gpu-platform/users/${user_name}/workspace"
 readonly state_file="/etc/h100-platform/users/${user_name}.state"
 
 h100_require_workspace_alias "${user_name}"
@@ -201,7 +202,7 @@ h100_wait_healthy "${container}" 120 || h100_fail 'GPU container did not become 
 
 docker inspect "${container}" | jq -e \
   --arg job "${slurm_job_id}" --arg uuid "${gpu_uuid}" \
-  --arg workspace "${workspace}" '
+  --arg workspace "${workspace}" --arg backing_workspace "${backing_workspace}" '
     .[0] as $c
     | $c.State.Running == true
     and $c.HostConfig.Privileged == false
@@ -221,7 +222,11 @@ docker inspect "${container}" | jq -e \
     and $c.Config.Labels["h100.dev.gpu-uuid"] == $uuid
     and (($c.Config.Env // []) | index("NVIDIA_VISIBLE_DEVICES=" + $uuid)) != null
     and (($c.Config.Env // []) | index("CUDA_VISIBLE_DEVICES=0")) != null
-    and (($c.Mounts // []) | map(select(.Source == $workspace and .Destination == "/workspace" and .RW == true)) | length == 1)
+    and (($c.Mounts // []) | map(select(
+      (.Source == $workspace or .Source == $backing_workspace)
+      and .Destination == "/workspace"
+      and .RW == true
+    )) | length == 1)
     and (($c.Mounts // []) | map(.Destination) | index("/var/run/docker.sock") | not)
     and (($c.Mounts // []) | map(.Source) | index("/") | not)
   ' >/dev/null || h100_fail 'GPU container failed its allocation and isolation postconditions'
