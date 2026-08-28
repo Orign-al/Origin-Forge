@@ -161,7 +161,7 @@ def test_web_binds_user_ingress_without_exposing_internal_services() -> None:
     assert "IPAddressDeny=any" in service.splitlines()
     assert "IPAddressAllow=localhost" in service.splitlines()
     assert "IPAddressAllow=20.10.10.0/24" in service.splitlines()
-    assert "IPAddressAllow=10.10.10.0/24" not in service.splitlines()
+    assert "IPAddressAllow=10.10.10.0/24" in service.splitlines()
     assert "IPAddressAllow=10.82.36.0/24" not in service.splitlines()
     assert "h100-portal-web-tun1.service" not in installer
     assert not (PORTAL_ROOT / "deploy/systemd/h100-portal-web-tun1.service").exists()
@@ -232,10 +232,19 @@ def test_legacy_easytier_ingress_and_compose_reconciliation_are_installed() -> N
     ingress = (PLATFORM_ROOT / "scripts/h100-easytier-legacy-ingress").read_text()
     reconcile = (PLATFORM_ROOT / "scripts/h100-reconcile-dual-easytier-ingress").read_text()
     unit = (PORTAL_ROOT / "deploy/systemd/h100-easytier-legacy-ingress.service").read_text()
+    reconcile_service = (
+        PORTAL_ROOT / "deploy/systemd/h100-reconcile-dual-easytier-ingress.service"
+    ).read_text()
+    reconcile_timer = (
+        PORTAL_ROOT / "deploy/systemd/h100-reconcile-dual-easytier-ingress.timer"
+    ).read_text()
 
     assert '-i "${LEGACY_INTERFACE}"' in ingress
     assert "${H100_LEGACY_PUBLIC_ACCESS_IP}/32" in ingress
     assert "22023:22999" in ingress
+    assert "readonly PORTAL_PORT=18080" in ingress
+    assert "h100-easytier-legacy-portal-http" in ingress
+    assert "${H100_PUBLIC_ACCESS_IP}:${PORTAL_PORT}" in ingress
     assert '--to-destination "${H100_PUBLIC_ACCESS_IP}"' in ingress
     assert "10.82.36.1" not in ingress
     assert "docker compose" in reconcile
@@ -244,4 +253,14 @@ def test_legacy_easytier_ingress_and_compose_reconciliation_are_installed() -> N
     assert "/usr/local/sbin/h100-easytier-legacy-ingress" in installer
     assert "/usr/local/sbin/h100-reconcile-dual-easytier-ingress" in installer
     assert "h100-easytier-legacy-ingress.service" in installer
+    assert "h100-reconcile-dual-easytier-ingress.service" in installer
+    assert "h100-reconcile-dual-easytier-ingress.timer" in installer
     assert "ExecStart=/usr/local/sbin/h100-easytier-legacy-ingress apply" in unit
+    assert (
+        "ExecStart=/usr/local/sbin/h100-reconcile-dual-easytier-ingress --apply"
+        in reconcile_service
+    )
+    assert "ProtectSystem=strict" in reconcile_service
+    assert "RestrictAddressFamilies=AF_UNIX" in reconcile_service
+    assert "OnUnitActiveSec=5min" in reconcile_timer
+    assert "Persistent=true" in reconcile_timer

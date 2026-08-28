@@ -1,0 +1,31 @@
+[Unit]
+Description=Reconcile managed container dual EasyTier SSH definitions
+Requires=docker.service easytier@home.service
+After=docker.service easytier@home.service h100-easytier-legacy-ingress.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/h100-reconcile-dual-easytier-ingress --apply
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ReadWritePaths=/srv/gpu-platform/platform/config/dev-containers
+ReadWritePaths=/srv/gpu-platform/backups
+ReadWritePaths=/var/log/h100-platform-audit.log
+ReadWritePaths=/run/lock
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+AmbientCapabilities=
+UMask=0077

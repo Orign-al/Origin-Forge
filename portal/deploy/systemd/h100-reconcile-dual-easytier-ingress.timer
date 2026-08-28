@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically reconcile managed container dual EasyTier SSH definitions
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=5min
+AccuracySec=10s
+RandomizedDelaySec=15s
+Persistent=true
+Unit=h100-reconcile-dual-easytier-ingress.service
+
+[Install]
+WantedBy=timers.target

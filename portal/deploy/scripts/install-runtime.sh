@@ -211,7 +211,9 @@ for unit in \
   h100-portal-lease-expiry.timer \
   h100-portal-provision-reconcile.service \
   h100-portal-provision-reconcile.timer \
-  h100-easytier-legacy-ingress.service; do
+  h100-easytier-legacy-ingress.service \
+  h100-reconcile-dual-easytier-ingress.service \
+  h100-reconcile-dual-easytier-ingress.timer; do
   install -o root -g root -m 0644 "$SOURCE_DIR/deploy/systemd/$unit" "$UNIT_DIR/$unit"
 done
 

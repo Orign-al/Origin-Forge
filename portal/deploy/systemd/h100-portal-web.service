@@ -30,6 +30,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET
 IPAddressDeny=any
 IPAddressAllow=localhost
 IPAddressAllow=20.10.10.0/24
+IPAddressAllow=10.10.10.0/24
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes

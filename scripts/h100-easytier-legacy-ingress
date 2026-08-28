@@ -5,7 +5,9 @@ source /usr/local/lib/h100-platform/h100-platform-common.sh
 
 readonly LEGACY_INTERFACE=tun0
 readonly MANAGED_PORT_RANGE=22023:22999
-readonly RULE_COMMENT=h100-easytier-legacy-container-ssh
+readonly PORTAL_PORT=18080
+readonly SSH_RULE_COMMENT=h100-easytier-legacy-container-ssh
+readonly PORTAL_RULE_COMMENT=h100-easytier-legacy-portal-http
 readonly IPTABLES=/usr/sbin/iptables
 
 usage() {
@@ -20,12 +22,22 @@ fi
 readonly action=$1
 h100_require_root
 
-rule=(
+# The rule arrays are resolved by name in the idempotent helpers below.
+# shellcheck disable=SC2034
+ssh_rule=(
   -i "${LEGACY_INTERFACE}"
   -d "${H100_LEGACY_PUBLIC_ACCESS_IP}/32"
   -p tcp --dport "${MANAGED_PORT_RANGE}"
-  -m comment --comment "${RULE_COMMENT}"
+  -m comment --comment "${SSH_RULE_COMMENT}"
   -j DNAT --to-destination "${H100_PUBLIC_ACCESS_IP}"
+)
+# shellcheck disable=SC2034
+portal_rule=(
+  -i "${LEGACY_INTERFACE}"
+  -d "${H100_LEGACY_PUBLIC_ACCESS_IP}/32"
+  -p tcp --dport "${PORTAL_PORT}"
+  -m comment --comment "${PORTAL_RULE_COMMENT}"
+  -j DNAT --to-destination "${H100_PUBLIC_ACCESS_IP}:${PORTAL_PORT}"
 )
 
 interfaces_active() {
@@ -36,7 +48,23 @@ interfaces_active() {
 }
 
 rule_present() {
-  "${IPTABLES}" -w 5 -t nat -C PREROUTING "${rule[@]}" >/dev/null 2>&1
+  local -n candidate_rule=$1
+  "${IPTABLES}" -w 5 -t nat -C PREROUTING "${candidate_rule[@]}" >/dev/null 2>&1
+}
+
+apply_rule() {
+  local -n candidate_rule=$1
+  if ! rule_present "$1"; then
+    "${IPTABLES}" -w 5 -t nat -I PREROUTING 1 "${candidate_rule[@]}"
+  fi
+  rule_present "$1"
+}
+
+remove_rule() {
+  local -n candidate_rule=$1
+  while rule_present "$1"; do
+    "${IPTABLES}" -w 5 -t nat -D PREROUTING "${candidate_rule[@]}"
+  done
 }
 
 case "${action}" in
@@ -47,22 +75,23 @@ case "${action}" in
     done
     interfaces_active \
       || h100_fail 'both EasyTier ingress interfaces must be active'
-    if ! rule_present; then
-      "${IPTABLES}" -w 5 -t nat -I PREROUTING 1 "${rule[@]}"
-    fi
-    rule_present || h100_fail 'legacy EasyTier SSH ingress rule was not installed'
-    printf 'LEGACY EASYTIER SSH INGRESS ACTIVE address=%s ports=%s target=%s\n' \
-      "${H100_LEGACY_PUBLIC_ACCESS_IP}" "${MANAGED_PORT_RANGE}" "${H100_PUBLIC_ACCESS_IP}"
+    apply_rule ssh_rule \
+      || h100_fail 'legacy EasyTier SSH ingress rule was not installed'
+    apply_rule portal_rule \
+      || h100_fail 'legacy EasyTier Portal ingress rule was not installed'
+    printf 'LEGACY EASYTIER INGRESS ACTIVE address=%s ssh_ports=%s portal_port=%s target=%s\n' \
+      "${H100_LEGACY_PUBLIC_ACCESS_IP}" "${MANAGED_PORT_RANGE}" \
+      "${PORTAL_PORT}" "${H100_PUBLIC_ACCESS_IP}"
     ;;
   check)
     interfaces_active || h100_fail 'both EasyTier ingress interfaces are not active'
-    rule_present || h100_fail 'legacy EasyTier SSH ingress rule is absent'
-    printf 'LEGACY EASYTIER SSH INGRESS PASS\n'
+    rule_present ssh_rule || h100_fail 'legacy EasyTier SSH ingress rule is absent'
+    rule_present portal_rule || h100_fail 'legacy EasyTier Portal ingress rule is absent'
+    printf 'LEGACY EASYTIER INGRESS PASS\n'
     ;;
   remove)
-    while rule_present; do
-      "${IPTABLES}" -w 5 -t nat -D PREROUTING "${rule[@]}"
-    done
-    printf 'LEGACY EASYTIER SSH INGRESS REMOVED\n'
+    remove_rule portal_rule
+    remove_rule ssh_rule
+    printf 'LEGACY EASYTIER INGRESS REMOVED\n'
     ;;
 esac
