@@ -113,16 +113,9 @@ def resolve_self_compute_context(
         and container.development_profile in {CPU_DEVELOPMENT_PROFILE, GPU_DEVELOPMENT_PROFILE}
         and container.gpu_count
         == (1 if container.development_profile == GPU_DEVELOPMENT_PROFILE else 0)
+        and ((container.gpu_allocation_job_id is None) == (container.gpu_allocation_uuid is None))
         and (
-            container.observed_state != "RUNNING"
-            or container.development_profile == CPU_DEVELOPMENT_PROFILE
-            or (
-                container.gpu_allocation_job_id is not None
-                and container.gpu_allocation_uuid is not None
-            )
-        )
-        and (
-            container.development_profile != CPU_DEVELOPMENT_PROFILE
+            container.development_profile == GPU_DEVELOPMENT_PROFILE
             or (container.gpu_allocation_job_id is None and container.gpu_allocation_uuid is None)
         )
     )

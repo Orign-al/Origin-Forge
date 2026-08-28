@@ -145,10 +145,25 @@ def workspace_relative_parts(value: str | PurePosixPath) -> tuple[str, ...]:
 
 
 def profile_gpu_count(profile: str) -> int:
-    """Return the fixed interactive GPU count for a development profile."""
+    """Return the fixed per-user GPU entitlement for a development profile."""
 
     if profile == CPU_DEVELOPMENT_PROFILE:
         return 0
     if profile == GPU_DEVELOPMENT_PROFILE:
         return 1
     raise ValueError("development profile is not approved")
+
+
+def container_runtime_gpu_state(
+    allocation_job_id: object | None, allocation_uuid: object | None
+) -> str:
+    """Describe only the container's transitional runtime GPU binding.
+
+    GPU-capable development profiles remain GPU-less while resident.  The
+    non-empty state exists solely so a pre-decoupling, exact UUID-bound
+    container can be stopped and converged safely.
+    """
+
+    if (allocation_job_id is None) != (allocation_uuid is None):
+        raise ValueError("container GPU allocation coordinates are incomplete")
+    return "SLURM_ALLOCATED_1" if allocation_job_id is not None else "NONE"

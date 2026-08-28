@@ -281,8 +281,14 @@ def sync_active_container_ssh_keys(
                 "message": "容器或 Lease 当前不满足密钥同步条件",
             },
         )
-    gpu_profile = container.development_profile == GPU_DEVELOPMENT_PROFILE
-    if gpu_profile != bool(container.gpu_allocation_job_id and container.gpu_allocation_uuid):
+    allocation_pair_valid = (container.gpu_allocation_job_id is None) == (
+        container.gpu_allocation_uuid is None
+    )
+    allocation_profile_valid = (
+        container.development_profile == GPU_DEVELOPMENT_PROFILE
+        or container.gpu_allocation_job_id is None
+    )
+    if not allocation_pair_valid or not allocation_profile_valid:
         raise HTTPException(
             status_code=409,
             detail={

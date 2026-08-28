@@ -97,7 +97,7 @@ def _audit(
 
 def _safe_staged_container(container: PortalContainer) -> bool:
     spec = container.safe_spec if isinstance(container.safe_spec, dict) else {}
-    expected_gpu = "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1"
+    expected_gpu = "NONE"
     return bool(
         container.development_profile in {CPU_DEVELOPMENT_PROFILE, GPU_DEVELOPMENT_PROFILE}
         and container.gpu_count
@@ -346,7 +346,7 @@ def _worker_payload(target: ActivationTarget, operation: PortalOperation) -> dic
         "expected_host_access": "DISABLED_BY_PLATFORM_POLICY",
         "expected_shell": "/usr/sbin/nologin",
         "expected_password_state": "LOCKED",
-        "expected_gpu": "NONE" if target.container.gpu_count == 0 else "SLURM_ALLOCATED_1",
+        "expected_gpu": "NONE",
         "lease_id": str(uuid.uuid4()),
         "deployment_version": deployment_version(),
     }
@@ -416,7 +416,7 @@ def _reconcile_prior_failed_activation(
     db.commit()
     rollback = _rollback_worker(context, failed, dict(payload))
 
-    managed = db.scalar(
+    reloaded_managed = db.scalar(
         select(PortalManagedUser)
         .where(
             PortalManagedUser.id == managed_id,
@@ -427,7 +427,7 @@ def _reconcile_prior_failed_activation(
     recovered = db.scalar(
         select(PortalOperation).where(PortalOperation.id == failed_id).with_for_update()
     )
-    if managed is None or recovered is None:
+    if reloaded_managed is None or recovered is None:
         db.rollback()
         raise _error(
             409,
@@ -467,6 +467,7 @@ def _reconcile_prior_failed_activation(
             "上次激活尚未完成安全回滚；Lease 未启动",
         )
 
+    managed = reloaded_managed
     container = db.scalar(
         select(PortalContainer)
         .where(PortalContainer.owner_managed_user_id == managed_id)
@@ -794,14 +795,7 @@ def activate_self_compute(
     )
     allocation_job_id = worker_result.get("gpu_allocation_job_id")
     allocation_uuid = worker_result.get("gpu_allocation_uuid")
-    allocation_ok = (
-        allocation_job_id is None and allocation_uuid is None
-        if payload.get("development_profile") == CPU_DEVELOPMENT_PROFILE
-        else isinstance(allocation_job_id, int)
-        and allocation_job_id > 0
-        and isinstance(allocation_uuid, str)
-        and allocation_uuid.startswith("GPU-")
-    )
+    allocation_ok = allocation_job_id is None and allocation_uuid is None
     worker_ok = worker_ok and allocation_ok
     if not worker_ok:
         error = worker_result.get("error", {})

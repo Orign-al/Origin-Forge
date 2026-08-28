@@ -876,7 +876,7 @@ def _validate_compute_activate_self(payload: dict[str, Any]) -> dict[str, Any]:
             "activation development profile is not approved",
         )
     profile_gpu = profile_gpu_count(str(profile))
-    expected_gpu = "NONE" if profile_gpu == 0 else "SLURM_ALLOCATED_1"
+    expected_gpu = "NONE"
     if (
         payload.get("container_name") != f"gpu-dev-{username}"
         or payload.get("workspace_path") != str(workspace_path(int(uid)))
@@ -1167,8 +1167,9 @@ def _validate_ssh_key_sync_active_container(payload: dict[str, Any]) -> dict[str
         and isinstance(gpu_uuid, str)
         and re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", gpu_uuid) is not None
     )
-    if (profile == GPU_DEVELOPMENT_PROFILE) != gpu_bound or (
-        profile == CPU_DEVELOPMENT_PROFILE and (gpu_job_id is not None or gpu_uuid is not None)
+    gpu_unbound = gpu_job_id is None and gpu_uuid is None
+    if (not gpu_bound and not gpu_unbound) or (
+        profile == CPU_DEVELOPMENT_PROFILE and not gpu_unbound
     ):
         raise PayloadValidationError(
             "SSH_KEY_SYNC_GPU_BINDING_REJECTED",
@@ -1564,7 +1565,13 @@ def _validate_container_lifecycle(
             "CONTAINER_PROFILE_REJECTED", "development profile is not approved"
         )
     gpu_count = profile_gpu_count(str(profile))
-    expected_gpu = "NONE" if gpu_count == 0 else "SLURM_ALLOCATED_1"
+    allocation_job_id = payload.get("gpu_allocation_job_id")
+    allocation_uuid = payload.get("gpu_allocation_uuid")
+    expected_gpu = (
+        "SLURM_ALLOCATED_1"
+        if allocation_job_id is not None and allocation_uuid is not None
+        else "NONE"
+    )
     if (
         payload.get("name") != expected_name
         or payload.get("expected_gpu") != expected_gpu
@@ -1578,8 +1585,6 @@ def _validate_container_lifecycle(
     result["workspace_path"] = str(workspace_path(result["uid"]))
     result["development_profile"] = profile
     result["container_gpu"] = gpu_count
-    allocation_job_id = payload.get("gpu_allocation_job_id")
-    allocation_uuid = payload.get("gpu_allocation_uuid")
     if (allocation_job_id is None) != (allocation_uuid is None):
         raise PayloadValidationError(
             "GPU_ALLOCATION_BINDING_REJECTED", "GPU allocation coordinates are incomplete"
@@ -1788,9 +1793,13 @@ def _validate_container_terminal(payload: dict[str, Any]) -> dict[str, Any]:
             "TERMINAL_TARGET_REJECTED", "terminal development profile is not approved"
         )
     gpu_count = profile_gpu_count(str(profile))
-    expected_gpu = "NONE" if gpu_count == 0 else "SLURM_ALLOCATED_1"
     allocation_job_id = payload.get("gpu_allocation_job_id")
     allocation_uuid = payload.get("gpu_allocation_uuid")
+    expected_gpu = (
+        "SLURM_ALLOCATED_1"
+        if allocation_job_id is not None and allocation_uuid is not None
+        else "NONE"
+    )
     if (
         payload.get("name") != expected_name
         or payload.get("workspace_path") != str(workspace_path(result["uid"]))
@@ -1800,16 +1809,16 @@ def _validate_container_terminal(payload: dict[str, Any]) -> dict[str, Any]:
         or payload.get("slurm_qos") != "general"
         or (allocation_job_id is None) != (allocation_uuid is None)
         or (
-            profile == GPU_DEVELOPMENT_PROFILE
+            allocation_job_id is not None
             and (
-                not isinstance(allocation_job_id, int)
+                profile != GPU_DEVELOPMENT_PROFILE
+                or not isinstance(allocation_job_id, int)
                 or isinstance(allocation_job_id, bool)
                 or not 0 < allocation_job_id < 2**63
                 or not isinstance(allocation_uuid, str)
                 or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", allocation_uuid) is None
             )
         )
-        or (profile == CPU_DEVELOPMENT_PROFILE and allocation_job_id is not None)
         or payload.get("host_access") != "DISABLED_BY_PLATFORM_POLICY"
     ):
         raise PayloadValidationError(
@@ -1894,7 +1903,7 @@ def _validate_restore(payload: dict[str, Any]) -> dict[str, Any]:
     if profile not in DEVELOPMENT_PROFILES:
         raise PayloadValidationError("RESTORE_PAYLOAD_REJECTED", "restore profile is invalid")
     gpu_count = profile_gpu_count(str(profile))
-    expected_gpu = "NONE" if gpu_count == 0 else "SLURM_ALLOCATED_1"
+    expected_gpu = "NONE"
     if (
         payload.get("container_name") != expected_name
         or payload.get("workspace_path") != str(workspace_path(result["uid"]))
@@ -2011,9 +2020,13 @@ def _validate_recycle(payload: dict[str, Any]) -> dict[str, Any]:
     if profile not in DEVELOPMENT_PROFILES:
         raise PayloadValidationError("RECYCLE_PAYLOAD_REJECTED", "recycle profile is invalid")
     gpu_count = profile_gpu_count(str(profile))
-    expected_gpu = "NONE" if gpu_count == 0 else "SLURM_ALLOCATED_1"
     allocation_job_id = payload.get("gpu_allocation_job_id")
     allocation_uuid = payload.get("gpu_allocation_uuid")
+    expected_gpu = (
+        "SLURM_ALLOCATED_1"
+        if allocation_job_id is not None and allocation_uuid is not None
+        else "NONE"
+    )
     if (
         payload.get("container_name") != expected_name
         or payload.get("workspace_path") != str(workspace_path(result["uid"]))
@@ -2105,7 +2118,11 @@ def _validate_restore_rollback(payload: dict[str, Any]) -> dict[str, Any]:
     gpu_count = profile_gpu_count(str(profile))
     allocation_job_id = payload.get("gpu_allocation_job_id")
     allocation_uuid = payload.get("gpu_allocation_uuid")
-    expected_gpu = "NONE" if gpu_count == 0 else "SLURM_ALLOCATED_1"
+    expected_gpu = (
+        "SLURM_ALLOCATED_1"
+        if allocation_job_id is not None and allocation_uuid is not None
+        else "NONE"
+    )
     if (
         payload.get("container_name") != f"gpu-dev-{result['username']}"
         or payload.get("workspace_path") != str(workspace_path(result["uid"]))

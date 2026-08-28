@@ -1764,7 +1764,7 @@ def test_restore_rollback_recycles_container_and_preserves_workspace(
         "lease_id": lease_id,
         "lease_starts_at": utcnow().isoformat(),
         "lease_expires_at": (utcnow() + timedelta(hours=2)).isoformat(),
-        "expected_gpu": "SLURM_ALLOCATED_1",
+        "expected_gpu": "NONE",
         "host_access": "DISABLED_BY_PLATFORM_POLICY",
         "expected_key_fingerprints": ["SHA256:fixture20002"],
     }

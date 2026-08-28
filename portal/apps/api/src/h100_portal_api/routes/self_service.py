@@ -9,6 +9,7 @@ from h100_portal_contracts.workspace import (
     GPU_DEVELOPMENT_PROFILE,
     WORKSPACE_CONTAINER_PATH,
     WORKSPACE_DEFAULT_WORKDIR,
+    container_runtime_gpu_state,
     workspace_path,
 )
 from sqlalchemy import select
@@ -207,6 +208,9 @@ def _rollback_restored_resource(
             "gpu_allocation_uuid": worker_result.get("gpu_allocation_uuid"),
         }
     )
+    recycle_payload["expected_gpu"] = container_runtime_gpu_state(
+        recycle_payload["gpu_allocation_job_id"], recycle_payload["gpu_allocation_uuid"]
+    )
     try:
         rollback = call_worker(
             "resource.restore.rollback",
@@ -381,7 +385,7 @@ def _execute_restore(
         restored=True,
     )
     lease.id = uuid.uuid4()
-    expected_gpu = "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1"
+    expected_gpu = "NONE"
     payload = {
         "restore_request_id": str(restore.id),
         "managed_user_id": str(managed.id),
@@ -480,15 +484,7 @@ def _execute_restore(
     observed_fingerprints = result.get("container_key_fingerprints")
     allocation_job_id = result.get("gpu_allocation_job_id")
     allocation_uuid = result.get("gpu_allocation_uuid")
-    allocation_valid = (
-        allocation_job_id is None and allocation_uuid is None
-        if container.gpu_count == 0
-        else isinstance(allocation_job_id, int)
-        and not isinstance(allocation_job_id, bool)
-        and allocation_job_id > 0
-        and isinstance(allocation_uuid, str)
-        and allocation_uuid.startswith("GPU-")
-    )
+    allocation_valid = allocation_job_id is None and allocation_uuid is None
     if (
         result.get("container_state") != "RUNNING"
         or result.get("container_gpu") != expected_gpu
@@ -784,25 +780,14 @@ def self_container_connection(
             PortalSshKey.container_install_state == "INSTALLED",
         )
     )
-    gpu_binding_ready = bool(
-        container.development_profile != "GPU_1_8CPU_32GB"
-        or (
-            container.gpu_count == 1
-            and container.gpu_allocation_job_id is not None
-            and container.gpu_allocation_uuid is not None
-        )
-    )
     available = bool(
         lease.get("active")
         and container.observed_state == "RUNNING"
         and key is not None
         and managed.compute_environment_state == "ACTIVE"
-        and gpu_binding_ready
     )
-    runtime_gpu = (
-        "SLURM_ALLOCATED_1"
-        if available and container.development_profile == "GPU_1_8CPU_32GB"
-        else "NONE"
+    runtime_gpu = container_runtime_gpu_state(
+        container.gpu_allocation_job_id, container.gpu_allocation_uuid
     )
     return {
         "status": "OK",
@@ -903,7 +888,9 @@ def _container_action(
         "lease_id": str(lease_id) if lease_id else None,
         "lease_starts_at": (ensure_utc(lease_starts_at).isoformat() if lease_starts_at else None),
         "lease_expires_at": ensure_utc(lease_deadline).isoformat() if lease_deadline else None,
-        "expected_gpu": "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1",
+        "expected_gpu": container_runtime_gpu_state(
+            container.gpu_allocation_job_id, container.gpu_allocation_uuid
+        ),
     }
     operation = _new_operation(
         db,
@@ -951,17 +938,10 @@ def _container_action(
         db.commit()
         raise
     expected_state = "STOPPED" if action == "stop" else "RUNNING"
-    expected_gpu = "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1"
+    expected_gpu = "NONE"
     allocation_job_id = result.get("gpu_allocation_job_id")
     allocation_uuid = result.get("gpu_allocation_uuid")
-    gpu_postcondition = (
-        allocation_job_id is None and allocation_uuid is None
-        if container.gpu_count == 0 or expected_state == "STOPPED"
-        else isinstance(allocation_job_id, int)
-        and allocation_job_id > 0
-        and isinstance(allocation_uuid, str)
-        and allocation_uuid.startswith("GPU-")
-    )
+    gpu_postcondition = allocation_job_id is None and allocation_uuid is None
     if (
         result.get("container_state") != expected_state
         or result.get("container_gpu") != expected_gpu
@@ -1133,7 +1113,9 @@ def create_self_terminal(
         "slurm_qos": managed.slurm_qos,
         "lease_id": str(resources.active_lease.id),
         "lease_expires_at": ensure_utc(resources.terminal_lease.expires_at).isoformat(),
-        "expected_gpu": "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1",
+        "expected_gpu": container_runtime_gpu_state(
+            container.gpu_allocation_job_id, container.gpu_allocation_uuid
+        ),
         "host_access": "DISABLED_BY_PLATFORM_POLICY",
         "expected_key_fingerprints": fingerprints,
         "cols": body.cols,

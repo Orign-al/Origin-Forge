@@ -20,9 +20,11 @@ h100_require_pilot_gpu_isolation_if_managed "${user_name}"
 
 state_file="/etc/h100-platform/users/${user_name}.state"
 if [[ -f "${state_file}" && ! -L "${state_file}" ]] \
-  && grep -Fxq 'VERSION=4' "${state_file}" \
-  && grep -Fxq 'DEVELOPMENT_PROFILE=GPU_1_8CPU_32GB' "${state_file}"; then
-  h100_fail 'GPU Development must use the allocation-aware restart handler'
+  && grep -Fxq 'VERSION=4' "${state_file}"; then
+  allocation_job_id="$(awk -F= '$1 == "GPU_ALLOCATION_JOB_ID" {print substr($0, index($0, "=") + 1)}' "${state_file}")"
+  allocation_uuid="$(awk -F= '$1 == "GPU_ALLOCATION_UUID" {print substr($0, index($0, "=") + 1)}' "${state_file}")"
+  [[ -z "${allocation_job_id}" && -z "${allocation_uuid}" ]] \
+    || h100_fail 'GPU-bound Container must use the allocation-aware restart handler'
 fi
 
 container="$(h100_container_name "${user_name}")"

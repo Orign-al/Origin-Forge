@@ -3542,7 +3542,7 @@ def provision_reserved_compute_environment(
             "cpus": 8,
             "memory_gb": 32,
             "pids_limit": 4096,
-            "gpu": "NONE" if plan.container_gpu == 0 else "SLURM_ALLOCATED_1",
+            "gpu": "NONE",
             "development_profile": plan.container_profile,
             "privileged": False,
             "host_network": False,

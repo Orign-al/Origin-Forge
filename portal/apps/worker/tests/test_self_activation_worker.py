@@ -51,7 +51,7 @@ def gpu_activation_payload() -> dict[str, Any]:
         **activation_payload(),
         "development_profile": "GPU_1_8CPU_32GB",
         "container_gpu": 1,
-        "expected_gpu": "SLURM_ALLOCATED_1",
+        "expected_gpu": "NONE",
     }
 
 
@@ -234,12 +234,11 @@ def test_one_click_activation_keeps_lease_not_started_until_postconditions_pass(
     ]
 
 
-def test_gpu_activation_obtains_one_owner_bound_allocation_before_container_start(
+def test_gpu_activation_starts_persistent_container_without_gpu_allocation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = gpu_activation_payload()
     fingerprints = list(payload["ssh_key_fingerprints"])
-    gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
     lifecycle: dict[str, str] = {"STATUS": "STAGED"}
     events: list[tuple[str, Any]] = []
     active_starts_at: datetime | None = None
@@ -271,8 +270,8 @@ def test_gpu_activation_obtains_one_owner_bound_allocation_before_container_star
         assert expected_fingerprints == fingerprints
         events.append(("security", require_running))
         if require_running:
-            assert bound_payload["gpu_allocation_job_id"] == 701
-            assert bound_payload["gpu_allocation_uuid"] == gpu_uuid
+            assert bound_payload["gpu_allocation_job_id"] is None
+            assert bound_payload["gpu_allocation_uuid"] is None
         return {}
 
     monkeypatch.setattr(handlers, "_activation_container_security", security)
@@ -300,13 +299,6 @@ def test_gpu_activation_obtains_one_owner_bound_allocation_before_container_star
         events.append(("state", (status, gpu_allocation_job_id, gpu_allocation_uuid)))
 
     monkeypatch.setattr(handlers, "_write_activation_lifecycle_state", write_state)
-    monkeypatch.setattr(
-        handlers,
-        "_submit_gpu_development_allocation",
-        lambda bound_payload: (
-            events.append(("allocation", bound_payload["lease_expires_at"])) or (701, gpu_uuid)
-        ),
-    )
 
     def run_script(argv: list[str], **_kwargs: Any) -> dict[str, bool]:
         events.append((Path(argv[0]).name, argv[1:]))
@@ -324,15 +316,12 @@ def test_gpu_activation_obtains_one_owner_bound_allocation_before_container_star
     result = handlers.handle(worker_request(payload))
 
     assert result["status"] == "SUCCEEDED"
-    assert result["container_gpu"] == "SLURM_ALLOCATED_1"
-    assert result["gpu_allocation_job_id"] == 701
-    assert result["gpu_allocation_uuid"] == gpu_uuid
-    allocation_index = next(i for i, event in enumerate(events) if event[0] == "allocation")
-    start_index = next(
-        i for i, event in enumerate(events) if event[0] == "h100-container-gpu-runtime"
-    )
-    assert allocation_index < start_index
-    assert events[start_index][1] == ["start", "origin-pilot2", "701", gpu_uuid]
+    assert result["container_gpu"] == "NONE"
+    assert result["gpu_allocation_job_id"] is None
+    assert result["gpu_allocation_uuid"] is None
+    start_index = next(i for i, event in enumerate(events) if event[0] == "h100-container-start")
+    assert events[start_index][1] == ["origin-pilot2"]
+    assert all(event[0] != "h100-container-gpu-runtime" for event in events)
 
 
 def test_container_start_failure_rolls_back_without_active_lease(

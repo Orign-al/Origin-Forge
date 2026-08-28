@@ -201,7 +201,7 @@ def _staged_activation(
         development_profile=development_profile,
         gpu_count=1 if development_profile == "GPU_1_8CPU_32GB" else 0,
         safe_spec={
-            "gpu": ("SLURM_ALLOCATED_1" if development_profile == "GPU_1_8CPU_32GB" else "NONE"),
+            "gpu": "NONE",
             "privileged": False,
             "host_network": False,
             "host_pid": False,
@@ -307,14 +307,8 @@ def _worker_success(calls: list[tuple[str, dict[str, Any]]]):
             "container_name": payload["container_name"],
             "container_state": "RUNNING",
             "container_gpu": payload["expected_gpu"],
-            "gpu_allocation_job_id": (
-                701 if payload["development_profile"] == "GPU_1_8CPU_32GB" else None
-            ),
-            "gpu_allocation_uuid": (
-                "GPU-11111111-2222-3333-4444-555555555555"
-                if payload["development_profile"] == "GPU_1_8CPU_32GB"
-                else None
-            ),
+            "gpu_allocation_job_id": None,
+            "gpu_allocation_uuid": None,
             "container_cpus": 8,
             "container_memory_gb": 32,
             "container_pids_limit": 4096,
@@ -413,7 +407,7 @@ def test_owner_can_activate_staged_compute_once_without_users_write(
     assert audit is not None and audit.actor == target.user.normalized_login
 
 
-def test_owner_activation_persists_gpu_development_allocation_coordinates(
+def test_owner_activation_keeps_gpu_development_container_gpu_less(
     client: Any,
     database: Session,
     origin_headers: dict[str, str],
@@ -435,7 +429,7 @@ def test_owner_activation_persists_gpu_development_allocation_coordinates(
     payload = calls[0][1]["payload"]
     assert payload["development_profile"] == "GPU_1_8CPU_32GB"
     assert payload["container_gpu"] == 1
-    assert payload["expected_gpu"] == "SLURM_ALLOCATED_1"
+    assert payload["expected_gpu"] == "NONE"
     assert payload["workspace_path"] == "/storage/users/20012"
 
     database.expire_all()
@@ -444,8 +438,8 @@ def test_owner_activation_persists_gpu_development_allocation_coordinates(
     assert container.development_profile == "GPU_1_8CPU_32GB"
     assert container.gpu_count == 1
     assert container.observed_state == "RUNNING"
-    assert container.gpu_allocation_job_id == 701
-    assert container.gpu_allocation_uuid == "GPU-11111111-2222-3333-4444-555555555555"
+    assert container.gpu_allocation_job_id is None
+    assert container.gpu_allocation_uuid is None
 
 
 def test_double_activate_is_idempotent_and_never_extends_lease(

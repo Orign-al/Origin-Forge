@@ -746,11 +746,6 @@ class PortalContainer(Base):
             name="ck_portal_container_development_profile",
         ),
         CheckConstraint(
-            "observed_state != 'RUNNING' OR development_profile = 'STANDARD_8CPU_32GB' OR "
-            "(gpu_allocation_job_id IS NOT NULL AND gpu_allocation_uuid IS NOT NULL)",
-            name="ck_portal_container_running_gpu_allocation",
-        ),
-        CheckConstraint(
             "(gpu_allocation_job_id IS NULL AND gpu_allocation_uuid IS NULL) OR "
             "(gpu_allocation_job_id IS NOT NULL AND gpu_allocation_uuid IS NOT NULL)",
             name="ck_portal_container_gpu_allocation_pair",

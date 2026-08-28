@@ -72,9 +72,13 @@ require_activated_pilot_access() {
       [[ "$(pilot_state_value "${state_file}" WORKSPACE_PATH)" == \
         "${H100_WORKSPACE_ROOT}/${state_uid}" ]] \
         || h100_fail 'multi-user Container workspace binding is invalid'
-      [[ "$(pilot_state_value "${state_file}" DEVELOPMENT_PROFILE)" == \
-        STANDARD_8CPU_32GB ]] \
-        || h100_fail 'GPU Development must use the Slurm-bound GPU runtime handler'
+      case "$(pilot_state_value "${state_file}" DEVELOPMENT_PROFILE)" in
+        STANDARD_8CPU_32GB|GPU_1_8CPU_32GB) ;;
+        *) h100_fail 'multi-user Container development profile is invalid' ;;
+      esac
+      [[ -z "$(pilot_state_value "${state_file}" GPU_ALLOCATION_JOB_ID)" \
+        && -z "$(pilot_state_value "${state_file}" GPU_ALLOCATION_UUID)" ]] \
+        || h100_fail 'GPU-bound Container must use the allocation-aware runtime handler'
       [[ "$(pilot_state_value "${state_file}" LEASE_ID)" =~ \
         ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] \
         || h100_fail 'multi-user Container Lease ID is invalid'
@@ -166,6 +170,20 @@ require_activated_pilot_access
 container="$(h100_container_name "${user_name}")"
 docker container inspect "${container}" >/dev/null 2>&1 \
   || h100_fail "container does not exist: ${container}"
+docker inspect "${container}" | jq -e '
+  .[0].State.Running == false
+  and .[0].HostConfig.Privileged == false
+  and .[0].HostConfig.NetworkMode != "host"
+  and .[0].HostConfig.PidMode != "host"
+  and .[0].HostConfig.IpcMode != "host"
+  and ((.[0].HostConfig.DeviceRequests // []) | length == 0)
+  and ((.[0].HostConfig.Devices // []) | length == 0)
+  and ((.[0].HostConfig.DeviceCgroupRules // []) | length == 0)
+  and ((.[0].HostConfig.CapAdd // []) | length == 0)
+  and ((.[0].Config.Env // []) | map(select(
+    startswith("NVIDIA_VISIBLE_DEVICES=") or startswith("CUDA_VISIBLE_DEVICES=")
+  )) | length == 0)
+' >/dev/null || h100_fail 'container start requires a GPU-less isolated definition'
 docker start "${container}" >/dev/null
 if ! h100_wait_healthy "${container}" 120; then
   docker stop --time 30 "${container}" >/dev/null 2>&1 || true

@@ -1983,7 +1983,7 @@ def managed_container_lifecycle_payload(
         "lease_id": str(uuid.uuid4()),
         "lease_starts_at": lease_starts_at.isoformat(),
         "lease_expires_at": (lease_starts_at + timedelta(hours=2)).isoformat(),
-        "expected_gpu": "SLURM_ALLOCATED_1" if gpu else "NONE",
+        "expected_gpu": "NONE",
     }
 
 
@@ -3179,43 +3179,10 @@ def test_gpu_development_allocation_is_owner_lease_and_scheduler_bound_across_re
     assert rejected.value.code == "GPU_ALLOCATION_NOT_RUNNING"
 
 
-def test_gpu_development_submit_uses_exact_one_gpu_and_fixed_sleep(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    payload = managed_container_lifecycle_payload(development_profile="GPU_1_8CPU_32GB")
-    captured: dict[str, object] = {}
-
-    def run_as_user(bound_payload, argv, timeout, **_kwargs):  # type: ignore[no-untyped-def]
-        captured["payload"] = bound_payload
-        captured["argv"] = argv
-        captured["timeout"] = timeout
-        return {"ok": True, "stdout": "701\n", "stderr": ""}
-
-    monkeypatch.setattr(handlers, "_run_as_managed_user", run_as_user)
-    monkeypatch.setattr(handlers, "_gpu_development_partition_preflight", lambda: None)
-    monkeypatch.setattr(
-        handlers,
-        "_gpu_allocation_binding",
-        lambda bound_payload, job_id: (
-            "GPU-11111111-2222-3333-4444-555555555555"
-            if bound_payload == payload and job_id == 701
-            else pytest.fail("allocation lookup lost its exact binding")
-        ),
-    )
-    job_id, gpu_uuid = handlers._submit_gpu_development_allocation(payload)
-    argv = captured["argv"]
-    assert job_id == 701
-    assert gpu_uuid == "GPU-11111111-2222-3333-4444-555555555555"
-    assert "--gres=gpu:h100:1" in argv
-    assert "--partition=gpu-dev" in argv
-    assert not any("gpu:2" in item for item in argv)
-    assert not any(item.startswith("--time=") or item.startswith("--deadline=") for item in argv)
-    assert "--export=ALL" in argv
-    assert not any("WORKSPACE=" in item for item in argv)
-    assert f"--chdir={payload['workspace_path']}" in argv
-    assert f"--comment=h100-gpu-dev:{payload['managed_user_id']}:{payload['lease_id']}" in argv
-    assert argv[-1] == "--wrap=/usr/bin/sleep infinity"
-    assert captured["payload"] == payload
+def test_gpu_development_has_no_persistent_allocation_submitter() -> None:
+    source = Path(handlers.__file__).read_text(encoding="utf-8")
+    assert not hasattr(handlers, "_submit_gpu_development_allocation")
+    assert "/usr/bin/sleep infinity" not in source
 
 
 def test_gpu_allocation_cancel_accepts_only_owner_bound_terminal_replay(
@@ -3417,65 +3384,6 @@ def test_active_container_lifecycle_advances_only_to_contiguous_successor(
             gpu_allocation_uuid=None,
         )
     assert rejected.value.code == "RESOURCE_LIFECYCLE_STATE_REJECTED"
-
-
-def test_gpu_development_partition_must_be_non_default_and_infinite(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        handlers,
-        "script_integrity",
-        lambda: {
-            "h100-platform-common": {"integrity_ok": True},
-            "h100-gpu-development-epilog": {"integrity_ok": True},
-        },
-    )
-
-    def valid_preflight(binary: str, args: list[str], **_kwargs):  # type: ignore[no-untyped-def]
-        assert binary == "scontrol"
-        if args == ["show", "config"]:
-            return {
-                "ok": True,
-                "stdout": "Epilog[0]             = /usr/local/sbin/h100-gpu-development-epilog\n",
-            }
-        return {
-            "ok": True,
-            "stdout": (
-                "PartitionName=gpu-dev AllowAccounts=ALL Default=NO "
-                "MaxTime=INFINITE Nodes=sagsh100server State=UP\n"
-            ),
-        }
-
-    monkeypatch.setattr(
-        handlers,
-        "run_fixed",
-        valid_preflight,
-    )
-    handlers._gpu_development_partition_preflight()
-
-    def finite_preflight(binary: str, args: list[str], **_kwargs):  # type: ignore[no-untyped-def]
-        result = valid_preflight(binary, args)
-        if args != ["show", "config"]:
-            result["stdout"] = str(result["stdout"]).replace("INFINITE", "08:00:00")
-        return result
-
-    monkeypatch.setattr(handlers, "run_fixed", finite_preflight)
-    with pytest.raises(handlers.LifecycleValidationError) as rejected:
-        handlers._gpu_development_partition_preflight()
-    assert rejected.value.code == "GPU_DEVELOPMENT_PARTITION_REJECTED"
-
-    monkeypatch.setattr(
-        handlers,
-        "run_fixed",
-        lambda binary, args, **_kwargs: (
-            {"ok": True, "stdout": "Epilog = (null)\n"}
-            if args == ["show", "config"]
-            else valid_preflight(binary, args)
-        ),
-    )
-    with pytest.raises(handlers.LifecycleValidationError) as rejected:
-        handlers._gpu_development_partition_preflight()
-    assert rejected.value.code == "GPU_DEVELOPMENT_PARTITION_REJECTED"
 
 
 def test_cpu_container_security_rejects_any_nvidia_runtime_surface(
@@ -3750,12 +3658,10 @@ def test_gpu_container_security_requires_one_uuid_and_no_host_escape(
     assert rejected.value.code == "CONTAINER_SECURITY_REJECTED"
 
 
-def test_gpu_start_failure_cancels_new_allocation(
+def test_gpu_profile_start_failure_never_creates_or_cancels_an_allocation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     payload = managed_container_lifecycle_payload(development_profile="GPU_1_8CPU_32GB")
-    job_id = 701
-    gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
     monkeypatch.setattr(
         handlers,
         "_managed_container_security",
@@ -3771,11 +3677,6 @@ def test_gpu_start_failure_cancels_new_allocation(
         },
     )
     monkeypatch.setattr(
-        handlers,
-        "_submit_gpu_development_allocation",
-        lambda _payload: (job_id, gpu_uuid),
-    )
-    monkeypatch.setattr(
         handlers, "_bind_active_container_lifecycle", lambda *_args, **_kwargs: None
     )
     monkeypatch.setattr(
@@ -3785,7 +3686,7 @@ def test_gpu_start_failure_cancels_new_allocation(
 
     def script(argv, **_kwargs):  # type: ignore[no-untyped-def]
         calls.append(argv)
-        return {"ok": argv[1] == "stop"}
+        return {"ok": False}
 
     cancelled: list[int] = []
     monkeypatch.setattr(handlers, "run_allowlisted_script", script)
@@ -3798,8 +3699,54 @@ def test_gpu_start_failure_cancels_new_allocation(
         request("container.start", requested_by="origin-pilot"), payload
     )
     assert result["error"]["code"] == "CONTAINER_START_FAILED"
-    assert [call[1] for call in calls] == ["start", "stop"]
-    assert cancelled == [job_id]
+    assert [Path(call[0]).name for call in calls] == ["h100-container-start"]
+    assert cancelled == []
+
+
+def test_gpu_profile_start_runs_persistent_container_without_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = managed_container_lifecycle_payload(development_profile="GPU_1_8CPU_32GB")
+    inspections = iter(({"state": {"Running": False}}, {"state": {"Running": True}}))
+    monkeypatch.setattr(
+        handlers,
+        "_managed_container_security",
+        lambda *_args, **_kwargs: next(inspections),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {
+            "h100-container-stop": {"integrity_ok": True},
+            "h100-container-start": {"integrity_ok": True},
+        },
+    )
+    bound: list[tuple[int | None, str | None]] = []
+    monkeypatch.setattr(
+        handlers,
+        "_bind_active_container_lifecycle",
+        lambda _payload, *, gpu_allocation_job_id, gpu_allocation_uuid: bound.append(
+            (gpu_allocation_job_id, gpu_allocation_uuid)
+        ),
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda argv, **_kwargs: calls.append(argv) or {"ok": True},
+    )
+
+    result = handlers._execute_managed_container_lifecycle(
+        request("container.start", requested_by="origin-pilot"), payload
+    )
+
+    assert result["status"] == "SUCCEEDED"
+    assert result["container_state"] == "RUNNING"
+    assert result["container_gpu"] == "NONE"
+    assert result["gpu_allocation_job_id"] is None
+    assert result["gpu_allocation_uuid"] is None
+    assert bound == [(None, None)]
+    assert calls == [[handlers.SCRIPT_ALLOWLIST["h100-container-start"], "origin-pilot"]]
 
 
 def test_gpu_stop_removes_container_before_allocation_cancel(
@@ -4248,7 +4195,7 @@ def test_recycle_rejects_a_different_v4_lease_or_gpu_allocation(
         **portal4a_recycle_payload(),
         "development_profile": "GPU_1_8CPU_32GB",
         "container_gpu": 1,
-        "expected_gpu": "SLURM_ALLOCATED_1",
+        "expected_gpu": "NONE",
         "gpu_allocation_job_id": 701,
         "gpu_allocation_uuid": "GPU-11111111-2222-3333-4444-555555555555",
     }
@@ -4348,7 +4295,7 @@ def test_gpu_restore_and_recycle_payloads_are_exactly_allocation_bound() -> None
         **portal4a_restore_payload(),
         "development_profile": "GPU_1_8CPU_32GB",
         "container_gpu": 1,
-        "expected_gpu": "SLURM_ALLOCATED_1",
+        "expected_gpu": "NONE",
     }
     validated_restore = validate_payload("resource.restore", restore)
     assert validated_restore["workspace_path"] == "/storage/users/20001"
@@ -4560,18 +4507,16 @@ def test_portal4a_restore_stops_partial_start_before_resuspending_key(
     assert not active.exists()
 
 
-def test_gpu_restore_retains_allocation_when_partial_container_removal_fails(
+def test_gpu_restore_failure_rolls_back_without_any_gpu_allocation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     payload = {
         **portal4a_restore_payload(),
         "development_profile": "GPU_1_8CPU_32GB",
         "container_gpu": 1,
-        "expected_gpu": "SLURM_ALLOCATED_1",
+        "expected_gpu": "NONE",
     }
     configure_resource_lifecycle_transitions(monkeypatch)
-    job_id = 701
-    gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
     suspended = tmp_path / "users/origin-pilot/home/.ssh/authorized_keys.portal-recycle"
     suspended.parent.mkdir(parents=True)
     suspended.write_text("ssh-ed25519 fixture\n", encoding="utf-8")
@@ -4596,24 +4541,22 @@ def test_gpu_restore_retains_allocation_when_partial_container_removal_fails(
     monkeypatch.setattr(
         handlers,
         "script_integrity",
-        lambda: {"h100-container-gpu-runtime": {"integrity_ok": True}},
-    )
-    monkeypatch.setattr(
-        handlers,
-        "_submit_gpu_development_allocation",
-        lambda _payload: (job_id, gpu_uuid),
+        lambda: {
+            "h100-container-start": {"integrity_ok": True},
+            "h100-container-stop": {"integrity_ok": True},
+        },
     )
     events: list[str] = []
 
     def run_script(argv, **_kwargs):  # type: ignore[no-untyped-def]
-        events.append(str(argv[1]))
+        events.append(Path(argv[0]).name)
         return {"ok": False}
 
     monkeypatch.setattr(handlers, "run_allowlisted_script", run_script)
     monkeypatch.setattr(
         handlers,
         "_cancel_gpu_development_allocation",
-        lambda *_args: pytest.fail("allocation must remain until container removal is proven"),
+        lambda *_args: pytest.fail("GPU-less restore must not touch an allocation"),
     )
 
     result = handlers._execute_resource_restore(request("resource.restore"), payload)
@@ -4621,9 +4564,9 @@ def test_gpu_restore_retains_allocation_when_partial_container_removal_fails(
     assert result["status"] == "ERROR"
     assert result["error"]["code"] == "RESTORE_ROLLBACK_FAILED"
     assert result["gpu_allocation_state_known"] is True
-    assert result["gpu_allocation_job_id"] == job_id
-    assert result["gpu_allocation_uuid"] == gpu_uuid
-    assert events == ["start", "stop"]
+    assert result["gpu_allocation_job_id"] is None
+    assert result["gpu_allocation_uuid"] is None
+    assert events == ["h100-container-start", "h100-container-stop"]
     assert suspended.exists()
     assert not active.exists()
 

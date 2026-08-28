@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
-from h100_portal_contracts.workspace import workspace_path
+from h100_portal_contracts.workspace import container_runtime_gpu_state, workspace_path
 from sqlalchemy import exists, or_, select, update
 from sqlalchemy.orm import Session, aliased
 
@@ -519,7 +519,9 @@ def _execute_cleanup(
         "slurm_account": managed.slurm_account,
         "slurm_qos": managed.slurm_qos,
         "expires_at": ensure_utc(lease.expires_at).isoformat(),
-        "expected_gpu": "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1",
+        "expected_gpu": container_runtime_gpu_state(
+            container.gpu_allocation_job_id, container.gpu_allocation_uuid
+        ),
         "host_access": "DISABLED_BY_PLATFORM_POLICY",
         "expected_key_fingerprints": expected_key_fingerprints,
     }
@@ -557,7 +559,7 @@ def _execute_cleanup(
         )
         return False
     observed_fingerprints = result.get("container_key_fingerprints")
-    expected_gpu = "NONE" if container.gpu_count == 0 else "SLURM_ALLOCATED_1"
+    expected_gpu = "NONE"
     success = (
         result.get("status") == "SUCCEEDED"
         and result.get("container_state") == "STOPPED"

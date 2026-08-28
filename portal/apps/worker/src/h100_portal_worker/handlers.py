@@ -5852,12 +5852,18 @@ def _activation_active_lifecycle(
         )
     allocation_job_id = lifecycle.get("GPU_ALLOCATION_JOB_ID", "")
     allocation_uuid = lifecycle.get("GPU_ALLOCATION_UUID", "")
-    gpu_profile = payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
-    if gpu_profile != bool(allocation_job_id and allocation_uuid) or (
-        allocation_job_id
-        and (
-            not allocation_job_id.isdigit()
-            or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", allocation_uuid) is None
+    if (
+        (not allocation_job_id) != (not allocation_uuid)
+        or (
+            payload["development_profile"] == CPU_DEVELOPMENT_PROFILE
+            and (allocation_job_id or allocation_uuid)
+        )
+        or (
+            allocation_job_id
+            and (
+                not allocation_job_id.isdigit()
+                or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", allocation_uuid) is None
+            )
         )
     ):
         raise LifecycleValidationError(
@@ -6204,7 +6210,7 @@ def _bind_active_container_lifecycle(
     gpu_allocation_job_id: int | None,
     gpu_allocation_uuid: str | None,
 ) -> None:
-    """Atomically bind one start/restart to the current Lease and GPU allocation."""
+    """Atomically bind one start/restart to its Lease and optional legacy allocation."""
 
     lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
     _validate_resource_lifecycle_binding(lifecycle, payload, _lifecycle_fingerprints(lifecycle))
@@ -6250,11 +6256,13 @@ def _bind_active_container_lifecycle(
             "RESOURCE_LIFECYCLE_STATE_REJECTED",
             "container action Lease does not match the managed lifecycle",
         )
-    gpu_profile = payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
-    if gpu_profile != bool(gpu_allocation_job_id is not None and gpu_allocation_uuid is not None):
+    if (gpu_allocation_job_id is None) != (gpu_allocation_uuid is None) or (
+        payload["development_profile"] == CPU_DEVELOPMENT_PROFILE
+        and gpu_allocation_job_id is not None
+    ):
         raise LifecycleValidationError(
             "RESOURCE_LIFECYCLE_STATE_REJECTED",
-            "container action GPU lifecycle binding is incomplete",
+            "container action GPU lifecycle binding is invalid",
         )
     if gpu_allocation_job_id is not None and (
         not 0 < gpu_allocation_job_id < 2**63
@@ -6366,11 +6374,13 @@ def _activate_restored_lifecycle(
             "RESOURCE_LIFECYCLE_STATE_REJECTED",
             "managed lifecycle is not a recoverable expired resource",
         )
-    gpu_profile = payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
-    if gpu_profile != bool(gpu_allocation_job_id is not None and gpu_allocation_uuid is not None):
+    if (gpu_allocation_job_id is None) != (gpu_allocation_uuid is None) or (
+        payload["development_profile"] == CPU_DEVELOPMENT_PROFILE
+        and gpu_allocation_job_id is not None
+    ):
         raise LifecycleValidationError(
             "RESOURCE_LIFECYCLE_STATE_REJECTED",
-            "restore lifecycle GPU allocation binding is incomplete",
+            "restore lifecycle GPU allocation binding is invalid",
         )
     if gpu_allocation_job_id is not None and (
         not 0 < gpu_allocation_job_id < 2**63
@@ -6517,10 +6527,23 @@ def _mark_recycled_lifecycle(
         expected_uuid = payload.get("gpu_allocation_uuid")
         if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE:
             if (
-                not isinstance(expected_job_id, int)
-                or not isinstance(expected_uuid, str)
-                or lifecycle.get("GPU_ALLOCATION_JOB_ID") != str(expected_job_id)
-                or lifecycle.get("GPU_ALLOCATION_UUID") != expected_uuid
+                (expected_job_id is None) != (expected_uuid is None)
+                or (
+                    expected_job_id is not None
+                    and (
+                        not isinstance(expected_job_id, int)
+                        or not isinstance(expected_uuid, str)
+                        or lifecycle.get("GPU_ALLOCATION_JOB_ID") != str(expected_job_id)
+                        or lifecycle.get("GPU_ALLOCATION_UUID") != expected_uuid
+                    )
+                )
+                or (
+                    expected_job_id is None
+                    and (
+                        lifecycle.get("GPU_ALLOCATION_JOB_ID")
+                        or lifecycle.get("GPU_ALLOCATION_UUID")
+                    )
+                )
             ):
                 raise LifecycleValidationError(
                     "RESOURCE_LIFECYCLE_STATE_REJECTED",
@@ -6789,7 +6812,7 @@ def _activation_container_security(
         and container.get("gpu")
         == (
             "REQUESTED"
-            if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE and require_running
+            if payload.get("gpu_allocation_job_id") is not None and require_running
             else "NONE"
         )
         and not container.get("docker_socket_mounted")
@@ -7098,43 +7121,46 @@ def _execute_self_compute_activation(
             require_running=running,
             expected_fingerprints=fingerprints,
         )
-        if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE:
-            if allocation_job_id is None:
-                allocation_job_id, allocation_uuid = _submit_gpu_development_allocation(
-                    runtime_payload
-                )
-                runtime_payload.update(
-                    {
-                        "gpu_allocation_job_id": allocation_job_id,
-                        "gpu_allocation_uuid": allocation_uuid,
-                    }
-                )
-                _write_activation_lifecycle_state(
-                    payload,
-                    status="ACTIVATING",
-                    fingerprints=fingerprints,
-                    starts_at=None,
-                    expires_at=None,
-                    gpu_allocation_job_id=allocation_job_id,
-                    gpu_allocation_uuid=allocation_uuid,
-                )
-            elif _gpu_allocation_binding(payload, allocation_job_id) != allocation_uuid:
+        # GPU Development is a GPU-capable profile, not a permanent GPU
+        # reservation.  An interrupted activation from the former coupled
+        # runtime is converged by removing its exact UUID-bound container
+        # before the Slurm allocation is cancelled.
+        if isinstance(allocation_job_id, int) and isinstance(allocation_uuid, str):
+            if _gpu_allocation_binding(payload, allocation_job_id) != allocation_uuid:
                 raise LifecycleValidationError(
                     "GPU_ALLOCATION_POSTCONDITION_FAILED",
                     "activation GPU differs from its live Slurm allocation",
                 )
-        if not running:
-            start_argv = (
-                [
-                    SCRIPT_ALLOWLIST["h100-container-gpu-runtime"],
-                    "start",
-                    str(payload["username"]),
-                    str(allocation_job_id),
-                    str(allocation_uuid),
-                ]
-                if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
-                else [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])]
+            if running:
+                stopped = run_allowlisted_script(
+                    [
+                        SCRIPT_ALLOWLIST["h100-container-gpu-runtime"],
+                        "stop",
+                        str(payload["username"]),
+                        str(allocation_job_id),
+                        allocation_uuid,
+                    ],
+                    timeout=150,
+                )
+                if not stopped.get("ok"):
+                    raise LifecycleValidationError(
+                        "CONTAINER_STOP_FAILED",
+                        "legacy GPU-bound activation container could not be stopped",
+                    )
+                running = False
+            _cancel_gpu_development_allocation(runtime_payload, allocation_job_id)
+            allocation_job_id = None
+            allocation_uuid = None
+            runtime_payload.update({"gpu_allocation_job_id": None, "gpu_allocation_uuid": None})
+            _write_activation_lifecycle_state(
+                payload,
+                status="ACTIVATING",
+                fingerprints=fingerprints,
+                starts_at=None,
+                expires_at=None,
             )
+        if not running:
+            start_argv = [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])]
             started = run_allowlisted_script(start_argv, timeout=150)
             if not started.get("ok"):
                 raise LifecycleValidationError(
@@ -9406,78 +9432,6 @@ def _gpu_allocation_binding(payload: dict[str, Any], job_id: int) -> str:
     return resolved_gpu_uuid
 
 
-def _gpu_development_partition_preflight() -> None:
-    result = run_fixed("scontrol", ["show", "partition", "gpu-dev", "-o"], timeout=15)
-    line = str(result.get("stdout", ""))
-    configuration = run_fixed("scontrol", ["show", "config"], timeout=15)
-    configuration_text = str(configuration.get("stdout", ""))
-    integrity = script_integrity()
-    epilog_integrity = integrity.get("h100-gpu-development-epilog", {})
-    common_integrity = integrity.get("h100-platform-common", {})
-    if (
-        not result.get("ok")
-        or re.search(r"(?:^|\s)PartitionName=gpu-dev(?:\s|$)", line) is None
-        or re.search(r"(?:^|\s)Default=NO(?:\s|$)", line) is None
-        or re.search(r"(?:^|\s)State=UP(?:\s|$)", line) is None
-        or re.search(r"(?:^|\s)MaxTime=(?:INFINITE|UNLIMITED)(?:\s|$)", line) is None
-        or not configuration.get("ok")
-        or re.search(
-            r"(?:^|\n)Epilog(?:\[0\])?\s*=\s*/usr/local/sbin/h100-gpu-development-epilog(?:\s|$)",
-            configuration_text,
-        )
-        is None
-        or epilog_integrity.get("integrity_ok") is not True
-        or common_integrity.get("integrity_ok") is not True
-    ):
-        raise LifecycleValidationError(
-            "GPU_DEVELOPMENT_PARTITION_REJECTED",
-            "the non-default GPU development safety-lock partition is unavailable",
-        )
-
-
-def _submit_gpu_development_allocation(payload: dict[str, Any]) -> tuple[int, str]:
-    _gpu_development_partition_preflight()
-    workspace = Path(str(payload["workspace_path"]))
-    argv = [
-        BINARIES["sbatch"],
-        "--parsable",
-        f"--account={payload['slurm_account']}",
-        f"--qos={payload['slurm_qos']}",
-        "--partition=gpu-dev",
-        f"--job-name=portal-gpu-dev-{payload['uid']}",
-        "--cpus-per-task=8",
-        "--mem=32768M",
-        "--gres=gpu:h100:1",
-        f"--chdir={workspace}",
-        "--export=ALL",
-        f"--comment=h100-gpu-dev:{payload['managed_user_id']}:{payload['lease_id']}",
-        f"--output={workspace}/outputs/.gpu-development-%j.out",
-        f"--error={workspace}/outputs/.gpu-development-%j.err",
-        "--wrap=/usr/bin/sleep infinity",
-    ]
-    submitted = _run_as_managed_user(payload, argv, timeout=30)
-    match = re.fullmatch(r"(\d+)(?:;[A-Za-z0-9_.-]+)?\s*", str(submitted.get("stdout", "")))
-    if not submitted.get("ok") or match is None:
-        raise LifecycleValidationError(
-            "GPU_ALLOCATION_SUBMIT_FAILED", "Slurm GPU development allocation failed"
-        )
-    job_id = int(match.group(1))
-    try:
-        for _attempt in range(120):
-            try:
-                return job_id, _gpu_allocation_binding(payload, job_id)
-            except LifecycleValidationError as exc:
-                if exc.code != "GPU_ALLOCATION_NOT_RUNNING":
-                    raise
-            time.sleep(0.5)
-        raise LifecycleValidationError(
-            "GPU_ALLOCATION_UNAVAILABLE", "one GPU did not become available before timeout"
-        )
-    except LifecycleValidationError:
-        _run_as_managed_user(payload, [BINARIES["scancel"], str(job_id)], timeout=20)
-        raise
-
-
 GPU_ALLOCATION_TERMINAL_STATES = frozenset(
     {
         "BOOT_FAIL",
@@ -10234,9 +10188,6 @@ def _execute_managed_container_lifecycle(
     action_override: str | None = None,
     owner_required: bool = True,
 ) -> dict[str, Any]:
-    new_allocation = False
-    start_invoked = False
-    allocation_lifecycle_bound = False
     allocation_job_id = payload.get("gpu_allocation_job_id")
     allocation_uuid = payload.get("gpu_allocation_uuid")
     try:
@@ -10263,22 +10214,20 @@ def _execute_managed_container_lifecycle(
         required_scripts = {"h100-container-stop"}
         if action in {"start", "restart"}:
             required_scripts.add("h100-container-start")
-        if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE:
+        if isinstance(allocation_job_id, int):
             required_scripts.add("h100-container-gpu-runtime")
         integrity = script_integrity()
         if not all(integrity.get(name, {}).get("integrity_ok", False) for name in required_scripts):
             raise LifecycleValidationError(
                 "SCRIPT_INTEGRITY_FAILED", "container lifecycle script integrity failed"
             )
-        profile_is_gpu = payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
         if action in {"stop", "restart"} and bool(before.get("state", {}).get("Running")):
-            if profile_is_gpu:
-                if not isinstance(allocation_job_id, int) or not isinstance(allocation_uuid, str):
+            if isinstance(allocation_job_id, int) and isinstance(allocation_uuid, str):
+                if _gpu_allocation_binding(payload, allocation_job_id) != allocation_uuid:
                     raise LifecycleValidationError(
-                        "GPU_ALLOCATION_BINDING_REJECTED",
-                        "running GPU container has no allocation binding",
+                        "GPU_ALLOCATION_POSTCONDITION_FAILED",
+                        "container GPU differs from its live Slurm allocation",
                     )
-                _gpu_allocation_binding(payload, allocation_job_id)
                 stopped = run_allowlisted_script(
                     [
                         SCRIPT_ALLOWLIST["h100-container-gpu-runtime"],
@@ -10307,9 +10256,22 @@ def _execute_managed_container_lifecycle(
                 )
             if not stopped.get("ok"):
                 raise LifecycleValidationError("CONTAINER_STOP_FAILED", "container stop failed")
-        elif (
-            action in {"stop", "restart"} and profile_is_gpu and isinstance(allocation_job_id, int)
-        ):
+        elif action in {"stop", "restart"} and isinstance(allocation_job_id, int):
+            assert isinstance(allocation_uuid, str)
+            _cancel_gpu_development_allocation(payload, allocation_job_id)
+            stopped_job_id = allocation_job_id
+            stopped_gpu_uuid = allocation_uuid
+            allocation_job_id = None
+            allocation_uuid = None
+            _clear_active_gpu_lifecycle_binding(
+                payload,
+                expected_job_id=stopped_job_id,
+                expected_gpu_uuid=stopped_gpu_uuid,
+            )
+        if action == "start" and isinstance(allocation_job_id, int):
+            # Transitional compatibility for a stopped legacy GPU container:
+            # its definition is already GPU-less, so release the stale exact
+            # allocation before starting the persistent development runtime.
             assert isinstance(allocation_uuid, str)
             _cancel_gpu_development_allocation(payload, allocation_job_id)
             stopped_job_id = allocation_job_id
@@ -10322,48 +10284,15 @@ def _execute_managed_container_lifecycle(
                 expected_gpu_uuid=stopped_gpu_uuid,
             )
         if action in {"start", "restart"}:
-            if profile_is_gpu:
-                allocation_payload = {
-                    **payload,
-                    "gpu_allocation_job_id": None,
-                    "gpu_allocation_uuid": None,
-                }
-                allocation_job_id, allocation_uuid = _submit_gpu_development_allocation(
-                    allocation_payload
-                )
-                new_allocation = True
-                _bind_active_container_lifecycle(
-                    payload,
-                    gpu_allocation_job_id=allocation_job_id,
-                    gpu_allocation_uuid=allocation_uuid,
-                )
-                allocation_lifecycle_bound = True
-                start_invoked = True
-                started = run_allowlisted_script(
-                    [
-                        SCRIPT_ALLOWLIST["h100-container-gpu-runtime"],
-                        "start",
-                        str(payload["username"]),
-                        str(allocation_job_id),
-                        allocation_uuid,
-                    ],
-                    timeout=150,
-                )
-                if not started.get("ok"):
-                    # The fixed wrapper can fail after Docker has created or started
-                    # the container.  Keep the allocation bound until the exception
-                    # rollback has first removed that possibly live container.
-                    pass
-            else:
-                _bind_active_container_lifecycle(
-                    payload,
-                    gpu_allocation_job_id=None,
-                    gpu_allocation_uuid=None,
-                )
-                started = run_allowlisted_script(
-                    [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])],
-                    timeout=150,
-                )
+            _bind_active_container_lifecycle(
+                payload,
+                gpu_allocation_job_id=None,
+                gpu_allocation_uuid=None,
+            )
+            started = run_allowlisted_script(
+                [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])],
+                timeout=150,
+            )
             if not started.get("ok"):
                 raise LifecycleValidationError("CONTAINER_START_FAILED", "container start failed")
         expected_running = action != "stop"
@@ -10373,16 +10302,6 @@ def _execute_managed_container_lifecycle(
             "gpu_allocation_uuid": allocation_uuid,
         }
         _managed_container_security(postflight_payload, require_running=expected_running)
-        if (
-            profile_is_gpu
-            and expected_running
-            and isinstance(allocation_job_id, int)
-            and _gpu_allocation_binding(postflight_payload, allocation_job_id) != allocation_uuid
-        ):
-            raise LifecycleValidationError(
-                "GPU_ALLOCATION_POSTCONDITION_FAILED",
-                "container GPU differs from the live Slurm allocation",
-            )
         return {
             "status": "SUCCEEDED",
             "handler": request.operation_type,
@@ -10390,54 +10309,11 @@ def _execute_managed_container_lifecycle(
             "name": payload["name"],
             "username": payload["username"],
             "container_state": "RUNNING" if expected_running else "STOPPED",
-            "container_gpu": payload["expected_gpu"],
+            "container_gpu": "NONE",
             "gpu_allocation_job_id": allocation_job_id,
             "gpu_allocation_uuid": allocation_uuid,
         }
     except LifecycleValidationError as exc:
-        rollback_failed = False
-        if new_allocation and isinstance(allocation_job_id, int):
-            failed_job_id = allocation_job_id
-            failed_gpu_uuid = allocation_uuid
-            if start_invoked and isinstance(allocation_uuid, str):
-                stopped = run_allowlisted_script(
-                    [
-                        SCRIPT_ALLOWLIST["h100-container-gpu-runtime"],
-                        "stop",
-                        str(payload["username"]),
-                        str(allocation_job_id),
-                        allocation_uuid,
-                    ],
-                    timeout=150,
-                )
-                rollback_failed = not bool(stopped.get("ok"))
-            if not rollback_failed:
-                try:
-                    _cancel_gpu_development_allocation(payload, allocation_job_id)
-                except LifecycleValidationError:
-                    rollback_failed = True
-            if not rollback_failed:
-                allocation_job_id = None
-                allocation_uuid = None
-                if allocation_lifecycle_bound and isinstance(failed_gpu_uuid, str):
-                    try:
-                        _clear_active_gpu_lifecycle_binding(
-                            payload,
-                            expected_job_id=failed_job_id,
-                            expected_gpu_uuid=failed_gpu_uuid,
-                        )
-                    except LifecycleValidationError:
-                        rollback_failed = True
-        if rollback_failed:
-            return {
-                "status": "ERROR",
-                "gpu_allocation_state_known": False,
-                "error": {
-                    "code": "GPU_ALLOCATION_ROLLBACK_FAILED",
-                    "message": "GPU container start failed and allocation cleanup is incomplete",
-                    "cause": exc.code,
-                },
-            }
         return {
             "status": "ERROR",
             "gpu_allocation_state_known": True,
@@ -10505,24 +10381,30 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
             labels = observed_container.get("safe_labels", {})
             raw_job_id = labels.get("h100.dev.gpu-allocation-job")
             raw_uuid = labels.get("h100.dev.gpu-uuid")
-            if (
-                not isinstance(raw_job_id, str)
-                or not raw_job_id.isdigit()
-                or not isinstance(raw_uuid, str)
-                or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", raw_uuid) is None
-            ):
+            if (raw_job_id is None) != (raw_uuid is None):
                 raise LifecycleValidationError(
                     "GPU_ALLOCATION_BINDING_REJECTED",
-                    "running restored GPU container lacks an allocation binding",
+                    "running restored GPU container has an incomplete allocation binding",
                 )
-            allocation_job_id = int(raw_job_id)
-            allocation_uuid = raw_uuid
-            lifecycle_payload.update(
-                {
-                    "gpu_allocation_job_id": allocation_job_id,
-                    "gpu_allocation_uuid": allocation_uuid,
-                }
-            )
+            if raw_job_id is not None:
+                if (
+                    not isinstance(raw_job_id, str)
+                    or not raw_job_id.isdigit()
+                    or not isinstance(raw_uuid, str)
+                    or re.fullmatch(r"GPU-[0-9a-fA-F-]{32,40}", raw_uuid) is None
+                ):
+                    raise LifecycleValidationError(
+                        "GPU_ALLOCATION_BINDING_REJECTED",
+                        "running restored GPU container allocation binding is invalid",
+                    )
+                allocation_job_id = int(raw_job_id)
+                allocation_uuid = raw_uuid
+                lifecycle_payload.update(
+                    {
+                        "gpu_allocation_job_id": allocation_job_id,
+                        "gpu_allocation_uuid": allocation_uuid,
+                    }
+                )
         container = _managed_container_security(lifecycle_payload, require_running=None)
         running = bool(container.get("state", {}).get("Running"))
         if running:
@@ -10560,56 +10442,23 @@ def _execute_resource_restore(request: WorkerRequest, payload: dict[str, Any]) -
         if suspended.exists():
             os.replace(suspended, active)
         integrity = script_integrity()
-        start_script = (
-            "h100-container-gpu-runtime"
-            if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
-            else "h100-container-start"
-        )
+        start_script = "h100-container-start"
         if not integrity.get(start_script, {}).get("integrity_ok", False):
             raise LifecycleValidationError(
                 "SCRIPT_INTEGRITY_FAILED", "container start script integrity failed"
             )
-        if payload["development_profile"] == GPU_DEVELOPMENT_PROFILE:
-            allocation_job_id, allocation_uuid = _submit_gpu_development_allocation(payload)
-            prior_lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
-            _activate_restored_lifecycle(
-                payload,
-                fingerprints,
-                gpu_allocation_job_id=allocation_job_id,
-                gpu_allocation_uuid=allocation_uuid,
-            )
-            # A failed start can still leave a partially created runtime, so
-            # rollback must prove it removed before releasing the allocation.
-            start_invoked = True
-            started = run_allowlisted_script(
-                [
-                    SCRIPT_ALLOWLIST["h100-container-gpu-runtime"],
-                    "start",
-                    str(payload["username"]),
-                    str(allocation_job_id),
-                    allocation_uuid,
-                ],
-                timeout=150,
-            )
-            lifecycle_payload.update(
-                {
-                    "gpu_allocation_job_id": allocation_job_id,
-                    "gpu_allocation_uuid": allocation_uuid,
-                }
-            )
-        else:
-            prior_lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
-            _activate_restored_lifecycle(
-                payload,
-                fingerprints,
-                gpu_allocation_job_id=None,
-                gpu_allocation_uuid=None,
-            )
-            start_invoked = True
-            started = run_allowlisted_script(
-                [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])],
-                timeout=150,
-            )
+        prior_lifecycle = _read_managed_lifecycle_state(str(payload["username"]))
+        _activate_restored_lifecycle(
+            payload,
+            fingerprints,
+            gpu_allocation_job_id=None,
+            gpu_allocation_uuid=None,
+        )
+        start_invoked = True
+        started = run_allowlisted_script(
+            [SCRIPT_ALLOWLIST["h100-container-start"], str(payload["username"])],
+            timeout=150,
+        )
         if not started.get("ok"):
             raise LifecycleValidationError(
                 "CONTAINER_START_FAILED", "restored container failed to start"
@@ -10812,19 +10661,15 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
         allocation_uuid = payload.get("gpu_allocation_uuid")
         if running:
             failed_step = "CONTAINER_STOP"
-            is_gpu = payload["development_profile"] == GPU_DEVELOPMENT_PROFILE
-            script_name = "h100-container-gpu-runtime" if is_gpu else "h100-container-stop"
+            has_allocation = isinstance(allocation_job_id, int) and isinstance(allocation_uuid, str)
+            script_name = "h100-container-gpu-runtime" if has_allocation else "h100-container-stop"
             integrity = script_integrity()
             if not integrity.get(script_name, {}).get("integrity_ok", False):
                 raise LifecycleValidationError(
                     "SCRIPT_INTEGRITY_FAILED", "container stop script integrity failed"
                 )
-            if is_gpu:
-                if not isinstance(allocation_job_id, int) or not isinstance(allocation_uuid, str):
-                    raise LifecycleValidationError(
-                        "GPU_ALLOCATION_BINDING_REJECTED",
-                        "running GPU container has no allocation binding",
-                    )
+            if has_allocation:
+                assert isinstance(allocation_job_id, int) and isinstance(allocation_uuid, str)
                 if _gpu_allocation_binding(lifecycle_payload, allocation_job_id) != allocation_uuid:
                     raise LifecycleValidationError(
                         "GPU_ALLOCATION_POSTCONDITION_FAILED",
@@ -10903,7 +10748,7 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
             "cancelled_pending_job_ids": cancelled_pending_ids,
             "cancelled_running_job_ids": cancelled_running_ids,
             "container_state": "STOPPED",
-            "container_gpu": payload["expected_gpu"],
+            "container_gpu": "NONE",
             "gpu_allocation_job_id": None,
             "gpu_allocation_uuid": None,
             "container_key_state": "SUSPENDED_BY_RECYCLE",
@@ -10912,7 +10757,7 @@ def _execute_resource_recycle(request: WorkerRequest, payload: dict[str, Any]) -
             "host_access": "DISABLED",
             "data_preserved": True,
             "container_definition_preserved": True,
-            "gpu_allocation_revoked": True,
+            "gpu_allocation_revoked": gpu_allocation_revoked,
             "auto_permanent_delete": False,
         }
     except LifecycleValidationError as exc:
@@ -11089,18 +10934,69 @@ def _execute_host_access_revoke(request: WorkerRequest, payload: dict[str, Any])
 def dry_run_plan(request: WorkerRequest, payload: dict[str, Any]) -> dict[str, Any]:
     if request.operation_type == "container.profile.upgrade_gpu":
         return _gpu_profile_upgrade_preflight(payload)
-    if request.operation_type in {
-        "container.profile.upgrade_gpu.rollback",
-        "container.start_after_profile_upgrade",
-        "container.stop_after_profile_upgrade",
-    }:
+    if request.operation_type == "container.profile.upgrade_gpu.rollback":
         return {
             "status": "ERROR",
             "error": {
                 "code": "GPU_PROFILE_UPGRADE_DRY_RUN_REJECTED",
-                "message": "rollback and post-upgrade start require a committed upgrade",
+                "message": "rollback requires a committed upgrade",
             },
         }
+    if request.operation_type in {
+        "container.start_after_profile_upgrade",
+        "container.stop_after_profile_upgrade",
+    }:
+        try:
+            action = "start" if ".start_" in request.operation_type else "stop"
+            container = _managed_container_security(
+                payload, require_running=False if action == "start" else None
+            )
+            allocation_job_id = payload.get("gpu_allocation_job_id")
+            allocation_uuid = payload.get("gpu_allocation_uuid")
+            if isinstance(allocation_job_id, int):
+                try:
+                    observed_uuid = _gpu_allocation_binding(payload, allocation_job_id)
+                except LifecycleValidationError as exc:
+                    if exc.code != "GPU_ALLOCATION_NOT_RUNNING":
+                        raise
+                    _gpu_allocation_terminal_binding(payload, allocation_job_id)
+                else:
+                    if observed_uuid != allocation_uuid:
+                        raise LifecycleValidationError(
+                            "GPU_ALLOCATION_POSTCONDITION_FAILED",
+                            "container GPU differs from the live Slurm allocation",
+                        )
+            required = {"h100-container-stop"}
+            if action == "start":
+                required.add("h100-container-start")
+            if isinstance(allocation_job_id, int):
+                required.add("h100-container-gpu-runtime")
+            integrity = script_integrity()
+            failed = sorted(
+                name for name in required if not integrity.get(name, {}).get("integrity_ok", False)
+            )
+            if failed:
+                raise LifecycleValidationError(
+                    "SCRIPT_INTEGRITY_FAILED",
+                    "container lifecycle script integrity failed",
+                )
+            return {
+                "status": "DRY_RUN",
+                "handler": request.operation_type,
+                "execution_enabled": False,
+                "container_state": (
+                    "RUNNING" if container.get("state", {}).get("Running") else "STOPPED"
+                ),
+                "container_gpu": payload["expected_gpu"],
+                "gpu_allocation_job_id": allocation_job_id,
+                "gpu_allocation_uuid": allocation_uuid,
+                "target_runtime_gpu": "NONE",
+            }
+        except LifecycleValidationError as exc:
+            return {
+                "status": "ERROR",
+                "error": {"code": exc.code, "message": str(exc)},
+            }
     if request.operation_type == "compute.provision.plan":
         return _compute_provision_plan(payload)
     if request.operation_type == "compute.provision.dry_run":
