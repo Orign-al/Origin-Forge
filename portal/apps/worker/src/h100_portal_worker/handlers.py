@@ -9950,6 +9950,15 @@ def _profile_upgrade_lifecycle_preflight(
     return lifecycle, container
 
 
+def _profile_upgrade_backup_directory_is_safe(metadata: os.stat_result) -> bool:
+    return bool(
+        stat.S_ISDIR(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and metadata.st_uid == 0
+        and stat.S_IMODE(metadata.st_mode) in {0o700, 0o2700}
+    )
+
+
 def _profile_upgrade_backup(payload: dict[str, Any], lifecycle: dict[str, str]) -> tuple[Path, str]:
     backup_dir = PLATFORM_BACKUP_ROOT / f"gpu-profile-upgrade-{payload['operation_id']}"
     backup_path = backup_dir / f"{payload['username']}.state"
@@ -9958,12 +9967,7 @@ def _profile_upgrade_backup(payload: dict[str, Any], lifecycle: dict[str, str]) 
     try:
         backup_dir.mkdir(mode=0o700, parents=False, exist_ok=True)
         metadata = backup_dir.lstat()
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or stat.S_ISLNK(metadata.st_mode)
-            or metadata.st_uid != 0
-            or stat.S_IMODE(metadata.st_mode) != 0o700
-        ):
+        if not _profile_upgrade_backup_directory_is_safe(metadata):
             raise OSError("unsafe profile upgrade backup directory")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):

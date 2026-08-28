@@ -146,6 +146,17 @@ def test_gpu_profile_upgrade_payload_is_exact_and_owner_approved(
     assert committed[0]["DEVELOPMENT_PROFILE"] == "GPU_1_8CPU_32GB"
 
 
+def test_gpu_profile_upgrade_backup_accepts_inherited_setgid_without_group_access() -> None:
+    def metadata(mode: int, *, uid: int = 0) -> os.stat_result:
+        return os.stat_result((stat.S_IFDIR | mode, 1, 1, 2, uid, 987, 0, 0, 0, 0))
+
+    assert handlers._profile_upgrade_backup_directory_is_safe(metadata(0o700))
+    assert handlers._profile_upgrade_backup_directory_is_safe(metadata(0o2700))
+    assert not handlers._profile_upgrade_backup_directory_is_safe(metadata(0o2750))
+    assert not handlers._profile_upgrade_backup_directory_is_safe(metadata(0o2701))
+    assert not handlers._profile_upgrade_backup_directory_is_safe(metadata(0o2700, uid=1000))
+
+
 def test_protocol_round_trip_and_size_limit() -> None:
     framed = encode_frame({"status": "OK", "value": 1})
     assert decode_frame(framed)["value"] == 1
