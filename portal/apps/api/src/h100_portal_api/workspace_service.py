@@ -96,6 +96,12 @@ class WorkspaceResolution:
             "canonical_path": str(self.binding.canonical_workspace),
             "container_path": str(self.binding.container_workspace),
             "compute_runtime_path": str(self.binding.compute_workspace),
+            "container_home_path": str(self.binding.compute_home),
+            "compute_home_path": str(self.binding.compute_home),
+            "persistent_paths": [
+                str(self.binding.container_workspace),
+                str(self.binding.compute_home),
+            ],
             "backing_layout": self.binding.layout.value,
             "mount_contract_version": WORKSPACE_MOUNT_CONTRACT_VERSION,
             "quota": {
@@ -136,7 +142,7 @@ def resolve_workspace(db: Session, user: PortalUser) -> WorkspaceResolution:
     if (
         managed.portal_user_id != user.id
         or storage.owner_managed_user_id != managed.id
-        or storage.root_path != str(binding.quota_root)
+        or storage.root_path != str(binding.canonical_workspace)
         or managed.project_id is None
         or managed.quota_bytes != WORKSPACE_QUOTA_BYTES
         or storage.quota_bytes != WORKSPACE_QUOTA_BYTES

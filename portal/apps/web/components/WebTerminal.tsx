@@ -173,7 +173,7 @@ export function WebTerminal() {
     const dimensions = terminalSize(host);
     dimensionsRef.current = dimensions;
     const screen = new TerminalScreen(dimensions.cols, dimensions.rows);
-    screen.feed(`${tRef.current("H100 开发容器网页终端")}\r\n`);
+    screen.feed(`${tRef.current("开发容器网页终端")}\r\n`);
     screen.feed(
       `${tRef.current("只连接自己的开发容器；宿主访问保持禁用，GPU 为 NONE。")}\r\n\r\n`,
     );

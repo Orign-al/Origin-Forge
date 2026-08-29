@@ -37,8 +37,6 @@ import {
   SectionCard,
 } from "./PortalShell";
 
-const APPROVED_IMAGE =
-  "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a";
 const DEFAULT_JOB_SCRIPT = `set -eu
 
 echo "hello from Slurm"
@@ -464,8 +462,8 @@ export function OrdinaryDashboard() {
             {t(
               gpuProfile
                 ? gpuAllocated
-                  ? "GPU Development · H100 × 1 已由 Slurm 分配"
-                  : "GPU Development · H100 当前未分配"
+                  ? "开发容器 · H100 × 1 过渡分配"
+                  : "开发容器 · 无 GPU Device；H100 作业按需调度"
                 : "CPU Development · 无 GPU Device",
             )}
           </div>
@@ -491,8 +489,8 @@ export function OrdinaryDashboard() {
             {t(
               gpuProfile
                 ? gpuAllocated
-                  ? "此 GPU Development 容器已通过 Slurm 分配 1 张 H100，可进行 CUDA 开发与调试。"
-                  : "启动 GPU Development 容器时，平台将通过 Slurm 分配 1 张 H100。"
+                  ? "此容器仍处于旧版 H100 过渡绑定；平台将自动收敛为按作业调度。"
+                  : "开发容器不挂载 GPU；H100 仅在作业运行期间由 Slurm 按需分配并在结束后自动释放。"
                 : "CPU Development 容器用于编写代码、编译和准备数据，不挂载 GPU Device。",
             )}
           </p>
@@ -546,8 +544,8 @@ export function OrdinaryConnection() {
         subtitle={t(
           gpuProfile
             ? gpuAllocated
-              ? "GPU Development · H100 × 1 已由 Slurm 分配"
-              : "GPU Development · H100 当前未分配"
+              ? "开发容器 · H100 × 1 过渡分配"
+              : "开发容器 · 无 GPU Device；H100 作业按需调度"
             : "CPU Development · 无 GPU Device",
         )}
       >
@@ -569,13 +567,15 @@ export function OrdinaryConnection() {
             <dd>SSH Public Key</dd>
           </div>
           <div className="kv">
-            <dt>GPU</dt>
-            <dd>
-              {gpuProfile
-                ? `H100 × 1 · ${gpuAllocated ? "SLURM ALLOCATED" : "NOT ALLOCATED"}`
-                : "NONE"}
-            </dd>
+            <dt>{t("容器 GPU")}</dt>
+            <dd>{gpuAllocated ? "H100 × 1 · TRANSITIONAL" : "NONE"}</dd>
           </div>
+          {gpuProfile ? (
+            <div className="kv">
+              <dt>{t("GPU 作业")}</dt>
+              <dd>{t("H100 × 1 · 按需调度")}</dd>
+            </div>
+          ) : null}
           <div className="kv">
             <dt>{t("状态")}</dt>
             <dd>{connection.available ? "AVAILABLE" : "DISABLED"}</dd>
@@ -664,8 +664,8 @@ export function OrdinaryContainer() {
         subtitle={t(
           gpuProfile
             ? gpuAllocated
-              ? "GPU Development · H100 × 1 已由 Slurm 分配"
-              : "GPU Development · H100 当前未分配"
+              ? "开发容器 · H100 × 1 过渡分配"
+              : "开发容器 · 无 GPU Device；H100 作业按需调度"
             : "CPU Development · 无 GPU Device",
         )}
       >
@@ -687,13 +687,15 @@ export function OrdinaryContainer() {
             <dd>{container.pids_limit}</dd>
           </div>
           <div className="kv">
-            <dt>GPU</dt>
-            <dd>
-              {gpuProfile
-                ? `H100 × 1 · ${gpuAllocated ? "SLURM ALLOCATED" : "NOT ALLOCATED"}`
-                : "NONE"}
-            </dd>
+            <dt>{t("容器 GPU")}</dt>
+            <dd>{gpuAllocated ? "H100 × 1 · TRANSITIONAL" : "NONE"}</dd>
           </div>
+          {gpuProfile ? (
+            <div className="kv">
+              <dt>{t("GPU 作业")}</dt>
+              <dd>{t("H100 × 1 · 按需调度")}</dd>
+            </div>
+          ) : null}
           <div className="kv">
             <dt>{t("用途")}</dt>
             <dd>{t("开发与数据准备")}</dd>
@@ -807,7 +809,6 @@ export function OrdinaryJobs() {
   const [memory, setMemory] = useState(4096);
   const [gpu, setGpu] = useState<0 | 1>(0);
   const [minutes, setMinutes] = useState(30);
-  const [containerized, setContainerized] = useState(false);
   const [selected, setSelected] = useState<SelfJob | null>(null);
   const logs = useQuery({
     queryKey: ["self-job-logs", selected?.id],
@@ -827,7 +828,7 @@ export function OrdinaryJobs() {
         memory_mb: memory,
         gpu_count: gpu,
         time_limit_seconds: minutes * 60,
-        image_ref: containerized ? APPROVED_IMAGE : null,
+        image_ref: null,
         idempotency_key: randomUuid(),
       }),
     onSuccess: async () =>
@@ -851,7 +852,7 @@ export function OrdinaryJobs() {
       />
       <SectionCard
         title="新建作业"
-        subtitle="脚本由Portal保存为自己的不可变作业快照，并以当前Linux用户提交"
+        subtitle="脚本以当前Linux用户提交到批准的隔离运行时；/workspace 与自己的 /home 路径均为零复制持久化存储"
       >
         <form className="job-form-grid" onSubmit={onSubmit}>
           <label>
@@ -910,17 +911,6 @@ export function OrdinaryJobs() {
               value={minutes}
               onChange={(e) => setMinutes(Number(e.target.value))}
             />
-          </label>
-          <label>
-            {t("运行环境")}
-            <select
-              className="ui-input"
-              value={containerized ? "approved" : "host"}
-              onChange={(e) => setContainerized(e.target.value === "approved")}
-            >
-              <option value="host">{t("标准 Slurm")}</option>
-              <option value="approved">{t("已批准 CUDA 容器")}</option>
-            </select>
           </label>
           <div className="job-submit-row">
             <Button
@@ -990,10 +980,10 @@ export function OrdinaryStorage() {
     <>
       <PageHeading
         title="存储"
-        description="自己的私有工作区和配额"
+        description="自己的持久化私有存储和总配额"
         action={<StatusBadge value={storage.state} />}
       />
-      <SectionCard title="工作区配额">
+      <SectionCard title="私有存储总配额">
         <dl className="kv-grid">
           <div className="kv">
             <dt>{t("总配额")}</dt>
@@ -1014,7 +1004,7 @@ export function OrdinaryStorage() {
         </dl>
         <div className="notice">
           {t(
-            "其他普通用户不能读取、列出或写入此目录。共享数据使用单独批准的数据集。",
+            "已使用量包含 /home/<用户名> 与 /workspace；开发容器、CPU 作业和 GPU 作业均可通过相同路径直接零复制读写，并共享一个 XFS project 配额。",
           )}
         </div>
       </SectionCard>
@@ -1202,7 +1192,7 @@ export function OrdinaryHelp() {
           <SectionCard title="当前状态">
             <p>
               {t(
-                "计算身份、私有存储、Slurm association 与所选开发容器已经安全 Stage；Container 保持停止，GPU Development 尚未由 Slurm 分配 H100，Lease 尚未启动。",
+                "计算身份、私有存储、Slurm association 与所选开发容器已经安全 Stage；Container 保持停止且不占用 H100，Lease 尚未启动。",
               )}
             </p>
           </SectionCard>
@@ -1223,7 +1213,7 @@ export function OrdinaryHelp() {
         <SectionCard title="开发容器">
           <p>
             {t(
-              "CPU Development 默认无 GPU；GPU Development 启动时通过 Slurm 分配 1 张 H100。",
+              "开发容器始终不挂载 GPU；GPU Development 开通最多 1 张 H100 的按需作业额度。",
             )}
           </p>
           <Link className="table-link" href="/access">

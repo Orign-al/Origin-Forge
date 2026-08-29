@@ -1,9 +1,10 @@
 {
-  "h100-platform-common": "38a5b5e28e2521924d0940a2c9f6c2519c8318b4aaea15a06a9da7445eee2bb6",
-  "h100-provision-stage": "3a56f144d29d2ad3dcfe861fbb393d8e3428f12fe8c23536eddfc9803070718b",
+  "h100-platform-common": "1b2d6acc7b2ea4a7d55bd889834f4a9358224bde3e13b0cef7ea6884df9e2bf1",
+  "h100-provision-stage": "c3656c1ae06ab93b75b48ac1e26d1b2ca1c05bbe39ca18d36662ada1cb166425",
   "h100-workspace-alias": "8d09a8362b06cda292b57b8db3d9c64af80260994d2aec8170c8e500ed39ea11",
+  "h100-home-alias": "bfeb6f9e2a0471fc450f648c68d2b24a51d78b934ff7d61f12206f1b44b9cd20",
   "h100-container-create": "309157019351c2d2244329c2430502fe26b578088815e15ec64405ec6ec02388",
-  "h100-container-delete": "561d92f4997c50182fc4248420e8b9f0b0cdf406a990a75aa4bfe227ddae024c",
+  "h100-container-delete": "84b76544c4515a63b61c31e0fdd3fad8828bb3436e36e88e25966e3c9bad3636",
   "h100-container-rebuild": "274e32a9c3c6939e0ef5693a7563fa75dac079b9c1283267273ee17d08133a79",
   "h100-container-start": "4da99e943afe15dd99f262d2f63ed5100760e5022686a5f5b0dc2a02ccaeda87",
   "h100-container-gpu-runtime": "f9aaa459f65c1309630be1ce58b5bde39e9ddf38307368d8047ba95eedd8686a",

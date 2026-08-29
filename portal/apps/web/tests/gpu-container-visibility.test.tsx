@@ -7,6 +7,7 @@ import {
   OrdinaryConnection,
   OrdinaryContainer,
   OrdinaryDashboard,
+  OrdinaryStorage,
 } from "../components/OrdinaryUserPages";
 import type { SelfEnvironment } from "../lib/api";
 import { I18nProvider } from "../lib/i18n";
@@ -18,7 +19,7 @@ const GPU_CONTAINER: SelfEnvironment["container"] = {
   connection_state: "AVAILABLE",
   profile: "GPU_1_8CPU_32GB",
   gpu: 1,
-  gpu_allocation_state: "ALLOCATED",
+  gpu_allocation_state: "NONE",
   cpus: 8,
   memory_gb: 32,
   pids_limit: 4096,
@@ -80,7 +81,7 @@ function renderWithCache(
 afterEach(cleanup);
 
 describe("ordinary-user GPU Development visibility", () => {
-  it("renders the live Slurm H100 allocation on the dashboard", () => {
+  it("explains the GPU-less resident container and on-demand H100 jobs", () => {
     renderWithCache(<OrdinaryDashboard />, [
       [["self-environment"], { status: "OK", environment: ENVIRONMENT }],
       [
@@ -89,6 +90,7 @@ describe("ordinary-user GPU Development visibility", () => {
           status: "OK",
           storage: {
             root: "/storage/users/20005",
+            paths: ["/workspace", "/home/umar"],
             quota_bytes: 322_122_547_200,
             used_bytes: 1_024,
             available_bytes: 322_122_546_176,
@@ -100,17 +102,45 @@ describe("ordinary-user GPU Development visibility", () => {
     ]);
 
     expect(
-      screen.getByText("GPU Development · H100 × 1 已由 Slurm 分配"),
+      screen.getByText("开发容器 · 无 GPU Device；H100 作业按需调度"),
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "此 GPU Development 容器已通过 Slurm 分配 1 张 H100，可进行 CUDA 开发与调试。",
+        "开发容器不挂载 GPU；H100 仅在作业运行期间由 Slurm 按需分配并在结束后自动释放。",
       ),
     ).toBeInTheDocument();
+    expect(screen.queryByText(/NOT ALLOCATED/)).toBeNull();
     expect(screen.queryByText("CPU Development · 无 GPU Device")).toBeNull();
   });
 
-  it("shows the exact runtime GPU on the connection page", () => {
+  it("shows no resident GPU and the on-demand job entitlement", () => {
+    renderWithCache(<OrdinaryConnection />, [
+      [
+        ["self-container-connection"],
+        {
+          status: "OK",
+          connection: {
+            available: true,
+            host: "20.10.10.3",
+            port: 22027,
+            username: "umar",
+            authentication: "SSH_PUBLIC_KEY",
+            profile: "GPU_1_8CPU_32GB",
+            gpu: "NONE",
+            key_fingerprint: "SHA256:fixture",
+            command: "ssh fixture",
+            vscode: "Host fixture",
+          },
+        },
+      ],
+    ]);
+
+    expect(screen.getByText("NONE")).toBeInTheDocument();
+    expect(screen.getByText("H100 × 1 · 按需调度")).toBeInTheDocument();
+    expect(screen.queryByText(/NOT ALLOCATED/)).toBeNull();
+  });
+
+  it("labels a legacy live allocation as transitional", () => {
     renderWithCache(<OrdinaryConnection />, [
       [
         ["self-container-connection"],
@@ -132,37 +162,10 @@ describe("ordinary-user GPU Development visibility", () => {
       ],
     ]);
 
-    expect(screen.getByText("H100 × 1 · SLURM ALLOCATED")).toBeInTheDocument();
-    expect(screen.queryByText("NONE")).toBeNull();
-  });
-
-  it("does not mislabel a stopped GPU profile as CPU Development", () => {
-    renderWithCache(<OrdinaryConnection />, [
-      [
-        ["self-container-connection"],
-        {
-          status: "OK",
-          connection: {
-            available: false,
-            host: "20.10.10.3",
-            port: 22027,
-            username: "umar",
-            authentication: "SSH_PUBLIC_KEY",
-            profile: "GPU_1_8CPU_32GB",
-            gpu: "NONE",
-            key_fingerprint: "SHA256:fixture",
-            command: null,
-            vscode: null,
-          },
-        },
-      ],
-    ]);
-
     expect(
-      screen.getByText("GPU Development · H100 当前未分配"),
+      screen.getByText("开发容器 · H100 × 1 过渡分配"),
     ).toBeInTheDocument();
-    expect(screen.getByText("H100 × 1 · NOT ALLOCATED")).toBeInTheDocument();
-    expect(screen.queryByText("CPU Development · 无 GPU Device")).toBeNull();
+    expect(screen.getByText("H100 × 1 · TRANSITIONAL")).toBeInTheDocument();
   });
 
   it("distinguishes a stopped GPU profile from the default CPU profile", () => {
@@ -177,9 +180,9 @@ describe("ordinary-user GPU Development visibility", () => {
     ]);
 
     expect(
-      screen.getByText("GPU Development · H100 当前未分配"),
+      screen.getByText("开发容器 · 无 GPU Device；H100 作业按需调度"),
     ).toBeInTheDocument();
-    expect(screen.getByText("H100 × 1 · NOT ALLOCATED")).toBeInTheDocument();
+    expect(screen.getByText("H100 × 1 · 按需调度")).toBeInTheDocument();
     first.unmount();
 
     renderWithCache(<OrdinaryContainer />, [
@@ -189,5 +192,31 @@ describe("ordinary-user GPU Development visibility", () => {
       screen.getByText("CPU Development · 无 GPU Device"),
     ).toBeInTheDocument();
     expect(screen.getByText("NONE")).toBeInTheDocument();
+  });
+
+  it("labels XFS project usage as the total persistent private quota", () => {
+    renderWithCache(<OrdinaryStorage />, [
+      [
+        ["self-storage"],
+        {
+          status: "OK",
+          storage: {
+            root: "/storage/users/20005",
+            paths: ["/workspace", "/home/umar"],
+            quota_bytes: 300 * 1024 ** 3,
+            used_bytes: 80 * 1024 ** 3,
+            available_bytes: 220 * 1024 ** 3,
+            state: "ACTIVE",
+            private: true,
+          },
+        },
+      ],
+    ]);
+
+    expect(screen.getByText("私有存储总配额")).toBeInTheDocument();
+    expect(screen.getByText("80.0 GB")).toBeInTheDocument();
+    expect(
+      screen.getByText(/已使用量包含 \/home/),
+    ).toBeInTheDocument();
   });
 });

@@ -48,7 +48,9 @@ def test_worker_workspace_readiness_proves_inode_mount_owner_directories_and_quo
 ) -> None:
     quota_root = tmp_path / "origin-pilot2"
     workspace = quota_root / "workspace"
+    home = quota_root / "home"
     workspace.mkdir(parents=True, mode=0o700)
+    home.mkdir(mode=0o700)
     quota_root.chmod(0o700)
     workspace.chmod(0o700)
     uid = os.getuid()
@@ -63,8 +65,11 @@ def test_worker_workspace_readiness_proves_inode_mount_owner_directories_and_quo
         gid=gid,
         layout=WorkspaceLayout.LEGACY_BIND_ALIAS,
         quota_root=PurePosixPath(quota_root),
+        backing_home=PurePosixPath(home),
+        canonical_home=PurePosixPath(home),
         backing_workspace=PurePosixPath(workspace),
         canonical_workspace=PurePosixPath(workspace),
+        compute_home=PurePosixPath("/home/origin-pilot2"),
     )
     payload = {
         "username": binding.username,
@@ -123,6 +128,7 @@ def test_worker_workspace_readiness_proves_inode_mount_owner_directories_and_quo
 def test_workspace_runtime_is_zero_copy_profile_aware_and_alias_aware() -> None:
     fstab = (PLATFORM_ROOT / "config/fstab").read_text()
     alias = (PLATFORM_ROOT / "scripts/h100-workspace-alias").read_text()
+    home_alias = (PLATFORM_ROOT / "scripts/h100-home-alias").read_text()
     common = (PLATFORM_ROOT / "scripts/h100-platform-common.sh").read_text()
     stage = (PLATFORM_ROOT / "scripts/h100-provision-stage").read_text()
     create = (PLATFORM_ROOT / "scripts/h100-container-create").read_text()
@@ -169,9 +175,18 @@ def test_workspace_runtime_is_zero_copy_profile_aware_and_alias_aware() -> None:
     assert "local h100_audit_target_value=$2" in common
     assert "canonical workspace has dependent submounts" in alias
     assert "rsync" not in alias
+    assert 'backing_home="${backing_root}/home"' in home_alias
+    assert 'canonical_home="${H100_HOME_ALIAS_ROOT}/${user_uid}"' in home_alias
+    assert "Options=bind,rw,nosuid,nodev" in home_alias
+    assert "stat -c '%d:%i'" in home_alias
+    assert "h100-portal-worker\\.service" in home_alias
+    assert "nsenter --target 1 --mount" in home_alias
+    assert "rsync" not in home_alias
     assert "/srv/gpu-platform/workspaces" not in fstab
     assert "/storage/users none bind" not in fstab
     assert "GPU_1_8CPU_32GB" in stage
+    assert '"${HOME_ALIAS_TOOL}" prepare' in stage
+    assert '"${HOME_ALIAS_TOOL}" verify' in stage
     assert "GPU development profile requires max GPU one" in stage
     assert "target: /shared" in stage
     assert "target: /shared" in create
@@ -193,6 +208,8 @@ def test_workspace_runtime_is_zero_copy_profile_aware_and_alias_aware() -> None:
     assert '"${H100_WORKSPACE_ALIAS_TOOL}" verify' in common
     assert 'isolation_marker_two="${backing_workspace}' in stage
     assert "stat -c '%d:%i' \"${workspace_root}\"" not in stage
+    assert 'grep -Fxq "${project_id}:${user_root}" /etc/projects' in delete
+    assert 'grep -Fxq "${project_id}:${workspace_root}" /etc/projects' not in delete
     assert delete.index("workspace_alias_tool") < delete.index("rm -rf --one-file-system")
 
 
@@ -240,6 +257,7 @@ def test_runtime_manifest_pins_workspace_execution_artifacts() -> None:
     manifest = json.loads(manifest_path.read_text())
     expected = {
         "h100-workspace-alias": PLATFORM_ROOT / "scripts/h100-workspace-alias",
+        "h100-home-alias": PLATFORM_ROOT / "scripts/h100-home-alias",
         "h100-platform-common": PLATFORM_ROOT / "scripts/h100-platform-common.sh",
         "h100-provision-stage": PLATFORM_ROOT / "scripts/h100-provision-stage",
         "h100-container-start": PLATFORM_ROOT / "scripts/h100-container-start",
@@ -253,5 +271,6 @@ def test_runtime_manifest_pins_workspace_execution_artifacts() -> None:
     assert handlers.SCRIPT_ALLOWLIST["h100-workspace-alias"] == (
         "/usr/local/sbin/h100-workspace-alias"
     )
+    assert handlers.SCRIPT_ALLOWLIST["h100-home-alias"] == "/usr/local/sbin/h100-home-alias"
     for name, source in expected.items():
         assert manifest[name] == hashlib.sha256(source.read_bytes()).hexdigest()

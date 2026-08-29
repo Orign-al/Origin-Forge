@@ -282,10 +282,17 @@ const EN_US: Record<string, string> = {
   "Host SSH 已按普通用户策略关闭":
     "Host SSH is disabled by ordinary-user policy",
   "CPU Development · 无 GPU Device": "CPU Development · no GPU device",
-  "GPU Development · H100 × 1 已由 Slurm 分配":
-    "GPU Development · H100 × 1 allocated by Slurm",
-  "GPU Development · H100 当前未分配":
-    "GPU Development · H100 is not currently allocated",
+  "开发容器 · H100 × 1 过渡分配":
+    "Development container · transitional H100 × 1 allocation",
+  "开发容器 · 无 GPU Device；H100 作业按需调度":
+    "Development container · no GPU device; H100 jobs are scheduled on demand",
+  "此容器仍处于旧版 H100 过渡绑定；平台将自动收敛为按作业调度。":
+    "This container still has a legacy transitional H100 binding; the platform will automatically converge it to job-based scheduling.",
+  "开发容器不挂载 GPU；H100 仅在作业运行期间由 Slurm 按需分配并在结束后自动释放。":
+    "The development container has no GPU mounted. Slurm allocates an H100 only while a job runs and releases it automatically afterward.",
+  "容器 GPU": "Container GPU",
+  "GPU 作业": "GPU Job",
+  "H100 × 1 · 按需调度": "H100 × 1 · On-demand scheduling",
   GPU任务上限: "GPU Job Limit",
   通过作业页面提交: "Submit through the Jobs page",
   可用空间: "Available Space",
@@ -295,10 +302,6 @@ const EN_US: Record<string, string> = {
   进入自己的长期开发容器: "Open your long-running development container",
   "CPU Development 容器用于编写代码、编译和准备数据，不挂载 GPU Device。":
     "Use the CPU Development container to write code, compile, and prepare data; it has no GPU device mounted.",
-  "启动 GPU Development 容器时，平台将通过 Slurm 分配 1 张 H100。":
-    "When the GPU Development container starts, the platform allocates one H100 through Slurm.",
-  "此 GPU Development 容器已通过 Slurm 分配 1 张 H100，可进行 CUDA 开发与调试。":
-    "This GPU Development container has one H100 allocated through Slurm and is ready for CUDA development and debugging.",
   打开网页终端: "Open Web Terminal",
   查看SSH连接: "View SSH Access",
   提交计算任务: "Submit a Compute Job",
@@ -306,8 +309,12 @@ const EN_US: Record<string, string> = {
   "选择工作区中的脚本，通过Portal提交到Slurm。":
     "Select a script in your workspace and submit it to Slurm through the Portal.",
   自己的长期开发容器: "Your long-running development container",
-  "CPU Development 默认无 GPU；GPU Development 启动时通过 Slurm 分配 1 张 H100。":
-    "CPU Development has no GPU by default; GPU Development allocates one H100 through Slurm when it starts.",
+  "开发容器始终不挂载 GPU；GPU Development 开通最多 1 张 H100 的按需作业额度。":
+    "Development containers never mount a GPU. GPU Development enables an on-demand job entitlement of up to one H100.",
+  "GPU Development 开通 H100 作业额度；常驻开发容器仍不挂载 GPU。":
+    "GPU Development enables the H100 job entitlement; the resident development container still has no GPU mounted.",
+  "GPU Development 将作业上限固定为 1；H100 仅在作业运行期间分配并在结束后自动释放。":
+    "GPU Development fixes the job limit at one. An H100 is allocated only while a job runs and is released automatically afterward.",
   认证: "Authentication",
   "用户密钥 Fingerprint": "User Key Fingerprint",
   未安装: "Not installed",
@@ -321,6 +328,13 @@ const EN_US: Record<string, string> = {
   "开发容器连接信息暂时不可用。":
     "Development container connection details are temporarily unavailable.",
   自己的长期开发环境: "Your long-running development environment",
+  自己的持久化私有存储和总配额:
+    "Your persistent private storage and total quota",
+  私有存储总配额: "Total Private Storage Quota",
+  "已使用量包含 /home/<用户名> 与 /workspace；开发容器、CPU 作业和 GPU 作业均可通过相同路径直接零复制读写，并共享一个 XFS project 配额。":
+    "Usage includes /home/<username> and /workspace. The development container and all CPU/GPU jobs read and write both paths directly with zero copy under one XFS project quota.",
+  "脚本以当前Linux用户提交到批准的隔离运行时；/workspace 与自己的 /home 路径均为零复制持久化存储":
+    "Scripts run as your Linux identity in the approved isolated runtime. /workspace and your /home path are both persistent zero-copy storage.",
   GPU计算请通过作业页面提交: "Submit GPU compute through the Jobs page",
   用途: "Purpose",
   开发与数据准备: "Development and data preparation",
@@ -398,8 +412,8 @@ const EN_US: Record<string, string> = {
   "下一阶段通过资源申请与管理员审批进入 Compute Provisioning。":
     "Next, submit a resource request and obtain administrator approval to enter compute provisioning.",
   "完成 Container SSH 密钥注册": "Complete Container SSH key registration",
-  "计算身份、私有存储、Slurm association 与所选开发容器已经安全 Stage；Container 保持停止，GPU Development 尚未由 Slurm 分配 H100，Lease 尚未启动。":
-    "The compute identity, private storage, Slurm association, and selected development container are safely staged. The container remains stopped, GPU Development has no H100 allocation from Slurm yet, and the lease has not started.",
+  "计算身份、私有存储、Slurm association 与所选开发容器已经安全 Stage；Container 保持停止且不占用 H100，Lease 尚未启动。":
+    "The compute identity, private storage, Slurm association, and selected development container are safely staged. The container remains stopped without occupying an H100, and the lease has not started.",
   "只登记你自己的 ED25519 公钥，Scope 固定为 CONTAINER。":
     "Register only your own ED25519 public key; scope is fixed to CONTAINER.",
   普通用户计算流程: "Ordinary user compute workflow",
@@ -497,7 +511,6 @@ const EN_US: Record<string, string> = {
     "The backend will run security prechecks, install the container public key, start and verify the development container. The lease starts only after every step succeeds.",
   "正在激活…": "Activating…",
   网页终端连接失败: "Web terminal connection failed",
-  "H100 开发容器网页终端": "H100 Development Container Web Terminal",
   "只连接自己的开发容器；宿主访问保持禁用，GPU 为 NONE。":
     "Connected only to your development container; host access remains disabled and GPU is NONE.",
   "终端已关闭：{reason}": "Terminal closed: {reason}",

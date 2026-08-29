@@ -6,6 +6,7 @@ set -euo pipefail
 readonly H100_PLATFORM_ROOT=/srv/gpu-platform/platform
 readonly H100_DATA_ROOT=/srv/gpu-platform
 readonly H100_WORKSPACE_ROOT=/storage/users
+readonly H100_HOME_ALIAS_ROOT=/storage/homes
 readonly H100_MANAGEMENT_IP=10.82.36.1
 readonly H100_PUBLIC_ACCESS_IP=20.10.10.3
 readonly H100_LEGACY_PUBLIC_ACCESS_IP=10.10.10.220
@@ -18,6 +19,7 @@ readonly H100_LOCK_FILE=/run/lock/h100-platform.lock
 readonly H100_GPU_ISOLATION_REGISTRY=/etc/h100-platform/gpu-isolated-users
 readonly H100_GPU_ISOLATION_TOOL=/usr/local/sbin/h100-user-gpu-isolation
 readonly H100_WORKSPACE_ALIAS_TOOL=/usr/local/sbin/h100-workspace-alias
+readonly H100_HOME_ALIAS_TOOL=/usr/local/sbin/h100-home-alias
 
 h100_fail() {
   printf 'ERROR: %s\n' "$*" >&2

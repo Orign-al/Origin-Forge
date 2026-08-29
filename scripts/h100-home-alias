@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# The Worker has a private mount namespace. Lifecycle calls re-enter PID 1's
+# mount namespace to create the persistent host alias, then mirror that exact
+# bind into the running Worker namespace when necessary.
+readonly HOME_ALIAS_INSTALLED_PATH=/usr/local/sbin/h100-home-alias
+home_alias_worker_context=0
+if grep -Eq '(^|/)h100-portal-worker\.service($|/)' /proc/self/cgroup 2>/dev/null; then
+  home_alias_worker_context=1
+fi
+if [[ "${EUID}" == 0 && "${home_alias_worker_context}" == 1 \
+  && -e /proc/1/ns/mnt && -e /proc/self/ns/mnt \
+  && "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ]]; then
+  [[ "$0" == "${HOME_ALIAS_INSTALLED_PATH}" \
+    && -x "${HOME_ALIAS_INSTALLED_PATH}" \
+    && ! -L "${HOME_ALIAS_INSTALLED_PATH}" \
+    && "$(stat -c '%u' /proc/1)" == 0 ]] \
+    || { printf 'ERROR: home alias host namespace entry is invalid\n' >&2; exit 1; }
+  exec /usr/bin/nsenter --target 1 --mount \
+    --root=/proc/1/root --wd=/proc/1/cwd -- \
+    "${HOME_ALIAS_INSTALLED_PATH}" "$@"
+fi
+unset home_alias_worker_context
+
+source /usr/local/lib/h100-platform/h100-platform-common.sh
+
+readonly UNIT_ROOT=/etc/systemd/system
+readonly WORKER_SERVICE=h100-portal-worker.service
+readonly UID_MIN=20000
+readonly UID_MAX=60000
+
+usage() {
+  printf '%s\n' \
+    'Usage:' \
+    '  sudo h100-home-alias prepare USER UID GID' \
+    '  sudo h100-home-alias verify USER UID GID' \
+    '  sudo h100-home-alias remove USER UID GID --confirm-remove USER'
+}
+
+if [[ "${1:-}" == --help ]]; then
+  usage
+  exit 0
+fi
+if (($# != 4 && $# != 6)); then
+  usage >&2
+  exit 2
+fi
+
+readonly action=$1
+readonly user_name=$2
+readonly user_uid=$3
+readonly user_gid=$4
+readonly backing_root="${H100_DATA_ROOT}/users/${user_name}"
+readonly backing_home="${backing_root}/home"
+readonly canonical_home="${H100_HOME_ALIAS_ROOT}/${user_uid}"
+readonly unit_name="storage-homes-${user_uid}.mount"
+readonly unit_path="${UNIT_ROOT}/${unit_name}"
+
+h100_require_root
+h100_validate_username "${user_name}"
+[[ "${user_name}" =~ ^[a-z][a-z0-9-]{0,31}$ ]] \
+  || h100_fail 'home alias username is outside the managed contract'
+[[ "${user_uid}" =~ ^[0-9]+$ && "${user_gid}" =~ ^[0-9]+$ ]] \
+  || h100_fail 'home alias UID/GID must be numeric'
+((user_uid >= UID_MIN && user_uid <= UID_MAX && user_gid >= UID_MIN && user_gid <= UID_MAX)) \
+  || h100_fail 'home alias UID/GID is outside the managed range'
+[[ "$(id -u "${user_name}")" == "${user_uid}" \
+  && "$(id -g "${user_name}")" == "${user_gid}" ]] \
+  || h100_fail 'home alias identity differs from NSS'
+[[ "${backing_home}" == /srv/gpu-platform/users/"${user_name}"/home \
+  && "${canonical_home}" == /storage/homes/"${user_uid}" ]] \
+  || h100_fail 'home alias path escaped the fixed roots'
+
+h100_acquire_lock
+h100_install_audit_trap home-alias "${user_name}:${user_uid}"
+temp_unit=
+created_mountpoint=0
+installed_unit=0
+
+cleanup_home_alias() {
+  local exit_status=$?
+  if ((exit_status != 0)); then
+    if ((installed_unit == 1)); then
+      if declare -F unmount_worker_alias >/dev/null 2>&1; then
+        ( trap - EXIT; unmount_worker_alias ) >/dev/null 2>&1 || true
+      fi
+      systemctl disable --now "${unit_name}" >/dev/null 2>&1 || true
+      rm -f -- "${unit_path}"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    if ((created_mountpoint == 1)) \
+      && ! findmnt --noheadings --mountpoint "${canonical_home}" >/dev/null 2>&1 \
+      && [[ -d "${canonical_home}" && ! -L "${canonical_home}" ]] \
+      && [[ -z "$(find "${canonical_home}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+      rmdir -- "${canonical_home}" || true
+    fi
+  fi
+  if [[ -n "${temp_unit}" ]]; then
+    case "${temp_unit}" in
+      /etc/systemd/system/.storage-homes-*.mount.*) rm -f -- "${temp_unit}" ;;
+    esac
+  fi
+  trap - EXIT
+  h100_audit "${H100_AUDIT_ACTION}" "${H100_AUDIT_TARGET}" \
+    "${H100_AUDIT_OUTCOME}" "${exit_status}"
+  exit "${exit_status}"
+}
+trap cleanup_home_alias EXIT
+
+verify_backing() {
+  [[ -d "${backing_root}" && ! -L "${backing_root}" \
+    && -d "${backing_home}" && ! -L "${backing_home}" ]] \
+    || h100_fail 'authoritative home backing is unavailable'
+  [[ "$(stat -c '%u:%g' "${backing_root}")" == "${user_uid}:${user_gid}" \
+    && "$(stat -c '%u:%g' "${backing_home}")" == "${user_uid}:${user_gid}" ]] \
+    || h100_fail 'authoritative home ownership is invalid'
+  h100_workspace_mode_is_private "${backing_root}" \
+    && h100_workspace_mode_is_private "${backing_home}" \
+    || h100_fail 'authoritative home is accessible to other users'
+  [[ "$(stat -c '%d' "${backing_home}")" == "$(stat -c '%d' "${H100_DATA_ROOT}")" ]] \
+    || h100_fail 'authoritative home is outside the quota filesystem'
+}
+
+verify_parent() {
+  [[ -d "${H100_HOME_ALIAS_ROOT}" && ! -L "${H100_HOME_ALIAS_ROOT}" \
+    && "$(stat -c '%u:%g:%a' "${H100_HOME_ALIAS_ROOT}")" == 0:0:711 ]] \
+    || h100_fail 'canonical home parent metadata is invalid'
+}
+
+verify_unmounted_mountpoint() {
+  [[ -d "${canonical_home}" && ! -L "${canonical_home}" \
+    && "$(stat -c '%u:%g:%a' "${canonical_home}")" == 0:0:700 \
+    && -z "$(find "${canonical_home}" -mindepth 1 -maxdepth 1 -print -quit)" ]] \
+    || h100_fail 'canonical home mountpoint collision or metadata is invalid'
+}
+
+expected_unit() {
+  cat <<EOF
+[Unit]
+Description=Portal private home alias for UID ${user_uid}
+RequiresMountsFor=/srv/gpu-platform
+Before=h100-portal-worker.service h100-portal-api.service
+
+[Mount]
+What=${backing_home}
+Where=${canonical_home}
+Type=none
+Options=bind,rw,nosuid,nodev
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+mount_contract_ready() {
+  local target options option
+  target="$(findmnt --noheadings --raw --output TARGET \
+    --mountpoint "${canonical_home}" 2>/dev/null)" || return 1
+  [[ "${target}" == "${canonical_home}" \
+    && "$(stat -c '%d:%i' "${backing_home}")" == \
+       "$(stat -c '%d:%i' "${canonical_home}")" \
+    && "$(stat -c '%u:%g' "${canonical_home}")" == "${user_uid}:${user_gid}" ]] \
+    || return 1
+  h100_workspace_mode_is_private "${canonical_home}" || return 1
+  options="$(findmnt --noheadings --raw --output OPTIONS \
+    --mountpoint "${canonical_home}" 2>/dev/null)" || return 1
+  for option in rw nosuid nodev; do
+    tr ',' '\n' <<<"${options}" | grep -Fxq "${option}" || return 1
+  done
+}
+
+worker_pid() {
+  local pid
+  pid="$(systemctl show --property MainPID --value "${WORKER_SERVICE}")" \
+    || h100_fail 'Worker mount namespace identity is unavailable'
+  [[ "${pid}" =~ ^[0-9]+$ ]] || h100_fail 'Worker mount namespace PID is invalid'
+  [[ "${pid}" != 0 ]] || return 1
+  [[ -e "/proc/${pid}/ns/mnt" && "$(stat -c '%u' "/proc/${pid}")" == 0 ]] \
+    || h100_fail 'Worker mount namespace process is unavailable'
+  grep -Eq '(^|/)h100-portal-worker\.service($|/)' "/proc/${pid}/cgroup" \
+    || h100_fail 'Worker mount namespace cgroup is invalid'
+  printf '%s\n' "${pid}"
+}
+
+worker_exec() {
+  local pid=$1
+  shift
+  /usr/bin/nsenter --target "${pid}" --mount \
+    --root="/proc/${pid}/root" --wd="/proc/${pid}/cwd" -- "$@"
+}
+
+worker_contract_ready() {
+  local pid=$1 options option
+  worker_exec "${pid}" /usr/bin/findmnt --noheadings --mountpoint \
+    "${canonical_home}" >/dev/null 2>&1 || return 1
+  [[ "$(worker_exec "${pid}" /usr/bin/stat -c '%d:%i' "${backing_home}")" == \
+    "$(worker_exec "${pid}" /usr/bin/stat -c '%d:%i' "${canonical_home}")" \
+    && "$(worker_exec "${pid}" /usr/bin/stat -c '%u:%g' "${canonical_home}")" == \
+       "${user_uid}:${user_gid}" ]] || return 1
+  options="$(worker_exec "${pid}" /usr/bin/findmnt --noheadings --raw \
+    --output OPTIONS --mountpoint "${canonical_home}")" || return 1
+  for option in rw nosuid nodev; do
+    tr ',' '\n' <<<"${options}" | grep -Fxq "${option}" || return 1
+  done
+}
+
+sync_worker_alias() {
+  local pid
+  pid="$(worker_pid)" || return 0
+  worker_contract_ready "${pid}" && return 0
+  worker_exec "${pid}" /usr/bin/test -d "${canonical_home}" \
+    && worker_exec "${pid}" /usr/bin/test ! -L "${canonical_home}" \
+    || h100_fail 'Worker canonical home mountpoint is invalid'
+  if worker_exec "${pid}" /usr/bin/findmnt --noheadings --mountpoint \
+    "${canonical_home}" >/dev/null 2>&1; then
+    h100_fail 'Worker canonical home mount collision is invalid'
+  fi
+  worker_exec "${pid}" /usr/bin/mount --bind "${backing_home}" "${canonical_home}"
+  worker_exec "${pid}" /usr/bin/mount -o remount,bind,rw,nosuid,nodev \
+    "${canonical_home}" "${canonical_home}"
+  worker_contract_ready "${pid}" \
+    || h100_fail 'Worker canonical home mount contract did not converge'
+}
+
+unmount_worker_alias() {
+  local pid
+  pid="$(worker_pid)" || return 0
+  if worker_exec "${pid}" /usr/bin/findmnt --noheadings --mountpoint \
+    "${canonical_home}" >/dev/null 2>&1; then
+    worker_contract_ready "${pid}" \
+      || h100_fail 'Worker canonical home mount differs from the owner binding'
+    worker_exec "${pid}" /usr/bin/umount "${canonical_home}"
+  fi
+}
+
+verify_alias() {
+  verify_backing
+  verify_parent
+  mount_contract_ready || h100_fail 'canonical home mount contract is invalid'
+  [[ -f "${unit_path}" && ! -L "${unit_path}" \
+    && "$(stat -c '%u:%g:%a' "${unit_path}")" == 0:0:644 ]] \
+    || h100_fail 'home mount unit metadata is invalid'
+  cmp -s <(expected_unit) "${unit_path}" \
+    || h100_fail 'home mount unit content is inconsistent'
+}
+
+case "${action}" in
+  prepare)
+    (($# == 4)) || h100_fail 'prepare does not accept removal confirmation fields'
+    verify_backing
+    if [[ ! -e "${H100_HOME_ALIAS_ROOT}" ]]; then
+      install -d -o root -g root -m 0711 "${H100_HOME_ALIAS_ROOT}"
+    fi
+    verify_parent
+    if [[ ! -e "${canonical_home}" ]]; then
+      install -d -o root -g root -m 0700 "${canonical_home}"
+      created_mountpoint=1
+    elif findmnt --noheadings --mountpoint "${canonical_home}" >/dev/null 2>&1; then
+      verify_alias
+      sync_worker_alias
+      h100_mark_success
+      printf 'HOME ALIAS READY user=%s uid=%s\n' "${user_name}" "${user_uid}"
+      exit 0
+    else
+      verify_unmounted_mountpoint
+    fi
+    [[ ! -e "${unit_path}" && ! -L "${unit_path}" ]] \
+      || h100_fail 'home mount unit collision detected'
+    temp_unit="$(mktemp "${UNIT_ROOT}/.${unit_name}.XXXXXX")"
+    expected_unit >"${temp_unit}"
+    chown root:root "${temp_unit}"
+    chmod 0644 "${temp_unit}"
+    sync -f "${temp_unit}"
+    mv -fT -- "${temp_unit}" "${unit_path}"
+    temp_unit=
+    installed_unit=1
+    systemctl daemon-reload
+    systemctl enable --now "${unit_name}"
+    mount_contract_ready || h100_fail 'canonical home mount did not converge'
+    verify_alias
+    sync_worker_alias
+    ;;
+  verify)
+    (($# == 4)) || h100_fail 'verify does not accept removal confirmation fields'
+    verify_alias
+    ;;
+  remove)
+    (($# == 6)) || h100_fail 'remove requires an explicit owner confirmation'
+    [[ "$5" == --confirm-remove && "$6" == "${user_name}" ]] \
+      || h100_fail 'home alias removal confirmation is invalid'
+    verify_alias
+    unmount_worker_alias
+    systemctl disable --now "${unit_name}"
+    findmnt --noheadings --mountpoint "${canonical_home}" >/dev/null 2>&1 \
+      && h100_fail 'canonical home remained mounted'
+    verify_unmounted_mountpoint
+    rmdir -- "${canonical_home}"
+    rm -f -- "${unit_path}"
+    systemctl daemon-reload
+    verify_backing
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
+printf 'HOME ALIAS %s user=%s uid=%s backing=%s canonical=%s\n' \
+  "${action^^}" "${user_name}" "${user_uid}" "${backing_home}" "${canonical_home}"
+h100_mark_success

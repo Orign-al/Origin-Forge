@@ -18,7 +18,7 @@ from h100_portal_worker import handlers, server
 from h100_portal_worker import terminal as worker_terminal
 from h100_portal_worker.handlers import handle, run_fixed
 from h100_portal_worker.protocol import ProtocolError, decode_frame, encode_frame
-from h100_portal_worker.schemas import WorkerRequest, validate_payload
+from h100_portal_worker.schemas import APPROVED_JOB_IMAGE, WorkerRequest, validate_payload
 from pydantic import ValidationError
 
 
@@ -1261,6 +1261,7 @@ def test_project_quota_validation_requires_enforcement_and_exact_hard_limit(
     monkeypatch.setattr(handlers, "run_fixed", quota_command)
     result = handlers._verified_project_quota(30001, 300)
     assert result["hard_limit_gb"] == 300
+    assert result["used_bytes"] == 0
     assert result["enforcement"] == "ON"
 
     def wrong_limit(_binary: str, args: list[str], timeout: float = 20.0) -> dict[str, object]:
@@ -1275,6 +1276,76 @@ def test_project_quota_validation_requires_enforcement_and_exact_hard_limit(
     monkeypatch.setattr(handlers, "run_fixed", wrong_limit)
     with pytest.raises(handlers.LifecycleValidationError, match="hard quota"):
         handlers._verified_project_quota(30001, 300)
+
+
+def test_self_storage_reports_authoritative_project_quota_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "managed_user_id": str(uuid.uuid4()),
+        "username": "ordinary-user",
+        "uid": 20011,
+        "gid": 20011,
+        "workspace_path": "/storage/users/20011",
+        "quota_root": "/srv/gpu-platform/users/ordinary-user",
+        "project_id": 30011,
+        "quota_bytes": 300 * 1024**3,
+    }
+    binding = SimpleNamespace(
+        username="ordinary-user",
+        quota_root=Path("/srv/gpu-platform/users/ordinary-user"),
+    )
+    monkeypatch.setattr(handlers, "_managed_account", lambda _payload: object())
+    monkeypatch.setattr(
+        handlers,
+        "_workspace_binding_for_payload",
+        lambda _payload, require_alias: binding if require_alias else None,
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_safe_file_lines",
+        lambda path: (
+            ["30011:/srv/gpu-platform/users/ordinary-user"]
+            if path == handlers.PROJECTS_FILE
+            else ["h100_ordinary-user:30011"]
+        ),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_verified_project_quota",
+        lambda project_id, quota_gb: {
+            "project_id": project_id,
+            "hard_limit_gb": quota_gb,
+            "used_bytes": 80 * 1024**3,
+        },
+    )
+
+    result = handlers._self_storage(payload)
+
+    assert result["status"] == "OK"
+    assert result["used_bytes"] == 80 * 1024**3
+
+
+def test_self_storage_schema_binds_project_quota_to_managed_owner() -> None:
+    payload = {
+        "managed_user_id": str(uuid.uuid4()),
+        "username": "ordinary-user",
+        "uid": 20011,
+        "gid": 20011,
+        "workspace_path": "/storage/users/20011",
+        "quota_root": "/srv/gpu-platform/users/ordinary-user",
+        "project_id": 30011,
+        "quota_bytes": 300 * 1024**3,
+    }
+
+    assert validate_payload("self.storage.read", payload) == payload
+    with pytest.raises(ValueError, match="workspace"):
+        validate_payload(
+            "self.storage.read",
+            {**payload, "quota_root": "/srv/gpu-platform/users/other-user"},
+        )
+    with pytest.raises(ValueError, match="project or quota"):
+        validate_payload("self.storage.read", {**payload, "project_id": 29999})
 
 
 def test_guard_metrics_validation_binds_current_user_and_deny_results(
@@ -2539,6 +2610,11 @@ def managed_job_payload(*, username: str = "origin-pilot", uid: int = 20001) -> 
         "uid": uid,
         "gid": uid,
         "workspace_path": f"/storage/users/{uid}",
+        "quota_root": f"/srv/gpu-platform/users/{username}",
+        "home_source": f"/storage/homes/{uid}",
+        "home_path": f"/home/{username}",
+        "project_id": 30000 + uid - 20000,
+        "quota_bytes": 300 * 1024**3,
         "name": "portal-job",
         "script_relative_path": f".portal/job-scripts/{portal_job_id}.sh",
         "script_content": script,
@@ -2554,7 +2630,7 @@ def managed_job_payload(*, username: str = "origin-pilot", uid: int = 20001) -> 
         "slurm_account": "company",
         "slurm_qos": "general",
         "max_gpu": 1,
-        "image_ref": None,
+        "image_ref": APPROVED_JOB_IMAGE,
     }
 
 
@@ -2949,9 +3025,71 @@ def test_unified_workspace_visibility_and_output_persistence_share_one_inode(
     assert (container_workspace / "outputs/result.txt").samefile(slurm_output)
 
 
+def test_unified_home_and_workspace_are_bidirectional_zero_copy_without_foreign_mounts(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "users/origin-pilot2"
+    backing_home = private_root / "home"
+    backing_workspace = private_root / "workspace"
+    backing_home.mkdir(parents=True, mode=0o700)
+    backing_workspace.mkdir(mode=0o700)
+    dev_home = tmp_path / "dev/home/origin-pilot2"
+    dev_workspace = tmp_path / "dev/workspace"
+    job_home = tmp_path / "job/home/origin-pilot2"
+    job_workspace = tmp_path / "job/workspace"
+    for alias, target in (
+        (dev_home, backing_home),
+        (dev_workspace, backing_workspace),
+        (job_home, backing_home),
+        (job_workspace, backing_workspace),
+    ):
+        alias.parent.mkdir(parents=True, exist_ok=True)
+        alias.symlink_to(target, target_is_directory=True)
+
+    home_input = dev_home / "zero-copy-home-test.dat"
+    workspace_input = dev_workspace / "zero-copy-workspace-test.dat"
+    home_input.write_bytes(b"home-zero-copy\n")
+    workspace_input.write_bytes(b"workspace-zero-copy\n")
+    home_input.chmod(0o600)
+    workspace_input.chmod(0o600)
+
+    assert (
+        hashlib.sha256((job_home / home_input.name).read_bytes()).digest()
+        == hashlib.sha256(home_input.read_bytes()).digest()
+    )
+    assert (
+        hashlib.sha256((job_workspace / workspace_input.name).read_bytes()).digest()
+        == hashlib.sha256(workspace_input.read_bytes()).digest()
+    )
+    assert (job_home / home_input.name).samefile(home_input)
+    assert (job_workspace / workspace_input.name).samefile(workspace_input)
+
+    job_home_result = job_home / "zero-copy-job-home-result.dat"
+    job_workspace_result = job_workspace / "zero-copy-job-workspace-result.dat"
+    job_home_result.write_bytes(b"job-home-result\n")
+    job_workspace_result.write_bytes(b"job-workspace-result\n")
+    assert (dev_home / job_home_result.name).samefile(job_home_result)
+    assert (dev_workspace / job_workspace_result.name).samefile(job_workspace_result)
+    assert (dev_home / job_home_result.name).read_bytes() == b"job-home-result\n"
+    assert (dev_workspace / job_workspace_result.name).read_bytes() == b"job-workspace-result\n"
+
+    payload = managed_job_payload(username="origin-pilot2", uid=20002)
+    argv = handlers._managed_sbatch_argv(
+        payload,
+        workdir=Path(str(payload["workspace_path"])) / "projects",
+        stdout=Path(str(payload["workspace_path"])) / "outputs/job.out",
+        stderr=Path(str(payload["workspace_path"])) / "outputs/job.err",
+        staged_descriptor=9,
+    )
+    mounts = next(item for item in argv if item.startswith("--container-mounts="))
+    assert "/storage/homes/20002:/home/origin-pilot2" in mounts
+    assert "origin-pilot" not in mounts.replace("origin-pilot2", "")
+    assert "/storage/homes/20001" not in mounts
+
+
 def test_workspace_payload_rejects_cross_user_storage_binding() -> None:
     payload = managed_job_payload(username="origin-pilot", uid=20001)
-    with pytest.raises(ValueError, match="WORKSPACE_BINDING_REJECTED"):
+    with pytest.raises(ValueError, match="USER_STORAGE_BINDING_REJECTED"):
         validate_payload(
             "self.job.submit",
             {**payload, "workspace_path": "/storage/users/20002"},
@@ -3067,6 +3205,15 @@ def test_job_script_is_staged_then_only_fixed_sbatch_runs_as_target_user(
     monkeypatch.setattr(handlers, "_managed_slurm_security_preflight", lambda _payload: None)
     monkeypatch.setattr(
         handlers,
+        "_job_storage_binding",
+        lambda bound_payload: handlers.workspace_binding(
+            str(bound_payload["username"]),
+            int(bound_payload["uid"]),
+            int(bound_payload["gid"]),
+        ),
+    )
+    monkeypatch.setattr(
+        handlers,
         "_ensure_managed_enroot_directories",
         lambda bound_payload: captured.update(enroot_payload=bound_payload),
     )
@@ -3112,7 +3259,7 @@ def test_job_script_is_staged_then_only_fixed_sbatch_runs_as_target_user(
     assert not any(item in {"bash", "sh", "sudo"} for item in command)
 
 
-def test_portal4a_gpu_job_mounts_only_owned_root_and_disables_host_home(
+def test_portal4a_jobs_mount_only_owner_workspace_and_persistent_home(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     payload = managed_job_payload()
@@ -3136,9 +3283,13 @@ def test_portal4a_gpu_job_mounts_only_owned_root_and_disables_host_home(
     assert not any("WORKSPACE=" in item for item in argv)
     assert f"--container-image={payload['image_ref']}" in argv
     assert "--no-container-mount-home" in argv
-    assert f"--container-mounts={workspace}:{workspace},{workspace}:/workspace" in argv
+    assert (
+        f"--container-mounts={workspace}:{workspace},{workspace}:/workspace,"
+        "/storage/homes/20001:/home/origin-pilot"
+    ) in argv
     assert argv[-1] == "/proc/self/fd/9"
-    assert not any("/home/origin-pilot" in item for item in argv)
+    assert not any("/home/origin-pilot2" in item for item in argv)
+    assert not any("/srv/gpu-platform/users/origin-pilot2" in item for item in argv)
 
 
 def test_gpu_development_allocation_is_owner_lease_and_scheduler_bound_across_renewal(

@@ -33,7 +33,7 @@ SystemCallArchitectures=native
 # fixed-argv lifecycle scripts.  Stage needs account databases and exact
 # systemd/project mappings under /etc, managed homes, platform data, and the
 # fixed lifecycle-script audit log.
-ReadWritePaths=/etc /home /storage/users /srv/gpu-platform /run/h100-portal /var/lib/h100-portal /var/log/h100-portal /var/log/h100-platform-audit.log
+ReadWritePaths=/etc /home /storage/users /storage/homes /srv/gpu-platform /run/h100-portal /var/lib/h100-portal /var/log/h100-portal /var/log/h100-platform-audit.log
 # Portal-3F invokes the integrity-pinned GPU bypass guard inside the Worker
 # namespace. Permit only its Node Exporter textfile output directory.
 ReadWritePaths=/var/lib/node_exporter/textfile_collector

@@ -14,12 +14,13 @@ MANAGED_UID_MIN = 20_000
 MANAGED_UID_MAX = 60_000
 
 WORKSPACE_ROOT = PurePosixPath("/storage/users")
+HOME_ALIAS_ROOT = PurePosixPath("/storage/homes")
 LEGACY_STORAGE_ROOT = PurePosixPath("/srv/gpu-platform/users")
 WORKSPACE_CONTAINER_PATH = PurePosixPath("/workspace")
 WORKSPACE_COMPUTE_PATH = PurePosixPath("/workspace")
 WORKSPACE_DEFAULT_WORKDIR = PurePosixPath("projects")
 WORKSPACE_LOGICAL_ROOT = PurePosixPath("workspace")
-WORKSPACE_MOUNT_CONTRACT_VERSION = 1
+WORKSPACE_MOUNT_CONTRACT_VERSION = 2
 WORKSPACE_QUOTA_BYTES = 300 * 1024**3
 WORKSPACE_REQUIRED_DIRECTORIES = (
     PurePosixPath("projects"),
@@ -56,8 +57,11 @@ class WorkspaceBinding:
     gid: int
     layout: WorkspaceLayout
     quota_root: PurePosixPath
+    backing_home: PurePosixPath
+    canonical_home: PurePosixPath
     backing_workspace: PurePosixPath
     canonical_workspace: PurePosixPath
+    compute_home: PurePosixPath
     container_workspace: PurePosixPath = WORKSPACE_CONTAINER_PATH
     compute_workspace: PurePosixPath = WORKSPACE_COMPUTE_PATH
 
@@ -108,14 +112,18 @@ def workspace_binding(
     else:
         quota_root = canonical
         backing = canonical
+    backing_home = quota_root / "home"
     return WorkspaceBinding(
         username=username,
         uid=validated_uid,
         gid=validated_gid,
         layout=layout,
         quota_root=quota_root,
+        backing_home=backing_home,
+        canonical_home=HOME_ALIAS_ROOT / str(validated_uid),
         backing_workspace=backing,
         canonical_workspace=canonical,
+        compute_home=PurePosixPath("/home") / username,
     )
 
 

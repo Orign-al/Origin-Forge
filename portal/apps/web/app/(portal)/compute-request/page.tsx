@@ -221,7 +221,9 @@ export default function ComputeRequestPage() {
                 </select>
               </label>
               <p className="muted">
-                GPU Development 通过 Slurm 分配 1 张 H100，仅容器运行期间持有。
+                {t(
+                  "GPU Development 开通 H100 作业额度；常驻开发容器仍不挂载 GPU。",
+                )}
               </p>
             </SectionCard>
             <SectionCard
@@ -246,7 +248,7 @@ export default function ComputeRequestPage() {
               <p className="muted">
                 {profile === "GPU_1_8CPU_32GB"
                   ? t(
-                      "GPU Development 占用该用户唯一 GPU 额度；停止容器后额度返回调度器。",
+                      "GPU Development 将作业上限固定为 1；H100 仅在作业运行期间分配并在结束后自动释放。",
                     )
                   : t("GPU 任务通过 Portal 作业页面提交，最多 1 张。")}
               </p>

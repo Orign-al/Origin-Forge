@@ -68,6 +68,7 @@ user_root="${H100_DATA_ROOT}/users/${user_name}"
 user_uid="$(id -u "${user_name}")"
 workspace_root="${H100_WORKSPACE_ROOT}/${user_uid}"
 workspace_alias_tool=/usr/local/sbin/h100-workspace-alias
+home_alias_tool=/usr/local/sbin/h100-home-alias
 host_key_root="${H100_DATA_ROOT}/container-data/${user_name}"
 [[ ! -L "${user_root}" && "$(realpath -e "${user_root}")" == "${user_root}" ]] \
   || h100_fail 'user data path validation failed'
@@ -83,11 +84,16 @@ host_key_root="${H100_DATA_ROOT}/container-data/${user_name}"
 project_name="h100_${user_name}"
 project_id="$(awk -F: -v name="${project_name}" '$1 == name {print $2}' /etc/projid)"
 [[ "${project_id}" =~ ^[0-9]+$ ]] || h100_fail 'project ID mapping is invalid'
-grep -Fxq "${project_id}:${workspace_root}" /etc/projects \
+grep -Fxq "${project_id}:${user_root}" /etc/projects \
   || h100_fail 'project path mapping is invalid'
 
 [[ -x "${workspace_alias_tool}" && ! -L "${workspace_alias_tool}" ]] \
   || h100_fail 'workspace alias removal handler is unavailable'
+[[ -x "${home_alias_tool}" && ! -L "${home_alias_tool}" ]] \
+  || h100_fail 'home alias removal handler is unavailable'
+"${home_alias_tool}" verify "${user_name}" "${user_uid}" "$(id -g "${user_name}")"
+"${home_alias_tool}" remove "${user_name}" "${user_uid}" "$(id -g "${user_name}")" \
+  --confirm-remove "${user_name}"
 "${workspace_alias_tool}" verify "${user_name}" "${user_uid}" "$(id -g "${user_name}")"
 "${workspace_alias_tool}" remove "${user_name}" "${user_uid}" "$(id -g "${user_name}")" \
   --confirm-remove "${user_name}"

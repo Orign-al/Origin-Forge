@@ -18,12 +18,15 @@ def test_legacy_workspace_binding_keeps_quota_root_and_aliases_only_workspace() 
 
     assert binding.layout is WorkspaceLayout.LEGACY_BIND_ALIAS
     assert binding.quota_root == PurePosixPath("/srv/gpu-platform/users/origin-pilot2")
+    assert binding.backing_home == binding.quota_root / "home"
+    assert binding.canonical_home == PurePosixPath("/storage/homes/20002")
+    assert binding.compute_home == PurePosixPath("/home/origin-pilot2")
     assert binding.backing_workspace == binding.quota_root / "workspace"
     assert binding.canonical_workspace == PurePosixPath("/storage/users/20002")
     assert binding.container_workspace == PurePosixPath("/workspace")
     assert binding.compute_workspace == WORKSPACE_COMPUTE_PATH == PurePosixPath("/workspace")
     assert binding.default_job_workdir == PurePosixPath("/storage/users/20002/projects")
-    assert WORKSPACE_MOUNT_CONTRACT_VERSION == 1
+    assert WORKSPACE_MOUNT_CONTRACT_VERSION == 2
     assert WORKSPACE_QUOTA_BYTES == 300 * 1024**3
     assert (
         PurePosixPath("projects"),

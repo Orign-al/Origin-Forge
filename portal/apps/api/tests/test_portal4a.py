@@ -49,6 +49,7 @@ from h100_portal_api.routes import self_service
 from h100_portal_api.schemas import RestoreCreateRequest
 from h100_portal_api.security import digest_secret, hash_password
 from h100_portal_api.terminal_service import TerminalServiceError
+from h100_portal_api.workspace_service import resolve_workspace
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -840,6 +841,74 @@ def test_independent_cookie_jars_isolate_sessions_logout_relogin_and_self_resour
     assert first_shared.revoked_at is not None
 
 
+def test_self_storage_reads_total_project_quota_usage(
+    database: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = _identity(
+        database,
+        login="storage-user",
+        username="storage-user",
+        uid=20011,
+        port=22033,
+    )
+    calls: list[dict[str, object]] = []
+
+    def worker(operation_type: str, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append({"operation_type": operation_type, **kwargs})
+        return {
+            "status": "OK",
+            "handler": "self.storage.read",
+            "used_bytes": 80 * 1024**3,
+        }
+
+    monkeypatch.setattr("h100_portal_api.routes.self_service.call_worker", worker)
+
+    response = self_service.self_storage(
+        context=AuthContext(identity.user, None, ""),
+        db=database,
+    )
+
+    assert response["storage"]["used_bytes"] == 80 * 1024**3
+    assert response["storage"]["available_bytes"] == 220 * 1024**3
+    assert calls[0]["operation_type"] == "self.storage.read"
+    worker_payload = calls[0]["payload"]
+    assert worker_payload == {
+        "managed_user_id": str(identity.managed.id),
+        "username": "storage-user",
+        "uid": 20011,
+        "gid": 20011,
+        "workspace_path": "/storage/users/20011",
+        "quota_root": "/srv/gpu-platform/users/storage-user",
+        "project_id": 30011,
+        "quota_bytes": 300 * 1024**3,
+    }
+
+
+def test_workspace_metadata_keeps_canonical_path_and_derives_private_quota_root(
+    database: Session,
+) -> None:
+    identity = _identity(
+        database,
+        login="workspace-user",
+        username="workspace-user",
+        uid=20012,
+        port=22034,
+    )
+
+    resolution = resolve_workspace(database, identity.user)
+
+    assert resolution.storage.root_path == "/storage/users/20012"
+    assert resolution.worker_payload()["workspace_path"] == "/storage/users/20012"
+    assert resolution.worker_payload()["quota_root"] == ("/srv/gpu-platform/users/workspace-user")
+
+    resolution.storage.root_path = "/srv/gpu-platform/users/workspace-user"
+    database.commit()
+    with pytest.raises(HTTPException) as rejected:
+        resolve_workspace(database, identity.user)
+    assert rejected.value.detail["code"] == "WORKSPACE_METADATA_REJECTED"
+
+
 def test_job_and_container_operations_enforce_active_lease_gpu_and_time(
     client,
     database: Session,
@@ -904,6 +973,15 @@ def test_job_and_container_operations_enforce_active_lease_gpu_and_time(
     assert worker_payload["slurm_qos"] == "general"
     assert worker_payload["max_gpu"] == 1
     assert worker_payload["workspace_path"] == "/storage/users/20002"
+    assert worker_payload["quota_root"] == "/srv/gpu-platform/users/origin-pilot2"
+    assert worker_payload["home_source"] == "/storage/homes/20002"
+    assert worker_payload["home_path"] == "/home/origin-pilot2"
+    assert worker_payload["project_id"] == identity.managed.project_id
+    assert worker_payload["quota_bytes"] == 300 * 1024**3
+    assert worker_payload["image_ref"] == (
+        "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
+        "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
+    )
     assert worker_payload["workdir_relative_path"] == "projects"
     assert worker_payload["script_relative_path"].startswith(".portal/job-scripts/")
     assert worker_payload["stdout_relative_path"].startswith("outputs/")

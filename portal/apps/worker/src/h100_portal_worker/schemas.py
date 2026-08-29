@@ -1349,6 +1349,11 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
         "uid",
         "gid",
         "workspace_path",
+        "quota_root",
+        "home_source",
+        "home_path",
+        "project_id",
+        "quota_bytes",
         "name",
         "script_relative_path",
         "script_content",
@@ -1369,12 +1374,38 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
     if set(payload) != fields:
         raise PayloadValidationError("JOB_SPEC_REJECTED", "job specification fields are incomplete")
     result = _managed_identity(payload)
-    expected_workspace = str(workspace_path(result["uid"]))
-    if payload.get("workspace_path") != expected_workspace:
+    binding = workspace_binding(result["username"], result["uid"], result["gid"])
+    if (
+        payload.get("workspace_path") != str(binding.canonical_workspace)
+        or payload.get("quota_root") != str(binding.quota_root)
+        or payload.get("home_source") != str(binding.canonical_home)
+        or payload.get("home_path") != str(binding.compute_home)
+    ):
         raise PayloadValidationError(
-            "WORKSPACE_BINDING_REJECTED", "workspace is not derived from the managed UID"
+            "USER_STORAGE_BINDING_REJECTED",
+            "job storage is not derived from the managed owner",
         )
-    result["workspace_path"] = expected_workspace
+    project_id = payload.get("project_id")
+    quota_bytes = payload.get("quota_bytes")
+    if (
+        not isinstance(project_id, int)
+        or isinstance(project_id, bool)
+        or not PROJECT_ID_MIN <= project_id <= PROJECT_ID_MAX
+        or quota_bytes != STANDARD_COMPUTE_STORAGE_BYTES
+    ):
+        raise PayloadValidationError(
+            "STORAGE_QUOTA_REJECTED", "job storage project or quota is invalid"
+        )
+    result.update(
+        {
+            "workspace_path": str(binding.canonical_workspace),
+            "quota_root": str(binding.quota_root),
+            "home_source": str(binding.canonical_home),
+            "home_path": str(binding.compute_home),
+            "project_id": project_id,
+            "quota_bytes": quota_bytes,
+        }
+    )
     portal_job_id = _canonical_uuid(payload.get("portal_job_id"), "Portal job ID")
     result.update(
         {
@@ -1419,7 +1450,7 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
     if time_limit > remaining:
         raise PayloadValidationError("JOB_EXCEEDS_LEASE", "job time limit exceeds lease deadline")
     image_ref = payload.get("image_ref")
-    if image_ref not in {None, APPROVED_JOB_IMAGE}:
+    if image_ref != APPROVED_JOB_IMAGE:
         raise PayloadValidationError("IMAGE_NOT_APPROVED", "container image is not approved")
     script_content = payload.get("script_content")
     script_sha256 = payload.get("script_sha256")
@@ -2276,17 +2307,47 @@ def validate_payload(
     if operation_type == "self.job.status.read":
         return _validate_self_job_target(payload)
     if operation_type == "self.storage.read":
-        if set(payload) != {"managed_user_id", "username", "uid", "gid", "workspace_path"}:
+        fields = {
+            "managed_user_id",
+            "username",
+            "uid",
+            "gid",
+            "workspace_path",
+            "quota_root",
+            "project_id",
+            "quota_bytes",
+        }
+        if set(payload) != fields:
             raise PayloadValidationError(
                 "STORAGE_TARGET_REJECTED", "storage target fields are invalid"
             )
         result = _managed_identity(payload)
-        expected_workspace = str(workspace_path(result["uid"]))
-        if payload.get("workspace_path") != expected_workspace:
+        binding = workspace_binding(result["username"], result["uid"], result["gid"])
+        if payload.get("workspace_path") != str(binding.canonical_workspace) or payload.get(
+            "quota_root"
+        ) != str(binding.quota_root):
             raise PayloadValidationError(
-                "WORKSPACE_BINDING_REJECTED", "workspace is not derived from the managed UID"
+                "WORKSPACE_BINDING_REJECTED", "workspace is not derived from the managed owner"
             )
-        result["workspace_path"] = expected_workspace
+        project_id = payload.get("project_id")
+        quota_bytes = payload.get("quota_bytes")
+        if (
+            not isinstance(project_id, int)
+            or isinstance(project_id, bool)
+            or not PROJECT_ID_MIN <= project_id <= PROJECT_ID_MAX
+            or quota_bytes != STANDARD_COMPUTE_STORAGE_BYTES
+        ):
+            raise PayloadValidationError(
+                "STORAGE_QUOTA_REJECTED", "storage project or quota is invalid"
+            )
+        result.update(
+            {
+                "workspace_path": str(binding.canonical_workspace),
+                "quota_root": str(binding.quota_root),
+                "project_id": project_id,
+                "quota_bytes": quota_bytes,
+            }
+        )
         return result
     if operation_type == "self.workspace.check":
         fields = {

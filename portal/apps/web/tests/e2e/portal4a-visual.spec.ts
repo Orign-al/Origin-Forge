@@ -483,7 +483,6 @@ for (const viewport of [
       .getByLabel("执行脚本")
       .fill('set -eu\necho "portal script"\nwhoami\nid');
     await page.getByLabel("GPU").selectOption("1");
-    await page.getByLabel("运行环境").selectOption("approved");
     await expect(page.getByRole("button", { name: "提交作业" })).toBeEnabled();
     await capture(page, viewport.label, "08-job-submit");
 
@@ -495,6 +494,7 @@ for (const viewport of [
     expect(state.jobBodies).toHaveLength(1);
     expect(state.jobBodies[0]?.gpu_count).toBe(1);
     expect(state.jobBodies[0]?.script).toContain("portal script");
+    expect(state.jobBodies[0]?.image_ref).toBeNull();
     expect(state.jobBodies[0]).not.toHaveProperty("script_path");
     expect(state.jobBodies[0]).not.toHaveProperty("workdir");
 

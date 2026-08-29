@@ -29,6 +29,7 @@ from typing import Any
 from h100_portal_contracts.workspace import (
     CPU_DEVELOPMENT_PROFILE,
     GPU_DEVELOPMENT_PROFILE,
+    WORKSPACE_MOUNT_CONTRACT_VERSION,
     WORKSPACE_QUOTA_BYTES,
     WORKSPACE_REQUIRED_DIRECTORIES,
     WorkspaceBinding,
@@ -92,6 +93,7 @@ BINARIES = {
 SCRIPT_ALLOWLIST = {
     "h100-provision-stage": "/usr/local/sbin/h100-provision-stage",
     "h100-workspace-alias": "/usr/local/sbin/h100-workspace-alias",
+    "h100-home-alias": "/usr/local/sbin/h100-home-alias",
     "h100-user-create": "/usr/local/sbin/h100-user-create",
     "h100-user-gpu-isolation": "/usr/local/sbin/h100-user-gpu-isolation",
     "h100-container-create": "/usr/local/sbin/h100-container-create",
@@ -214,6 +216,7 @@ COMPUTE_STAGE_REQUIRED_SCRIPTS = frozenset(
         "h100-provision-stage",
         "h100-platform-common",
         "h100-workspace-alias",
+        "h100-home-alias",
         "h100-user-gpu-isolation",
         "h100-gpu-bypass-guard",
     }
@@ -3674,6 +3677,21 @@ def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
         raise LifecycleValidationError(
             "COMPUTE_STAGE_POSTCONDITION_FAILED", "staged Linux password is not locked"
         )
+    home_alias = run_allowlisted_script(
+        [
+            SCRIPT_ALLOWLIST["h100-home-alias"],
+            "verify",
+            username,
+            str(payload["uid"]),
+            str(payload["gid"]),
+        ],
+        timeout=60,
+    )
+    if not home_alias.get("ok"):
+        raise LifecycleValidationError(
+            "COMPUTE_STAGE_POSTCONDITION_FAILED",
+            "canonical owner home alias is unavailable",
+        )
     host_key = Path(account.pw_dir) / ".ssh/authorized_keys"
     container_key = PILOT_DATA_ROOT / username / "home/.ssh/authorized_keys"
     if any(path.exists() or path.is_symlink() for path in (host_key, container_key)):
@@ -4791,18 +4809,26 @@ def _verified_project_quota(project_id: int, quota_gb: int) -> dict[str, Any]:
     )
     expected_hard_blocks = quota_gb * 1024 * 1024
     observed_hard_blocks: int | None = None
+    observed_used_blocks: int | None = None
     if report.get("ok"):
         for line in str(report.get("stdout", "")).splitlines():
             fields = line.split()
-            if len(fields) >= 4 and fields[0] == f"#{project_id}" and fields[3].isdigit():
+            if (
+                len(fields) >= 4
+                and fields[0] == f"#{project_id}"
+                and fields[1].isdigit()
+                and fields[3].isdigit()
+            ):
+                observed_used_blocks = int(fields[1])
                 observed_hard_blocks = int(fields[3])
                 break
-    if observed_hard_blocks != expected_hard_blocks:
+    if observed_hard_blocks != expected_hard_blocks or observed_used_blocks is None:
         raise LifecycleValidationError(
             "STAGE_POSTCONDITION_FAILED", "XFS project hard quota differs from approval"
         )
     return {
         "project_id": project_id,
+        "used_bytes": observed_used_blocks * 1024,
         "hard_limit_gb": quota_gb,
         "accounting": "ON",
         "enforcement": "ON",
@@ -8612,6 +8638,83 @@ def _workspace_binding_for_payload(
     return binding
 
 
+def _job_storage_binding(payload: dict[str, Any]) -> WorkspaceBinding:
+    """Verify both zero-copy Job mounts from one authoritative owner binding."""
+
+    account = _managed_account(payload)
+    binding = _workspace_binding_for_payload(payload, require_alias=True)
+    if (
+        account.pw_dir != str(binding.compute_home)
+        or payload.get("home_source") != str(binding.canonical_home)
+        or payload.get("home_path") != str(binding.compute_home)
+    ):
+        raise LifecycleValidationError(
+            "HOME_BINDING_REJECTED", "job home is not derived from the managed owner"
+        )
+    try:
+        parent_metadata = Path(binding.canonical_home).parent.lstat()
+        backing_metadata = Path(binding.backing_home).lstat()
+        canonical_metadata = Path(binding.canonical_home).lstat()
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "HOME_BINDING_REJECTED", "canonical owner home alias is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or stat.S_ISLNK(parent_metadata.st_mode)
+        or parent_metadata.st_uid != 0
+        or parent_metadata.st_gid != 0
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o711
+        or any(
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != binding.uid
+            or metadata.st_gid != binding.gid
+            or stat.S_IMODE(metadata.st_mode) & 0o007
+            for metadata in (backing_metadata, canonical_metadata)
+        )
+        or (backing_metadata.st_dev, backing_metadata.st_ino)
+        != (canonical_metadata.st_dev, canonical_metadata.st_ino)
+    ):
+        raise LifecycleValidationError(
+            "HOME_BINDING_REJECTED", "canonical owner home alias is invalid"
+        )
+    mounted = run_fixed(
+        "findmnt",
+        [
+            "--noheadings",
+            "--raw",
+            "--output",
+            "TARGET,OPTIONS",
+            "--mountpoint",
+            str(binding.canonical_home),
+        ],
+        timeout=15,
+    )
+    mount_fields = str(mounted.get("stdout", "")).strip().split(maxsplit=1)
+    if (
+        not mounted.get("ok")
+        or len(mount_fields) != 2
+        or mount_fields[0] != str(binding.canonical_home)
+        or not {"rw", "nosuid", "nodev"}.issubset(set(mount_fields[1].split(",")))
+    ):
+        raise LifecycleValidationError(
+            "HOME_BINDING_REJECTED", "canonical owner home mount is not security normalized"
+        )
+    project_id = int(payload["project_id"])
+    quota_bytes = int(payload["quota_bytes"])
+    if (
+        quota_bytes != WORKSPACE_QUOTA_BYTES
+        or f"{project_id}:{binding.quota_root}" not in _safe_file_lines(PROJECTS_FILE)
+        or f"h100_{binding.username}:{project_id}" not in _safe_file_lines(PROJID_FILE)
+    ):
+        raise LifecycleValidationError(
+            "STORAGE_QUOTA_REJECTED", "job storage XFS project mapping is invalid"
+        )
+    _verified_project_quota(project_id, quota_bytes // 1024**3)
+    return binding
+
+
 def _validate_owned_descriptor(
     descriptor: int, *, directory: bool, uid: int, gid: int
 ) -> os.stat_result:
@@ -9011,15 +9114,19 @@ def _managed_sbatch_argv(
     ]
     if int(payload["gpu_count"]) == 1:
         argv.append("--gres=gpu:h100:1")
-    if payload.get("image_ref"):
-        owned_root = Path(str(payload["workspace_path"]))
-        argv.extend(
-            [
-                f"--container-image={payload['image_ref']}",
-                "--no-container-mount-home",
-                f"--container-mounts={owned_root}:{owned_root},{owned_root}:/workspace",
-            ]
-        )
+    owned_root = Path(str(payload["workspace_path"]))
+    home_source = Path(str(payload["home_source"]))
+    home_path = Path(str(payload["home_path"]))
+    argv.extend(
+        [
+            f"--container-image={payload['image_ref']}",
+            "--no-container-mount-home",
+            (
+                f"--container-mounts={owned_root}:{owned_root},"
+                f"{owned_root}:/workspace,{home_source}:{home_path}"
+            ),
+        ]
+    )
     argv.append(f"/proc/self/fd/{staged_descriptor}")
     return argv
 
@@ -9028,8 +9135,8 @@ def _execute_self_job_submit(request: WorkerRequest, payload: dict[str, Any]) ->
     staged_descriptor: int | None = None
     try:
         _managed_slurm_security_preflight(payload)
-        if payload.get("image_ref"):
-            _ensure_managed_enroot_directories(payload)
+        binding = _job_storage_binding(payload)
+        _ensure_managed_enroot_directories(payload)
         uid = int(payload["uid"])
         gid = int(payload["gid"])
         root = Path(str(payload["workspace_path"]))
@@ -9090,6 +9197,9 @@ def _execute_self_job_submit(request: WorkerRequest, payload: dict[str, Any]) ->
             "uid": uid,
             "gid": gid,
             "gpu_count": payload["gpu_count"],
+            "workspace_path": str(binding.compute_workspace),
+            "home_path": str(binding.compute_home),
+            "mount_contract_version": WORKSPACE_MOUNT_CONTRACT_VERSION,
             "lease_deadline_at": payload["lease_deadline_at"],
             "shell": False,
         }
@@ -9224,29 +9334,24 @@ def _self_job_status(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _self_storage(payload: dict[str, Any]) -> dict[str, Any]:
     try:
-        account = _managed_account(payload)
-        root = Path(workspace_path(int(payload["uid"])))
-        resolved = root.resolve(strict=True)
-        metadata = resolved.lstat()
+        _managed_account(payload)
+        binding = _workspace_binding_for_payload(payload, require_alias=True)
+        project_id = int(payload["project_id"])
+        quota_bytes = int(payload["quota_bytes"])
         if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or stat.S_ISLNK(metadata.st_mode)
-            or metadata.st_uid != account.pw_uid
-            or metadata.st_gid != account.pw_gid
-            or stat.S_IMODE(metadata.st_mode) & 0o007
+            quota_bytes != WORKSPACE_QUOTA_BYTES
+            or f"{project_id}:{binding.quota_root}" not in _safe_file_lines(PROJECTS_FILE)
+            or f"h100_{binding.username}:{project_id}" not in _safe_file_lines(PROJID_FILE)
         ):
             raise LifecycleValidationError(
-                "STORAGE_OWNERSHIP_REJECTED", "user storage ownership or mode is invalid"
+                "STORAGE_QUOTA_REJECTED", "storage XFS project mapping is invalid"
             )
-        usage = run_fixed("du", ["-s", "-B1", str(resolved)], timeout=60)
-        match = re.fullmatch(r"(\d+)\s+.+\n?", str(usage.get("stdout", "")))
-        if not usage.get("ok") or match is None:
-            raise LifecycleValidationError("STORAGE_USAGE_FAILED", "storage usage is unavailable")
+        quota = _verified_project_quota(project_id, quota_bytes // 1024**3)
         return {
             "status": "OK",
             "handler": "self.storage.read",
             "username": payload["username"],
-            "used_bytes": int(match.group(1)),
+            "used_bytes": int(quota["used_bytes"]),
             "private": True,
         }
     except (LifecycleValidationError, OSError) as exc:

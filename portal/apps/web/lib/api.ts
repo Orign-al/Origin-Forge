@@ -972,6 +972,7 @@ export const selfStorage = () =>
     status: string;
     storage: {
       root: string;
+      paths: [string, string];
       quota_bytes: number | null;
       used_bytes?: number | null;
       available_bytes?: number | null;

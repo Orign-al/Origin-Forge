@@ -10,6 +10,7 @@ from h100_portal_contracts.workspace import (
     WORKSPACE_CONTAINER_PATH,
     WORKSPACE_DEFAULT_WORKDIR,
     container_runtime_gpu_state,
+    workspace_binding,
     workspace_path,
 )
 from sqlalchemy import select
@@ -83,6 +84,7 @@ APPROVED_IMAGE_REFS = {
     "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
     "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
 }
+APPROVED_JOB_IMAGE = next(iter(APPROVED_IMAGE_REFS))
 
 
 def _error(status_code: int, code: str, message: str) -> HTTPException:
@@ -1369,6 +1371,7 @@ def submit_self_job(
         raise _error(422, "IMAGE_NOT_APPROVED", "镜像不在管理员批准清单中")
     resources = resolve_self_compute_context(db, context.user, lock=True)
     managed = resources.managed
+    binding = workspace_binding(managed.unix_username, managed.uid, managed.gid)
     active = resources.active_lease
     terminal = resources.terminal_lease
     now = utcnow()
@@ -1401,9 +1404,15 @@ def submit_self_job(
     workdir = str(WORKSPACE_DEFAULT_WORKDIR)
     stdout = f"outputs/{job_id}.out"
     stderr = f"outputs/{job_id}.err"
+    image_ref = body.image_ref or APPROVED_JOB_IMAGE
     payload = {
         **resources.worker_identity(),
         "workspace_path": resources.workspace,
+        "quota_root": str(binding.quota_root),
+        "home_source": str(binding.canonical_home),
+        "home_path": str(binding.compute_home),
+        "project_id": managed.project_id,
+        "quota_bytes": resources.storage.quota_bytes,
         "portal_job_id": str(job_id),
         "lease_id": str(active.id),
         "name": body.name,
@@ -1421,7 +1430,7 @@ def submit_self_job(
         "slurm_account": managed.slurm_account,
         "slurm_qos": managed.slurm_qos,
         "max_gpu": resources.max_gpu,
-        "image_ref": body.image_ref,
+        "image_ref": image_ref,
     }
     operation_payload = {key: value for key, value in payload.items() if key != "script_content"}
     operation_payload["script_bytes"] = len(script_bytes)
@@ -1451,7 +1460,7 @@ def submit_self_job(
         memory_mb=body.memory_mb,
         gpu_count=body.gpu_count,
         time_limit_seconds=body.time_limit_seconds,
-        image_ref=body.image_ref,
+        image_ref=image_ref,
         lease_deadline_at=terminal.expires_at,
     )
     db.add(job)
@@ -1645,6 +1654,11 @@ def self_storage(
                 "uid": managed.uid,
                 "gid": managed.gid,
                 "workspace_path": str(workspace_path(managed.uid)),
+                "quota_root": str(
+                    workspace_binding(managed.unix_username, managed.uid, managed.gid).quota_root
+                ),
+                "project_id": managed.project_id,
+                "quota_bytes": quota,
             },
             requested_by=context.user.normalized_login,
             idempotency_key=f"self-storage-read:{managed.id}",
@@ -1659,6 +1673,12 @@ def self_storage(
         "status": "OK",
         "storage": {
             "root": str(workspace_path(managed.uid)),
+            "paths": [
+                str(WORKSPACE_CONTAINER_PATH),
+                str(
+                    workspace_binding(managed.unix_username, managed.uid, managed.gid).compute_home
+                ),
+            ],
             "quota_bytes": quota,
             "used_bytes": used,
             "available_bytes": max(0, quota - used)

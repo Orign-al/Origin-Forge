@@ -13,6 +13,7 @@ readonly PORTAL3F_GPU_PROBE_SOURCE="${PLATFORM_DIR}/tests/gpu-device-mapping/gpu
 readonly COMPUTE_STAGE_SOURCE="${PLATFORM_DIR}/scripts/h100-provision-stage"
 readonly PLATFORM_COMMON_SOURCE="${PLATFORM_DIR}/scripts/h100-platform-common.sh"
 readonly WORKSPACE_ALIAS_SOURCE="${PLATFORM_DIR}/scripts/h100-workspace-alias"
+readonly HOME_ALIAS_SOURCE="${PLATFORM_DIR}/scripts/h100-home-alias"
 readonly USER_CREATE_SOURCE="${PLATFORM_DIR}/scripts/h100-user-create"
 readonly USER_GPU_ISOLATION_SOURCE="${PLATFORM_DIR}/scripts/h100-user-gpu-isolation"
 readonly CONTAINER_CREATE_SOURCE="${PLATFORM_DIR}/scripts/h100-container-create"
@@ -51,6 +52,8 @@ done
   || { echo "required deployment input missing: $PLATFORM_COMMON_SOURCE" >&2; exit 1; }
 [[ -f "$WORKSPACE_ALIAS_SOURCE" && ! -L "$WORKSPACE_ALIAS_SOURCE" ]] \
   || { echo "required deployment input missing: $WORKSPACE_ALIAS_SOURCE" >&2; exit 1; }
+[[ -f "$HOME_ALIAS_SOURCE" && ! -L "$HOME_ALIAS_SOURCE" ]] \
+  || { echo "required deployment input missing: $HOME_ALIAS_SOURCE" >&2; exit 1; }
 [[ -f "$USER_CREATE_SOURCE" && ! -L "$USER_CREATE_SOURCE" ]] \
   || { echo "required deployment input missing: $USER_CREATE_SOURCE" >&2; exit 1; }
 [[ -f "$USER_GPU_ISOLATION_SOURCE" && ! -L "$USER_GPU_ISOLATION_SOURCE" ]] \
@@ -107,6 +110,7 @@ install -d -o root -g root -m 0755 \
   "$RUNTIME_DIR/apps/web/.next/standalone/apps/web/.next/static" \
   "$RUNTIME_DIR/scripts" \
   "$RUNTIME_DIR/tests/gpu-device-mapping"
+install -d -o root -g root -m 0711 /storage/homes
 rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
   "$SOURCE_DIR/apps/web/.next/static/" \
   "$RUNTIME_DIR/apps/web/.next/standalone/apps/web/.next/static/"
@@ -136,6 +140,9 @@ install -o root -g gpu-platform-admin -m 0640 \
 install -o root -g gpu-platform-admin -m 0750 \
   "$WORKSPACE_ALIAS_SOURCE" \
   /usr/local/sbin/h100-workspace-alias
+install -o root -g gpu-platform-admin -m 0750 \
+  "$HOME_ALIAS_SOURCE" \
+  /usr/local/sbin/h100-home-alias
 install -o root -g gpu-platform-admin -m 0750 \
   "$USER_CREATE_SOURCE" \
   /usr/local/sbin/h100-user-create

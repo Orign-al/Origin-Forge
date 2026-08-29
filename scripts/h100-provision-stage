@@ -11,6 +11,7 @@ readonly COMPOSE_ROOT=/srv/gpu-platform/platform/config/dev-containers
 readonly CONTAINER_DATA_ROOT=/srv/gpu-platform/container-data
 readonly LOCAL_IMAGE_TOOL=/opt/h100-portal/venv/bin/h100-portal-local-image
 readonly WORKSPACE_ALIAS_TOOL=/usr/local/sbin/h100-workspace-alias
+readonly HOME_ALIAS_TOOL=/usr/local/sbin/h100-home-alias
 readonly GUARD_SERVICE=h100-gpu-bypass-guard.service
 readonly UID_MIN=20000
 readonly UID_MAX=60000
@@ -32,6 +33,7 @@ created_container=0
 created_compose=0
 created_image=0
 created_workspace_alias=0
+created_home_alias=0
 committed=0
 transaction_started=0
 backup_dir=
@@ -51,6 +53,7 @@ project_name=
 user_root=
 backing_workspace=
 workspace_root=
+home_alias_root=
 development_profile=
 container_name=
 compose_dir=
@@ -185,6 +188,19 @@ rollback() {
     fi
   else
     rollback_mark WORKSPACE_ALIAS NOT_REQUIRED
+  fi
+  if ((created_home_alias == 1)) \
+    || { [[ -n "${home_alias_root}" ]] \
+      && findmnt --noheadings --mountpoint "${home_alias_root}" >/dev/null 2>&1; }; then
+    if "${HOME_ALIAS_TOOL}" remove "${username}" "${uid}" "${gid}" \
+      --confirm-remove "${username}" >/dev/null 2>&1; then
+      rollback_mark HOME_ALIAS SUCCEEDED
+    else
+      rollback_mark HOME_ALIAS FAILED
+      manual_review=1
+    fi
+  else
+    rollback_mark HOME_ALIAS NOT_REQUIRED
   fi
   if ((created_image == 1)); then
     if docker image rm "${derived_image}" >/dev/null 2>&1; then
@@ -390,6 +406,7 @@ project_name="h100_${username}"
 user_root="${H100_DATA_ROOT}/users/${username}"
 backing_workspace="${user_root}/workspace"
 workspace_root="${H100_WORKSPACE_ROOT}/${uid}"
+home_alias_root="${H100_HOME_ALIAS_ROOT}/${uid}"
 container_name="gpu-dev-${username}"
 derived_image="h100-local/dev-container:ubuntu24.04-${username}-${plan_id}"
 compose_dir="${COMPOSE_ROOT}/${username}"
@@ -400,7 +417,7 @@ getent passwd "${username}" >/dev/null && fail 'Linux user already exists'
 getent group "${username}" >/dev/null && fail 'Linux group already exists'
 getent passwd "${uid}" >/dev/null && fail 'UID already exists'
 getent group "${gid}" >/dev/null && fail 'GID already exists'
-[[ ! -e "${user_root}" && ! -e "${workspace_root}" \
+[[ ! -e "${user_root}" && ! -e "${workspace_root}" && ! -e "${home_alias_root}" \
   && ! -e "${CONTAINER_DATA_ROOT}/${username}" ]] \
   || fail 'target storage already exists'
 [[ ! -e "${state_file}" && ! -e "${compose_dir}" ]] || fail 'target lifecycle state exists'
@@ -533,6 +550,9 @@ install -d -o "${uid}" -g "${gid}" -m 0700 \
 "${WORKSPACE_ALIAS_TOOL}" prepare "${username}" "${uid}" "${gid}"
 created_workspace_alias=1
 "${WORKSPACE_ALIAS_TOOL}" verify "${username}" "${uid}" "${gid}"
+"${HOME_ALIAS_TOOL}" prepare "${username}" "${uid}" "${gid}"
+created_home_alias=1
+"${HOME_ALIAS_TOOL}" verify "${username}" "${uid}" "${gid}"
 install -d -o root -g root -m 0700 \
   "${CONTAINER_DATA_ROOT}/${username}" \
   "${CONTAINER_DATA_ROOT}/${username}/ssh-host-keys"
