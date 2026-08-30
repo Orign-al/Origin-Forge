@@ -28,6 +28,8 @@ readonly CONTAINER_GPU_RUNTIME_SOURCE="${PLATFORM_DIR}/scripts/h100-container-gp
 readonly GPU_DEVELOPMENT_EPILOG_SOURCE="${PLATFORM_DIR}/scripts/h100-gpu-development-epilog"
 readonly EASYTIER_LEGACY_INGRESS_SOURCE="${PLATFORM_DIR}/scripts/h100-easytier-legacy-ingress"
 readonly EASYTIER_DUAL_RECONCILE_SOURCE="${PLATFORM_DIR}/scripts/h100-reconcile-dual-easytier-ingress"
+readonly USER_CLI_SOURCE="${SOURCE_DIR}/apps/cli/h100"
+readonly CLI_ROLLOUT_SOURCE="${PLATFORM_DIR}/scripts/h100-cli-rollout"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "install-runtime.sh must run as root" >&2
@@ -82,6 +84,10 @@ done
   || { echo "required deployment input missing: $EASYTIER_LEGACY_INGRESS_SOURCE" >&2; exit 1; }
 [[ -f "$EASYTIER_DUAL_RECONCILE_SOURCE" && ! -L "$EASYTIER_DUAL_RECONCILE_SOURCE" ]] \
   || { echo "required deployment input missing: $EASYTIER_DUAL_RECONCILE_SOURCE" >&2; exit 1; }
+[[ -f "$USER_CLI_SOURCE" && ! -L "$USER_CLI_SOURCE" ]] \
+  || { echo "required deployment input missing: $USER_CLI_SOURCE" >&2; exit 1; }
+[[ -f "$CLI_ROLLOUT_SOURCE" && ! -L "$CLI_ROLLOUT_SOURCE" ]] \
+  || { echo "required deployment input missing: $CLI_ROLLOUT_SOURCE" >&2; exit 1; }
 
 rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
   --exclude=/node_modules/ \
@@ -134,6 +140,9 @@ install -d -o root -g root -m 0700 "${SSH_KEY_STAGING_DIR}"
 # alias handler before the Stage handler and integrity manifest can refer to
 # them, so an interrupted deployment remains fail closed.
 install -d -o root -g gpu-platform-admin -m 0750 "${PLATFORM_LIBRARY_DIR}"
+install -o root -g root -m 0555 \
+  "$USER_CLI_SOURCE" \
+  "${PLATFORM_LIBRARY_DIR}/h100-cli"
 install -o root -g gpu-platform-admin -m 0640 \
   "$PLATFORM_COMMON_SOURCE" \
   "${PLATFORM_LIBRARY_DIR}/h100-platform-common.sh"
@@ -189,6 +198,9 @@ install -o root -g root -m 0750 \
 install -o root -g root -m 0750 \
   "$EASYTIER_DUAL_RECONCILE_SOURCE" \
   /usr/local/sbin/h100-reconcile-dual-easytier-ingress
+install -o root -g root -m 0750 \
+  "$CLI_ROLLOUT_SOURCE" \
+  /usr/local/sbin/h100-cli-rollout
 
 install -o root -g root -m 0640 \
   "$SOURCE_DIR/deploy/worker-scripts.json" \
@@ -220,7 +232,9 @@ for unit in \
   h100-portal-provision-reconcile.timer \
   h100-easytier-legacy-ingress.service \
   h100-reconcile-dual-easytier-ingress.service \
-  h100-reconcile-dual-easytier-ingress.timer; do
+  h100-reconcile-dual-easytier-ingress.timer \
+  h100-cli-rollout.service \
+  h100-cli-rollout.timer; do
   install -o root -g root -m 0644 "$SOURCE_DIR/deploy/systemd/$unit" "$UNIT_DIR/$unit"
 done
 

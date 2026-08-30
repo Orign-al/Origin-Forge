@@ -112,6 +112,10 @@ INTEGRITY_FILE_ALLOWLIST = {
     # h100-provision-stage sources this root-owned library before it performs
     # any validation or writes, so it is part of the execution trust boundary.
     "h100-platform-common": "/usr/local/lib/h100-platform/h100-platform-common.sh",
+    # The ordinary-user CLI is mounted read-only into development containers.
+    # The rollout helper is host-only and never exposed inside a container.
+    "h100-cli": "/usr/local/lib/h100-platform/h100-cli",
+    "h100-cli-rollout": "/usr/local/sbin/h100-cli-rollout",
 }
 SCRIPT_HASH_CONFIG = Path("/etc/h100-portal/worker-scripts.json")
 GPU_ISOLATED_USERS = Path("/etc/h100-platform/gpu-isolated-users")
@@ -8810,6 +8814,28 @@ def _managed_user_path(root: Path, relative: str, *, directory: bool, uid: int, 
         return path
 
 
+def _managed_job_workdir(root: Path, relative: str, *, uid: int, gid: int) -> Path:
+    if relative != ".":
+        return _managed_user_path(root, relative, directory=True, uid=uid, gid=gid)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        _validate_owned_descriptor(descriptor, directory=True, uid=uid, gid=gid)
+        return root
+    except LifecycleValidationError:
+        raise
+    except OSError as exc:
+        raise LifecycleValidationError(
+            "USER_PATH_NOT_FOUND", "requested user path cannot be opened safely"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _read_regular_descriptor(descriptor: int, metadata: os.stat_result) -> bytes:
     if metadata.st_size <= 0 or metadata.st_size > 1024 * 1024:
         raise LifecycleValidationError("JOB_SCRIPT_REJECTED", "job script size is invalid")
@@ -9123,7 +9149,8 @@ def _managed_sbatch_argv(
             "--no-container-mount-home",
             (
                 f"--container-mounts={owned_root}:{owned_root},"
-                f"{owned_root}:/workspace,{home_source}:{home_path}"
+                f"{owned_root}:/workspace,{home_source}:{home_source},"
+                f"{home_source}:{home_path}"
             ),
         ]
     )
@@ -9145,10 +9172,12 @@ def _execute_self_job_submit(request: WorkerRequest, payload: dict[str, Any]) ->
                 "WORKSPACE_BINDING_REJECTED", "workspace is not derived from the managed UID"
             )
         content = str(payload["script_content"]).encode("utf-8")
-        workdir = _managed_user_path(
-            root,
+        workdir_root = (
+            root if payload["workdir_scope"] == "workspace" else Path(str(payload["home_source"]))
+        )
+        workdir = _managed_job_workdir(
+            workdir_root,
             str(payload["workdir_relative_path"]),
-            directory=True,
             uid=uid,
             gid=gid,
         )
@@ -9222,14 +9251,17 @@ def _execute_self_job_cancel(request: WorkerRequest, payload: dict[str, Any]) ->
         cancelled = _run_as_managed_user(payload, [BINARIES["scancel"], str(job_id)], timeout=20)
         if not cancelled.get("ok"):
             raise LifecycleValidationError("JOB_CANCEL_FAILED", "Slurm job cancellation failed")
-        return {
+        response: dict[str, Any] = {
             "status": "SUCCEEDED",
             "handler": "self.job.cancel",
             "request_id": request.request_id,
             "slurm_job_id": job_id,
             "slurm_user": payload["username"],
-            "job_state": "CANCELLED",
         }
+        projection = _self_job_status(payload)
+        if projection.get("status") == "OK":
+            response["job_state"] = projection.get("job_state")
+        return response
     except LifecycleValidationError as exc:
         return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
 
@@ -9271,6 +9303,30 @@ def _self_job_logs(payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}
 
 
+def _slurm_elapsed_seconds(value: str | None) -> int | None:
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
+    match = re.fullmatch(r"(?:(\d+)-)?(\d{1,2}):(\d{2}):(\d{2})", value)
+    if match is None:
+        return None
+    days, hours, minutes, seconds = match.groups()
+    return int(days or 0) * 86400 + int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+
+
+def _slurm_timestamp(value: str | None) -> str | None:
+    if not value or value in {"Unknown", "N/A", "None"}:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat()
+
+
 def _self_job_status(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         _managed_account(payload)
@@ -9282,9 +9338,13 @@ def _self_job_status(payload: dict[str, Any]) -> dict[str, Any]:
         live = run_fixed("scontrol", ["show", "job", str(job_id), "-o"], timeout=15)
         if live.get("ok"):
             line = str(live.get("stdout", ""))
-            state_match = re.search(r"(?:^|\s)JobState=([^\s]+)", line)
-            state = state_match.group(1) if state_match else "UNKNOWN"
+            fields = dict(re.findall(r"(?:^|\s)([A-Za-z][A-Za-z0-9]*)=([^\s]*)", line))
+            state = fields.get("JobState", "UNKNOWN")
             exit_code = None
+            elapsed_seconds = _slurm_elapsed_seconds(fields.get("RunTime"))
+            started_at = _slurm_timestamp(fields.get("StartTime"))
+            finished_at = _slurm_timestamp(fields.get("EndTime"))
+            reason = fields.get("Reason")
         else:
             history = run_fixed(
                 "sacct",
@@ -9295,7 +9355,7 @@ def _self_job_status(payload: dict[str, Any]) -> dict[str, Any]:
                     "-j",
                     str(job_id),
                     "-o",
-                    "JobIDRaw,User,State,ExitCode,Elapsed,AllocTRES,StdOut,StdErr",
+                    "JobIDRaw,User,State,ExitCode,ElapsedRaw,Start,End,Reason",
                 ],
                 timeout=20,
             )
@@ -9320,6 +9380,12 @@ def _self_job_status(payload: dict[str, Any]) -> dict[str, Any]:
                 )
             state = row[2]
             exit_code = row[3]
+            elapsed_seconds = _slurm_elapsed_seconds(row[4])
+            started_at = _slurm_timestamp(row[5])
+            finished_at = _slurm_timestamp(row[6])
+            reason = row[7]
+        if reason in {None, "", "None", "N/A"}:
+            reason = None
         return {
             "status": "OK",
             "handler": "self.job.status.read",
@@ -9327,6 +9393,10 @@ def _self_job_status(payload: dict[str, Any]) -> dict[str, Any]:
             "slurm_user": payload["username"],
             "job_state": state,
             "exit_code": exit_code,
+            "state_reason": str(reason)[:512] if reason else None,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "elapsed_seconds": elapsed_seconds,
         }
     except LifecycleValidationError as exc:
         return {"status": "ERROR", "error": {"code": exc.code, "message": str(exc)}}

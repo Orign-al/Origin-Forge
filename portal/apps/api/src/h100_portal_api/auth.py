@@ -8,6 +8,7 @@ from fastapi import HTTPException, Request, Response, status
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from h100_portal_api.audit import record_audit
 from h100_portal_api.config import get_settings
 from h100_portal_api.delegated_auth import (
     DELEGATED_CREDENTIAL_PREFIX,
@@ -15,6 +16,7 @@ from h100_portal_api.delegated_auth import (
 )
 from h100_portal_api.enums import PasswordActionTokenState, PasswordState
 from h100_portal_api.models import (
+    PortalCliToken,
     PortalDelegatedTestSession,
     PortalManagedUser,
     PortalPasswordSetupToken,
@@ -34,6 +36,8 @@ from h100_portal_api.security import (
 )
 
 AUTH_ERROR = {"code": "AUTHENTICATION_FAILED", "message": "用户名或密码不正确"}
+CLI_TOKEN_PREFIX = "h100_cli_"  # noqa: S105 - public credential type discriminator
+CLI_TOKEN_PERMISSIONS = frozenset({"self.jobs.submit", "self.jobs.read", "self.jobs.cancel"})
 
 
 class AuthContext(NamedTuple):
@@ -44,6 +48,7 @@ class AuthContext(NamedTuple):
     session_raw: str
     actor_user: PortalUser | None = None
     delegation: PortalDelegatedTestSession | None = None
+    cli_token: PortalCliToken | None = None
 
     @property
     def actor(self) -> PortalUser:
@@ -56,6 +61,10 @@ class AuthContext(NamedTuple):
     @property
     def is_delegated(self) -> bool:
         return self.delegation is not None
+
+    @property
+    def is_cli_token(self) -> bool:
+        return self.cli_token is not None
 
 
 class SlidingRateLimiter:
@@ -122,16 +131,15 @@ def require_preauth_csrf(request: Request) -> None:
 
 
 def require_session_csrf(request: Request, context: AuthContext) -> None:
-    if context.is_delegated:
-        # A delegated bearer is an explicit proof-of-possession credential, not
-        # an ambient browser cookie.  Scope enforcement has already run in the
-        # permission dependency; still bind this write to the exact header that
-        # produced the context.
+    if context.is_delegated or context.is_cli_token:
+        # Bearer credentials are explicit proof-of-possession credentials, not
+        # ambient browser cookies. Bind the write to the exact credential that
+        # produced this context; authorization is enforced separately.
         authorization = request.headers.get("authorization", "")
         if not secrets.compare_digest(authorization, f"Bearer {context.session_raw}"):
             raise HTTPException(
                 status_code=403,
-                detail={"code": "DELEGATED_CREDENTIAL_REJECTED", "message": "委托凭据无效"},
+                detail={"code": "BEARER_CREDENTIAL_REJECTED", "message": "Bearer凭据无效"},
             )
         return
     ensure_allowed_origin(request)
@@ -346,6 +354,74 @@ def load_delegated_context(db: Session, request: Request) -> AuthContext:
     )
 
 
+def load_cli_token_context(db: Session, request: Request) -> AuthContext:
+    if "token" in request.query_params:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "CLI_TOKEN_QUERY_REJECTED", "message": "CLI Token不得放入查询字符串"},
+        )
+    authorization = request.headers.get("authorization", "")
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        raise HTTPException(
+            status_code=401, detail={"code": "AUTH_REQUIRED", "message": "请先登录"}
+        )
+    credential = authorization[len(prefix) :]
+    expected_length = len(CLI_TOKEN_PREFIX) + 64
+    if len(credential) != expected_length or not credential.startswith(CLI_TOKEN_PREFIX):
+        raise HTTPException(
+            status_code=401, detail={"code": "AUTH_REQUIRED", "message": "请先登录"}
+        )
+    cli_token = db.scalar(
+        select(PortalCliToken).where(PortalCliToken.token_hash == digest_secret(credential))
+    )
+    now = utcnow()
+    if cli_token is None:
+        raise HTTPException(
+            status_code=401, detail={"code": "AUTH_REQUIRED", "message": "CLI Token无效"}
+        )
+    user = db.get(PortalUser, cli_token.user_id)
+    denied_code = None
+    if cli_token.revoked_at is not None:
+        denied_code = "CLI_TOKEN_REVOKED"
+    elif cli_token.expires_at is not None and ensure_utc(cli_token.expires_at) <= now:
+        denied_code = "CLI_TOKEN_EXPIRED"
+    elif (
+        user is None
+        or user.account_state != "ACTIVE"
+        or user.password_state != PasswordState.SET
+        or role_names(user) != ["user"]
+    ):
+        denied_code = "CLI_TOKEN_ACCOUNT_INACTIVE"
+    if denied_code is not None or user is None:
+        if user is not None:
+            record_audit(
+                db,
+                event_type="CLI_TOKEN_USE",
+                actor=user.normalized_login,
+                actor_role=highest_role(user),
+                source_ip=client_ip(request),
+                user_agent=user_agent(request),
+                object_type="cli_token",
+                object_id=str(cli_token.id),
+                result="DENIED",
+                metadata={"reason": denied_code, "path": request.url.path},
+            )
+            db.commit()
+        raise HTTPException(
+            status_code=401,
+            detail={"code": denied_code or "AUTH_REQUIRED", "message": "CLI Token无效或已失效"},
+        )
+    cli_token.last_used_at = now
+    request.state.cli_token_audit = {
+        "token_id": str(cli_token.id),
+        "user": user.normalized_login,
+        "label": cli_token.label,
+    }
+    db.commit()
+    return AuthContext(user=user, session=None, session_raw=credential, cli_token=cli_token)
+
+
 def require_recent_reauthentication(context: AuthContext) -> None:
     if context.is_delegated or context.session is None:
         raise HTTPException(
@@ -371,6 +447,15 @@ def revoke_user_sessions(db: Session, user_id: object, except_id: object | None 
     if except_id is not None:
         statement = statement.where(PortalSession.id != except_id)
     result = db.execute(statement.values(revoked_at=utcnow()))
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+def revoke_user_cli_tokens(db: Session, user_id: object) -> int:
+    result = db.execute(
+        update(PortalCliToken)
+        .where(PortalCliToken.user_id == user_id, PortalCliToken.revoked_at.is_(None))
+        .values(revoked_at=utcnow())
+    )
     return int(getattr(result, "rowcount", 0) or 0)
 
 

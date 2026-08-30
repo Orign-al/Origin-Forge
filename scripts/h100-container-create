@@ -160,6 +160,12 @@ services:
         target: /etc/ssh/persistent
         bind:
           propagation: rprivate
+      - type: bind
+        source: /usr/local/lib/h100-platform/h100-cli
+        target: /usr/local/bin/h100
+        read_only: true
+        bind:
+          propagation: rprivate
     environment:
       TZ: Asia/Shanghai
     cpus: 8.0
@@ -203,6 +209,7 @@ docker inspect "${container}" | jq -e \
       | map([.HostIp, .HostPort]) | sort)
       == ([[$host_ip, $host_port], [$legacy_host_ip, $host_port]] | sort))
     and (($c.Mounts // []) | map(select(.Source == $workspace and .Destination == "/workspace" and .RW == true)) | length == 1)
+    and (($c.Mounts // []) | map(select(.Source == "/usr/local/lib/h100-platform/h100-cli" and .Destination == "/usr/local/bin/h100" and .RW == false)) | length == 1)
     and (($c.Mounts // []) | map(.Destination) | index("/var/run/docker.sock") | not)
     and (($c.Mounts // []) | map(.Source) | index("/") | not)
   ' >/dev/null || h100_fail 'created container failed isolation/resource validation'

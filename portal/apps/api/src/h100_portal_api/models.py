@@ -164,6 +164,27 @@ class PortalSession(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class PortalCliToken(Base):
+    __tablename__ = "portal_cli_tokens"
+    __table_args__ = (
+        CheckConstraint(
+            "expires_at IS NULL OR expires_at > created_at", name="ck_cli_token_expiry"
+        ),
+        Index("ix_cli_token_user_active", "user_id", "revoked_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("portal_users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    label: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class PortalDelegatedTestSession(Base):
     """Short-lived, scope-limited bearer delegation for controlled acceptance tests."""
 
@@ -894,7 +915,9 @@ class PortalJob(Base):
     slurm_job_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, index=True)
     name: Mapped[str] = mapped_column(String(64), nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    state_reason: Mapped[str | None] = mapped_column(String(512))
     script_relative_path: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_path: Mapped[str | None] = mapped_column(String(512))
     workdir_relative_path: Mapped[str] = mapped_column(String(255), nullable=False)
     stdout_relative_path: Mapped[str] = mapped_column(String(255), nullable=False)
     stderr_relative_path: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -906,7 +929,9 @@ class PortalJob(Base):
     lease_deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    elapsed_seconds: Mapped[int | None] = mapped_column(Integer)
     exit_code: Mapped[str | None] = mapped_column(String(32))
 
 

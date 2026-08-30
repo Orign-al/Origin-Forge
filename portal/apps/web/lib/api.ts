@@ -259,6 +259,18 @@ export type PortalSession = {
   source_ip: string;
 };
 
+export type CliToken = {
+  id: string;
+  label: string;
+  state: "ACTIVE" | "EXPIRED" | "REVOKED";
+  created_at: string;
+  expires_at: string | null;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  scopes: ["self.jobs.submit", "self.jobs.read", "self.jobs.cancel"];
+  owner_bound: true;
+};
+
 export type ComputeLease = {
   id?: string;
   state: string;
@@ -308,19 +320,25 @@ export type SelfJob = {
   slurm_job_id: number | null;
   name: string;
   state: string;
+  reason: string | null;
   cpus: number;
   memory_mb: number;
   gpu_count: 0 | 1;
   time_limit_seconds: number;
   script_path: string;
+  script_snapshot_path: string;
+  source_path: string | null;
   workdir: string;
   stdout_path: string;
   stderr_path: string;
   lease_deadline_at: string;
   created_at: string;
   submitted_at: string | null;
+  started_at: string | null;
   finished_at: string | null;
+  elapsed_seconds: number | null;
   exit_code: string | null;
+  authoritative: boolean;
 };
 
 export type SelfTerminal = {
@@ -658,6 +676,26 @@ export const revokeOtherSessions = () =>
   apiFetch<{ revoked: number }>("/auth/sessions/revoke-others", {
     method: "POST",
   });
+export const cliTokens = () =>
+  apiFetch<{ status: string; tokens: CliToken[]; count: number }>(
+    "/auth/cli-tokens",
+  );
+export const createCliToken = (payload: {
+  label: string;
+  expires_in_days: number | null;
+}) =>
+  apiFetch<{
+    status: "CREATED";
+    token: string;
+    credential: CliToken;
+  }>("/auth/cli-tokens", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+export const revokeCliToken = (id: string) =>
+  apiFetch<void>(`/auth/cli-tokens/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
 export const changePassword = (payload: {
   current_password: string;
   new_password: string;
@@ -949,6 +987,7 @@ export const submitSelfJob = (payload: {
   gpu_count: 0 | 1;
   time_limit_seconds: number;
   image_ref: string | null;
+  source_path?: string | null;
   idempotency_key: string;
 }) =>
   apiFetch<{ status: string; job: SelfJob }>("/self/jobs", {
@@ -956,7 +995,7 @@ export const submitSelfJob = (payload: {
     body: JSON.stringify(payload),
   });
 export const selfJobLogs = (id: string) =>
-  apiFetch<{ status: string; stdout: string; stderr: string }>(
+  apiFetch<{ status: string; stdout: string; stderr: string; job: SelfJob }>(
     `/self/jobs/${encodeURIComponent(id)}/logs`,
   );
 export const cancelSelfJob = (id: string) =>

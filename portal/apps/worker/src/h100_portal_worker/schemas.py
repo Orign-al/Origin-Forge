@@ -8,7 +8,6 @@ from h100_portal_contracts.workspace import (
     CPU_DEVELOPMENT_PROFILE,
     DEVELOPMENT_PROFILES,
     GPU_DEVELOPMENT_PROFILE,
-    WORKSPACE_DEFAULT_WORKDIR,
     profile_gpu_count,
     workspace_binding,
     workspace_path,
@@ -1358,6 +1357,7 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
         "script_relative_path",
         "script_content",
         "script_sha256",
+        "workdir_scope",
         "workdir_relative_path",
         "stdout_relative_path",
         "stderr_relative_path",
@@ -1468,7 +1468,13 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
     ):
         raise PayloadValidationError("JOB_SCRIPT_REJECTED", "job script artifact is invalid")
     expected_script = f".portal/job-scripts/{portal_job_id}.sh"
-    workdir = _relative_user_path(payload.get("workdir_relative_path"), "workdir")
+    workdir_scope = payload.get("workdir_scope")
+    if workdir_scope not in {"workspace", "home"}:
+        raise PayloadValidationError(
+            "ARBITRARY_PATH_REJECTED", "job working directory scope is invalid"
+        )
+    workdir_value = payload.get("workdir_relative_path")
+    workdir = "." if workdir_value == "." else _relative_user_path(workdir_value, "workdir")
     slurm_account = payload.get("slurm_account")
     slurm_qos = payload.get("slurm_qos")
     if slurm_account != "company" or slurm_qos != "general":
@@ -1490,6 +1496,7 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
             ),
             "script_content": script_content,
             "script_sha256": script_sha256,
+            "workdir_scope": workdir_scope,
             "workdir_relative_path": workdir,
             "stdout_relative_path": stdout_path,
             "stderr_relative_path": stderr_path,
@@ -1504,12 +1511,8 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
             "image_ref": image_ref,
         }
     )
-    if result["script_relative_path"] != expected_script or workdir != str(
-        WORKSPACE_DEFAULT_WORKDIR
-    ):
-        raise PayloadValidationError(
-            "JOB_SCRIPT_REJECTED", "job script and working directory are not server-bound"
-        )
+    if result["script_relative_path"] != expected_script:
+        raise PayloadValidationError("JOB_SCRIPT_REJECTED", "job script path is not server-bound")
     return result
 
 

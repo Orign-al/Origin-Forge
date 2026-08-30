@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+source /usr/local/lib/h100-platform/h100-platform-common.sh
+
+readonly CLI_SOURCE=/usr/local/lib/h100-platform/h100-cli
+readonly CLI_TARGET=/usr/local/bin/h100
+
+usage() {
+  printf 'Usage: h100-cli-rollout {--all|USER}\n'
+}
+
+if (($# != 1)) || [[ "$1" == --help ]]; then
+  usage
+  [[ "${1:-}" == --help && $# -eq 1 ]] && exit 0 || exit 2
+fi
+
+h100_require_root
+[[ -f "${CLI_SOURCE}" && ! -L "${CLI_SOURCE}" ]] \
+  || h100_fail 'host-managed CLI source is unavailable'
+[[ "$(stat -c '%U:%G:%a' "${CLI_SOURCE}")" == root:root:555 ]] \
+  || h100_fail 'host-managed CLI source metadata is invalid'
+expected_sha256="$(sha256sum "${CLI_SOURCE}" | awk '{print $1}')"
+readonly expected_sha256
+
+rollout_container() {
+  local container=$1
+  local expected_user=$2
+  local actual_name actual_user actual_uid actual_gid observed_sha256
+  local temp_target=/usr/local/bin/.h100-rollout
+
+  h100_validate_username "${expected_user}"
+  actual_name="$(docker inspect --format '{{.Name}}' "${container}")"
+  actual_name="${actual_name#/}"
+  actual_user="$(docker inspect --format '{{index .Config.Labels "h100.dev.user"}}' "${container}")"
+  actual_uid="$(docker inspect --format '{{index .Config.Labels "h100.dev.uid"}}' "${container}")"
+  actual_gid="$(docker inspect --format '{{index .Config.Labels "h100.dev.gid"}}' "${container}")"
+  [[ "${actual_name}" == "gpu-dev-${expected_user}" \
+    && "${actual_user}" == "${expected_user}" \
+    && "${actual_uid}" == "$(id -u "${expected_user}")" \
+    && "${actual_gid}" == "$(id -g "${expected_user}")" ]] \
+    || h100_fail "managed container identity is invalid: ${container}"
+  docker inspect "${container}" | jq -e '
+    .[0].HostConfig.Privileged == false
+    and .[0].HostConfig.NetworkMode != "host"
+    and .[0].HostConfig.PidMode != "host"
+    and .[0].HostConfig.IpcMode != "host"
+    and ((.[0].HostConfig.CapAdd // []) | index("SYS_ADMIN") | not)
+    and ((.[0].Mounts // []) | map(.Destination) | index("/var/run/docker.sock") | not)
+    and ((.[0].Mounts // []) | map(.Destination) | index("/run/h100-portal/worker.sock") | not)
+  ' >/dev/null || h100_fail "container security boundary is invalid: ${container}"
+
+  if [[ "$(docker inspect --format '{{.State.Running}}' "${container}")" != true ]]; then
+    printf 'CLI DEFERRED user=%s container=%s state=stopped\n' "${expected_user}" "${container}"
+    return 0
+  fi
+
+  if docker inspect "${container}" | jq -e \
+    --arg source "${CLI_SOURCE}" --arg target "${CLI_TARGET}" '
+      ((.[0].Mounts // [])
+        | map(select(.Source == $source and .Destination == $target and .RW == false))
+        | length) == 1
+    ' >/dev/null; then
+    observed_sha256="$(docker exec "${container}" sha256sum "${CLI_TARGET}" | awk '{print $1}')"
+    [[ "${observed_sha256}" == "${expected_sha256}" ]] \
+      || h100_fail "Compose-mounted CLI hash is stale: ${container}"
+    printf 'CLI READY user=%s container=%s mode=compose-read-only sha256=%s\n' \
+      "${expected_user}" "${container}" "${expected_sha256}"
+    return 0
+  fi
+  docker inspect "${container}" | jq -e --arg target "${CLI_TARGET}" '
+    ((.[0].Mounts // []) | map(select(.Destination == $target)) | length) == 0
+  ' >/dev/null || h100_fail "unexpected CLI target mount exists: ${container}"
+
+  if docker exec "${container}" test -e "${CLI_TARGET}"; then
+    [[ "$(docker exec "${container}" stat -c '%U:%G:%a' "${CLI_TARGET}")" == root:root:555 ]] \
+      || h100_fail "existing container CLI metadata is invalid: ${container}"
+    observed_sha256="$(docker exec "${container}" sha256sum "${CLI_TARGET}" | awk '{print $1}')"
+    if [[ "${observed_sha256}" == "${expected_sha256}" ]]; then
+      printf 'CLI READY user=%s container=%s mode=live-root-owned sha256=%s\n' \
+        "${expected_user}" "${container}" "${expected_sha256}"
+      return 0
+    fi
+  fi
+  docker exec --user 0 "${container}" rm -f -- "${temp_target}"
+  docker cp "${CLI_SOURCE}" "${container}:${temp_target}"
+  docker exec --user 0 "${container}" chown root:root "${temp_target}"
+  docker exec --user 0 "${container}" chmod 0555 "${temp_target}"
+  observed_sha256="$(docker exec "${container}" sha256sum "${temp_target}" | awk '{print $1}')"
+  [[ "${observed_sha256}" == "${expected_sha256}" ]] \
+    || h100_fail "staged container CLI hash is invalid: ${container}"
+  docker exec --user 0 "${container}" mv -f -- "${temp_target}" "${CLI_TARGET}"
+  [[ "$(docker exec "${container}" stat -c '%U:%G:%a' "${CLI_TARGET}")" == root:root:555 ]] \
+    || h100_fail "container CLI metadata is invalid: ${container}"
+  observed_sha256="$(docker exec "${container}" sha256sum "${CLI_TARGET}" | awk '{print $1}')"
+  [[ "${observed_sha256}" == "${expected_sha256}" ]] \
+    || h100_fail "container CLI hash is invalid: ${container}"
+  printf 'CLI READY user=%s container=%s mode=live-root-owned sha256=%s\n' \
+    "${expected_user}" "${container}" "${expected_sha256}"
+}
+
+if [[ "$1" == --all ]]; then
+  found=0
+  while IFS=$'\t' read -r container user_name; do
+    [[ -n "${container}" && -n "${user_name}" ]] || continue
+    found=$((found + 1))
+    rollout_container "${container}" "${user_name}"
+  done < <(
+    docker ps --all --filter label=h100.dev.user \
+      --format '{{.Names}}\t{{.Label "h100.dev.user"}}' | sort
+  )
+  printf 'CLI ROLLOUT COMPLETE containers=%s\n' "${found}"
+else
+  h100_validate_username "$1"
+  rollout_container "$(h100_container_name "$1")" "$1"
+fi

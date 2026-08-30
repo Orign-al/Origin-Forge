@@ -16,10 +16,15 @@ type MockState = {
   createdInvitedUser?: boolean;
   setupLinkGenerated?: boolean;
   resetLinkGenerated?: boolean;
+  cliReauthenticated?: boolean;
+  cliTokenCreated?: boolean;
+  cliTokenRevoked?: boolean;
 };
 
 const MOCK_SETUP_TOKEN = "test-only-portal-setup-token-with-forty-eight-bytes";
 const MOCK_PASSWORD = "A sufficiently long portal passphrase";
+const MOCK_CLI_TOKEN_ID = "00000000-0000-4000-8000-000000000060";
+const MOCK_CLI_TOKEN = `h100_cli_${"A".repeat(64)}`;
 
 const owner = {
   id: "00000000-0000-4000-8000-000000000001",
@@ -495,6 +500,75 @@ async function installMockApi(page: Page, state: MockState): Promise<void> {
     }
     if (path === "/auth/password") {
       await json(route, { changed: true });
+      return;
+    }
+    if (path === "/auth/reauthenticate") {
+      state.cliReauthenticated = true;
+      await json(route, { reauthenticated: true });
+      return;
+    }
+    if (path === "/auth/cli-tokens" && request.method() === "GET") {
+      const tokens = state.cliTokenRevoked
+        ? []
+        : [
+            {
+              id: MOCK_CLI_TOKEN_ID,
+              label: state.cliTokenCreated
+                ? "development container"
+                : "existing container",
+              state: "ACTIVE",
+              created_at: "2026-08-30T12:00:00Z",
+              expires_at: "2026-11-28T12:00:00Z",
+              last_used_at: null,
+              revoked_at: null,
+              scopes: [
+                "self.jobs.submit",
+                "self.jobs.read",
+                "self.jobs.cancel",
+              ],
+              owner_bound: true,
+            },
+          ];
+      await json(route, { status: "OK", tokens, count: tokens.length });
+      return;
+    }
+    if (path === "/auth/cli-tokens" && request.method() === "POST") {
+      if (!state.cliReauthenticated) {
+        await json(
+          route,
+          { detail: { code: "REAUTH_REQUIRED", message: "需要最近重新认证" } },
+          428,
+        );
+        return;
+      }
+      state.cliTokenCreated = true;
+      await json(
+        route,
+        {
+          status: "CREATED",
+          token: MOCK_CLI_TOKEN,
+          credential: {
+            id: MOCK_CLI_TOKEN_ID,
+            label: "development container",
+            state: "ACTIVE",
+            created_at: "2026-08-30T12:00:00Z",
+            expires_at: "2026-11-28T12:00:00Z",
+            last_used_at: null,
+            revoked_at: null,
+            scopes: ["self.jobs.submit", "self.jobs.read", "self.jobs.cancel"],
+            owner_bound: true,
+          },
+        },
+        201,
+      );
+      return;
+    }
+    if (
+      path === `/auth/cli-tokens/${MOCK_CLI_TOKEN_ID}` &&
+      request.method() === "DELETE"
+    ) {
+      state.cliTokenRevoked = true;
+      await route.fulfill({ status: 204, body: "" });
       return;
     }
     if (path === "/self/compute-request") {
@@ -1204,6 +1278,27 @@ test("账号安全页显示会话并可撤销其他会话", async ({ page }) => 
   await expect(page.getByText("127.0.0.1", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "撤销其他会话" }).click();
   await expect(page.getByRole("status")).toContainText("已撤销 0 个其他会话");
+});
+
+test("普通用户重认证后一次查看并撤销CLI Token", async ({ page }) => {
+  const state: MockState = { authenticated: true, role: "user" };
+  await installMockApi(page, state);
+  await page.goto("/account/security");
+  await expect(page.getByRole("heading", { name: "CLI Tokens" })).toBeVisible();
+  await page.getByLabel("Token名称").fill("development container");
+  await page.getByLabel("当前网页密码").nth(1).fill(MOCK_PASSWORD);
+  await page.getByRole("button", { name: "创建Token" }).click();
+
+  await expect(page.getByText(MOCK_CLI_TOKEN)).toBeVisible();
+  expect(state.cliReauthenticated).toBe(true);
+  expect(state.cliTokenCreated).toBe(true);
+
+  const tokenRow = page.getByRole("row", {
+    name: /development container ACTIVE/u,
+  });
+  await tokenRow.getByRole("button", { name: "撤销", exact: true }).click();
+  await expect(page.getByText(MOCK_CLI_TOKEN)).toHaveCount(0);
+  expect(state.cliTokenRevoked).toBe(true);
 });
 
 test("容器详情显示默认安全属性", async ({ page }) => {

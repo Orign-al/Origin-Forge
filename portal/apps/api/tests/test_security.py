@@ -120,3 +120,5 @@ def test_recursive_redaction() -> None:
     assert safe_metadata({"message": "open http://portal/setup-password#token=raw-secret"}) == {
         "message": "[REDACTED]"
     }
+    cli_token = f"h100_cli_{'A' * 64}"
+    assert safe_metadata({"path": f"/workspace/{cli_token}/train.sh"}) == {"path": "[REDACTED]"}

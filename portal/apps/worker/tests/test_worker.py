@@ -2619,6 +2619,7 @@ def managed_job_payload(*, username: str = "origin-pilot", uid: int = 20001) -> 
         "script_relative_path": f".portal/job-scripts/{portal_job_id}.sh",
         "script_content": script,
         "script_sha256": hashlib.sha256(script.encode()).hexdigest(),
+        "workdir_scope": "workspace",
         "workdir_relative_path": "projects",
         "stdout_relative_path": f"outputs/{portal_job_id}.out",
         "stderr_relative_path": f"outputs/{portal_job_id}.err",
@@ -2674,13 +2675,135 @@ def test_portal4a_worker_schema_fixes_job_outputs_and_gpu_limit() -> None:
     for changed in (
         {"script_sha256": "0" * 64},
         {"script_relative_path": "user-selected.sh"},
-        {"workdir_relative_path": "datasets"},
+        {"workdir_scope": "host"},
+        {"workdir_relative_path": "../datasets"},
         {"workspace_path": "/storage/users/20002"},
         {"slurm_account": "platform-admin"},
         {"username": "root", "uid": 0, "gid": 0},
     ):
         with pytest.raises(ValueError):
             validate_payload("self.job.submit", {**payload, **changed})
+
+
+def managed_job_target_payload(
+    *, username: str = "origin-pilot", uid: int = 20001, slurm_job_id: int = 149
+) -> dict[str, object]:
+    return {
+        "portal_job_id": str(uuid.uuid4()),
+        "managed_user_id": "3b95b4f0-95d9-444a-8f0b-46288195a807",
+        "username": username,
+        "uid": uid,
+        "gid": uid,
+        "workspace_path": f"/storage/users/{uid}",
+        "slurm_job_id": slurm_job_id,
+    }
+
+
+def test_self_job_status_projects_live_scontrol_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = validate_payload("self.job.status.read", managed_job_target_payload())
+    calls: list[tuple[str, list[str]]] = []
+
+    monkeypatch.setattr(handlers, "_managed_account", lambda _payload: object())
+
+    def fixed(binary: str, args: list[str], **_kwargs: object) -> dict[str, object]:
+        calls.append((binary, args))
+        assert binary == "scontrol"
+        assert args == ["show", "job", "149", "-o"]
+        return {
+            "ok": True,
+            "stdout": (
+                "JobId=149 UserId=origin-pilot(20001) JobState=RUNNING "
+                "Reason=None RunTime=00:02:03 StartTime=2026-08-30T12:00:00 "
+                "EndTime=Unknown"
+            ),
+            "stderr": "",
+            "exit_code": 0,
+        }
+
+    monkeypatch.setattr(handlers, "run_fixed", fixed)
+    result = handlers._self_job_status(payload)
+
+    assert result == {
+        "status": "OK",
+        "handler": "self.job.status.read",
+        "slurm_job_id": 149,
+        "slurm_user": "origin-pilot",
+        "job_state": "RUNNING",
+        "exit_code": None,
+        "state_reason": None,
+        "started_at": "2026-08-30T12:00:00+00:00",
+        "finished_at": None,
+        "elapsed_seconds": 123,
+    }
+    assert calls == [("scontrol", ["show", "job", "149", "-o"])] * 2
+
+
+def test_self_job_status_projects_terminal_sacct_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = validate_payload("self.job.status.read", managed_job_target_payload())
+    calls: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(handlers, "_managed_account", lambda _payload: object())
+
+    def fixed(binary: str, args: list[str], **_kwargs: object) -> dict[str, object]:
+        calls.append((binary, args))
+        if binary == "scontrol":
+            return {"ok": False, "stdout": "", "stderr": "invalid job id", "exit_code": 1}
+        if args[-1] == "User":
+            return {"ok": True, "stdout": "origin-pilot|\n", "stderr": "", "exit_code": 0}
+        assert args[-1] == "JobIDRaw,User,State,ExitCode,ElapsedRaw,Start,End,Reason"
+        return {
+            "ok": True,
+            "stdout": (
+                "149|origin-pilot|COMPLETED|0:0|3661|2026-08-30T12:00:00|"
+                "2026-08-30T13:01:01|None|\n"
+            ),
+            "stderr": "",
+            "exit_code": 0,
+        }
+
+    monkeypatch.setattr(handlers, "run_fixed", fixed)
+    result = handlers._self_job_status(payload)
+
+    assert result["status"] == "OK"
+    assert result["job_state"] == "COMPLETED"
+    assert result["exit_code"] == "0:0"
+    assert result["elapsed_seconds"] == 3661
+    assert result["started_at"] == "2026-08-30T12:00:00+00:00"
+    assert result["finished_at"] == "2026-08-30T13:01:01+00:00"
+    assert result["state_reason"] is None
+    assert [binary for binary, _args in calls] == ["scontrol", "sacct", "scontrol", "sacct"]
+
+
+def test_self_job_cancel_reports_only_post_cancel_authoritative_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = validate_payload("self.job.cancel", managed_job_target_payload())
+    monkeypatch.setattr(handlers, "_managed_account", lambda _payload: object())
+    monkeypatch.setattr(handlers, "_slurm_job_owner", lambda _job_id: "origin-pilot")
+    monkeypatch.setattr(
+        handlers,
+        "_run_as_managed_user",
+        lambda _payload, command, **_kwargs: {
+            "ok": command == [handlers.BINARIES["scancel"], "149"]
+        },
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_self_job_status",
+        lambda _payload: {"status": "OK", "job_state": "CANCELLED"},
+    )
+
+    result = handlers._execute_self_job_cancel(request("self.job.cancel"), payload)
+    assert result["status"] == "SUCCEEDED"
+    assert result["job_state"] == "CANCELLED"
+
+    monkeypatch.setattr(
+        handlers,
+        "_self_job_status",
+        lambda _payload: {"status": "ERROR", "error": {"code": "JOB_STATUS_FAILED"}},
+    )
+    accepted = handlers._execute_self_job_cancel(request("self.job.cancel"), payload)
+    assert accepted["status"] == "SUCCEEDED"
+    assert "job_state" not in accepted
 
 
 def test_multi_user_worker_schema_accepts_origin_pilot2_owner_binding() -> None:
@@ -3219,7 +3342,7 @@ def test_job_script_is_staged_then_only_fixed_sbatch_runs_as_target_user(
     )
     monkeypatch.setattr(
         handlers,
-        "_managed_user_path",
+        "_managed_job_workdir",
         lambda *_args, **_kwargs: workdir,
     )
     monkeypatch.setattr(
@@ -3285,6 +3408,7 @@ def test_portal4a_jobs_mount_only_owner_workspace_and_persistent_home(
     assert "--no-container-mount-home" in argv
     assert (
         f"--container-mounts={workspace}:{workspace},{workspace}:/workspace,"
+        "/storage/homes/20001:/storage/homes/20001,"
         "/storage/homes/20001:/home/origin-pilot"
     ) in argv
     assert argv[-1] == "/proc/self/fd/9"

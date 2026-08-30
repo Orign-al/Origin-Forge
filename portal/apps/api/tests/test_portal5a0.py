@@ -13,6 +13,7 @@ from h100_portal_api.enums import (
 )
 from h100_portal_api.models import (
     PortalAuditEvent,
+    PortalCliToken,
     PortalComputeLease,
     PortalContainer,
     PortalManagedUser,
@@ -273,6 +274,15 @@ def test_password_reset_is_30_minutes_revokes_sessions_and_preserves_identity_st
                 absolute_expires_at=now + timedelta(hours=12),
             )
         )
+    cli_raw = f"h100_cli_{'R' * 64}"
+    cli_token = PortalCliToken(
+        user_id=target.id,
+        token_hash=digest_secret(cli_raw),
+        label="password reset fixture",
+        created_at=now,
+        expires_at=now + timedelta(days=30),
+    )
+    database.add(cli_token)
     database.commit()
     headers = login_headers(client, origin_headers, login=owner.normalized_login)
     first_response = client.post(f"/api/v1/users/{target.id}/password-reset-links", headers=headers)
@@ -324,6 +334,14 @@ def test_password_reset_is_30_minutes_revokes_sessions_and_preserves_identity_st
         select(PortalSession).where(PortalSession.user_id == target.id)
     ).all()
     assert sessions and all(item.revoked_at is not None for item in sessions)
+    database.refresh(cli_token)
+    assert cli_token.revoked_at is not None
+    assert (
+        client.get(
+            "/api/v1/self/cli-auth", headers={"Authorization": f"Bearer {cli_raw}"}
+        ).status_code
+        == 401
+    )
     audit_types = database.scalars(select(PortalAuditEvent.event_type)).all()
     assert "PASSWORD_RESET_COMPLETED" in audit_types
     assert "SESSION_REVOKED_AFTER_PASSWORD_RESET" in audit_types

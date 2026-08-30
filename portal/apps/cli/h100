@@ -1,0 +1,745 @@
+#!/usr/bin/env python3
+"""Origin Forge ordinary-user Job CLI."""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from contextlib import suppress
+from pathlib import Path
+from typing import Any, NoReturn
+
+VERSION = "1.0.0"
+SCHEMA_VERSION = "h100.cli.v1"
+DEFAULT_PORTAL_URL = "http://20.10.10.3:18080/api/v1"
+TOKEN_RE = re.compile(r"^h100_cli_[A-Za-z0-9_-]{64}$")
+JSON_RESPONSE_PARSE_ERRORS = (TypeError, ValueError, json.JSONDecodeError)
+JOB_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+    r"[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+TERMINAL_STATES = {
+    "BOOT_FAIL",
+    "CANCELLED",
+    "COMPLETED",
+    "DEADLINE",
+    "FAILED",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "PREEMPTED",
+    "REVOKED",
+    "TIMEOUT",
+}
+
+EXIT_FAILURE = 1
+EXIT_USAGE = 2
+EXIT_AUTH = 3
+EXIT_NOT_FOUND = 4
+EXIT_REJECTED = 5
+
+
+class CliError(Exception):
+    def __init__(self, message: str, *, exit_code: int = EXIT_FAILURE, code: str = "CLI_ERROR"):
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.code = code
+
+
+class ApiError(CliError):
+    def __init__(self, status: int, code: str, message: str):
+        if status == 401:
+            exit_code = EXIT_AUTH
+        elif status in {403, 404}:
+            exit_code = EXIT_NOT_FOUND
+        elif status in {409, 422, 429}:
+            exit_code = EXIT_REJECTED
+        else:
+            exit_code = EXIT_FAILURE
+        super().__init__(message, exit_code=exit_code, code=code)
+        self.status = status
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        return None
+
+
+def _json(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True))
+
+
+def _config_dir() -> Path:
+    configured = os.environ.get("H100_CONFIG_HOME")
+    if configured:
+        base = Path(configured)
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        base = Path(xdg) if xdg else Path.home() / ".config"
+        base = base / "h100"
+    if not base.is_absolute():
+        raise CliError("Credential directory must be an absolute path.", exit_code=EXIT_AUTH)
+    return base
+
+
+def _credentials_path() -> Path:
+    return _config_dir() / "credentials"
+
+
+def _secure_directory(path: Path, *, create: bool) -> None:
+    if path.is_symlink():
+        raise CliError("Credential directory must not be a symlink.", exit_code=EXIT_AUTH)
+    if create:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        metadata = path.stat()
+    except FileNotFoundError as exc:
+        raise CliError(
+            "No CLI credentials found. Run 'h100 auth login'.", exit_code=EXIT_AUTH
+        ) from exc
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise CliError("Credential directory ownership is invalid.", exit_code=EXIT_AUTH)
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        os.chmod(path, 0o700)
+
+
+def _portal_url(value: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise CliError(
+            "Portal URL must not contain credentials, query, or fragment.", exit_code=EXIT_USAGE
+        )
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise CliError("Portal URL must be HTTP or HTTPS.", exit_code=EXIT_USAGE)
+    if parsed.scheme == "http" and parsed.hostname not in {"20.10.10.3", "127.0.0.1", "localhost"}:
+        raise CliError(
+            "Plain HTTP is allowed only for the approved private Portal.", exit_code=EXIT_USAGE
+        )
+    path = parsed.path.rstrip("/")
+    if path not in {"", "/api/v1"}:
+        raise CliError("Portal URL path must be empty or /api/v1.", exit_code=EXIT_USAGE)
+    origin = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    return f"{origin}/api/v1"
+
+
+def _write_credentials(token: str, portal_url: str) -> None:
+    directory = _config_dir()
+    _secure_directory(directory, create=True)
+    target = _credentials_path()
+    if target.is_symlink():
+        raise CliError("Credentials file must not be a symlink.", exit_code=EXIT_AUTH)
+    descriptor, temporary = tempfile.mkstemp(prefix=".credentials.", dir=directory)
+    try:
+        os.fchmod(descriptor, 0o600)
+        payload = json.dumps(
+            {"version": 1, "portal_url": portal_url, "token": token},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, target)
+        os.chmod(target, 0o600)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        with suppress(FileNotFoundError):
+            os.unlink(temporary)
+
+
+def _read_credentials() -> dict[str, str]:
+    directory = _config_dir()
+    _secure_directory(directory, create=False)
+    path = _credentials_path()
+    if path.is_symlink():
+        raise CliError("Credentials file must not be a symlink.", exit_code=EXIT_AUTH)
+    try:
+        metadata = path.stat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise CliError("Credentials file must be owner-only mode 0600.", exit_code=EXIT_AUTH)
+        raw = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise CliError(
+            "No CLI credentials found. Run 'h100 auth login'.", exit_code=EXIT_AUTH
+        ) from exc
+    if len(raw) > 4096:
+        raise CliError("Credentials file is invalid.", exit_code=EXIT_AUTH)
+    try:
+        payload = json.loads(raw)
+        token = payload["token"]
+        portal_url = payload["portal_url"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise CliError("Credentials file is invalid.", exit_code=EXIT_AUTH) from exc
+    if not isinstance(token, str) or TOKEN_RE.fullmatch(token) is None:
+        raise CliError("Credentials file contains an invalid token.", exit_code=EXIT_AUTH)
+    if not isinstance(portal_url, str):
+        raise CliError("Credentials file contains an invalid Portal URL.", exit_code=EXIT_AUTH)
+    return {"token": token, "portal_url": _portal_url(portal_url)}
+
+
+def _api(
+    method: str,
+    path: str,
+    *,
+    body: dict[str, object] | None = None,
+    credentials: dict[str, str] | None = None,
+    portal_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 30,
+) -> dict[str, Any]:
+    auth = (
+        credentials
+        if credentials is not None
+        else {"portal_url": portal_url, "token": token}
+        if portal_url is not None and token is not None
+        else _read_credentials()
+    )
+    base = portal_url or auth["portal_url"]
+    credential = token or auth["token"]
+    data = None
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {credential}",
+        "User-Agent": f"h100-cli/{VERSION}",
+    }
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    # ``base`` has already passed the strict HTTP(S) Portal URL allowlist above.
+    request = urllib.request.Request(  # noqa: S310
+        f"{base}{path}", data=data, headers=headers, method=method
+    )
+    try:
+        opener = urllib.request.build_opener(_NoRedirect)
+        with opener.open(request, timeout=timeout) as response:
+            raw = response.read(2 * 1024 * 1024 + 1)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(1024 * 1024)
+        code = "REQUEST_FAILED"
+        message = f"Portal request failed with HTTP {exc.code}."
+        try:
+            error_payload = json.loads(raw)
+            detail = error_payload.get("detail")
+            if isinstance(detail, dict):
+                code = str(detail.get("code", code))
+                message = str(detail.get("message", message))
+            elif isinstance(detail, list):
+                fields = [
+                    ".".join(item.get("loc", [])) for item in detail if isinstance(item, dict)
+                ]
+                message = f"Request validation failed: {', '.join(fields) or 'invalid fields'}."
+        except JSON_RESPONSE_PARSE_ERRORS:
+            pass
+        raise ApiError(exc.code, code, message) from None
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise CliError(
+            f"Portal is unavailable: {exc.reason if hasattr(exc, 'reason') else exc}"
+        ) from None
+    if len(raw) > 2 * 1024 * 1024:
+        raise CliError("Portal response exceeded the CLI safety limit.")
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CliError("Portal returned an invalid JSON response.") from exc
+    if not isinstance(payload, dict):
+        raise CliError("Portal returned an invalid response object.")
+    return payload
+
+
+def _auth_login(args: argparse.Namespace) -> int:
+    if args.token_stdin:
+        token = sys.stdin.readline().rstrip("\r\n")
+    else:
+        token = getpass.getpass("CLI Token: ")
+    if TOKEN_RE.fullmatch(token) is None:
+        raise CliError("Invalid CLI token format.", exit_code=EXIT_AUTH, code="CLI_TOKEN_INVALID")
+    portal_url = _portal_url(os.environ.get("H100_PORTAL_URL", DEFAULT_PORTAL_URL))
+    status = _api("GET", "/self/cli-auth", portal_url=portal_url, token=token)
+    _write_credentials(token, portal_url)
+    user = status.get("user", {})
+    output = {
+        "schema_version": SCHEMA_VERSION,
+        "command": "auth.login",
+        "ok": True,
+        "authenticated": True,
+        "user": user,
+        "portal_url": portal_url,
+    }
+    if args.json:
+        _json(output)
+    else:
+        print(f"Authenticated as {user.get('login_name', 'unknown')}.")
+    return 0
+
+
+def _auth_status(args: argparse.Namespace) -> int:
+    credentials = _read_credentials()
+    status = _api("GET", "/self/cli-auth", credentials=credentials)
+    output = {
+        "schema_version": SCHEMA_VERSION,
+        "command": "auth.status",
+        "ok": True,
+        "authenticated": True,
+        "portal_url": credentials["portal_url"],
+        "user": status.get("user"),
+        "credential": status.get("credential"),
+    }
+    if args.json:
+        _json(output)
+    else:
+        user = status.get("user", {})
+        credential = status.get("credential", {})
+        print("Authenticated: yes")
+        print(f"User: {user.get('login_name', 'unknown')}")
+        print(f"Token label: {credential.get('label', 'unknown')}")
+        print(f"Expires: {credential.get('expires_at') or 'never'}")
+    return 0
+
+
+def _auth_logout(args: argparse.Namespace) -> int:
+    _secure_directory(_config_dir(), create=False)
+    path = _credentials_path()
+    if path.is_symlink():
+        raise CliError("Credentials file must not be a symlink.", exit_code=EXIT_AUTH)
+    with suppress(FileNotFoundError):
+        path.unlink()
+    output = {
+        "schema_version": SCHEMA_VERSION,
+        "command": "auth.logout",
+        "ok": True,
+        "credential_removed": True,
+    }
+    if args.json:
+        _json(output)
+    else:
+        print("Local CLI credentials removed.")
+    return 0
+
+
+def _memory_mb(value: str) -> int:
+    match = re.fullmatch(r"([1-9][0-9]*)([MmGg](?:i?[Bb])?)?", value)
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            "memory must be an integer with optional M/MiB/G/GiB suffix"
+        )
+    amount = int(match.group(1))
+    suffix = (match.group(2) or "M").lower()
+    return amount * 1024 if suffix.startswith("g") else amount
+
+
+def _duration_seconds(value: str) -> int:
+    if value.isdigit():
+        return int(value)
+    match = re.fullmatch(r"(?:(\d+)-)?(\d{1,2}):(\d{2}):(\d{2})", value)
+    if match is None:
+        raise argparse.ArgumentTypeError("time must be seconds or [D-]HH:MM:SS")
+    days, hours, minutes, seconds = (int(item or 0) for item in match.groups())
+    if minutes > 59 or seconds > 59:
+        raise argparse.ArgumentTypeError("minutes and seconds must be between 00 and 59")
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def _default_name(path: Path) -> str:
+    value = re.sub(r"[^A-Za-z0-9_.-]", "-", path.stem)[:64].strip("-._")
+    if not value or not value[0].isalnum():
+        value = f"job-{value}"[:64]
+    return value or "job"
+
+
+def _inside(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return path != root
+    except ValueError:
+        return False
+
+
+def _job_config() -> dict[str, Any]:
+    return _api("GET", "/self/jobs/config")
+
+
+def _job_submit(args: argparse.Namespace) -> int:
+    config = _job_config()
+    try:
+        script = Path(args.script).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise CliError(f"Cannot resolve script: {exc}", exit_code=EXIT_USAGE) from None
+    allowed_roots = [Path(str(item)) for item in config.get("allowed_script_roots", [])]
+    if not any(_inside(script, root) for root in allowed_roots):
+        roots = ", ".join(str(root) for root in allowed_roots)
+        raise CliError(f"Script must be inside one of: {roots}.", exit_code=EXIT_USAGE)
+    maximum = int(config.get("limits", {}).get("script_bytes", {}).get("maximum", 8192))
+    try:
+        if not stat.S_ISREG(script.stat().st_mode):
+            raise CliError("Script must be a regular file.", exit_code=EXIT_USAGE)
+        with script.open("rb") as handle:
+            raw = handle.read(maximum + 1)
+        content = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CliError(f"Script must be readable UTF-8 text: {exc}", exit_code=EXIT_USAGE) from None
+    if not raw or len(raw) > maximum or b"\x00" in raw:
+        raise CliError(
+            f"Script must be non-empty UTF-8 text up to {maximum} bytes.", exit_code=EXIT_USAGE
+        )
+    if any(line.lstrip().startswith("#SBATCH") for line in content.splitlines()):
+        raise CliError(
+            "CLI v1 rejects #SBATCH directives; use --cpus, --memory, --gpus, and --time.",
+            exit_code=EXIT_USAGE,
+            code="SBATCH_DIRECTIVE_REJECTED",
+        )
+    defaults = config.get("defaults", {})
+    body = {
+        "name": args.name or _default_name(script),
+        "script": content,
+        "cpus": args.cpus if args.cpus is not None else int(defaults["cpus"]),
+        "memory_mb": (args.memory if args.memory is not None else int(defaults["memory_mb"])),
+        "gpu_count": args.gpus if args.gpus is not None else int(defaults["gpu_count"]),
+        "time_limit_seconds": (
+            args.time if args.time is not None else int(defaults["time_limit_seconds"])
+        ),
+        "image_ref": None,
+        "source_path": script.as_posix(),
+        "idempotency_key": str(uuid.uuid4()),
+    }
+    result = _api("POST", "/self/jobs", body=body, timeout=60)
+    job = result.get("job", {})
+    output = {
+        "schema_version": SCHEMA_VERSION,
+        "command": "job.submit",
+        "ok": True,
+        "job": job,
+    }
+    if args.json:
+        _json(output)
+    else:
+        print("Job submitted successfully.")
+        print()
+        print(f"Portal Job ID: {job.get('id')}")
+        print(f"Slurm Job ID: {job.get('slurm_job_id')}")
+        print(f"State: {job.get('state')}")
+        print(f"GPU: {job.get('gpu_count')}")
+        print(f"Script: {job.get('source_path') or script.as_posix()}")
+    return 0
+
+
+def _elapsed(value: object) -> str:
+    if not isinstance(value, int) or value < 0:
+        return "-"
+    hours, remainder = divmod(value, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _table(rows: list[dict[str, Any]]) -> None:
+    headers = ["ID", "NAME", "STATE", "GPU", "CPU", "MEMORY", "SUBMITTED", "ELAPSED"]
+    values = []
+    for job in rows:
+        values.append(
+            [
+                str(job.get("id", "-")),
+                str(job.get("name", "-")),
+                str(job.get("state", "-")),
+                str(job.get("gpu_count", "-")),
+                str(job.get("cpus", "-")),
+                f"{job.get('memory_mb', '-')}M",
+                str(job.get("submitted_at") or "-")[:19],
+                _elapsed(job.get("elapsed_seconds")),
+            ]
+        )
+    widths = [len(item) for item in headers]
+    for row in values:
+        widths = [max(current, len(value)) for current, value in zip(widths, row, strict=True)]
+    print("  ".join(value.ljust(width) for value, width in zip(headers, widths, strict=True)))
+    for row in values:
+        print("  ".join(value.ljust(width) for value, width in zip(row, widths, strict=True)))
+
+
+def _job_list(args: argparse.Namespace) -> int:
+    query = urllib.parse.urlencode(
+        {
+            key: value
+            for key, value in {"limit": args.limit, "state": args.state}.items()
+            if value is not None
+        }
+    )
+    result = _api("GET", f"/self/jobs?{query}")
+    jobs = result.get("jobs", [])
+    output = {
+        "schema_version": SCHEMA_VERSION,
+        "command": "job.list",
+        "ok": True,
+        "count": len(jobs),
+        "jobs": jobs,
+    }
+    if args.json:
+        _json(output)
+    else:
+        _table(jobs)
+    return 0
+
+
+def _portal_job_id(value: str) -> str:
+    if JOB_ID_RE.fullmatch(value):
+        return value.lower()
+    if value.isdigit():
+        result = _api("GET", "/self/jobs?limit=200")
+        for job in result.get("jobs", []):
+            if job.get("slurm_job_id") == int(value):
+                return str(job["id"])
+        raise CliError("Job was not found.", exit_code=EXIT_NOT_FOUND, code="JOB_NOT_FOUND")
+    raise CliError(
+        "Job ID must be a Portal UUID or an owned Slurm numeric ID.", exit_code=EXIT_USAGE
+    )
+
+
+def _job_status(args: argparse.Namespace) -> int:
+    job_id = _portal_job_id(args.job_id)
+    result = _api("GET", f"/self/jobs/{urllib.parse.quote(job_id)}")
+    job = result.get("job", {})
+    output = {"schema_version": SCHEMA_VERSION, "command": "job.status", "ok": True, "job": job}
+    if args.json:
+        _json(output)
+    else:
+        fields = [
+            ("Portal Job ID", job.get("id")),
+            ("Slurm Job ID", job.get("slurm_job_id")),
+            ("Name", job.get("name")),
+            ("State", job.get("state")),
+            ("Reason", job.get("reason") or "-"),
+            ("CPU", job.get("cpus")),
+            ("Memory", f"{job.get('memory_mb')}M"),
+            ("GPU", job.get("gpu_count")),
+            ("Submitted", job.get("submitted_at") or "-"),
+            ("Started", job.get("started_at") or "-"),
+            ("Finished", job.get("finished_at") or "-"),
+            ("Exit Code", job.get("exit_code") or "-"),
+        ]
+        for label, value in fields:
+            print(f"{label}: {value}")
+    return 0
+
+
+def _selected_log(result: dict[str, Any], args: argparse.Namespace) -> str:
+    if args.all:
+        stdout = str(result.get("stdout", ""))
+        stderr = str(result.get("stderr", ""))
+        return f"{stdout}{stderr}"
+    if args.stderr:
+        return str(result.get("stderr", ""))
+    return str(result.get("stdout", ""))
+
+
+def _tail(value: str, count: int | None) -> str:
+    if count is None:
+        return value
+    return "".join(value.splitlines(keepends=True)[-count:]) if count else ""
+
+
+def _job_logs(args: argparse.Namespace) -> int:
+    job_id = _portal_job_id(args.job_id)
+    sequence = 0
+    result = _api("GET", f"/self/jobs/{urllib.parse.quote(job_id)}/logs")
+    current = _selected_log(result, args)
+    initial = _tail(current, args.tail)
+    if args.json:
+        _json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "command": "job.logs",
+                "ok": True,
+                "job_id": job_id,
+                "stream": bool(args.follow),
+                "sequence": sequence,
+                "stdout": result.get("stdout", ""),
+                "stderr": result.get("stderr", ""),
+                "selected": initial,
+                "terminal": result.get("job", {}).get("state") in TERMINAL_STATES,
+            }
+        )
+    else:
+        print(initial, end="" if initial.endswith("\n") or not initial else "\n")
+    if not args.follow:
+        return 0
+    try:
+        while result.get("job", {}).get("state") not in TERMINAL_STATES:
+            time.sleep(2)
+            result = _api("GET", f"/self/jobs/{urllib.parse.quote(job_id)}/logs")
+            updated = _selected_log(result, args)
+            delta = updated[len(current) :] if updated.startswith(current) else updated
+            current = updated
+            if not delta:
+                continue
+            sequence += 1
+            if args.json:
+                _json(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "command": "job.logs",
+                        "ok": True,
+                        "job_id": job_id,
+                        "stream": True,
+                        "sequence": sequence,
+                        "selected": delta,
+                        "terminal": result.get("job", {}).get("state") in TERMINAL_STATES,
+                    }
+                )
+            else:
+                print(delta, end="" if delta.endswith("\n") else "\n", flush=True)
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+def _job_cancel(args: argparse.Namespace) -> int:
+    job_id = _portal_job_id(args.job_id)
+    result = _api(
+        "POST",
+        f"/self/jobs/{urllib.parse.quote(job_id)}/cancel",
+        body={"idempotency_key": str(uuid.uuid4())},
+    )
+    job = result.get("job", {})
+    if args.wait:
+        while job.get("state") not in TERMINAL_STATES:
+            time.sleep(2)
+            job = _api("GET", f"/self/jobs/{urllib.parse.quote(job_id)}").get("job", {})
+    output = {
+        "schema_version": SCHEMA_VERSION,
+        "command": "job.cancel",
+        "ok": True,
+        "cancellation_requested": True,
+        "job": job,
+    }
+    if args.json:
+        _json(output)
+    else:
+        print("Cancellation requested.")
+        if args.wait:
+            print(f"State: {job.get('state')}")
+    return 0
+
+
+def _positive(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be zero or greater")
+    return parsed
+
+
+def _add_submit(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("script", help="script under /workspace or your /home")
+    parser.add_argument("--name", help="job name (1-64 safe characters)")
+    parser.add_argument("--cpus", type=int, help="CPU count (1-8; default fetched from Portal)")
+    parser.add_argument("--memory", type=_memory_mb, help="memory, e.g. 4096M or 32G (256M-32G)")
+    parser.add_argument("--gpus", type=int, help="H100 count (0-1; default fetched from Portal)")
+    parser.add_argument(
+        "--time", type=_duration_seconds, help="time [D-]HH:MM:SS (00:01:00-4-00:00:00)"
+    )
+    parser.add_argument("--json", action="store_true", help="emit stable JSON")
+    parser.set_defaults(handler=_job_submit)
+
+
+def _add_list(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--limit", type=int, default=20, help="recent jobs (1-200)")
+    parser.add_argument("--state", help="filter by authoritative Job state")
+    parser.add_argument("--json", action="store_true", help="emit stable JSON")
+    parser.set_defaults(handler=_job_list)
+
+
+def _add_cancel(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("job_id", help="Portal UUID or owned Slurm Job ID")
+    parser.add_argument("--wait", action="store_true", help="wait for a terminal state")
+    parser.add_argument("--json", action="store_true", help="emit stable JSON")
+    parser.set_defaults(handler=_job_cancel)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="h100", description="Origin Forge ordinary-user Job CLI")
+    parser.add_argument("--version", action="version", version=f"h100 {VERSION}")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    auth = commands.add_parser("auth", help="manage local CLI authentication")
+    auth_commands = auth.add_subparsers(dest="auth_command", required=True)
+    login = auth_commands.add_parser("login", help="store an owner-bound Personal CLI Token")
+    login.add_argument("--token-stdin", action="store_true", help="read token from standard input")
+    login.add_argument("--json", action="store_true", help="emit stable JSON")
+    login.set_defaults(handler=_auth_login)
+    status_parser = auth_commands.add_parser("status", help="verify the stored CLI Token")
+    status_parser.add_argument("--json", action="store_true", help="emit stable JSON")
+    status_parser.set_defaults(handler=_auth_status)
+    logout = auth_commands.add_parser("logout", help="remove local CLI credentials")
+    logout.add_argument("--json", action="store_true", help="emit stable JSON")
+    logout.set_defaults(handler=_auth_logout)
+
+    job = commands.add_parser("job", help="submit and manage your Portal Jobs")
+    job_commands = job.add_subparsers(dest="job_command", required=True)
+    _add_submit(job_commands.add_parser("submit", help="submit an immutable script snapshot"))
+    _add_list(job_commands.add_parser("list", help="list your recent Jobs"))
+    status = job_commands.add_parser("status", help="show authoritative Job state")
+    status.add_argument("job_id", help="Portal UUID or owned Slurm Job ID")
+    status.add_argument("--json", action="store_true", help="emit stable JSON")
+    status.set_defaults(handler=_job_status)
+    logs = job_commands.add_parser("logs", help="read or follow owner-only Job logs")
+    logs.add_argument("job_id", help="Portal UUID or owned Slurm Job ID")
+    stream = logs.add_mutually_exclusive_group()
+    stream.add_argument("--stderr", action="store_true", help="show stderr")
+    stream.add_argument("--all", action="store_true", help="show stdout followed by stderr")
+    logs.add_argument("--tail", type=_positive, help="show the last N lines initially")
+    logs.add_argument("--follow", action="store_true", help="poll until the Job is terminal")
+    logs.add_argument("--json", action="store_true", help="emit stable JSON or JSON Lines")
+    logs.set_defaults(handler=_job_logs)
+    _add_cancel(job_commands.add_parser("cancel", help="request cancellation through Portal"))
+
+    _add_submit(commands.add_parser("sbatch", help="compatibility alias for job submit"))
+    _add_list(commands.add_parser("squeue", help="compatibility alias for job list"))
+    _add_cancel(commands.add_parser("scancel", help="compatibility alias for job cancel"))
+    return parser
+
+
+def _fail(error: CliError, *, json_mode: bool) -> NoReturn:
+    if json_mode:
+        _json(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "ok": False,
+                "error": {
+                    "code": error.code,
+                    "message": str(error),
+                    **({"http_status": error.status} if isinstance(error, ApiError) else {}),
+                },
+            }
+        )
+    print(str(error), file=sys.stderr)
+    if isinstance(error, ApiError) and error.code == "GPU_LIMIT_EXCEEDED":
+        print("The platform currently allows at most one H100 per user.", file=sys.stderr)
+    raise SystemExit(error.exit_code)
+
+
+def main() -> int:
+    parser = _parser()
+    args = parser.parse_args()
+    try:
+        return int(args.handler(args))
+    except CliError as exc:
+        _fail(exc, json_mode=bool(getattr(args, "json", False)))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

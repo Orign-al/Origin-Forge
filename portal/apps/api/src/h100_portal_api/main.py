@@ -45,13 +45,24 @@ app.add_middleware(
     allow_origins=list(settings.allowed_origins),
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Accept", "Content-Type", "X-CSRF-Token"],
+    allow_headers=["Accept", "Authorization", "Content-Type", "X-CSRF-Token"],
 )
 
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
-    response = await call_next(request)
+    if "token" in request.query_params:
+        response = JSONResponse(
+            status_code=400,
+            content={
+                "detail": {
+                    "code": "TOKEN_QUERY_REJECTED",
+                    "message": "凭据不得放入查询字符串",
+                }
+            },
+        )
+    else:
+        response = await call_next(request)
     delegated = getattr(request.state, "delegated_audit", None)
     if isinstance(delegated, dict):
         try:
@@ -77,6 +88,30 @@ async def security_headers(request: Request, call_next):  # type: ignore[no-unty
                 db.commit()
         except Exception:
             LOG.exception("failed to persist delegated request audit")
+    cli_token = getattr(request.state, "cli_token_audit", None)
+    if isinstance(cli_token, dict):
+        try:
+            with SessionLocal() as db:
+                status_code = int(response.status_code)
+                record_audit(
+                    db,
+                    event_type="CLI_TOKEN_USE",
+                    actor=str(cli_token["user"]),
+                    actor_role="user",
+                    source_ip=client_ip(request),
+                    user_agent=user_agent(request),
+                    object_type="cli_token",
+                    object_id=str(cli_token["token_id"]),
+                    result="SUCCESS" if status_code < 400 else "DENIED",
+                    metadata={
+                        "label": str(cli_token["label"]),
+                        "action": f"{request.method} {request.url.path}",
+                        "status_code": status_code,
+                    },
+                )
+                db.commit()
+        except Exception:
+            LOG.exception("failed to persist CLI token request audit")
     response.headers.setdefault("Cache-Control", "no-store")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")

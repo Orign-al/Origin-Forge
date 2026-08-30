@@ -28,6 +28,7 @@ from h100_portal_api.lease_service import (
 from h100_portal_api.main import app
 from h100_portal_api.models import (
     PortalAuditEvent,
+    PortalCliToken,
     PortalComputeLease,
     PortalContainer,
     PortalJob,
@@ -49,6 +50,7 @@ from h100_portal_api.routes import self_service
 from h100_portal_api.schemas import RestoreCreateRequest
 from h100_portal_api.security import digest_secret, hash_password
 from h100_portal_api.terminal_service import TerminalServiceError
+from h100_portal_api.worker_client import WorkerClientError
 from h100_portal_api.workspace_service import resolve_workspace
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -982,6 +984,7 @@ def test_job_and_container_operations_enforce_active_lease_gpu_and_time(
         "nvcr.io#nvidia/cuda:13.2.0-base-ubuntu24.04@"
         "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
     )
+    assert worker_payload["workdir_scope"] == "workspace"
     assert worker_payload["workdir_relative_path"] == "projects"
     assert worker_payload["script_relative_path"].startswith(".portal/job-scripts/")
     assert worker_payload["stdout_relative_path"].startswith("outputs/")
@@ -1009,6 +1012,286 @@ def test_job_and_container_operations_enforce_active_lease_gpu_and_time(
     )
     assert expired_job.status_code == 409
     assert expired_job.json()["detail"]["code"] == "LEASE_INACTIVE"
+
+
+def test_cli_token_is_hash_only_scoped_revocable_and_never_reaches_worker(
+    client,
+    database: Session,
+    origin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    owner = _identity(database, login="cli-owner", username="cli-owner", uid=20021, port=22043)
+    other = _identity(database, login="cli-other", username="cli-other", uid=20022, port=22044)
+    other_job = _job(database, other, "other-private-job")
+    headers = _login(client, origin_headers, owner.user.normalized_login)
+
+    denied = client.post(
+        "/api/v1/auth/cli-tokens",
+        headers=headers,
+        json={"label": "development container", "expires_in_days": 90},
+    )
+    assert denied.status_code == 428
+    reauthenticated = client.post(
+        "/api/v1/auth/reauthenticate",
+        headers=headers,
+        json={"password": PASSWORD},
+    )
+    assert reauthenticated.status_code == 200
+    created = client.post(
+        "/api/v1/auth/cli-tokens",
+        headers=headers,
+        json={"label": "development container", "expires_in_days": 90},
+    )
+    assert created.status_code == 201
+    raw_token = created.json()["token"]
+    token_id = created.json()["credential"]["id"]
+    assert raw_token.startswith("h100_cli_")
+    stored = database.scalar(select(PortalCliToken).where(PortalCliToken.id == uuid.UUID(token_id)))
+    assert stored is not None
+    assert stored.token_hash == digest_secret(raw_token)
+    assert raw_token not in str(stored.__dict__)
+    bearer = {"Authorization": f"Bearer {raw_token}"}
+
+    cli_auth = client.get("/api/v1/self/cli-auth", headers=bearer)
+    assert cli_auth.status_code == 200
+    assert cli_auth.json()["user"]["login_name"] == "cli-owner"
+    assert client.get("/api/v1/self/cli-auth?token=forbidden", headers=bearer).status_code == 400
+    assert client.get("/api/v1/self/jobs?token=forbidden").status_code == 400
+    assert client.get("/api/v1/self/storage", headers=bearer).status_code == 403
+    assert client.get(f"/api/v1/self/jobs/{other_job.id}", headers=bearer).status_code == 404
+
+    calls: list[dict[str, object]] = []
+
+    def worker(operation_type: str, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append({"operation_type": operation_type, **kwargs})
+        return {
+            "status": "SUCCEEDED",
+            "request_id": str(uuid.uuid4()),
+            "slurm_job_id": 600 + len(calls),
+            "slurm_user": "cli-owner",
+        }
+
+    monkeypatch.setattr("h100_portal_api.routes.self_service.call_worker", worker)
+    job_body = {
+        "name": "cli-job",
+        "script": "set -eu\nwhoami\n",
+        "cpus": 2,
+        "memory_mb": 4096,
+        "gpu_count": 0,
+        "time_limit_seconds": 600,
+        "image_ref": None,
+        "source_path": "/workspace/projects/cli-test/train.sh",
+        "idempotency_key": str(uuid.uuid4()),
+    }
+    submitted = client.post("/api/v1/self/jobs", headers=bearer, json=job_body)
+    assert submitted.status_code == 200
+    assert submitted.json()["job"]["source_path"] == job_body["source_path"]
+    payload = calls[-1]["payload"]
+    assert payload["workdir_scope"] == "workspace"
+    assert payload["workdir_relative_path"] == "projects/cli-test"
+    assert raw_token not in json.dumps(calls, default=str)
+
+    home_submit = client.post(
+        "/api/v1/self/jobs",
+        headers=bearer,
+        json={
+            **job_body,
+            "name": "cli-home-job",
+            "source_path": "/home/cli-owner/experiments/train.sh",
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    assert home_submit.status_code == 200
+    assert calls[-1]["payload"]["workdir_scope"] == "home"
+    assert calls[-1]["payload"]["workdir_relative_path"] == "experiments"
+    before_bad_path = len(calls)
+    bad_path = client.post(
+        "/api/v1/self/jobs",
+        headers=bearer,
+        json={
+            **job_body,
+            "source_path": "/etc/train.sh",
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    assert bad_path.status_code == 422
+    assert bad_path.json()["detail"]["code"] == "JOB_SOURCE_PATH_REJECTED"
+    assert len(calls) == before_bad_path
+
+    before_gpu_two = len(calls)
+    gpu_two = client.post(
+        "/api/v1/self/jobs",
+        headers=bearer,
+        json={**job_body, "gpu_count": 2, "idempotency_key": str(uuid.uuid4())},
+    )
+    assert gpu_two.status_code == 422
+    assert gpu_two.json()["detail"]["code"] == "GPU_LIMIT_EXCEEDED"
+    assert len(calls) == before_gpu_two
+
+    listed = client.get("/api/v1/auth/cli-tokens")
+    assert listed.status_code == 200
+    assert "token" not in listed.json()["tokens"][0]
+    revoked = client.delete(f"/api/v1/auth/cli-tokens/{token_id}", headers=headers)
+    assert revoked.status_code == 204
+    assert client.get("/api/v1/self/cli-auth", headers=bearer).status_code == 401
+    audit_dump = json.dumps(
+        [row.safe_metadata for row in database.scalars(select(PortalAuditEvent)).all()],
+        default=str,
+    )
+    assert raw_token not in audit_dump
+
+
+def test_cli_token_expiry_password_rotation_and_admin_semantics(
+    client,
+    database: Session,
+    origin_headers: dict[str, str],
+) -> None:  # type: ignore[no-untyped-def]
+    owner = _identity(
+        database, login="cli-rotation", username="cli-rotation", uid=20023, port=22045
+    )
+    headers = _login(client, origin_headers, owner.user.normalized_login)
+    assert (
+        client.post(
+            "/api/v1/auth/reauthenticate", headers=headers, json={"password": PASSWORD}
+        ).status_code
+        == 200
+    )
+
+    def create(label: str) -> tuple[str, PortalCliToken]:
+        response = client.post(
+            "/api/v1/auth/cli-tokens",
+            headers=headers,
+            json={"label": label, "expires_in_days": 30},
+        )
+        assert response.status_code == 201
+        raw = response.json()["token"]
+        record = database.scalar(
+            select(PortalCliToken).where(PortalCliToken.token_hash == digest_secret(raw))
+        )
+        assert record is not None
+        return raw, record
+
+    expired_raw, expired_record = create("expired fixture")
+    expired_record.created_at = utcnow() - timedelta(days=2)
+    expired_record.expires_at = utcnow() - timedelta(days=1)
+    database.commit()
+    expired = client.get(
+        "/api/v1/self/cli-auth", headers={"Authorization": f"Bearer {expired_raw}"}
+    )
+    assert expired.status_code == 401
+    assert expired.json()["detail"]["code"] == "CLI_TOKEN_EXPIRED"
+
+    active_raw, active_record = create("password rotation fixture")
+    changed = client.post(
+        "/api/v1/auth/password",
+        headers=headers,
+        json={
+            "current_password": PASSWORD,
+            "new_password": "A new Portal password for CLI rotation 2026",
+            "confirmation": "A new Portal password for CLI rotation 2026",
+        },
+    )
+    assert changed.status_code == 200
+    database.refresh(active_record)
+    assert active_record.revoked_at is not None
+    assert (
+        client.get(
+            "/api/v1/self/cli-auth", headers={"Authorization": f"Bearer {active_raw}"}
+        ).status_code
+        == 401
+    )
+
+    admin = _admin(database)
+    admin_headers = _login(client, origin_headers, admin.normalized_login)
+    assert (
+        client.post(
+            "/api/v1/auth/reauthenticate", headers=admin_headers, json={"password": PASSWORD}
+        ).status_code
+        == 200
+    )
+    admin_token = client.post(
+        "/api/v1/auth/cli-tokens",
+        headers=admin_headers,
+        json={"label": "must not exist", "expires_in_days": 30},
+    )
+    assert admin_token.status_code == 403
+    assert admin_token.json()["detail"]["code"] == "CLI_TOKEN_ORDINARY_USER_ONLY"
+    admin_raw = f"h100_cli_{'M' * 64}"
+    database.add(
+        PortalCliToken(
+            user_id=admin.id,
+            token_hash=digest_secret(admin_raw),
+            label="direct admin fixture",
+            created_at=utcnow(),
+            expires_at=utcnow() + timedelta(days=30),
+        )
+    )
+    database.commit()
+    admin_use = client.get(
+        "/api/v1/self/cli-auth", headers={"Authorization": f"Bearer {admin_raw}"}
+    )
+    assert admin_use.status_code == 401
+    assert admin_use.json()["detail"]["code"] == "CLI_TOKEN_ACCOUNT_INACTIVE"
+
+
+def test_job_detail_persists_authoritative_slurm_projection_and_fails_closed(
+    client,
+    database: Session,
+    origin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(
+        database, login="projection-owner", username="projection-owner", uid=20024, port=22046
+    )
+    job = _job(database, identity, "authoritative-projection")
+    job.slurm_job_id = 149
+    database.commit()
+    headers = _login(client, origin_headers, identity.user.normalized_login)
+
+    monkeypatch.setattr(
+        "h100_portal_api.routes.self_service.call_worker",
+        lambda operation_type, **_kwargs: {
+            "status": "OK",
+            "handler": operation_type,
+            "slurm_job_id": 149,
+            "slurm_user": "projection-owner",
+            "job_state": "COMPLETED",
+            "exit_code": "0:0",
+            "state_reason": "Dependency",
+            "started_at": "2026-08-30T12:00:00+00:00",
+            "finished_at": "2026-08-30T12:01:01+00:00",
+            "elapsed_seconds": 61,
+        },
+    )
+    projected = client.get(f"/api/v1/self/jobs/{job.id}", headers=headers)
+    assert projected.status_code == 200
+    view = projected.json()["job"]
+    assert view["state"] == "COMPLETED"
+    assert view["reason"] == "Dependency"
+    assert view["started_at"] == "2026-08-30T12:00:00+00:00"
+    assert view["finished_at"] == "2026-08-30T12:01:01+00:00"
+    assert view["elapsed_seconds"] == 61
+    assert view["exit_code"] == "0:0"
+    assert view["authoritative"] is True
+    database.expire_all()
+    stored = database.get(PortalJob, job.id)
+    assert stored is not None
+    assert stored.state == "COMPLETED"
+    assert stored.elapsed_seconds == 61
+
+    def unavailable(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise WorkerClientError("WORKER_UNAVAILABLE", "fixture unavailable")
+
+    monkeypatch.setattr("h100_portal_api.routes.self_service.call_worker", unavailable)
+    stored.state = "RUNNING"
+    stored.finished_at = None
+    database.commit()
+    failed_list = client.get("/api/v1/self/jobs", headers=headers)
+    assert failed_list.status_code == 503
+    assert failed_list.json()["detail"]["code"] == "WORKER_UNAVAILABLE"
+    failed = client.get(f"/api/v1/self/jobs/{job.id}", headers=headers)
+    assert failed.status_code == 503
+    assert failed.json()["detail"]["code"] == "WORKER_UNAVAILABLE"
 
 
 def test_expired_timestamp_denies_new_access_even_when_database_state_is_active(

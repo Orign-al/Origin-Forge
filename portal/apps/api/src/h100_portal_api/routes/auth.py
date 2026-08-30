@@ -1,3 +1,4 @@
+import uuid
 from contextlib import suppress
 from datetime import timedelta
 
@@ -14,8 +15,10 @@ from h100_portal_api.auth import (
     create_session,
     rate_limiter,
     require_preauth_csrf,
+    require_recent_reauthentication,
     require_session_csrf,
     revoke_session,
+    revoke_user_cli_tokens,
     revoke_user_sessions,
     serialize_user,
     session_response,
@@ -32,6 +35,7 @@ from h100_portal_api.enums import (
     PasswordState,
 )
 from h100_portal_api.models import (
+    PortalCliToken,
     PortalPasswordCredential,
     PortalPasswordSetupToken,
     PortalSession,
@@ -39,8 +43,10 @@ from h100_portal_api.models import (
     ensure_utc,
     utcnow,
 )
+from h100_portal_api.rbac import role_names
 from h100_portal_api.schemas import (
     ChangePasswordRequest,
+    CliTokenCreateRequest,
     LoginRequest,
     PasswordActionExchangeRequest,
     ReauthenticateRequest,
@@ -67,6 +73,7 @@ def _auth_failure(db: Session, request: Request, user: PortalUser | None, normal
         if user.failed_login_count >= settings.login_failures_before_lock:
             user.locked_until = utcnow() + timedelta(minutes=settings.login_lock_minutes)
             user.account_state = AccountState.LOCKED
+            revoke_user_cli_tokens(db, user.id)
         record_audit(
             db,
             event_type="login.failure",
@@ -470,6 +477,7 @@ def setup_password(
         user.account_state = AccountState.ACTIVE
         user.activated_at = user.activated_at or now
     revoked_sessions = revoke_user_sessions(db, user.id)
+    revoked_cli_tokens = revoke_user_cli_tokens(db, user.id)
     terminal_registry.close_for_user(user.id)
     new_session = None
     session_raw = None
@@ -520,7 +528,11 @@ def setup_password(
             user_agent=user_agent(request),
             object_type="portal_user",
             object_id=str(user.id),
-            metadata={"revoked_count": revoked_sessions, "requires_login": True},
+            metadata={
+                "revoked_count": revoked_sessions,
+                "revoked_cli_tokens": revoked_cli_tokens,
+                "requires_login": True,
+            },
         )
     db.commit()
     _clear_password_action_cookie(response)
@@ -559,6 +571,150 @@ def me(
             recent_auth_valid_until.isoformat() if recent_auth_valid_until is not None else None
         ),
     }
+
+
+def _cli_token_view(token: PortalCliToken) -> dict[str, object]:
+    now = utcnow()
+    if token.revoked_at is not None:
+        state = "REVOKED"
+    elif token.expires_at is not None and ensure_utc(token.expires_at) <= now:
+        state = "EXPIRED"
+    else:
+        state = "ACTIVE"
+    return {
+        "id": str(token.id),
+        "label": token.label,
+        "state": state,
+        "created_at": ensure_utc(token.created_at).isoformat(),
+        "expires_at": ensure_utc(token.expires_at).isoformat() if token.expires_at else None,
+        "last_used_at": (
+            ensure_utc(token.last_used_at).isoformat() if token.last_used_at else None
+        ),
+        "revoked_at": ensure_utc(token.revoked_at).isoformat() if token.revoked_at else None,
+        "scopes": ["self.jobs.submit", "self.jobs.read", "self.jobs.cancel"],
+        "owner_bound": True,
+    }
+
+
+def _require_ordinary_cli_token_owner(context: AuthContext) -> None:
+    if role_names(context.user) != ["user"]:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "CLI_TOKEN_ORDINARY_USER_ONLY",
+                "message": "CLI Token仅供普通用户使用",
+            },
+        )
+
+
+@router.get("/cli-tokens")
+def cli_tokens(
+    db: Session = Depends(get_db), context: AuthContext = Depends(auth_context)
+) -> dict[str, object]:
+    _require_ordinary_cli_token_owner(context)
+    rows = db.scalars(
+        select(PortalCliToken)
+        .where(PortalCliToken.user_id == context.user.id)
+        .order_by(PortalCliToken.created_at.desc())
+        .limit(50)
+    ).all()
+    return {"status": "OK", "tokens": [_cli_token_view(row) for row in rows], "count": len(rows)}
+
+
+@router.post("/cli-tokens", status_code=status.HTTP_201_CREATED)
+def create_cli_token(
+    body: CliTokenCreateRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    context: AuthContext = Depends(auth_context),
+) -> dict[str, object]:
+    require_session_csrf(request, context)
+    require_recent_reauthentication(context)
+    _require_ordinary_cli_token_owner(context)
+    if not rate_limiter.allowed(f"cli-token-create:{context.user.id}", 10, 300):
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "RATE_LIMITED", "message": "CLI Token创建过于频繁"},
+        )
+    db.scalar(select(PortalUser).where(PortalUser.id == context.user.id).with_for_update())
+    rows = db.scalars(
+        select(PortalCliToken).where(
+            PortalCliToken.user_id == context.user.id,
+            PortalCliToken.revoked_at.is_(None),
+        )
+    ).all()
+    now = utcnow()
+    active_count = sum(
+        1 for row in rows if row.expires_at is None or ensure_utc(row.expires_at) > now
+    )
+    if active_count >= 10:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "CLI_TOKEN_LIMIT_REACHED", "message": "最多保留10个有效CLI Token"},
+        )
+    raw_token = f"h100_cli_{random_token(48)}"
+    token = PortalCliToken(
+        user_id=context.user.id,
+        token_hash=digest_secret(raw_token),
+        label=body.label,
+        created_at=now,
+        expires_at=(
+            now + timedelta(days=body.expires_in_days) if body.expires_in_days is not None else None
+        ),
+    )
+    db.add(token)
+    db.flush()
+    record_audit(
+        db,
+        event_type="CLI_TOKEN_CREATED",
+        actor=context.user.normalized_login,
+        actor_role="user",
+        source_ip=client_ip(request),
+        user_agent=user_agent(request),
+        object_type="cli_token",
+        object_id=str(token.id),
+        metadata={
+            "label": token.label,
+            "expires_at": token.expires_at.isoformat() if token.expires_at else None,
+            "ordinary_user_only": True,
+        },
+    )
+    db.commit()
+    return {"status": "CREATED", "token": raw_token, "credential": _cli_token_view(token)}
+
+
+@router.delete("/cli-tokens/{token_id}", status_code=status.HTTP_204_NO_CONTENT)
+def revoke_cli_token(
+    token_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    context: AuthContext = Depends(auth_context),
+) -> None:
+    require_session_csrf(request, context)
+    _require_ordinary_cli_token_owner(context)
+    token = db.scalar(
+        select(PortalCliToken)
+        .where(PortalCliToken.id == token_id, PortalCliToken.user_id == context.user.id)
+        .with_for_update()
+    )
+    if token is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "CLI_TOKEN_NOT_FOUND", "message": "CLI Token不存在"},
+        )
+    token.revoked_at = token.revoked_at or utcnow()
+    record_audit(
+        db,
+        event_type="CLI_TOKEN_REVOKED",
+        actor=context.user.normalized_login,
+        actor_role="user",
+        source_ip=client_ip(request),
+        user_agent=user_agent(request),
+        object_type="cli_token",
+        object_id=str(token.id),
+        metadata={"label": token.label},
+    )
+    db.commit()
 
 
 @router.get("/sessions")
@@ -669,6 +825,7 @@ def change_password(
     # fresh session in the same transaction. Keeping the old current session
     # alive would not be session rotation.
     revoke_user_sessions(db, context.user.id)
+    revoked_cli_tokens = revoke_user_cli_tokens(db, context.user.id)
     terminal_registry.close_for_user(context.user.id)
     new_session, session_raw, csrf_raw = create_session(db, context.user, request)
     new_session.reauthenticated_at = utcnow()
@@ -681,7 +838,12 @@ def change_password(
         user_agent=user_agent(request),
         object_type="portal_user",
         object_id=str(context.user.id),
-        metadata={"all_previous_sessions_revoked": True, "session_rotated": True},
+        metadata={
+            "all_previous_sessions_revoked": True,
+            "all_cli_tokens_revoked": True,
+            "revoked_cli_tokens": revoked_cli_tokens,
+            "session_rotated": True,
+        },
     )
     _record_session_created(db, request, context.user, new_session, reason="password_change")
     db.commit()

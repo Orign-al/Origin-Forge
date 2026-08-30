@@ -2,9 +2,10 @@ import hashlib
 import uuid
 from collections.abc import Sequence
 from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from h100_portal_contracts.workspace import (
     GPU_DEVELOPMENT_PROFILE,
     WORKSPACE_CONTAINER_PATH,
@@ -28,7 +29,11 @@ from h100_portal_api.auth import (
 )
 from h100_portal_api.config import get_settings
 from h100_portal_api.database import get_db
-from h100_portal_api.dependencies import permission_dependency, require_delegated_scope
+from h100_portal_api.dependencies import (
+    permission_dependency,
+    request_auth_context,
+    require_delegated_scope,
+)
 from h100_portal_api.enums import OperationStatus, RiskLevel
 from h100_portal_api.lease_service import (
     RenewalLeaseExpiredError,
@@ -85,6 +90,43 @@ APPROVED_IMAGE_REFS = {
     "sha256:36cccda4bebc3b0b1ebe1907ead8169cf144d45df890be871b36b304cf91145a"
 }
 APPROVED_JOB_IMAGE = next(iter(APPROVED_IMAGE_REFS))
+JOB_DEFAULTS = {"cpus": 2, "memory_mb": 4096, "gpu_count": 0, "time_limit_seconds": 1800}
+JOB_LIMITS = {
+    "cpus": {"minimum": 1, "maximum": 8},
+    "memory_mb": {"minimum": 256, "maximum": 32768},
+    "gpu_count": {"minimum": 0, "maximum": 1},
+    "time_limit_seconds": {"minimum": 60, "maximum": 345600},
+    "script_bytes": {"maximum": 8192},
+}
+JOB_TERMINAL_STATES = frozenset(
+    {
+        "BOOT_FAIL",
+        "CANCELLED",
+        "COMPLETED",
+        "DEADLINE",
+        "FAILED",
+        "NODE_FAIL",
+        "OUT_OF_MEMORY",
+        "PREEMPTED",
+        "REVOKED",
+        "TIMEOUT",
+    }
+)
+JOB_STATES = frozenset(
+    {
+        "SUBMITTING",
+        "PENDING",
+        "CONFIGURING",
+        "RUNNING",
+        "SUSPENDED",
+        "STOPPED",
+        "COMPLETING",
+        "REQUEUED",
+        "RESIZING",
+        *JOB_TERMINAL_STATES,
+        "UNKNOWN",
+    }
+)
 
 
 def _error(status_code: int, code: str, message: str) -> HTTPException:
@@ -1276,31 +1318,92 @@ def close_self_terminal(
     return {"status": "CLOSING"}
 
 
-def _job_view(job: PortalJob) -> dict[str, Any]:
+def _validated_cli_source_path(
+    source_path: str | None, username: str
+) -> tuple[str | None, str, str, str]:
+    if source_path is None:
+        return None, "/workspace/projects", "workspace", str(WORKSPACE_DEFAULT_WORKDIR)
+    path = PurePosixPath(source_path)
+    raw = path.as_posix()
+    if (
+        not path.is_absolute()
+        or raw != source_path
+        or any(part in {"", ".", ".."} for part in path.parts[1:])
+    ):
+        raise _error(422, "JOB_SOURCE_PATH_REJECTED", "脚本路径必须是规范绝对路径")
+    workspace_root = PurePosixPath("/workspace")
+    home_root = PurePosixPath("/home") / username
+    if path != workspace_root and path.is_relative_to(workspace_root):
+        scope = "workspace"
+        root = workspace_root
+    elif path != home_root and path.is_relative_to(home_root):
+        scope = "home"
+        root = home_root
+    else:
+        raise _error(
+            422,
+            "JOB_SOURCE_PATH_REJECTED",
+            "脚本只能位于自己的/workspace或/home目录",
+        )
+    parent = path.parent
+    relative = parent.relative_to(root).as_posix()
+    return source_path, parent.as_posix(), scope, "." if relative == "." else relative
+
+
+def _job_view(job: PortalJob, *, authoritative: bool = True) -> dict[str, Any]:
+    workdir = job.workdir_relative_path
+    if not workdir.startswith("/"):
+        workdir = f"/workspace/{workdir}"
     return {
         "id": str(job.id),
         "slurm_job_id": job.slurm_job_id,
         "name": job.name,
         "state": job.state,
+        "reason": job.state_reason,
         "cpus": job.requested_cpus,
         "memory_mb": job.memory_mb,
         "gpu_count": job.gpu_count,
         "time_limit_seconds": job.time_limit_seconds,
         "script_path": job.script_relative_path,
-        "workdir": job.workdir_relative_path,
+        "script_snapshot_path": f"/workspace/{job.script_relative_path}",
+        "source_path": job.source_path,
+        "workdir": workdir,
         "stdout_path": job.stdout_relative_path,
         "stderr_path": job.stderr_relative_path,
         "lease_deadline_at": ensure_utc(job.lease_deadline_at).isoformat(),
         "created_at": ensure_utc(job.created_at).isoformat(),
         "submitted_at": ensure_utc(job.submitted_at).isoformat() if job.submitted_at else None,
+        "started_at": ensure_utc(job.started_at).isoformat() if job.started_at else None,
         "finished_at": ensure_utc(job.finished_at).isoformat() if job.finished_at else None,
+        "elapsed_seconds": job.elapsed_seconds,
         "exit_code": job.exit_code,
+        "authoritative": authoritative,
     }
 
 
-def _refresh_job(context: AuthContext, resources: SelfResourceContext, job: PortalJob) -> None:
+def _worker_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value or value in {"Unknown", "N/A", "None"}:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return ensure_utc(parsed)
+
+
+def _refresh_job(
+    context: AuthContext,
+    resources: SelfResourceContext,
+    job: PortalJob,
+    *,
+    required: bool = False,
+) -> bool:
     if job.slurm_job_id is None:
-        return
+        return True
+    if job.state in JOB_TERMINAL_STATES and job.finished_at is not None:
+        return True
     managed = resources.managed
     try:
         result = call_worker(
@@ -1319,44 +1422,108 @@ def _refresh_job(context: AuthContext, resources: SelfResourceContext, job: Port
             dry_run=False,
             timeout_seconds=25,
         )
-    except WorkerClientError:
-        return
+    except WorkerClientError as exc:
+        if required:
+            raise _error(503, exc.code, "Slurm authoritative Job状态暂时不可用") from exc
+        return False
     if result.get("status") != "OK" or result.get("slurm_user") != managed.unix_username:
-        return
+        if required:
+            raise _error(503, "JOB_STATUS_UNAVAILABLE", "Slurm authoritative Job状态暂时不可用")
+        return False
     projected_state = str(result.get("job_state", job.state)).split("+", 1)[0].split(None, 1)[0]
-    if projected_state in {
-        "PENDING",
-        "RUNNING",
-        "COMPLETING",
-        "COMPLETED",
-        "FAILED",
-        "CANCELLED",
-        "TIMEOUT",
-        "OUT_OF_MEMORY",
-    }:
+    if projected_state in JOB_STATES:
         job.state = projected_state
+    reason = result.get("state_reason")
+    job.state_reason = str(reason)[:512] if reason else None
     exit_code = result.get("exit_code")
     job.exit_code = str(exit_code)[:32] if exit_code else job.exit_code
-    if job.state in {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY"}:
-        job.finished_at = job.finished_at or utcnow()
+    started_at = _worker_timestamp(result.get("started_at"))
+    finished_at = _worker_timestamp(result.get("finished_at"))
+    if started_at is not None:
+        job.started_at = started_at
+    elapsed = result.get("elapsed_seconds")
+    if isinstance(elapsed, int) and not isinstance(elapsed, bool) and elapsed >= 0:
+        job.elapsed_seconds = elapsed
+    if job.state in JOB_TERMINAL_STATES:
+        job.finished_at = finished_at or job.finished_at or utcnow()
+    return True
 
 
-@router.get("/self/jobs")
-def self_jobs(
+@router.get("/self/cli-auth")
+def self_cli_auth(
+    context: AuthContext = Depends(request_auth_context),
+) -> dict[str, Any]:
+    if not context.is_cli_token or context.cli_token is None:
+        raise _error(401, "CLI_TOKEN_REQUIRED", "需要有效的普通用户CLI Token")
+    return {
+        "status": "AUTHENTICATED",
+        "user": {
+            "id": str(context.user.id),
+            "login_name": context.user.login_name,
+            "unix_username": context.user.unix_username,
+            "role": "user",
+        },
+        "credential": {
+            "id": str(context.cli_token.id),
+            "label": context.cli_token.label,
+            "expires_at": (
+                ensure_utc(context.cli_token.expires_at).isoformat()
+                if context.cli_token.expires_at
+                else None
+            ),
+            "last_used_at": (
+                ensure_utc(context.cli_token.last_used_at).isoformat()
+                if context.cli_token.last_used_at
+                else None
+            ),
+        },
+    }
+
+
+@router.get("/self/jobs/config")
+def self_job_config(
     context: AuthContext = Depends(permission_dependency("self.jobs.read")),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     resources = resolve_self_compute_context(db, context.user)
+    username = resources.managed.unix_username
+    return {
+        "status": "OK",
+        "defaults": JOB_DEFAULTS,
+        "limits": JOB_LIMITS,
+        "allowed_script_roots": ["/workspace", f"/home/{username}"],
+        "username": username,
+        "cli_version": "1.0.0",
+        "sbatch_directives": "REJECTED",
+    }
+
+
+@router.get("/self/jobs")
+def self_jobs(
+    limit: int = Query(default=20, ge=1, le=200),
+    state: str | None = Query(default=None, min_length=1, max_length=32),
+    context: AuthContext = Depends(permission_dependency("self.jobs.read")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    resources = resolve_self_compute_context(db, context.user)
+    normalized_state = state.upper() if state else None
+    if normalized_state is not None and normalized_state not in JOB_STATES:
+        raise _error(422, "JOB_STATE_INVALID", "Job状态过滤值无效")
     rows = db.scalars(
         select(PortalJob)
         .where(PortalJob.owner_managed_user_id == resources.managed.id)
         .order_by(PortalJob.created_at.desc())
         .limit(200)
     ).all()
-    for row in rows[:50]:
-        _refresh_job(context, resources, row)
+    views: list[dict[str, Any]] = []
+    for row in rows:
+        authoritative = _refresh_job(context, resources, row, required=True)
+        if normalized_state is None or row.state == normalized_state:
+            views.append(_job_view(row, authoritative=authoritative))
+            if len(views) >= limit:
+                break
     db.commit()
-    return {"status": "OK", "jobs": [_job_view(row) for row in rows], "count": len(rows)}
+    return {"status": "OK", "jobs": views, "count": len(views)}
 
 
 @router.post("/self/jobs")
@@ -1367,10 +1534,15 @@ def submit_self_job(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     require_session_csrf(request, context)
+    if body.gpu_count not in {0, 1}:
+        raise _error(422, "GPU_LIMIT_EXCEEDED", "GPU request must be 0 or 1")
     if body.image_ref is not None and body.image_ref not in APPROVED_IMAGE_REFS:
         raise _error(422, "IMAGE_NOT_APPROVED", "镜像不在管理员批准清单中")
     resources = resolve_self_compute_context(db, context.user, lock=True)
     managed = resources.managed
+    source_path, logical_workdir, workdir_scope, workdir_relative = _validated_cli_source_path(
+        body.source_path, managed.unix_username
+    )
     binding = workspace_binding(managed.unix_username, managed.uid, managed.gid)
     active = resources.active_lease
     terminal = resources.terminal_lease
@@ -1401,7 +1573,6 @@ def submit_self_job(
         raise _error(422, "JOB_SCRIPT_REJECTED", "执行脚本不能超过8 KiB")
     script_sha256 = hashlib.sha256(script_bytes).hexdigest()
     script_path = f".portal/job-scripts/{job_id}.sh"
-    workdir = str(WORKSPACE_DEFAULT_WORKDIR)
     stdout = f"outputs/{job_id}.out"
     stderr = f"outputs/{job_id}.err"
     image_ref = body.image_ref or APPROVED_JOB_IMAGE
@@ -1419,7 +1590,8 @@ def submit_self_job(
         "script_relative_path": script_path,
         "script_content": script_content,
         "script_sha256": script_sha256,
-        "workdir_relative_path": workdir,
+        "workdir_scope": workdir_scope,
+        "workdir_relative_path": workdir_relative,
         "stdout_relative_path": stdout,
         "stderr_relative_path": stderr,
         "cpus": body.cpus,
@@ -1453,7 +1625,8 @@ def submit_self_job(
         name=body.name,
         state="SUBMITTING",
         script_relative_path=script_path,
-        workdir_relative_path=workdir,
+        source_path=source_path,
+        workdir_relative_path=logical_workdir,
         stdout_relative_path=stdout,
         stderr_relative_path=stderr,
         requested_cpus=body.cpus,
@@ -1511,7 +1684,12 @@ def submit_self_job(
         event_type="JOB_SUBMIT_ALLOWED",
         object_type="portal_job",
         object_id=str(job.id),
-        metadata={"slurm_job_id": slurm_job_id, "gpu_count": body.gpu_count},
+        metadata={
+            "slurm_job_id": slurm_job_id,
+            "gpu_count": body.gpu_count,
+            "source_path": source_path,
+            "workdir": logical_workdir,
+        },
     )
     db.commit()
     return {"status": "SUBMITTED", "job": _job_view(job)}
@@ -1540,7 +1718,7 @@ def self_job_detail(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     resources, job = _owned_job(db, context, job_id)
-    _refresh_job(context, resources, job)
+    _refresh_job(context, resources, job, required=True)
     db.commit()
     return {"status": "OK", "job": _job_view(job)}
 
@@ -1553,7 +1731,7 @@ def self_job_logs(
 ) -> dict[str, Any]:
     require_delegated_scope(context, "self.jobs.logs.read")
     resources, job = _owned_job(db, context, job_id)
-    _refresh_job(context, resources, job)
+    _refresh_job(context, resources, job, required=True)
     db.commit()
     managed = resources.managed
     result = _worker(
@@ -1571,7 +1749,12 @@ def self_job_logs(
         context=context,
         idempotency_key=f"self-job-logs:{job.id}",
     )
-    return {"status": "OK", "stdout": result.get("stdout", ""), "stderr": result.get("stderr", "")}
+    return {
+        "status": "OK",
+        "stdout": result.get("stdout", ""),
+        "stderr": result.get("stderr", ""),
+        "job": _job_view(job),
+    }
 
 
 @router.post("/self/jobs/{job_id}/cancel")
@@ -1600,6 +1783,9 @@ def cancel_self_job(
                 "DELEGATED_JOB_CANCEL_DENIED",
                 "委托测试会话只能取消自己创建的作业",
             )
+    _refresh_job(context, resources, job, required=True)
+    if job.state in JOB_TERMINAL_STATES:
+        raise _error(409, "JOB_ALREADY_TERMINAL", "只能取消非终态Job")
     if job.slurm_job_id is None:
         raise _error(409, "JOB_NOT_SUBMITTED", "作业尚未提交到Slurm")
     key = f"self-job-cancel:{job.id}:{body.idempotency_key}"
@@ -1617,8 +1803,12 @@ def cancel_self_job(
         context=context,
         idempotency_key=key,
     )
-    job.state = str(result.get("job_state", "CANCELLED"))
-    job.finished_at = utcnow()
+    projected_state = str(result.get("job_state", "")).split("+", 1)[0].split(None, 1)[0]
+    authoritative = projected_state in JOB_STATES
+    if projected_state in JOB_STATES:
+        job.state = projected_state
+    if job.state in JOB_TERMINAL_STATES:
+        job.finished_at = utcnow()
     _audit(
         db,
         request,
@@ -1629,7 +1819,10 @@ def cancel_self_job(
         metadata={"slurm_job_id": job.slurm_job_id},
     )
     db.commit()
-    return {"status": "CANCELLED", "job": _job_view(job)}
+    return {
+        "status": "CANCELLATION_REQUESTED",
+        "job": _job_view(job, authoritative=authoritative),
+    }
 
 
 @router.get("/self/storage")

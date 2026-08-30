@@ -132,7 +132,13 @@ def test_installer_publishes_every_root_allowlisted_script_from_the_manifest() -
     root_scripts = {
         name: PLATFORM_ROOT / "scripts" / name
         for name in manifest
-        if name not in {"h100-platform-common", "h100-origin-pilot-acceptance"}
+        if name
+        not in {
+            "h100-platform-common",
+            "h100-origin-pilot-acceptance",
+            "h100-cli",
+            "h100-cli-rollout",
+        }
     }
 
     assert root_scripts
@@ -141,6 +147,61 @@ def test_installer_publishes_every_root_allowlisted_script_from_the_manifest() -
         assert manifest[name] == hashlib.sha256(source.read_bytes()).hexdigest(), name
         assert str(source.relative_to(PLATFORM_ROOT)) in installer, name
         assert f"/usr/local/sbin/{name}" in installer, name
+
+
+def test_user_cli_is_installed_read_only_and_reconciled_without_container_restart() -> None:
+    cli = PORTAL_ROOT / "apps/cli/h100"
+    rollout = PLATFORM_ROOT / "scripts/h100-cli-rollout"
+    create = PLATFORM_ROOT / "scripts/h100-container-create"
+    installer = (PORTAL_ROOT / "deploy/scripts/install-runtime.sh").read_text()
+    service = (PORTAL_ROOT / "deploy/systemd/h100-cli-rollout.service").read_text()
+    timer = (PORTAL_ROOT / "deploy/systemd/h100-cli-rollout.timer").read_text()
+    manifest = json.loads((PORTAL_ROOT / "deploy/worker-scripts.json").read_text())
+
+    assert cli.is_file() and rollout.is_file()
+    assert cli.stat().st_mode & 0o111
+    assert rollout.stat().st_mode & 0o111
+    assert manifest["h100-cli"] == hashlib.sha256(cli.read_bytes()).hexdigest()
+    assert manifest["h100-cli-rollout"] == hashlib.sha256(rollout.read_bytes()).hexdigest()
+
+    install_lines = installer.splitlines()
+    assert 'readonly USER_CLI_SOURCE="${SOURCE_DIR}/apps/cli/h100"' in install_lines
+    assert 'readonly CLI_ROLLOUT_SOURCE="${PLATFORM_DIR}/scripts/h100-cli-rollout"' in install_lines
+    assert '  "${PLATFORM_LIBRARY_DIR}/h100-cli"' in install_lines
+    assert "  /usr/local/sbin/h100-cli-rollout" in install_lines
+    assert "h100-cli-rollout.service" in installer
+    assert "h100-cli-rollout.timer" in installer
+
+    create_text = create.read_text()
+    assert "source: /usr/local/lib/h100-platform/h100-cli" in create_text
+    assert "target: /usr/local/bin/h100" in create_text
+    assert "read_only: true" in create_text
+
+    rollout_text = rollout.read_text()
+    assert "docker restart" not in rollout_text
+    assert "docker compose restart" not in rollout_text
+    assert "nsenter" not in rollout_text
+    assert "/usr/bin/mount" not in rollout_text
+    assert 'docker cp "${CLI_SOURCE}" "${container}:${temp_target}"' in rollout_text
+    assert 'docker exec --user 0 "${container}" chown root:root "${temp_target}"' in rollout_text
+    assert 'docker exec --user 0 "${container}" chmod 0555 "${temp_target}"' in rollout_text
+    assert (
+        'docker exec --user 0 "${container}" mv -f -- "${temp_target}" "${CLI_TARGET}"'
+        in rollout_text
+    )
+    assert 'if [[ "${observed_sha256}" == "${expected_sha256}" ]]; then' in rollout_text
+    assert "mode=live-root-owned" in rollout_text
+    assert "mode=compose-read-only" in rollout_text
+    assert "state=stopped" in rollout_text
+
+    assert "ExecStart=/usr/local/sbin/h100-cli-rollout --all" in service.splitlines()
+    assert "User=root" in service.splitlines()
+    assert "NoNewPrivileges=yes" in service.splitlines()
+    assert "RestrictNamespaces=yes" in service.splitlines()
+    assert "RestrictAddressFamilies=AF_UNIX" in service.splitlines()
+    assert "ProtectSystem=strict" in service.splitlines()
+    assert "ReadWritePaths=/run /var/run/docker.sock" in service.splitlines()
+    assert "OnUnitActiveSec=60s" in timer.splitlines()
 
 
 def test_portal3f_worker_can_write_only_the_guard_metrics_directory() -> None:

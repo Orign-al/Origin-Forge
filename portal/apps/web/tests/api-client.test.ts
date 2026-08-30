@@ -3,11 +3,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { apiFetch } from "@h100-portal/api-client";
 import {
   activateSelfCompute,
+  createCliToken,
   closeSelfTerminal,
   enrollSshKey,
   failedProvisionReconciliationReadiness,
   reconcileFailedProvision,
   resizeSelfTerminal,
+  revokeCliToken,
   retryLeaseRecycle,
   sendSelfTerminalInput,
   startManagedContainer,
@@ -43,6 +45,54 @@ describe("API client", () => {
       }),
     ).resolves.toEqual({ ok: true });
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("creates and revokes owner-bound CLI tokens with CSRF and no token input", async () => {
+    document.cookie = "h100_csrf=test-csrf-value; Path=/";
+    const tokenId = "30000000-0000-4000-8000-000000000001";
+    const fetchMock = vi
+      .fn()
+      .mockImplementationOnce(
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+          expect(String(input)).toBe("/api/v1/auth/cli-tokens");
+          expect(init?.method).toBe("POST");
+          expect(new Headers(init?.headers).get("X-CSRF-Token")).toBe(
+            "test-csrf-value",
+          );
+          expect(JSON.parse(String(init?.body))).toEqual({
+            label: "development container",
+            expires_in_days: 90,
+          });
+          expect(String(init?.body)).not.toContain("h100_cli_");
+          return new Response(
+            JSON.stringify({
+              status: "CREATED",
+              token: `h100_cli_${"A".repeat(64)}`,
+              credential: { id: tokenId },
+            }),
+            { status: 201, headers: { "Content-Type": "application/json" } },
+          );
+        },
+      )
+      .mockImplementationOnce(
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+          expect(String(input)).toBe(`/api/v1/auth/cli-tokens/${tokenId}`);
+          expect(init?.method).toBe("DELETE");
+          expect(new Headers(init?.headers).get("X-CSRF-Token")).toBe(
+            "test-csrf-value",
+          );
+          expect(init?.body).toBeUndefined();
+          return new Response(null, { status: 204 });
+        },
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createCliToken({
+      label: "development container",
+      expires_in_days: 90,
+    });
+    await revokeCliToken(tokenId);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("sends only an idempotency key for owner-bound self activation", async () => {

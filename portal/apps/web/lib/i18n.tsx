@@ -156,6 +156,8 @@ const EN_US: Record<string, string> = {
     "This changes only the Portal identity password. It does not change Linux, SSH, containers, leases, or other compute resources.",
   "只管理 Portal 密码与服务端会话":
     "Manage only your Portal password and server-side sessions",
+  "只管理 Portal 密码、服务端会话与 CLI Token":
+    "Manage your Portal password, server-side sessions, and CLI Tokens",
   当前网页身份: "Current Web Identity",
   角色: "Role",
   账号: "Account",
@@ -184,6 +186,25 @@ const EN_US: Record<string, string> = {
   状态: "Status",
   操作: "Action",
   撤销: "Revoke",
+  "CLI Tokens": "CLI Tokens",
+  "仅用于自己的Portal Job；Token明文只显示一次":
+    "Only for your own Portal Jobs; plaintext is shown once",
+  Token名称: "Token label",
+  "例如：开发容器": "For example: development container",
+  有效期: "Expiration",
+  "30天": "30 days",
+  "90天": "90 days",
+  "365天": "365 days",
+  永不过期: "Never expires",
+  创建Token: "Create token",
+  "新CLI Token（仅显示一次）": "New CLI Token (shown once)",
+  复制Token: "Copy token",
+  "请输入Token名称和当前网页密码。":
+    "Enter a token label and your current web password.",
+  "CLI Token已创建；关闭本页后不会再次显示明文。":
+    "The CLI Token was created. Its plaintext will not be shown again after this page closes.",
+  "CLI Token创建失败；没有生成或保存新的凭据。":
+    "CLI Token creation failed. No new credential was generated or saved.",
   取消: "Cancel",
   继续: "Continue",
   总览: "Overview",

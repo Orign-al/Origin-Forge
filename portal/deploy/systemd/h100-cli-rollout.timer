@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically reconcile h100 CLI container mounts
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=h100-cli-rollout.service
+
+[Install]
+WantedBy=timers.target

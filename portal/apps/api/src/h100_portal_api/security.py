@@ -13,6 +13,7 @@ from h100_portal_api.config import get_settings
 
 LOGIN_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 SAFE_TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,127}$")
+CLI_TOKEN_RE = re.compile(r"(?:^|[^A-Za-z0-9_-])h100_cli_[A-Za-z0-9_-]{64}(?:$|[^A-Za-z0-9_-])")
 ALLOWED_KEY_TYPES = {"ssh-ed25519", "ecdsa-sha2-nistp256", "sk-ssh-ed25519@openssh.com"}
 WEAK_PASSWORDS = {
     "passwordpassword",
@@ -147,6 +148,8 @@ def safe_metadata(data: object, sensitive_keys: Iterable[str] | None = None) -> 
     if isinstance(data, str) and (
         "/setup-password#token=" in data or "/setup-password?token=" in data
     ):
+        return "[REDACTED]"
+    if isinstance(data, str) and CLI_TOKEN_RE.search(data):
         return "[REDACTED]"
     if isinstance(data, (str, int, float, bool)) or data is None:
         return data

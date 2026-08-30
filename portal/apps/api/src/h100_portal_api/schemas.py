@@ -39,6 +39,19 @@ class SetupPasswordRequest(ApiModel):
         return self
 
 
+class CliTokenCreateRequest(ApiModel):
+    label: str = Field(min_length=1, max_length=64)
+    expires_in_days: int | None = Field(default=90, ge=1, le=365)
+
+    @field_validator("label")
+    @classmethod
+    def normalize_label(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("CLI token label must not be blank")
+        return normalized
+
+
 class PortalUserCreateRequest(ApiModel):
     login_name: str = Field(min_length=1, max_length=64)
     display_name: str = Field(min_length=1, max_length=128)
@@ -371,9 +384,10 @@ class SelfJobSubmitRequest(ApiModel):
     script: str = Field(min_length=1, max_length=8192)
     cpus: int = Field(ge=1, le=8)
     memory_mb: int = Field(ge=256, le=32768)
-    gpu_count: Literal[0, 1]
+    gpu_count: int = Field(ge=0, le=32)
     time_limit_seconds: int = Field(ge=60, le=345600)
     image_ref: str | None = Field(default=None, max_length=512)
+    source_path: str | None = Field(default=None, min_length=1, max_length=512)
     idempotency_key: uuid.UUID
 
     @field_validator("script")
@@ -382,6 +396,8 @@ class SelfJobSubmitRequest(ApiModel):
         encoded = value.encode("utf-8")
         if not encoded or len(encoded) > 8 * 1024 or b"\x00" in encoded:
             raise ValueError("job script must be non-empty UTF-8 text up to 8 KiB")
+        if any(line.lstrip().startswith("#SBATCH") for line in value.splitlines()):
+            raise ValueError("#SBATCH directives are not accepted; use Portal resource fields")
         return value
 
 
