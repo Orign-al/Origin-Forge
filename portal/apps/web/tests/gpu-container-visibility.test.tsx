@@ -162,7 +162,9 @@ describe("ordinary-user GPU Development visibility", () => {
       ],
     ]);
 
-    expect(screen.getByText("开发容器 · H100 × 1 过渡分配")).toBeInTheDocument();
+    expect(
+      screen.getByText("开发容器 · H100 × 1 过渡分配"),
+    ).toBeInTheDocument();
     expect(screen.getByText("H100 × 1 · TRANSITIONAL")).toBeInTheDocument();
   });
 
