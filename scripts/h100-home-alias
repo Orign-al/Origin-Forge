@@ -6,23 +6,36 @@ set -euo pipefail
 # bind into the running Worker namespace when necessary.
 readonly HOME_ALIAS_INSTALLED_PATH=/usr/local/sbin/h100-home-alias
 home_alias_worker_context=0
+home_alias_host_namespace_pid=1
 if grep -Eq '(^|/)h100-portal-worker\.service($|/)' /proc/self/cgroup 2>/dev/null; then
   home_alias_worker_context=1
+elif [[ "${H100_HOME_ALIAS_NAMESPACE_REHEARSAL:-0}" == 1 \
+  && -f /rehearsal/enable-home-alias-namespace-rehearsal \
+  && ! -L /rehearsal/enable-home-alias-namespace-rehearsal \
+  && "$(stat -c '%u:%g:%a' /rehearsal/enable-home-alias-namespace-rehearsal)" == 0:0:600 ]]; then
+  home_alias_worker_context=1
+  if [[ "${H100_HOME_ALIAS_REHEARSAL_HOST_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+    home_alias_host_namespace_pid="${H100_HOME_ALIAS_REHEARSAL_HOST_PID}"
+  fi
 fi
 if [[ "${EUID}" == 0 && "${home_alias_worker_context}" == 1 \
-  && -e /proc/1/ns/mnt && -e /proc/self/ns/mnt \
-  && "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ]]; then
+  && -e "/proc/${home_alias_host_namespace_pid}/ns/mnt" && -e /proc/self/ns/mnt \
+  && "$(readlink /proc/self/ns/mnt)" != \
+    "$(readlink "/proc/${home_alias_host_namespace_pid}/ns/mnt")" ]]; then
   [[ "$0" == "${HOME_ALIAS_INSTALLED_PATH}" \
     && -x "${HOME_ALIAS_INSTALLED_PATH}" \
     && ! -L "${HOME_ALIAS_INSTALLED_PATH}" \
-    && "$(stat -c '%u' /proc/1)" == 0 ]] \
+    && "$(stat -c '%u' "/proc/${home_alias_host_namespace_pid}")" == 0 ]] \
     || { printf 'ERROR: home alias host namespace entry is invalid\n' >&2; exit 1; }
-  exec /usr/bin/nsenter --target 1 --mount \
-    --root=/proc/1/root --wd=/proc/1/cwd -- \
+  exec /usr/bin/nsenter --target "${home_alias_host_namespace_pid}" --mount \
+    --root="/proc/${home_alias_host_namespace_pid}/root" \
+    --wd="/proc/${home_alias_host_namespace_pid}/cwd" -- \
     "${HOME_ALIAS_INSTALLED_PATH}" "$@"
 fi
-unset home_alias_worker_context
+unset home_alias_worker_context home_alias_host_namespace_pid
 
+# Production uses this integrity-pinned absolute path.
+# shellcheck disable=SC1091
 source /usr/local/lib/h100-platform/h100-platform-common.sh
 
 readonly UNIT_ROOT=/etc/systemd/system
@@ -115,9 +128,10 @@ verify_backing() {
   [[ "$(stat -c '%u:%g' "${backing_root}")" == "${user_uid}:${user_gid}" \
     && "$(stat -c '%u:%g' "${backing_home}")" == "${user_uid}:${user_gid}" ]] \
     || h100_fail 'authoritative home ownership is invalid'
-  h100_workspace_mode_is_private "${backing_root}" \
-    && h100_workspace_mode_is_private "${backing_home}" \
-    || h100_fail 'authoritative home is accessible to other users'
+  if ! h100_workspace_mode_is_private "${backing_root}" \
+    || ! h100_workspace_mode_is_private "${backing_home}"; then
+    h100_fail 'authoritative home is accessible to other users'
+  fi
   [[ "$(stat -c '%d' "${backing_home}")" == "$(stat -c '%d' "${H100_DATA_ROOT}")" ]] \
     || h100_fail 'authoritative home is outside the quota filesystem'
 }
@@ -179,7 +193,12 @@ worker_pid() {
   [[ -e "/proc/${pid}/ns/mnt" && "$(stat -c '%u' "/proc/${pid}")" == 0 ]] \
     || h100_fail 'Worker mount namespace process is unavailable'
   grep -Eq '(^|/)h100-portal-worker\.service($|/)' "/proc/${pid}/cgroup" \
-    || h100_fail 'Worker mount namespace cgroup is invalid'
+    || { [[ "${H100_HOME_ALIAS_NAMESPACE_REHEARSAL:-0}" == 1 \
+      && -f /rehearsal/enable-home-alias-namespace-rehearsal \
+      && ! -L /rehearsal/enable-home-alias-namespace-rehearsal \
+      && "$(stat -c '%u:%g:%a' \
+        /rehearsal/enable-home-alias-namespace-rehearsal)" == 0:0:600 ]] \
+      || h100_fail 'Worker mount namespace cgroup is invalid'; }
   printf '%s\n' "${pid}"
 }
 
@@ -190,48 +209,133 @@ worker_exec() {
     --root="/proc/${pid}/root" --wd="/proc/${pid}/cwd" -- "$@"
 }
 
-worker_contract_ready() {
-  local pid=$1 options option
-  worker_exec "${pid}" /usr/bin/findmnt --noheadings --mountpoint \
-    "${canonical_home}" >/dev/null 2>&1 || return 1
+worker_visible_mount_record() {
+  local pid=$1
+  # ReadWritePaths can retain covered records at the same pathname. The final
+  # --target row is the record reached by path lookup inside the Worker.
+  worker_exec "${pid}" /usr/bin/findmnt --noheadings --raw \
+    --output TARGET,VFS-OPTIONS --target "${canonical_home}" 2>/dev/null \
+    | /usr/bin/tail -n 1
+}
+
+worker_covered_alias_placeholder_ready() {
+  local pid=$1 host_record host_target host_maj_min host_fsroot host_extra
+  local worker_records worker_target worker_maj_min worker_fsroot worker_extra
+  local worker_record_count=0 host_path_identity worker_path_identity
+
+  host_record="$(findmnt --noheadings --raw --output TARGET,MAJ:MIN,FSROOT \
+    --mountpoint "${canonical_home}" 2>/dev/null)" || return 1
+  [[ -n "${host_record}" && "${host_record}" != *$'\n'* ]] || return 1
+  read -r host_target host_maj_min host_fsroot host_extra <<<"${host_record}"
+  [[ "${host_target}" == "${canonical_home}" \
+    && "${host_maj_min}" =~ ^[0-9]+:[0-9]+$ \
+    && "${host_fsroot}" == /* \
+    && -z "${host_extra:-}" ]] || return 1
+
+  worker_records="$(worker_exec "${pid}" /usr/bin/findmnt --noheadings --raw \
+    --output TARGET,MAJ:MIN,FSROOT --mountpoint "${canonical_home}" 2>/dev/null)" \
+    || return 1
+  [[ -n "${worker_records}" ]] || return 1
+  while read -r worker_target worker_maj_min worker_fsroot worker_extra; do
+    [[ "${worker_target}" == "${canonical_home}" \
+      && "${worker_maj_min}" == "${host_maj_min}" \
+      && "${worker_fsroot}" == "${host_fsroot}" \
+      && -z "${worker_extra:-}" ]] || return 1
+    ((worker_record_count += 1))
+  done <<<"${worker_records}"
+  ((worker_record_count > 0 && worker_record_count <= 8)) || return 1
+
+  host_path_identity="$(stat -c '%d:%i' "${canonical_home}")" || return 1
+  worker_path_identity="$(worker_exec "${pid}" /usr/bin/stat -c '%d:%i' \
+    "${canonical_home}")" || return 1
+  [[ "${worker_path_identity}" != "${host_path_identity}" ]] || return 1
+  worker_exec "${pid}" /usr/bin/test -d "${canonical_home}" || return 1
+  worker_exec "${pid}" /usr/bin/test ! -L "${canonical_home}" || return 1
+  [[ "$(worker_exec "${pid}" /usr/bin/stat -c '%u:%g:%a' \
+    "${canonical_home}")" == 0:0:700 ]] || return 1
+  [[ -z "$(worker_exec "${pid}" /usr/bin/find "${canonical_home}" \
+    -mindepth 1 -maxdepth 1 -print -quit)" ]]
+}
+
+worker_mount_identity_ready() {
+  local pid=$1 record target worker_mode
+  record="$(worker_visible_mount_record "${pid}")" || return 1
+  target="${record%% *}"
+  [[ "${target}" == "${canonical_home}" ]] || return 1
   [[ "$(worker_exec "${pid}" /usr/bin/stat -c '%d:%i' "${backing_home}")" == \
     "$(worker_exec "${pid}" /usr/bin/stat -c '%d:%i' "${canonical_home}")" \
     && "$(worker_exec "${pid}" /usr/bin/stat -c '%u:%g' "${canonical_home}")" == \
        "${user_uid}:${user_gid}" ]] || return 1
-  options="$(worker_exec "${pid}" /usr/bin/findmnt --noheadings --raw \
-    --output OPTIONS --mountpoint "${canonical_home}")" || return 1
+  worker_mode="$(worker_exec "${pid}" /usr/bin/stat -c '%a' "${canonical_home}")" \
+    || return 1
+  [[ "${worker_mode}" =~ ^[0-7]+$ ]] || return 1
+  (((8#${worker_mode} & 0007) == 0)) || return 1
+}
+
+worker_mount_contract_ready() {
+  local pid=$1 record options option
+  worker_mount_identity_ready "${pid}" || return 1
+  record="$(worker_visible_mount_record "${pid}")" || return 1
+  options="${record#* }"
   for option in rw nosuid nodev; do
     tr ',' '\n' <<<"${options}" | grep -Fxq "${option}" || return 1
   done
 }
 
-sync_worker_alias() {
-  local pid
-  pid="$(worker_pid)" || return 0
-  worker_contract_ready "${pid}" && return 0
-  worker_exec "${pid}" /usr/bin/test -d "${canonical_home}" \
-    && worker_exec "${pid}" /usr/bin/test ! -L "${canonical_home}" \
-    || h100_fail 'Worker canonical home mountpoint is invalid'
-  if worker_exec "${pid}" /usr/bin/findmnt --noheadings --mountpoint \
-    "${canonical_home}" >/dev/null 2>&1; then
-    h100_fail 'Worker canonical home mount collision is invalid'
-  fi
-  worker_exec "${pid}" /usr/bin/mount --bind "${backing_home}" "${canonical_home}"
+normalize_worker_alias() {
+  local pid=$1
   worker_exec "${pid}" /usr/bin/mount -o remount,bind,rw,nosuid,nodev \
-    "${canonical_home}" "${canonical_home}"
-  worker_contract_ready "${pid}" \
-    || h100_fail 'Worker canonical home mount contract did not converge'
+    "${canonical_home}" "${canonical_home}" \
+    || { printf 'HOME ALIAS FAILURE CODE: WORKER_REMOUNT_FAILED\n' >&2; \
+      h100_fail 'Worker home mount security normalization failed'; }
+  worker_mount_contract_ready "${pid}" \
+    || { printf 'HOME ALIAS FAILURE CODE: WORKER_MOUNT_CONTRACT_INVALID\n' >&2; \
+      h100_fail 'Worker home mount contract is invalid'; }
+}
+
+sync_worker_alias() {
+  local pid visible_record
+  pid="$(worker_pid)" || return 0
+  worker_mount_contract_ready "${pid}" && return 0
+  if worker_mount_identity_ready "${pid}"; then
+    normalize_worker_alias "${pid}"
+    return 0
+  fi
+  visible_record="$(worker_visible_mount_record "${pid}" || true)"
+  if [[ "${visible_record%% *}" == "${canonical_home}" ]]; then
+    worker_covered_alias_placeholder_ready "${pid}" \
+      || { printf 'HOME ALIAS FAILURE CODE: WORKER_MOUNT_COLLISION\n' >&2; \
+        h100_fail 'Worker canonical home mount collision is invalid'; }
+  fi
+  if ! worker_exec "${pid}" /usr/bin/test -d "${canonical_home}" \
+    || ! worker_exec "${pid}" /usr/bin/test ! -L "${canonical_home}"; then
+    printf 'HOME ALIAS FAILURE CODE: WORKER_MOUNTPOINT_INVALID\n' >&2
+    h100_fail 'Worker canonical home mountpoint is invalid'
+  fi
+  worker_exec "${pid}" /usr/bin/mount --bind "${backing_home}" "${canonical_home}" \
+    || { printf 'HOME ALIAS FAILURE CODE: WORKER_BIND_FAILED\n' >&2; \
+      h100_fail 'Worker home bind could not be created'; }
+  normalize_worker_alias "${pid}"
 }
 
 unmount_worker_alias() {
-  local pid
+  local pid _attempt visible_record
   pid="$(worker_pid)" || return 0
-  if worker_exec "${pid}" /usr/bin/findmnt --noheadings --mountpoint \
-    "${canonical_home}" >/dev/null 2>&1; then
-    worker_contract_ready "${pid}" \
-      || h100_fail 'Worker canonical home mount differs from the owner binding'
+  for _attempt in {1..8}; do
+    if ! worker_mount_identity_ready "${pid}"; then
+      visible_record="$(worker_visible_mount_record "${pid}" || true)"
+      if [[ "${visible_record%% *}" == "${canonical_home}" ]]; then
+        worker_covered_alias_placeholder_ready "${pid}" && return 0
+        printf 'HOME ALIAS FAILURE CODE: WORKER_REMOVE_COLLISION\n' >&2
+        h100_fail 'Worker home mount removal identity is invalid'
+      fi
+      return 0
+    fi
+    worker_mount_contract_ready "${pid}" || normalize_worker_alias "${pid}"
     worker_exec "${pid}" /usr/bin/umount "${canonical_home}"
-  fi
+  done
+  printf 'HOME ALIAS FAILURE CODE: WORKER_REMOVE_BOUNDED\n' >&2
+  h100_fail 'Worker home mount remained after bounded removal'
 }
 
 verify_alias() {

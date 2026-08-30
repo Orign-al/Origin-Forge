@@ -180,7 +180,16 @@ def test_workspace_runtime_is_zero_copy_profile_aware_and_alias_aware() -> None:
     assert "Options=bind,rw,nosuid,nodev" in home_alias
     assert "stat -c '%d:%i'" in home_alias
     assert "h100-portal-worker\\.service" in home_alias
-    assert "nsenter --target 1 --mount" in home_alias
+    assert 'nsenter --target "${home_alias_host_namespace_pid}" --mount' in home_alias
+    assert "H100_HOME_ALIAS_NAMESPACE_REHEARSAL" in home_alias
+    assert "worker_visible_mount_record" in home_alias
+    assert "--output TARGET,VFS-OPTIONS --target" in home_alias
+    assert "worker_covered_alias_placeholder_ready" in home_alias
+    assert "TARGET,MAJ:MIN,FSROOT" in home_alias
+    assert "worker_mount_identity_ready" in home_alias
+    assert "normalize_worker_alias" in home_alias
+    assert "WORKER_MOUNT_COLLISION" in home_alias
+    assert "WORKER_REMOVE_COLLISION" in home_alias
     assert "rsync" not in home_alias
     assert "/srv/gpu-platform/workspaces" not in fstab
     assert "/storage/users none bind" not in fstab
