@@ -162,9 +162,7 @@ describe("ordinary-user GPU Development visibility", () => {
       ],
     ]);
 
-    expect(
-      screen.getByText("开发容器 · H100 × 1 过渡分配"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("开发容器 · H100 × 1 过渡分配")).toBeInTheDocument();
     expect(screen.getByText("H100 × 1 · TRANSITIONAL")).toBeInTheDocument();
   });
 
@@ -215,8 +213,6 @@ describe("ordinary-user GPU Development visibility", () => {
 
     expect(screen.getByText("私有存储总配额")).toBeInTheDocument();
     expect(screen.getByText("80.0 GB")).toBeInTheDocument();
-    expect(
-      screen.getByText(/已使用量包含 \/home/),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/已使用量包含 \/home/)).toBeInTheDocument();
   });
 });
