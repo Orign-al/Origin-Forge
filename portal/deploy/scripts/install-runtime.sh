@@ -30,6 +30,7 @@ readonly EASYTIER_LEGACY_INGRESS_SOURCE="${PLATFORM_DIR}/scripts/h100-easytier-l
 readonly EASYTIER_DUAL_RECONCILE_SOURCE="${PLATFORM_DIR}/scripts/h100-reconcile-dual-easytier-ingress"
 readonly USER_CLI_SOURCE="${SOURCE_DIR}/apps/cli/h100"
 readonly CLI_ROLLOUT_SOURCE="${PLATFORM_DIR}/scripts/h100-cli-rollout"
+readonly WEB_ARTIFACT_AUDITOR="${SOURCE_DIR}/deploy/scripts/web_artifact.py"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "install-runtime.sh must run as root" >&2
@@ -88,6 +89,16 @@ done
   || { echo "required deployment input missing: $USER_CLI_SOURCE" >&2; exit 1; }
 [[ -f "$CLI_ROLLOUT_SOURCE" && ! -L "$CLI_ROLLOUT_SOURCE" ]] \
   || { echo "required deployment input missing: $CLI_ROLLOUT_SOURCE" >&2; exit 1; }
+[[ -f "$WEB_ARTIFACT_AUDITOR" && ! -L "$WEB_ARTIFACT_AUDITOR" ]] \
+  || { echo "required deployment input missing: $WEB_ARTIFACT_AUDITOR" >&2; exit 1; }
+[[ -f "$SOURCE_DIR/apps/web/.next/standalone/apps/web/server.js" ]] \
+  || { echo "required Web entrypoint missing" >&2; exit 1; }
+[[ -d "$SOURCE_DIR/apps/web/.next/standalone/node_modules" \
+  && ! -L "$SOURCE_DIR/apps/web/.next/standalone/node_modules" ]] \
+  || { echo "self-contained Web dependency closure missing" >&2; exit 1; }
+
+/usr/bin/python3 "$WEB_ARTIFACT_AUDITOR" \
+  audit-tree "$SOURCE_DIR/apps/web/.next" --quiet
 
 rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
   --exclude=/node_modules/ \
