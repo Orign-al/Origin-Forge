@@ -131,7 +131,7 @@ The release does not place bare `sbatch`, `squeue`, or `scancel` replacements in
 Every successful object contains:
 
 ```json
-{"schema_version":"h100.cli.v1","command":"job.status","ok":true}
+{ "schema_version": "h100.cli.v1", "command": "job.status", "ok": true }
 ```
 
 Command payloads are additive within `h100.cli.v1`:
@@ -165,14 +165,14 @@ Errors use:
 
 ## Exit status
 
-| Code | Meaning |
-| ---: | --- |
-| 0 | Success, including Ctrl-C from log follow |
-| 1 | Generic client, transport, Portal, or server failure |
-| 2 | Usage or invalid CLI argument/local script |
-| 3 | Authentication required or credential rejected |
-| 4 | Authorization denied or resource not found |
-| 5 | Policy, quota, conflict, or validation rejection (HTTP 409/422/429) |
+| Code | Meaning                                                             |
+| ---: | ------------------------------------------------------------------- |
+|    0 | Success, including Ctrl-C from log follow                           |
+|    1 | Generic client, transport, Portal, or server failure                |
+|    2 | Usage or invalid CLI argument/local script                          |
+|    3 | Authentication required or credential rejected                      |
+|    4 | Authorization denied or resource not found                          |
+|    5 | Policy, quota, conflict, or validation rejection (HTTP 409/422/429) |
 
 Cross-owner Job access deliberately maps to the same resource-not-found behavior as an absent Job and does not disclose ownership.
 
