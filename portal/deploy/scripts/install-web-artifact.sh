@@ -49,7 +49,7 @@ if [[ -e "${TARGET_ROOT}/.next" || -L "${TARGET_ROOT}/.next" ]]; then
 else
   mkdir -m 0755 "${TARGET_ROOT}/.next"
 fi
-rsync -a --delete \
+rsync -a --checksum --delete \
   "${stage}/extract/.next/" \
   "${TARGET_ROOT}/.next/"
 /usr/bin/python3 "${AUDITOR}" audit-tree "${TARGET_ROOT}/.next" --quiet

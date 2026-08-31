@@ -25,6 +25,6 @@ portal/deploy/scripts/web_artifact.py build \
   --migration-head c1d2e3f4a5b6
 ```
 
-Production staging must use `deploy/scripts/install-web-artifact.sh`. That helper audits the archive before extraction, extracts into an isolated same-filesystem directory, audits the extracted tree, verifies the entrypoint and dependency closure, and only then synchronizes `.next` into the selected Web source directory. `install-runtime.sh` repeats the tree audit before its first runtime write.
+Production staging must use `deploy/scripts/install-web-artifact.sh`. That helper audits the archive before extraction, extracts into an isolated same-filesystem directory, audits the extracted tree, verifies the entrypoint and dependency closure, and only then synchronizes `.next` into the selected Web source directory. The synchronization compares file contents because deterministic archives normalize mtimes; size and mtime alone cannot identify a release. `install-runtime.sh` repeats the tree audit before its first runtime write.
 
 Release acceptance must additionally start the extracted standalone server from two unrelated temporary roots with an empty `NODE_PATH` and no build tree available, request `/login` and a static asset over HTTP, and rehearse old to new to old installation without retaining dependencies across releases.

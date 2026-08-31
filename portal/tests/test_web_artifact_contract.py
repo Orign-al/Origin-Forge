@@ -48,6 +48,31 @@ def _archive_with_member(archive: Path, member: tarfile.TarInfo) -> None:
         handle.addfile(member)
 
 
+def _build_artifact(
+    source: Path, archive: Path, manifest: Path
+) -> subprocess.CompletedProcess[str]:
+    return _run(
+        "build",
+        "--source",
+        str(source),
+        "--output",
+        str(archive),
+        "--manifest",
+        str(manifest),
+        "--git-commit",
+        "1" * 40,
+        "--git-tree",
+        "2" * 40,
+        "--production-parent",
+        "3" * 40,
+        "--cli-version",
+        "h100 1.0.0",
+        "--migration-head",
+        "c1d2e3f4a5b6",
+        "--quiet",
+    )
+
+
 def test_tree_audit_accepts_relative_internal_symlink(tmp_path: Path) -> None:
     source = _minimal_next(tmp_path)
     os.symlink("package", source / "standalone/node_modules/package-alias")
@@ -169,26 +194,7 @@ def test_build_is_minimal_self_contained_and_deterministic(tmp_path: Path) -> No
     archives = [tmp_path / "first.tar.gz", tmp_path / "second.tar.gz"]
     manifests = [tmp_path / "first.json", tmp_path / "second.json"]
     for archive, manifest in zip(archives, manifests, strict=True):
-        result = _run(
-            "build",
-            "--source",
-            str(source),
-            "--output",
-            str(archive),
-            "--manifest",
-            str(manifest),
-            "--git-commit",
-            "1" * 40,
-            "--git-tree",
-            "2" * 40,
-            "--production-parent",
-            "3" * 40,
-            "--cli-version",
-            "h100 1.0.0",
-            "--migration-head",
-            "c1d2e3f4a5b6",
-            "--quiet",
-        )
+        result = _build_artifact(source, archive, manifest)
         assert result.returncode == 0, result.stderr
 
     assert (
@@ -225,26 +231,7 @@ def test_web_installer_rejects_symlinked_target_tree(tmp_path: Path) -> None:
     source = _minimal_next(tmp_path / "source")
     archive = tmp_path / "artifact.tar.gz"
     manifest = tmp_path / "manifest.json"
-    built = _run(
-        "build",
-        "--source",
-        str(source),
-        "--output",
-        str(archive),
-        "--manifest",
-        str(manifest),
-        "--git-commit",
-        "1" * 40,
-        "--git-tree",
-        "2" * 40,
-        "--production-parent",
-        "3" * 40,
-        "--cli-version",
-        "h100 1.0.0",
-        "--migration-head",
-        "c1d2e3f4a5b6",
-        "--quiet",
-    )
+    built = _build_artifact(source, archive, manifest)
     assert built.returncode == 0, built.stderr
     target = tmp_path / "target"
     outside = tmp_path / "outside"
@@ -263,3 +250,50 @@ def test_web_installer_rejects_symlinked_target_tree(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert "Web .next target must be a real directory" in result.stderr
     assert not list(outside.iterdir())
+
+
+def test_web_installer_replaces_same_size_same_mtime_release_files(tmp_path: Path) -> None:
+    old_source = _minimal_next(tmp_path / "old-source")
+    new_source = _minimal_next(tmp_path / "new-source")
+    (old_source / "BUILD_ID").write_text("old-build-id\n")
+    (new_source / "BUILD_ID").write_text("new-build-id\n")
+    old_server = old_source / "standalone/apps/web/server.js"
+    new_server = new_source / "standalone/apps/web/server.js"
+    old_server.write_text("module.exports='old';\n")
+    new_server.write_text("module.exports='new';\n")
+    assert old_server.stat().st_size == new_server.stat().st_size
+    old_only = old_source / "standalone/apps/web/old-only"
+    old_only.write_text("removed\n")
+
+    old_archive = tmp_path / "old.tar.gz"
+    new_archive = tmp_path / "new.tar.gz"
+    assert _build_artifact(old_source, old_archive, tmp_path / "old.json").returncode == 0
+    assert _build_artifact(new_source, new_archive, tmp_path / "new.json").returncode == 0
+    target = tmp_path / "target"
+    target.mkdir()
+
+    old_install = subprocess.run(
+        [str(WEB_INSTALLER), str(old_archive), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert old_install.returncode == 0, old_install.stderr
+    installed_server = target / ".next/standalone/apps/web/server.js"
+    old_metadata = installed_server.stat()
+
+    new_install = subprocess.run(
+        [str(WEB_INSTALLER), str(new_archive), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert new_install.returncode == 0, new_install.stderr
+    assert (target / ".next/BUILD_ID").read_text() == "new-build-id\n"
+    assert installed_server.read_text() == "module.exports='new';\n"
+    assert installed_server.stat().st_size == old_metadata.st_size
+    assert installed_server.stat().st_mtime_ns == old_metadata.st_mtime_ns
+    assert not (target / ".next/standalone/apps/web/old-only").exists()
