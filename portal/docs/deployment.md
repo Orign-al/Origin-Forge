@@ -96,10 +96,20 @@ sudo systemd-analyze verify \
   /etc/systemd/system/h100-portal-worker.service
 sudo systemctl enable --now h100-portal-worker.socket
 sudo systemctl enable --now h100-portal-api.service
+sudo systemctl enable --now h100-portal-cli-ingress.service
 sudo systemctl disable --now h100-portal-web-tun1.service
 sudo systemctl enable h100-portal-web.service
 sudo systemctl restart h100-portal-web.service
+sudo systemctl enable --now h100-cli-rollout.timer
+sudo systemctl start h100-cli-rollout.service
 ```
+
+`h100-portal-cli-ingress.service` 只在 `h100.dev.user` Development Container 的实际
+Docker bridge gateway 上监听 `18082`，上游固定为 `127.0.0.1:18081`。启动前的 root-only
+inventory helper 只读取 Docker/IPAM 元数据；代理本身使用 `DynamicUser`，不能读取 Docker
+socket、Worker socket 或 Portal secret。`h100-cli-rollout` 按容器的真实 gateway 生成并热下发
+`/etc/h100/cli.json`（`root:root 0444`），不重启或重建容器。不得把该服务改为
+`0.0.0.0:18082`，也不得把 Portal API 改为非 loopback listener。
 
 `h100-portal-web-tun1.service` 是旧的逐接口兼容 unit。升级时先安装新 runtime，再停止并
 禁用该旧 unit，最后重启唯一的 `h100-portal-web.service`；否则旧进程会占用

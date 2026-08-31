@@ -30,6 +30,9 @@ readonly EASYTIER_LEGACY_INGRESS_SOURCE="${PLATFORM_DIR}/scripts/h100-easytier-l
 readonly EASYTIER_DUAL_RECONCILE_SOURCE="${PLATFORM_DIR}/scripts/h100-reconcile-dual-easytier-ingress"
 readonly USER_CLI_SOURCE="${SOURCE_DIR}/apps/cli/h100"
 readonly CLI_ROLLOUT_SOURCE="${PLATFORM_DIR}/scripts/h100-cli-rollout"
+readonly CLI_INGRESS_RECONCILE_SOURCE="${PLATFORM_DIR}/scripts/h100-cli-ingress-reconcile"
+readonly CLI_INGRESS_CONFIG_SOURCE="${SOURCE_DIR}/deploy/scripts/cli_ingress_config.py"
+readonly CLI_INGRESS_PROXY_SOURCE="${SOURCE_DIR}/deploy/scripts/cli_ingress_proxy.py"
 readonly WEB_ARTIFACT_AUDITOR="${SOURCE_DIR}/deploy/scripts/web_artifact.py"
 
 if [[ ${EUID} -ne 0 ]]; then
@@ -89,6 +92,12 @@ done
   || { echo "required deployment input missing: $USER_CLI_SOURCE" >&2; exit 1; }
 [[ -f "$CLI_ROLLOUT_SOURCE" && ! -L "$CLI_ROLLOUT_SOURCE" ]] \
   || { echo "required deployment input missing: $CLI_ROLLOUT_SOURCE" >&2; exit 1; }
+[[ -f "$CLI_INGRESS_RECONCILE_SOURCE" && ! -L "$CLI_INGRESS_RECONCILE_SOURCE" ]] \
+  || { echo "required deployment input missing: $CLI_INGRESS_RECONCILE_SOURCE" >&2; exit 1; }
+[[ -f "$CLI_INGRESS_CONFIG_SOURCE" && ! -L "$CLI_INGRESS_CONFIG_SOURCE" ]] \
+  || { echo "required deployment input missing: $CLI_INGRESS_CONFIG_SOURCE" >&2; exit 1; }
+[[ -f "$CLI_INGRESS_PROXY_SOURCE" && ! -L "$CLI_INGRESS_PROXY_SOURCE" ]] \
+  || { echo "required deployment input missing: $CLI_INGRESS_PROXY_SOURCE" >&2; exit 1; }
 [[ -f "$WEB_ARTIFACT_AUDITOR" && ! -L "$WEB_ARTIFACT_AUDITOR" ]] \
   || { echo "required deployment input missing: $WEB_ARTIFACT_AUDITOR" >&2; exit 1; }
 [[ -f "$SOURCE_DIR/apps/web/.next/standalone/apps/web/server.js" ]] \
@@ -212,6 +221,12 @@ install -o root -g root -m 0750 \
 install -o root -g root -m 0750 \
   "$CLI_ROLLOUT_SOURCE" \
   /usr/local/sbin/h100-cli-rollout
+install -o root -g root -m 0750 \
+  "$CLI_INGRESS_RECONCILE_SOURCE" \
+  /usr/local/sbin/h100-cli-ingress-reconcile
+install -o root -g root -m 0550 \
+  "$CLI_INGRESS_CONFIG_SOURCE" \
+  /usr/local/sbin/h100-cli-ingress-config
 
 install -o root -g root -m 0640 \
   "$SOURCE_DIR/deploy/worker-scripts.json" \
@@ -244,6 +259,7 @@ for unit in \
   h100-easytier-legacy-ingress.service \
   h100-reconcile-dual-easytier-ingress.service \
   h100-reconcile-dual-easytier-ingress.timer \
+  h100-portal-cli-ingress.service \
   h100-cli-rollout.service \
   h100-cli-rollout.timer; do
   install -o root -g root -m 0644 "$SOURCE_DIR/deploy/systemd/$unit" "$UNIT_DIR/$unit"

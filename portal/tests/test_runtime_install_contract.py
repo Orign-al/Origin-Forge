@@ -156,6 +156,10 @@ def test_user_cli_is_installed_read_only_and_reconciled_without_container_restar
     installer = (PORTAL_ROOT / "deploy/scripts/install-runtime.sh").read_text()
     service = (PORTAL_ROOT / "deploy/systemd/h100-cli-rollout.service").read_text()
     timer = (PORTAL_ROOT / "deploy/systemd/h100-cli-rollout.timer").read_text()
+    ingress_service = (PORTAL_ROOT / "deploy/systemd/h100-portal-cli-ingress.service").read_text()
+    ingress_config = PORTAL_ROOT / "deploy/scripts/cli_ingress_config.py"
+    ingress_proxy = PORTAL_ROOT / "deploy/scripts/cli_ingress_proxy.py"
+    ingress_reconcile = PLATFORM_ROOT / "scripts/h100-cli-ingress-reconcile"
     manifest = json.loads((PORTAL_ROOT / "deploy/worker-scripts.json").read_text())
 
     assert cli.is_file() and rollout.is_file()
@@ -171,6 +175,17 @@ def test_user_cli_is_installed_read_only_and_reconciled_without_container_restar
     assert "  /usr/local/sbin/h100-cli-rollout" in install_lines
     assert "h100-cli-rollout.service" in installer
     assert "h100-cli-rollout.timer" in installer
+    assert "h100-portal-cli-ingress.service" in installer
+    assert (
+        'CLI_INGRESS_CONFIG_SOURCE="${SOURCE_DIR}/deploy/scripts/cli_ingress_config.py"'
+        in installer
+    )
+    assert (
+        'CLI_INGRESS_PROXY_SOURCE="${SOURCE_DIR}/deploy/scripts/cli_ingress_proxy.py"' in installer
+    )
+    assert "/usr/local/sbin/h100-cli-ingress-config" in installer
+    assert "/usr/local/sbin/h100-cli-ingress-reconcile" in installer
+    assert ingress_config.is_file() and ingress_proxy.is_file() and ingress_reconcile.is_file()
 
     create_text = create.read_text()
     assert "source: /usr/local/lib/h100-platform/h100-cli" in create_text
@@ -192,16 +207,39 @@ def test_user_cli_is_installed_read_only_and_reconciled_without_container_restar
     assert 'if [[ "${observed_sha256}" == "${expected_sha256}" ]]; then' in rollout_text
     assert "mode=live-root-owned" in rollout_text
     assert "mode=compose-read-only" in rollout_text
-    assert "state=stopped" in rollout_text
+    assert "mode=stopped-hot-copy" in rollout_text
+    assert "CLI DEFERRED" not in rollout_text
+    assert "readonly CONFIG_TARGET=/etc/h100/cli.json" in rollout_text
+    assert '"${CONFIG_GENERATOR}" --container "${expected_user}"' in rollout_text
+    assert "docker restart" not in ingress_reconcile.read_text()
+    assert "systemctl try-restart h100-portal-cli-ingress.service" in ingress_reconcile.read_text()
+
+    assert "/usr/local/sbin/h100-cli-ingress-reconcile" in create_text
+    assert "/usr/local/sbin/h100-cli-rollout" in create_text
+    assert "private CLI ingress is not active" in create_text
 
     assert "ExecStart=/usr/local/sbin/h100-cli-rollout --all" in service.splitlines()
     assert "User=root" in service.splitlines()
     assert "NoNewPrivileges=yes" in service.splitlines()
     assert "RestrictNamespaces=yes" in service.splitlines()
-    assert "RestrictAddressFamilies=AF_UNIX" in service.splitlines()
+    assert "RestrictAddressFamilies=AF_UNIX AF_NETLINK" in service.splitlines()
     assert "ProtectSystem=strict" in service.splitlines()
     assert "ReadWritePaths=/run /var/run/docker.sock" in service.splitlines()
     assert "OnUnitActiveSec=60s" in timer.splitlines()
+
+    ingress_lines = ingress_service.splitlines()
+    assert "DynamicUser=yes" in ingress_lines
+    assert (
+        "ExecStartPre=+/usr/local/sbin/h100-cli-ingress-config --write /run/h100-cli-ingress/config.json"
+        in ingress_lines
+    )
+    assert any("cli_ingress_proxy.py" in line for line in ingress_lines)
+    assert "RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET" in ingress_lines
+    assert "CapabilityBoundingSet=" in ingress_lines
+    assert "AmbientCapabilities=" in ingress_lines
+    assert "0.0.0.0" not in ingress_service  # noqa: S104 -- prohibited wildcard contract.
+    assert "20.10.10.3" not in ingress_service
+    assert "10.82.36.1" not in ingress_service
 
 
 def test_portal3f_worker_can_write_only_the_guard_metrics_directory() -> None:

@@ -10,6 +10,9 @@ JSON schema: `h100.cli.v1`
 
 ```text
 ordinary user h100 CLI
+  -> platform-managed per-container endpoint
+  -> private bridge-only CLI ingress (:18082)
+  -> Portal API (127.0.0.1:18081)
   -> Portal /api/v1/self/*
   -> owner, Lease, quota, and policy validation
   -> root-owned Worker socket (not exposed to the container)
@@ -25,12 +28,16 @@ The CLI never connects to `slurmctld`, `slurmrestd`, the Worker socket, a databa
 - Owner/mode: `root:root`, `0555`.
 - New and rebuilt containers receive a Compose read-only bind mount.
 - Existing running containers receive an atomic `root:root` mode `0555` copy through `h100-cli-rollout`; the rollout verifies the staged and installed hashes and does not restart or rebuild them. This is the hot-update path because a host-only source cannot be safely live-bound into an already-created private mount namespace without pre-existing propagation.
-- Stopped existing containers are deferred until the periodic reconciler observes them running.
+- The same rollout writes `/etc/h100/cli.json` as `root:root 0444`. Its endpoint is generated from the container's validated Docker network gateway rather than a compiled-in address. Stopped containers are updated through `docker cp` without starting or recreating them, and the copied bytes and mode are verified.
 - The source, rollout helper, and container-create helper are SHA-256 bound in `portal/deploy/worker-scripts.json`.
 
 `h100 --version` returns the installed semantic CLI version. The executable is Python 3.10+ compatible and uses only the standard library.
 
 ## Authentication
+
+Before sending an Authorization header, every CLI operation fetches `/api/v1/cli/identity` without credentials and requires service `H100 Portal`, API compatibility `h100.cli.v1`, and CLI version `1.0.0`. Redirects are not followed. A missing, user-owned, symlinked, or non-`0444` platform endpoint configuration fails closed. Normal users neither select nor configure an endpoint.
+
+The private ingress binds only the real gateway addresses of Docker bridge networks belonging to `h100.dev.user` containers. It does not bind `0.0.0.0`, the EasyTier addresses, or the physical management address. It forwards only the CLI identity route and the method/path allowlist needed by `/self/cli-auth` and `/self/jobs`; admin, internal, Worker, debug, docs, OpenAPI, metrics, and storage routes are not exposed. It has no access log and never forwards cookies or proxy headers.
 
 An ordinary user creates a Personal CLI Token under **Account Security → CLI Tokens** after recent password reauthentication.
 

@@ -1,0 +1,37 @@
+[Unit]
+Description=H100 Portal private Development Container CLI ingress
+Documentation=file:/opt/h100-portal/docs/h100-cli-contract.md
+Requires=docker.service h100-portal-api.service
+After=network-online.target docker.service h100-portal-api.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+RuntimeDirectory=h100-cli-ingress
+RuntimeDirectoryMode=0755
+ExecStartPre=+/usr/local/sbin/h100-cli-ingress-config --write /run/h100-cli-ingress/config.json
+ExecStart=/usr/bin/python3 /opt/h100-portal/deploy/scripts/cli_ingress_proxy.py --config /run/h100-cli-ingress/config.json
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

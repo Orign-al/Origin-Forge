@@ -1,7 +1,7 @@
 [Unit]
 Description=Reconcile immutable h100 CLI into managed development containers
-After=docker.service
-Wants=docker.service
+After=docker.service h100-portal-cli-ingress.service
+Wants=docker.service h100-portal-cli-ingress.service
 
 [Service]
 Type=oneshot
@@ -19,7 +19,7 @@ ProtectHostname=yes
 ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

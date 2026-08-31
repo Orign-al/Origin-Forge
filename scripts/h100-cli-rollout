@@ -6,6 +6,9 @@ source /usr/local/lib/h100-platform/h100-platform-common.sh
 
 readonly CLI_SOURCE=/usr/local/lib/h100-platform/h100-cli
 readonly CLI_TARGET=/usr/local/bin/h100
+readonly CONFIG_GENERATOR=/usr/local/sbin/h100-cli-ingress-config
+readonly INGRESS_RECONCILE=/usr/local/sbin/h100-cli-ingress-reconcile
+readonly CONFIG_TARGET=/etc/h100/cli.json
 
 usage() {
   printf 'Usage: h100-cli-rollout {--all|USER}\n'
@@ -21,14 +24,55 @@ h100_require_root
   || h100_fail 'host-managed CLI source is unavailable'
 [[ "$(stat -c '%U:%G:%a' "${CLI_SOURCE}")" == root:root:555 ]] \
   || h100_fail 'host-managed CLI source metadata is invalid'
+[[ -f "${CONFIG_GENERATOR}" && ! -L "${CONFIG_GENERATOR}" ]] \
+  || h100_fail 'host-managed CLI configuration generator is unavailable'
+[[ -x "${INGRESS_RECONCILE}" && ! -L "${INGRESS_RECONCILE}" ]] \
+  || h100_fail 'private CLI ingress reconciler is unavailable'
 expected_sha256="$(sha256sum "${CLI_SOURCE}" | awk '{print $1}')"
 readonly expected_sha256
+work_dir="$(mktemp -d /tmp/h100-cli-rollout.XXXXXX)"
+cleanup() {
+  case "${work_dir}" in
+    /tmp/h100-cli-rollout.*) rm -rf -- "${work_dir}" ;;
+  esac
+}
+trap cleanup EXIT
+
+"${INGRESS_RECONCILE}"
+
+copy_stopped_file() {
+  local container=$1 source=$2 target=$3 expected_mode=$4 observed=$5
+  local archive="${observed}.tar" expected_permissions metadata
+  if ! docker cp "${source}" "${container}:${target}" 2>/dev/null; then
+    if [[ "${target}" != "${CONFIG_TARGET}" ]]; then
+      h100_fail "stopped container target is unavailable: ${container}:${target}"
+    fi
+    install -d -o root -g root -m 0755 "${work_dir}/h100"
+    install -o root -g root -m "${expected_mode}" "${source}" "${work_dir}/h100/cli.json"
+    docker cp "${work_dir}/h100" "${container}:/etc/h100"
+  fi
+  docker cp "${container}:${target}" - >"${archive}"
+  metadata="$(tar --numeric-owner --list --verbose --file "${archive}" | awk 'NR == 1 {print $1 " " $2}')"
+  case "${expected_mode}" in
+    444) expected_permissions='-r--r--r-- 0/0' ;;
+    555) expected_permissions='-r-xr-xr-x 0/0' ;;
+    *) h100_fail "unsupported stopped container file mode: ${expected_mode}" ;;
+  esac
+  [[ "${metadata}" == "${expected_permissions}" ]] \
+    || h100_fail "stopped container file ownership or mode is invalid: ${container}:${target}"
+  docker cp "${container}:${target}" "${observed}"
+  [[ "$(stat -c '%a' "${observed}")" == "${expected_mode}" ]] \
+    || h100_fail "stopped container file mode is invalid: ${container}:${target}"
+}
 
 rollout_container() {
   local container=$1
   local expected_user=$2
-  local actual_name actual_user actual_uid actual_gid observed_sha256
+  local actual_name actual_user actual_uid actual_gid observed_sha256 config_sha256 state
   local temp_target=/usr/local/bin/.h100-rollout
+  local temp_config_target=/etc/h100/.cli.json.rollout
+  local runtime_config="${work_dir}/${expected_user}.json"
+  local observed_config="${work_dir}/${expected_user}.observed.json"
 
   h100_validate_username "${expected_user}"
   actual_name="$(docker inspect --format '{{.Name}}' "${container}")"
@@ -51,10 +95,52 @@ rollout_container() {
     and ((.[0].Mounts // []) | map(.Destination) | index("/run/h100-portal/worker.sock") | not)
   ' >/dev/null || h100_fail "container security boundary is invalid: ${container}"
 
-  if [[ "$(docker inspect --format '{{.State.Running}}' "${container}")" != true ]]; then
-    printf 'CLI DEFERRED user=%s container=%s state=stopped\n' "${expected_user}" "${container}"
+  "${CONFIG_GENERATOR}" --container "${expected_user}" >"${runtime_config}"
+  chown root:root "${runtime_config}"
+  chmod 0444 "${runtime_config}"
+  jq -e '
+    .version == 1
+    and .service == "H100 Portal"
+    and .api_compatibility == "h100.cli.v1"
+    and (.portal_url | test("^http://172\\.(1[6-9]|2[0-9]|3[01])\\.[0-9]{1,3}\\.[0-9]{1,3}:18082/api/v1$"))
+  ' "${runtime_config}" >/dev/null \
+    || h100_fail "container CLI runtime configuration is invalid: ${container}"
+  config_sha256="$(sha256sum "${runtime_config}" | awk '{print $1}')"
+
+  state="$(docker inspect --format '{{.State.Status}}' "${container}")"
+  if [[ "${state}" != running ]]; then
+    if ! docker inspect "${container}" | jq -e \
+      --arg source "${CLI_SOURCE}" --arg target "${CLI_TARGET}" '
+        ((.[0].Mounts // [])
+          | map(select(.Source == $source and .Destination == $target and .RW == false))
+          | length) == 1
+      ' >/dev/null; then
+      copy_stopped_file \
+        "${container}" "${CLI_SOURCE}" "${CLI_TARGET}" 555 \
+        "${work_dir}/${expected_user}.cli.observed"
+      observed_sha256="$(sha256sum "${work_dir}/${expected_user}.cli.observed" | awk '{print $1}')"
+      [[ "${observed_sha256}" == "${expected_sha256}" ]] \
+        || h100_fail "stopped container CLI hash is invalid: ${container}"
+    fi
+    copy_stopped_file \
+      "${container}" "${runtime_config}" "${CONFIG_TARGET}" 444 "${observed_config}"
+    [[ "$(sha256sum "${observed_config}" | awk '{print $1}')" == "${config_sha256}" ]] \
+      || h100_fail "stopped container CLI configuration hash is invalid: ${container}"
+    printf 'CLI READY user=%s container=%s mode=stopped-hot-copy config_sha256=%s\n' \
+      "${expected_user}" "${container}" "${config_sha256}"
     return 0
   fi
+
+  docker exec --user 0 "${container}" install -d -o root -g root -m 0755 /etc/h100
+  docker exec --user 0 "${container}" rm -f -- "${temp_config_target}"
+  docker cp "${runtime_config}" "${container}:${temp_config_target}"
+  docker exec --user 0 "${container}" chown root:root "${temp_config_target}"
+  docker exec --user 0 "${container}" chmod 0444 "${temp_config_target}"
+  [[ "$(docker exec "${container}" sha256sum "${temp_config_target}" | awk '{print $1}')" == "${config_sha256}" ]] \
+    || h100_fail "staged container CLI configuration hash is invalid: ${container}"
+  docker exec --user 0 "${container}" mv -f -- "${temp_config_target}" "${CONFIG_TARGET}"
+  [[ "$(docker exec "${container}" stat -c '%U:%G:%a' "${CONFIG_TARGET}")" == root:root:444 ]] \
+    || h100_fail "container CLI configuration metadata is invalid: ${container}"
 
   if docker inspect "${container}" | jq -e \
     --arg source "${CLI_SOURCE}" --arg target "${CLI_TARGET}" '
@@ -67,6 +153,8 @@ rollout_container() {
       || h100_fail "Compose-mounted CLI hash is stale: ${container}"
     printf 'CLI READY user=%s container=%s mode=compose-read-only sha256=%s\n' \
       "${expected_user}" "${container}" "${expected_sha256}"
+    printf 'CLI CONFIG READY user=%s container=%s sha256=%s\n' \
+      "${expected_user}" "${container}" "${config_sha256}"
     return 0
   fi
   docker inspect "${container}" | jq -e --arg target "${CLI_TARGET}" '
@@ -80,6 +168,8 @@ rollout_container() {
     if [[ "${observed_sha256}" == "${expected_sha256}" ]]; then
       printf 'CLI READY user=%s container=%s mode=live-root-owned sha256=%s\n' \
         "${expected_user}" "${container}" "${expected_sha256}"
+      printf 'CLI CONFIG READY user=%s container=%s sha256=%s\n' \
+        "${expected_user}" "${container}" "${config_sha256}"
       return 0
     fi
   fi
@@ -98,6 +188,8 @@ rollout_container() {
     || h100_fail "container CLI hash is invalid: ${container}"
   printf 'CLI READY user=%s container=%s mode=live-root-owned sha256=%s\n' \
     "${expected_user}" "${container}" "${expected_sha256}"
+  printf 'CLI CONFIG READY user=%s container=%s sha256=%s\n' \
+    "${expected_user}" "${container}" "${config_sha256}"
 }
 
 if [[ "$1" == --all ]]; then

@@ -35,11 +35,22 @@ class PortalHandler(BaseHTTPRequestHandler):
         return self.headers.get("Authorization") == f"Bearer {TOKEN}"
 
     def do_GET(self) -> None:
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        if path == "/api/v1/cli/identity":
+            self.server.identity_authorization.append(self.headers.get("Authorization"))
+            self._json(
+                200,
+                {
+                    "service": self.server.identity_service,
+                    "api_compatibility": "h100.cli.v1",
+                    "cli_versions": ["1.0.0"],
+                },
+            )
+            return
         if not self._authorized():
             self._json(401, {"detail": {"code": "AUTH_REQUIRED", "message": "required"}})
             return
-        parsed = urlsplit(self.path)
-        path = parsed.path
         if path == "/api/v1/self/cli-auth":
             if self.server.redirect_auth:
                 self.send_response(307)
@@ -152,6 +163,8 @@ class PortalServer(ThreadingHTTPServer):
     log_reads: int
     redirect_auth: bool
     redirect_target: str
+    identity_service: str
+    identity_authorization: list[str | None]
     job: dict[str, object]
 
 
@@ -167,6 +180,8 @@ def portal(tmp_path: Path):  # type: ignore[no-untyped-def]
     server.log_reads = 0
     server.redirect_auth = False
     server.redirect_target = ""
+    server.identity_service = "H100 Portal"
+    server.identity_authorization = []
     server.job = {
         "id": PORTAL_JOB_ID,
         "slurm_job_id": 149,
@@ -203,10 +218,22 @@ def portal(tmp_path: Path):  # type: ignore[no-untyped-def]
 
 
 def _run(portal, config: Path, *args: str, stdin: str | None = None):  # type: ignore[no-untyped-def]
+    platform_config = config.parent / "platform-cli.json"
+    platform_config.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "portal_url": portal.url,
+                "service": "H100 Portal",
+                "api_compatibility": "h100.cli.v1",
+            }
+        )
+    )
     env = {
         **os.environ,
         "H100_CONFIG_HOME": str(config),
-        "H100_PORTAL_URL": portal.url,
+        "H100_PLATFORM_CONFIG": str(platform_config),
+        "H100_TESTING_ALLOW_PLATFORM_CONFIG": "1",
     }
     return subprocess.run(
         [str(CLI), *args],
@@ -228,6 +255,8 @@ def test_cli_auth_submit_list_status_logs_cancel_and_json_contract(portal, tmp_p
     credentials = config / "credentials"
     assert stat.S_IMODE(config.stat().st_mode) == 0o700
     assert stat.S_IMODE(credentials.stat().st_mode) == 0o600
+    assert json.loads(credentials.read_text()) == {"version": 2, "token": TOKEN}
+    assert portal.server.identity_authorization == [None]
 
     script = portal.server.workspace / "projects/train.sh"
     script.parent.mkdir()
@@ -355,3 +384,21 @@ def test_cli_never_forwards_token_across_http_redirect(portal, tmp_path: Path) -
     assert json.loads(result.stdout)["error"]["http_status"] == 307
     assert TOKEN not in result.stdout + result.stderr
     assert captured == []
+
+
+def test_cli_validates_service_identity_before_sending_token(portal, tmp_path: Path) -> None:
+    portal.server.identity_service = "Unexpected Service"
+    result = _run(
+        portal,
+        tmp_path / "config",
+        "auth",
+        "login",
+        "--token-stdin",
+        "--json",
+        stdin=TOKEN + "\n",
+    )
+
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["error"]["code"] == "PORTAL_IDENTITY_MISMATCH"
+    assert portal.server.identity_authorization == [None]
+    assert TOKEN not in result.stdout + result.stderr

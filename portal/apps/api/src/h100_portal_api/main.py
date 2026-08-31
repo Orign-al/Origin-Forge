@@ -170,6 +170,21 @@ def health_ready() -> JSONResponse:
     )
 
 
+@app.get("/api/v1/cli/identity", tags=["health"])
+def cli_service_identity() -> JSONResponse:
+    """Return the non-secret service contract checked before CLI credentials are sent."""
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "service": "H100 Portal",
+            "api_compatibility": "h100.cli.v1",
+            "cli_versions": ["1.0.0"],
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(platform.router, prefix="/api/v1")
 app.include_router(compute_requests.router, prefix="/api/v1")

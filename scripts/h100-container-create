@@ -214,6 +214,13 @@ docker inspect "${container}" | jq -e \
     and (($c.Mounts // []) | map(.Source) | index("/") | not)
   ' >/dev/null || h100_fail 'created container failed isolation/resource validation'
 
+/usr/local/sbin/h100-cli-ingress-reconcile
+systemctl is-active --quiet h100-portal-cli-ingress.service \
+  || h100_fail 'private CLI ingress is not active'
+/usr/local/sbin/h100-cli-rollout "${user_name}"
+docker exec "${container}" test -f /etc/h100/cli.json \
+  || h100_fail 'container CLI runtime configuration is unavailable'
+
 fingerprint="$(ssh-keygen -lf "${host_key_dir}/ssh_host_ed25519_key.pub")"
 {
   printf '# Managed development container creation\n\n'

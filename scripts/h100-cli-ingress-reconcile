@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+source /usr/local/lib/h100-platform/h100-platform-common.sh
+
+readonly CONFIG_GENERATOR=/usr/local/sbin/h100-cli-ingress-config
+readonly CONFIG_DIR=/run/h100-cli-ingress
+readonly CONFIG_PATH=${CONFIG_DIR}/config.json
+
+h100_require_root
+[[ -f "${CONFIG_GENERATOR}" && ! -L "${CONFIG_GENERATOR}" ]] \
+  || h100_fail 'private CLI ingress configuration generator is unavailable'
+install -d -o root -g root -m 0755 "${CONFIG_DIR}"
+before=''
+[[ -f "${CONFIG_PATH}" && ! -L "${CONFIG_PATH}" ]] \
+  && before="$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')"
+"${CONFIG_GENERATOR}" --write "${CONFIG_PATH}"
+after="$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')"
+if [[ "${before}" != "${after}" ]]; then
+  systemctl try-restart h100-portal-cli-ingress.service
+fi
+printf 'CLI INGRESS RECONCILED sha256=%s changed=%s\n' \
+  "${after}" "$([[ "${before}" == "${after}" ]] && printf no || printf yes)"
