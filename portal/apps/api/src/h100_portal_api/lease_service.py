@@ -144,6 +144,8 @@ def lease_view(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     trusted_now = ensure_utc(now or utcnow())
+    managed = db.get(PortalManagedUser, owner_id)
+    approval_required = managed.lease_renewal_approval_required if managed is not None else True
     try:
         active, terminal = entitlement(db, owner_id, now=trusted_now)
     except HTTPException:
@@ -159,6 +161,7 @@ def lease_view(
                 "renewal_available": False,
                 "max_duration_seconds": MAX_LEASE_DURATION_SECONDS,
                 "renewal_window_seconds": RENEWAL_WINDOW_SECONDS,
+                "renewal_approval_required": approval_required,
                 "auto_renew": False,
             }
         return {
@@ -173,6 +176,7 @@ def lease_view(
             "gpu_count": latest.gpu_count,
             "max_duration_seconds": MAX_LEASE_DURATION_SECONDS,
             "renewal_window_seconds": RENEWAL_WINDOW_SECONDS,
+            "renewal_approval_required": approval_required,
             "auto_renew": False,
         }
 
@@ -210,6 +214,7 @@ def lease_view(
         "renewal_window_seconds": RENEWAL_WINDOW_SECONDS,
         "maximum_renewal_seconds": MAX_LEASE_DURATION_SECONDS,
         "pending_renewal_id": str(pending.id) if pending is not None else None,
+        "renewal_approval_required": approval_required,
         "auto_renew": False,
     }
 
@@ -220,7 +225,7 @@ def create_lease(
     starts_at: datetime,
     duration_seconds: int,
     gpu_count: int,
-    approved_by: uuid.UUID,
+    approved_by: uuid.UUID | None,
     state: str = "ACTIVE",
     previous_lease_id: uuid.UUID | None = None,
     restored: bool = False,
@@ -255,6 +260,7 @@ def request_renewal(
     owner_id: uuid.UUID,
     duration_seconds: int,
     idempotency_key: str,
+    approval_required: bool = True,
     now: datetime | None = None,
 ) -> PortalLeaseRenewalRequest:
     if not 1 <= duration_seconds <= MAX_LEASE_DURATION_SECONDS:
@@ -299,6 +305,7 @@ def request_renewal(
         owner_managed_user_id=owner_id,
         lease_id=terminal.id,
         state="REQUESTED",
+        approval_required=approval_required,
         requested_duration_seconds=duration_seconds,
         idempotency_key=idempotency_key,
         requested_at=trusted_now,
@@ -314,7 +321,7 @@ def decide_renewal(
     *,
     request_id: uuid.UUID,
     decision: str,
-    decided_by: uuid.UUID,
+    decided_by: uuid.UUID | None,
     comment: str | None,
     now: datetime | None = None,
 ) -> tuple[PortalLeaseRenewalRequest, PortalComputeLease | None]:

@@ -134,6 +134,23 @@ Portal-3E-FINAL 修改 `h100-user-create`，增加固定 Activate 回滚入口�
 `deploy/worker-scripts.json` 必须保存同一精确值。不得使用通配 hash、跳过校验或先启动
 Worker 再补 allowlist；Worker 重启后必须先证明相关脚本的 `integrity_ok=true`。
 
+### Development Container sudo rollout
+
+新 Stage 的 Development Container 使用按用户生成的只读 sudoers 文件。部署前确认宿主已安装
+`/usr/sbin/visudo`；`install-runtime.sh` 会安装 hash-pinned
+`/usr/local/sbin/h100-container-sudo-enable`，但 Worker API 不提供调用该工具的 operation。
+
+既有容器不会因部署自动重建。管理员必须在单独批准该用户短暂中断后逐个执行：
+
+```bash
+sudo h100-container-sudo-enable USER --confirm=USER
+```
+
+执行前记录容器 ID、镜像、状态、`StartedAt`、`RestartCount` 和挂载；执行后验证镜像 digest
+未变、容器隔离仍满足安全模型、sudoers 为只读，并以该容器用户运行 `sudo -n id -u` 得到
+`0`。工具会在 `/srv/gpu-platform/platform/backups/container-sudo-USER-*` 创建独立回滚点。
+不要批量循环执行，不要跳过精确用户名确认，也不要把容器内 root 描述为宿主 sudo。
+
 ### Managed compute user SSH policy
 
 受管 policy source 是仓库根目录的

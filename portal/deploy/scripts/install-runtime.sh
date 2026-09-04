@@ -20,6 +20,7 @@ readonly CONTAINER_CREATE_SOURCE="${PLATFORM_DIR}/scripts/h100-container-create"
 readonly CONTAINER_START_SOURCE="${PLATFORM_DIR}/scripts/h100-container-start"
 readonly CONTAINER_STOP_SOURCE="${PLATFORM_DIR}/scripts/h100-container-stop"
 readonly CONTAINER_REBUILD_SOURCE="${PLATFORM_DIR}/scripts/h100-container-rebuild"
+readonly CONTAINER_SUDO_ENABLE_SOURCE="${PLATFORM_DIR}/scripts/h100-container-sudo-enable"
 readonly CONTAINER_DELETE_SOURCE="${PLATFORM_DIR}/scripts/h100-container-delete"
 readonly CONTAINER_STATUS_SOURCE="${PLATFORM_DIR}/scripts/h100-container-status"
 readonly QUOTA_SHOW_SOURCE="${PLATFORM_DIR}/scripts/h100-quota-show"
@@ -72,6 +73,8 @@ done
   || { echo "required deployment input missing: $CONTAINER_STOP_SOURCE" >&2; exit 1; }
 [[ -f "$CONTAINER_REBUILD_SOURCE" && ! -L "$CONTAINER_REBUILD_SOURCE" ]] \
   || { echo "required deployment input missing: $CONTAINER_REBUILD_SOURCE" >&2; exit 1; }
+[[ -f "$CONTAINER_SUDO_ENABLE_SOURCE" && ! -L "$CONTAINER_SUDO_ENABLE_SOURCE" ]] \
+  || { echo "required deployment input missing: $CONTAINER_SUDO_ENABLE_SOURCE" >&2; exit 1; }
 [[ -f "$CONTAINER_DELETE_SOURCE" && ! -L "$CONTAINER_DELETE_SOURCE" ]] \
   || { echo "required deployment input missing: $CONTAINER_DELETE_SOURCE" >&2; exit 1; }
 [[ -f "$CONTAINER_STATUS_SOURCE" && ! -L "$CONTAINER_STATUS_SOURCE" ]] \
@@ -194,6 +197,9 @@ install -o root -g gpu-platform-admin -m 0750 \
 install -o root -g gpu-platform-admin -m 0750 \
   "$CONTAINER_REBUILD_SOURCE" \
   /usr/local/sbin/h100-container-rebuild
+install -o root -g gpu-platform-admin -m 0750 \
+  "$CONTAINER_SUDO_ENABLE_SOURCE" \
+  /usr/local/sbin/h100-container-sudo-enable
 install -o root -g gpu-platform-admin -m 0750 \
   "$CONTAINER_DELETE_SOURCE" \
   /usr/local/sbin/h100-container-delete

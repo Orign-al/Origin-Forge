@@ -390,6 +390,121 @@ def test_renewal_window_approval_and_chain_preserve_remaining_time(database: Ses
     assert ensure_utc(successor.expires_at) == old_expiry + timedelta(hours=96)
 
 
+def test_admin_can_disable_renewal_approval_without_changing_pending_request(
+    client, database: Session, origin_headers: dict[str, str]
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(database, remaining_hours=12)
+    pending = request_renewal(
+        database,
+        owner_id=identity.managed.id,
+        duration_seconds=MAX_LEASE_DURATION_SECONDS,
+        idempotency_key="pending-before-policy-change",
+    )
+    admin = _admin(database)
+    headers = _login(client, origin_headers, admin.normalized_login)
+
+    response = client.put(
+        f"/api/v1/users/{identity.user.id}/lease-renewal-policy",
+        headers=headers,
+        json={"approval_required": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "UPDATED",
+        "policy": {"approval_required": False, "pending_requests_changed": False},
+    }
+    database.refresh(identity.managed)
+    database.refresh(pending)
+    assert identity.managed.lease_renewal_approval_required is False
+    assert pending.state == "REQUESTED"
+    assert pending.approval_required is True
+    assert pending.decided_at is None
+    event = database.scalar(
+        select(PortalAuditEvent).where(
+            PortalAuditEvent.event_type == "LEASE_RENEWAL_POLICY_UPDATED",
+            PortalAuditEvent.object_id == str(identity.managed.id),
+        )
+    )
+    assert event is not None
+    assert event.actor == admin.normalized_login
+    assert event.safe_metadata == {
+        "portal_user_id": str(identity.user.id),
+        "previous_approval_required": True,
+        "approval_required": False,
+        "pending_requests_unchanged": True,
+        "pending_request_count": 1,
+    }
+
+
+def test_per_user_policy_auto_approves_new_renewal_and_replays_idempotently(
+    client, database: Session, origin_headers: dict[str, str]
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(database, remaining_hours=12)
+    identity.managed.lease_renewal_approval_required = False
+    database.commit()
+    headers = _login(client, origin_headers, identity.user.normalized_login)
+    idempotency_key = str(uuid.uuid4())
+    payload = {
+        "duration_seconds": MAX_LEASE_DURATION_SECONDS,
+        "idempotency_key": idempotency_key,
+    }
+
+    first = client.post("/api/v1/self/lease/renewals", headers=headers, json=payload)
+    replay = client.post("/api/v1/self/lease/renewals", headers=headers, json=payload)
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert first.json() == replay.json()
+    assert first.json()["status"] == "APPROVED"
+    assert first.json()["approval_required"] is False
+    assert first.json()["resulting_lease_id"] is not None
+    renewal = database.scalar(
+        select(PortalLeaseRenewalRequest).where(
+            PortalLeaseRenewalRequest.owner_managed_user_id == identity.managed.id,
+            PortalLeaseRenewalRequest.idempotency_key == idempotency_key,
+        )
+    )
+    assert renewal is not None
+    assert renewal.state == "APPROVED"
+    assert renewal.approval_required is False
+    assert renewal.decided_by is None
+    assert renewal.decision_comment == "AUTO_APPROVED_BY_USER_RENEWAL_POLICY"
+    successor = database.get(PortalComputeLease, renewal.resulting_lease_id)
+    assert successor is not None
+    assert successor.approved_by is None
+    assert ensure_utc(successor.starts_at) == ensure_utc(identity.lease.expires_at)
+    assert ensure_utc(successor.expires_at) == ensure_utc(identity.lease.expires_at) + timedelta(
+        hours=96
+    )
+    events = database.scalars(
+        select(PortalAuditEvent).where(
+            PortalAuditEvent.event_type == "LEASE_RENEWAL_AUTO_APPROVED",
+            PortalAuditEvent.object_id == str(renewal.id),
+        )
+    ).all()
+    assert events
+    assert all(event.safe_metadata["approval_required"] is False for event in events)
+    assert all(event.safe_metadata["policy_source"] == "portal_managed_user" for event in events)
+
+
+def test_ordinary_user_cannot_change_renewal_approval_policy(
+    client, database: Session, origin_headers: dict[str, str]
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(database, remaining_hours=12)
+    headers = _login(client, origin_headers, identity.user.normalized_login)
+
+    response = client.put(
+        f"/api/v1/users/{identity.user.id}/lease-renewal-policy",
+        headers=headers,
+        json={"approval_required": False},
+    )
+
+    assert response.status_code == 403
+    database.refresh(identity.managed)
+    assert identity.managed.lease_renewal_approval_required is True
+
+
 def test_expired_renewal_requires_restore_and_boundary_decision_persists(
     database: Session,
 ) -> None:

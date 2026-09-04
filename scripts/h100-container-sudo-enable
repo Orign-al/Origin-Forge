@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /usr/local/lib/h100-platform/h100-platform-common.sh
+
+if [[ "${1:-}" == --help || $# -ne 2 ]]; then
+  printf 'Usage: sudo h100-container-sudo-enable USER --confirm=USER\n'
+  [[ "${1:-}" == --help ]] && exit 0 || exit 2
+fi
+
+readonly user_name=$1
+readonly confirmation=$2
+readonly target=/etc/sudoers.d/90-h100-dev-user
+
+h100_require_root
+h100_validate_username "${user_name}"
+[[ "${confirmation}" == "--confirm=${user_name}" ]] \
+  || h100_fail 'explicit user confirmation is required'
+case "${user_name}" in root|origin-al|codexops|nobody) h100_fail 'protected username' ;; esac
+h100_acquire_lock
+h100_require_managed_user "${user_name}"
+h100_require_home_alias "${user_name}"
+h100_require_managed_compose "${user_name}"
+h100_require_pilot_gpu_isolation_if_managed "${user_name}"
+
+[[ "$(getent passwd "${user_name}" | cut -d: -f7)" == /usr/sbin/nologin ]] \
+  || h100_fail 'managed Host account must remain nologin'
+[[ "$(passwd -S "${user_name}" | awk '{print $2}')" == L ]] \
+  || h100_fail 'managed Host password must remain locked'
+[[ ! -e "/home/${user_name}/.ssh/authorized_keys" \
+  && ! -L "/home/${user_name}/.ssh/authorized_keys" ]] \
+  || h100_fail 'managed Host SSH access must remain absent'
+for forbidden_group in sudo docker video render gpu-platform-admin adm systemd-journal; do
+  id -nG "${user_name}" | tr ' ' '\n' | grep -Fxq "${forbidden_group}" \
+    && h100_fail "managed Host user belongs to forbidden group: ${forbidden_group}"
+done
+
+container="$(h100_container_name "${user_name}")"
+config_dir="$(h100_config_dir "${user_name}")"
+compose_file="$(h100_compose_file "${user_name}")"
+policy_file="$(h100_container_sudo_policy_file "${user_name}")"
+docker container inspect "${container}" >/dev/null 2>&1 \
+  || h100_fail "container does not exist: ${container}"
+
+before_running="$(docker inspect --format '{{.State.Running}}' "${container}")"
+before_image="$(docker inspect --format '{{.Image}}' "${container}")"
+managed_uid="$(id -u "${user_name}")"
+home_source="${H100_DATA_ROOT}/users/${user_name}/home"
+canonical_home_source="${H100_HOME_ALIAS_ROOT}/${managed_uid}"
+workspace_source="${H100_WORKSPACE_ROOT}/${managed_uid}"
+shared_source="${H100_DATA_ROOT}/users/${user_name}/shared"
+host_key_source="${H100_CONTAINER_DATA_ROOT}/${user_name}/ssh-host-keys"
+cli_source="/usr/local/lib/h100-platform/h100-cli"
+before_policy=0
+if [[ -e "${policy_file}" || -L "${policy_file}" ]]; then
+  h100_require_container_sudo_policy "${user_name}"
+  before_policy=1
+fi
+
+docker inspect "${container}" | jq -e \
+  --arg target "${target}" \
+  --arg home_source "${home_source}" \
+  --arg canonical_home_source "${canonical_home_source}" \
+  --arg home_target "/home/${user_name}" \
+  --arg workspace_source "${workspace_source}" \
+  --arg shared_source "${shared_source}" \
+  --arg host_key_source "${host_key_source}" \
+  --arg cli_source "${cli_source}" \
+  --arg policy_source "${policy_file}" '
+  .[0] as $c
+  | $c.HostConfig.Privileged == false
+  and $c.HostConfig.NetworkMode != "host"
+  and $c.HostConfig.PidMode != "host"
+  and $c.HostConfig.IpcMode != "host"
+  and $c.HostConfig.CgroupnsMode != "host"
+  and ($c.AppArmorProfile | type == "string" and . != "" and . != "unconfined")
+  and (($c.HostConfig.CapAdd // []) | length == 0)
+  and (($c.HostConfig.DeviceRequests // []) | length == 0)
+  and (($c.HostConfig.Devices // []) | length == 0)
+  and (($c.HostConfig.SecurityOpt // []) | index("no-new-privileges:true") | not)
+  and (($c.HostConfig.SecurityOpt // []) | map(ascii_downcase)
+    | all(. != "apparmor=unconfined" and . != "seccomp=unconfined"))
+  and ((.[0].Mounts // []) | map(.Destination)
+    | index("/var/run/docker.sock") | not)
+  and ((.[0].Mounts // []) | map(.Destination) | index("/run/docker.sock") | not)
+  and ((.[0].Mounts // []) | map(.Destination) | index("/run/h100-portal/worker.sock") | not)
+  and ((.[0].Mounts // []) | map(.Destination) | index("/run/munge") | not)
+  and (($c.Mounts // []) | map(select(
+    ((.Source == $home_source or .Source == $canonical_home_source)
+      and .Destination == $home_target and .RW == true)
+    or (.Source == $workspace_source and .Destination == "/workspace" and .RW == true)
+    or (.Source == $shared_source and .Destination == "/shared" and .RW == true)
+    or (.Source == $host_key_source and .Destination == "/etc/ssh/persistent" and .RW == true)
+    or (.Source == $cli_source and .Destination == "/usr/local/bin/h100" and .RW == false)
+    or (.Source == $policy_source and .Destination == $target and .RW == false)
+  )) | length == (($c.Mounts // []) | length))
+  and ((.[0].Mounts // []) | map(select(.Destination == $target)) | length <= 1)
+' >/dev/null || h100_fail 'container isolation does not permit sudo policy enablement'
+
+timestamp="$(date +%Y%m%d-%H%M%S-%N)"
+backup_dir="${H100_PLATFORM_ROOT}/backups/container-sudo-${user_name}-${timestamp}"
+temporary="$(mktemp -d /tmp/h100-container-sudo.XXXXXX)"
+rollback_required=0
+rollback_failed=0
+
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  set +e
+  if ((rc != 0 && rollback_required == 1)); then
+    install -o root -g gpu-platform-admin -m 0640 \
+      "${backup_dir}/compose.before.yml" "${compose_file}" || rollback_failed=1
+    if [[ "${before_running}" == true ]]; then
+      docker compose --project-directory "${config_dir}" --file "${compose_file}" \
+        up --detach --force-recreate --no-build >/dev/null || rollback_failed=1
+      h100_wait_healthy "${container}" 120 || rollback_failed=1
+    else
+      docker compose --project-directory "${config_dir}" --file "${compose_file}" \
+        create --force-recreate --no-build >/dev/null || rollback_failed=1
+    fi
+    if ((before_policy == 0)); then
+      rm -f -- "${policy_file}" || rollback_failed=1
+      rmdir -- "$(dirname "${policy_file}")" 2>/dev/null || true
+    fi
+    [[ "$(docker inspect --format '{{.Image}}' "${container}" 2>/dev/null)" == "${before_image}" ]] \
+      || rollback_failed=1
+  fi
+  case "${temporary}" in /tmp/h100-container-sudo.*) rm -rf -- "${temporary}" ;; esac
+  if ((rollback_failed == 1)); then
+    printf 'CONTAINER SUDO ROLLBACK REQUIRES MANUAL REVIEW user=%s backup=%s\n' \
+      "${user_name}" "${backup_dir}" >&2
+  fi
+  h100_audit container-sudo-enable "${user_name}" \
+    "$([[ ${rc} == 0 ]] && printf SUCCESS || printf FAILED)" "${rc}"
+  exit "${rc}"
+}
+trap on_exit EXIT
+
+install -d -o root -g gpu-platform-admin -m 0750 "${backup_dir}"
+install -o root -g gpu-platform-admin -m 0640 "${compose_file}" \
+  "${backup_dir}/compose.before.yml"
+docker inspect "${container}" | jq '.[0] | {
+  Id, Image, State: {Status: .State.Status, Running: .State.Running, StartedAt: .State.StartedAt},
+  RestartCount, HostConfig: {Privileged: .HostConfig.Privileged,
+    NetworkMode: .HostConfig.NetworkMode, PidMode: .HostConfig.PidMode,
+    IpcMode: .HostConfig.IpcMode, CapAdd: .HostConfig.CapAdd,
+    DeviceRequests: .HostConfig.DeviceRequests, Devices: .HostConfig.Devices},
+  Mounts: [.Mounts[] | {Type, Source, Destination, RW}]
+}' >"${backup_dir}/container.before.json"
+chmod 0640 "${backup_dir}/container.before.json"
+chown root:gpu-platform-admin "${backup_dir}/container.before.json"
+
+rollback_required=1
+h100_prepare_container_sudo_policy "${user_name}"
+cat >"${temporary}/sudo.override.yml" <<EOF
+services:
+  dev:
+    volumes:
+      - type: bind
+        source: ${canonical_home_source}
+        target: /home/${user_name}
+        bind:
+          propagation: rprivate
+      - type: bind
+        source: ${policy_file}
+        target: ${target}
+        read_only: true
+        bind:
+          propagation: rprivate
+EOF
+
+docker compose --project-directory "${config_dir}" \
+  --file "${compose_file}" --file "${temporary}/sudo.override.yml" \
+  config >"${temporary}/compose.yml"
+docker compose --project-directory "${config_dir}" \
+  --file "${temporary}/compose.yml" config --quiet
+docker compose --project-directory "${config_dir}" \
+  --file "${temporary}/compose.yml" config --format json \
+  | jq -e \
+      --arg source "${policy_file}" \
+      --arg target "${target}" \
+      --arg home_source "${canonical_home_source}" \
+      --arg home_target "/home/${user_name}" '
+      .services.dev.volumes as $volumes
+      | ($volumes | map(select(.type == "bind" and .source == $source
+        and .target == $target and .read_only == true)) | length == 1)
+      and ($volumes | map(select(.type == "bind" and .source == $home_source
+        and .target == $home_target and (.read_only // false) == false)) | length == 1)
+    ' >/dev/null || h100_fail 'rendered compose sudo mount is invalid'
+install -o root -g gpu-platform-admin -m 0640 \
+  "${temporary}/compose.yml" "${compose_file}"
+
+if [[ "${before_running}" == true ]]; then
+  docker compose --project-directory "${config_dir}" --file "${compose_file}" \
+    up --detach --force-recreate --no-build >/dev/null
+  h100_wait_healthy "${container}" 120 \
+    || h100_fail 'container did not become healthy after sudo policy enablement'
+else
+  docker compose --project-directory "${config_dir}" --file "${compose_file}" \
+    create --force-recreate --no-build >/dev/null
+fi
+
+docker inspect "${container}" | jq -e \
+  --arg source "${policy_file}" \
+  --arg target "${target}" \
+  --arg home_source "${canonical_home_source}" \
+  --arg home_target "/home/${user_name}" \
+  --arg image "${before_image}" '
+  .[0] as $c
+  | $c.Image == $image
+  and $c.HostConfig.Privileged == false
+  and $c.HostConfig.NetworkMode != "host"
+  and $c.HostConfig.PidMode != "host"
+  and $c.HostConfig.IpcMode != "host"
+  and $c.HostConfig.CgroupnsMode != "host"
+  and ($c.AppArmorProfile | type == "string" and . != "" and . != "unconfined")
+  and (($c.HostConfig.CapAdd // []) | length == 0)
+  and (($c.HostConfig.DeviceRequests // []) | length == 0)
+  and (($c.HostConfig.Devices // []) | length == 0)
+  and (($c.HostConfig.SecurityOpt // []) | map(ascii_downcase)
+    | all(. != "apparmor=unconfined" and . != "seccomp=unconfined"))
+  and (($c.Mounts // []) | map(select(.Source == $source and .Destination == $target
+    and .RW == false)) | length == 1)
+  and (($c.Mounts // []) | map(select(.Source == $home_source
+    and .Destination == $home_target and .RW == true)) | length == 1)
+' >/dev/null || h100_fail 'container sudo postcondition or isolation validation failed'
+
+if [[ "${before_running}" == true ]]; then
+  [[ "$(docker exec --user "${user_name}" "${container}" sudo -n id -u)" == 0 ]] \
+    || h100_fail 'container user cannot obtain container root through sudo'
+else
+  image_ref="$(docker inspect --format '{{.Config.Image}}' "${container}")"
+  [[ "$(docker run --rm --network none --user "${user_name}" \
+    --mount "type=bind,source=${policy_file},target=${target},readonly" \
+    --entrypoint /usr/bin/sudo "${image_ref}" -n /usr/bin/id -u)" == 0 ]] \
+    || h100_fail 'stopped container image cannot use the managed sudo policy'
+fi
+
+rollback_required=0
+printf 'CONTAINER SUDO ENABLED user=%s container=%s policy=CONTAINER_ROOT_NOPASSWD backup=%s\n' \
+  "${user_name}" "${container}" "${backup_dir}"

@@ -20,6 +20,7 @@ import {
   me,
   reauthenticate,
   retryLeaseRecycle,
+  updateLeaseRenewalPolicy,
 } from "../lib/api";
 
 vi.mock("../lib/api", async (importOriginal) => {
@@ -30,6 +31,7 @@ vi.mock("../lib/api", async (importOriginal) => {
     me: vi.fn(),
     reauthenticate: vi.fn(),
     retryLeaseRecycle: vi.fn(),
+    updateLeaseRenewalPolicy: vi.fn(),
   };
 });
 
@@ -55,6 +57,7 @@ const user: User = {
     expires_at: "2026-08-14T05:24:55.083442Z",
     time_expired: true,
     lease_state: "ACTIVE",
+    renewal_approval_required: true,
   },
   linux_identity: {
     managed_user_id: "20000000-0000-4000-8000-000000000001",
@@ -142,6 +145,43 @@ afterEach(() => {
 });
 
 describe("administrator Lease lifecycle UI", () => {
+  it("updates the per-user renewal approval policy without implying pending changes", async () => {
+    vi.mocked(updateLeaseRenewalPolicy).mockResolvedValue({
+      status: "UPDATED",
+      policy: {
+        approval_required: false,
+        pending_requests_changed: false,
+      },
+    });
+    renderPanel("platform_owner", []);
+
+    const toggle = await screen.findByRole("checkbox", {
+      name: "续期需要管理员审批",
+    });
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(updateLeaseRenewalPolicy).toHaveBeenCalledWith(USER_ID, false);
+    });
+    expect(
+      await screen.findByText("该用户后续续期申请将在服务端校验后自动批准。"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("策略只影响后续新申请；已有待审批申请保持不变。"),
+    ).toBeInTheDocument();
+  });
+
+  it("does not let an ordinary user change another policy", async () => {
+    renderPanel("user", []);
+    const toggle = await screen.findByRole("checkbox", {
+      name: "续期需要管理员审批",
+    });
+    expect(toggle).toBeDisabled();
+    fireEvent.click(toggle);
+    expect(updateLeaseRenewalPolicy).not.toHaveBeenCalled();
+  });
+
   it("shows the expired ACTIVE anomaly and binds a typed, reauthenticated recovery", async () => {
     vi.mocked(reauthenticate).mockResolvedValue({ reauthenticated: true });
     vi.mocked(retryLeaseRecycle).mockResolvedValue({

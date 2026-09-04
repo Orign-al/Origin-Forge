@@ -1369,6 +1369,39 @@ button {
   gap: 18px;
 }
 
+.lease-renewal-policy {
+  display: grid;
+  gap: 12px;
+  padding: 16px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.lease-renewal-policy h3,
+.lease-renewal-policy p {
+  margin: 0;
+}
+
+.lease-renewal-policy-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.lease-renewal-policy-toggle input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--primary);
+}
+
+.lease-renewal-policy-toggle:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
 .lifecycle-badges {
   display: flex;
   flex-wrap: wrap;

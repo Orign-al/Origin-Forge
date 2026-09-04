@@ -48,6 +48,7 @@ const ENVIRONMENT: SelfEnvironment = {
     gpu_count: 1,
     max_duration_seconds: 345_600,
     renewal_window_seconds: 86_400,
+    renewal_approval_required: true,
     auto_renew: false,
   },
   container: GPU_CONTAINER,

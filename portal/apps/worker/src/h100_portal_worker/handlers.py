@@ -73,6 +73,7 @@ BINARIES = {
     "docker": "/usr/bin/docker",
     "systemctl": "/usr/bin/systemctl",
     "journalctl": "/usr/bin/journalctl",
+    "visudo": "/usr/sbin/visudo",
     "df": "/usr/bin/df",
     "vgs": "/usr/sbin/vgs",
     "xfs_quota": "/usr/sbin/xfs_quota",
@@ -116,6 +117,9 @@ INTEGRITY_FILE_ALLOWLIST = {
     # The rollout helper is host-only and never exposed inside a container.
     "h100-cli": "/usr/local/lib/h100-platform/h100-cli",
     "h100-cli-rollout": "/usr/local/sbin/h100-cli-rollout",
+    # Existing containers receive sudo only through this explicit, audited,
+    # user-confirmed migration tool; it is not callable through the Worker API.
+    "h100-container-sudo-enable": "/usr/local/sbin/h100-container-sudo-enable",
 }
 SCRIPT_HASH_CONFIG = Path("/etc/h100-portal/worker-scripts.json")
 GPU_ISOLATED_USERS = Path("/etc/h100-platform/gpu-isolated-users")
@@ -170,6 +174,8 @@ GUARD_METRIC_OWNER_GID = 0
 GUARD_METRIC_MAX_AGE_SECONDS = 15 * 60
 PILOT_STATE_ROOT = Path("/etc/h100-platform/users")
 PILOT_DATA_ROOT = Path("/srv/gpu-platform/users")
+CONTAINER_DATA_ROOT = Path("/srv/gpu-platform/container-data")
+HOME_ALIAS_ROOT = Path("/storage/homes")
 MANAGED_HOME_ROOT = Path("/home")
 PLATFORM_BACKUP_ROOT = Path("/srv/gpu-platform/platform/backups")
 PILOT_COMPOSE_ROOT = Path("/srv/gpu-platform/platform/config/dev-containers")
@@ -945,11 +951,14 @@ def containers_inspect(payload: dict[str, Any]) -> dict[str, Any]:
             "network_mode": host_config.get("NetworkMode"),
             "pid_mode": host_config.get("PidMode"),
             "ipc_mode": host_config.get("IpcMode"),
+            "cgroupns_mode": host_config.get("CgroupnsMode"),
+            "apparmor_profile": item.get("AppArmorProfile"),
             "mounts": mounts,
             "device_requests": device_requests,
             "devices": devices,
             "device_cgroup_rules": device_cgroup_rules,
             "cap_add": host_config.get("CapAdd"),
+            "security_opt": host_config.get("SecurityOpt"),
             "runtime": host_config.get("Runtime"),
             "runtime_user": config.get("User"),
             "safe_environment": safe_environment,
@@ -3648,11 +3657,31 @@ def _compute_stage_expected_mount_sources(payload: dict[str, Any]) -> set[str]:
     username = str(payload["username"])
     user_root = PILOT_DATA_ROOT / username
     return {
-        str(user_root / "home"),
+        str(HOME_ALIAS_ROOT / str(payload["uid"])),
         str(workspace_path(int(payload["uid"]))),
         str(user_root / "shared"),
-        f"/srv/gpu-platform/container-data/{username}/ssh-host-keys",
+        str(CONTAINER_DATA_ROOT / username / "ssh-host-keys"),
+        str(CONTAINER_DATA_ROOT / username / "sudoers/90-h100-dev-user"),
     }
+
+
+def _compute_stage_sudo_policy_valid(username: str) -> bool:
+    policy = CONTAINER_DATA_ROOT / username / "sudoers/90-h100-dev-user"
+    try:
+        metadata = policy.lstat()
+        content = policy.read_text(encoding="ascii")
+    except OSError, UnicodeDecodeError:
+        return False
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o440
+        or content != f"{username} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+    ):
+        return False
+    validation = run_fixed("visudo", ["-cf", str(policy)], timeout=10)
+    return bool(validation.get("ok"))
 
 
 def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3824,6 +3853,8 @@ def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
         and container.get("network_mode") != "host"
         and container.get("pid_mode") != "host"
         and container.get("ipc_mode") != "host"
+        and container.get("cgroupns_mode") != "host"
+        and container.get("apparmor_profile") not in {None, "", "unconfined"}
         and container.get("gpu") == "NONE"
         and not container.get("docker_socket_mounted")
         and not any(
@@ -3835,7 +3866,20 @@ def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
         and isinstance(state, dict)
         and state.get("Running") is False
         and state.get("Status") in {"created", "exited"}
+        and not {
+            "apparmor=unconfined",
+            "seccomp=unconfined",
+        }.intersection(str(item).lower() for item in container.get("security_opt", []) or [])
         and observed_sources == expected_sources
+        and _compute_stage_sudo_policy_valid(username)
+        and any(
+            str(item.get("Source", ""))
+            == str(CONTAINER_DATA_ROOT / username / "sudoers/90-h100-dev-user")
+            and str(item.get("Destination", "")) == "/etc/sudoers.d/90-h100-dev-user"
+            and item.get("RW") is False
+            for item in mounts
+            if isinstance(item, dict)
+        )
     ):
         raise LifecycleValidationError(
             "COMPUTE_STAGE_POSTCONDITION_FAILED", "staged container security state is invalid"
@@ -3880,6 +3924,7 @@ def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
             ),
             "ssh_port": payload["ssh_port"],
             "image_digest": container.get("image_digest") or container.get("image_id"),
+            "sudo": "CONTAINER_ROOT_NOPASSWD",
         },
         "guard": guard,
         "filesystem_isolation": {

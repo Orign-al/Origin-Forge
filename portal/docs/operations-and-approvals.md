@@ -114,6 +114,18 @@ idempotency key；旧 Plan 保持 `FAILED`，旧 Reservations 保持 `RELEASED`�
 `retry_authorization_operation_id` 保存完整 lineage。`PARTIAL_ROLLBACK_FAILED`、
 `PARTIAL_UNKNOWN`、`FAILED_HOLD`、缺项或任何绑定漂移均要求人工对账，不能进入 retry Gate。
 
+## 单用户 Lease 续期审批策略
+
+每个 `PortalManagedUser` 有独立的 `lease_renewal_approval_required` 策略，默认值为 `true`。
+只有具备 `users.write` 的管理员会话可以通过用户详情页修改；请求仍要求 CSRF，变更会记录
+前后值、目标 managed identity 和未改变的待审申请数。策略切换不追溯处理已经创建的
+`REQUESTED` 申请，申请行上的 `approval_required` 是创建时的策略快照。
+
+关闭审批仅影响该用户后续新申请。后端仍在 Lease 行锁内检查 24 小时续期窗口、单次最长
+96 小时、活动 Lease、资源策略、重复待审申请和幂等键；全部通过后才创建连续 successor
+Lease。自动批准记录 `LEASE_RENEWAL_AUTO_APPROVED`，`decided_by` 保持 `NULL`，从而不会伪造
+管理员审批人。策略开启时保持现有人工审批流程。普通用户不能读取或修改其他用户策略。
+
 ## Portal-3C 执行边界
 
 唯一 DRAFT 依次进入 `PENDING_APPROVAL → APPROVED → QUEUED → RUNNING`。API 只有在

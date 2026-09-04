@@ -32,6 +32,7 @@ from h100_portal_api.models import (
     PortalComputeLease,
     PortalComputeResourceRequest,
     PortalContainer,
+    PortalLeaseRenewalRequest,
     PortalManagedUser,
     PortalOperation,
     PortalOperationEvent,
@@ -43,7 +44,7 @@ from h100_portal_api.models import (
     utcnow,
 )
 from h100_portal_api.rbac import assignable_roles, has_permission, highest_role
-from h100_portal_api.schemas import PortalUserCreateRequest
+from h100_portal_api.schemas import LeaseRenewalPolicyUpdateRequest, PortalUserCreateRequest
 from h100_portal_api.security import digest_secret, normalize_login, random_token
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -185,9 +186,15 @@ def _admin_user_payload(user: PortalUser, db: Session) -> dict[str, Any]:
             "expires_at": ensure_utc(lease.expires_at).isoformat(),
             "time_expired": ensure_utc(lease.expires_at) <= now,
             "lease_state": lease.state,
+            "renewal_approval_required": managed.lease_renewal_approval_required,
         }
         if managed is not None and lease is not None
-        else {"has_lease": False}
+        else {
+            "has_lease": False,
+            "renewal_approval_required": (
+                managed.lease_renewal_approval_required if managed is not None else True
+            ),
+        }
     )
     return item
 
@@ -237,6 +244,7 @@ def resource_view(
         "container_gpu": safe_spec.get("gpu"),
         "container_cpus": safe_spec.get("cpus"),
         "container_memory_gb": safe_spec.get("memory_gb"),
+        "container_sudo": safe_spec.get("container_sudo"),
         "container_pids_limit": safe_spec.get("pids_limit"),
         "container_image_digest": container.image_digest if container is not None else None,
         "approved_host": get_settings().public_access_host,
@@ -535,6 +543,69 @@ def user_detail(
     item["linux_identity"] = resource_view(user, resource, container)
     item["compute_onboarding"] = compute_plan_view(user, db)
     return {"status": "OK", "user": item}
+
+
+@router.put("/{user_id}/lease-renewal-policy")
+def update_lease_renewal_policy(
+    user_id: str,
+    body: LeaseRenewalPolicyUpdateRequest,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("users.write")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_session_csrf(request, context)
+    target = db.scalar(
+        select(PortalUser).where(PortalUser.id == _user_id(user_id)).with_for_update()
+    )
+    if target is None:
+        raise HTTPException(
+            status_code=404, detail={"code": "USER_NOT_FOUND", "message": "用户不存在"}
+        )
+    managed = db.scalar(
+        select(PortalManagedUser)
+        .where(PortalManagedUser.portal_user_id == target.id)
+        .with_for_update()
+    )
+    if managed is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "MANAGED_IDENTITY_NOT_FOUND", "message": "当前账号没有受管计算身份"},
+        )
+    previous = managed.lease_renewal_approval_required
+    managed.lease_renewal_approval_required = body.approval_required
+    pending_count = len(
+        db.scalars(
+            select(PortalLeaseRenewalRequest.id).where(
+                PortalLeaseRenewalRequest.owner_managed_user_id == managed.id,
+                PortalLeaseRenewalRequest.state == "REQUESTED",
+            )
+        ).all()
+    )
+    record_audit(
+        db,
+        event_type="LEASE_RENEWAL_POLICY_UPDATED",
+        actor=context.user.normalized_login,
+        actor_role=highest_role(context.user),
+        source_ip=client_ip(request),
+        user_agent=user_agent(request),
+        object_type="portal_managed_user",
+        object_id=str(managed.id),
+        metadata={
+            "portal_user_id": str(target.id),
+            "previous_approval_required": previous,
+            "approval_required": body.approval_required,
+            "pending_requests_unchanged": True,
+            "pending_request_count": pending_count,
+        },
+    )
+    db.commit()
+    return {
+        "status": "UPDATED" if previous != body.approval_required else "UNCHANGED",
+        "policy": {
+            "approval_required": managed.lease_renewal_approval_required,
+            "pending_requests_changed": False,
+        },
+    }
 
 
 @router.get("/{user_id}/password-action-tokens")

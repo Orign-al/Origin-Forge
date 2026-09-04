@@ -326,6 +326,44 @@ def test_compute_stage_publishes_ssh_on_ipv4_ingress_and_keeps_public_address_se
     assert "_container_ssh_ingress_matches(" in worker_text
 
 
+def test_container_sudo_is_user_scoped_read_only_and_keeps_host_isolation() -> None:
+    stage = (PLATFORM_ROOT / "scripts/h100-provision-stage").read_text()
+    common = (PLATFORM_ROOT / "scripts/h100-platform-common.sh").read_text()
+    migration = (PLATFORM_ROOT / "scripts/h100-container-sudo-enable").read_text()
+    installer = (PORTAL_ROOT / "deploy/scripts/install-runtime.sh").read_text()
+
+    assert "h100_prepare_container_sudo_policy" in common
+    assert "ALL=(ALL:ALL) NOPASSWD: ALL" in common
+    assert "/usr/sbin/visudo -cf" in common
+    assert "stat -c '%u:%g:%a'" in common
+    assert "== 0:0:440" in common
+    assert "target: /etc/sudoers.d/90-h100-dev-user" in stage
+    assert "read_only: true" in stage
+    assert "container sudo policy" in stage or "sudo_policy" in stage
+    assert "h100_require_home_alias" in migration
+    assert "canonical home alias verification failed" in common
+    assert "source: ${home_alias_root}" in stage
+    assert "source: ${canonical_home_source}" in migration
+    assert "CgroupnsMode" in migration
+    assert "AppArmorProfile" in migration
+    assert '"apparmor=unconfined"' in migration
+    assert '"seccomp=unconfined"' in migration
+    assert "managed Host account must remain nologin" in migration
+    assert "managed Host password must remain locked" in migration
+    assert "managed Host SSH access must remain absent" in migration
+    assert "Privileged == false" in migration
+    assert 'NetworkMode != "host"' in migration
+    assert 'PidMode != "host"' in migration
+    assert 'IpcMode != "host"' in migration
+    assert "DeviceRequests" in migration
+    assert "/var/run/docker.sock" in migration
+    assert "/run/h100-portal/worker.sock" in migration
+    assert "/run/munge" in migration
+    assert "config --format json" in migration
+    assert "--force-recreate --no-build" in migration
+    assert "h100-container-sudo-enable" in installer
+
+
 def test_legacy_easytier_ingress_and_compose_reconciliation_are_installed() -> None:
     installer = (PORTAL_ROOT / "deploy/scripts/install-runtime.sh").read_text()
     ingress = (PLATFORM_ROOT / "scripts/h100-easytier-legacy-ingress").read_text()

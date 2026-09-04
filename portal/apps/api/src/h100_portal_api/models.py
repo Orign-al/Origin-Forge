@@ -350,6 +350,9 @@ class PortalManagedUser(Base):
     slurm_qos: Mapped[str | None] = mapped_column(String(64))
     project_id: Mapped[int | None] = mapped_column(Integer, unique=True)
     quota_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    lease_renewal_approval_required: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
     container_name: Mapped[str | None] = mapped_column(String(128), unique=True)
     container_port: Mapped[int | None] = mapped_column(Integer, unique=True)
     onboarding_state: Mapped[OnboardingState] = mapped_column(
@@ -875,6 +878,7 @@ class PortalLeaseRenewalRequest(Base):
         ForeignKey("portal_compute_leases.id", ondelete="CASCADE"), nullable=False, index=True
     )
     state: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    approval_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     requested_duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

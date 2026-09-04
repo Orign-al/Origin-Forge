@@ -289,6 +289,9 @@ const EN_US: Record<string, string> = {
   申请续期: "Request Renewal",
   将在到期前24小时开放续期: "Renewal opens 24 hours before expiry",
   续期申请未提交: "The renewal request was not submitted",
+  提交后需要管理员审批: "Administrator approval is required after submission",
+  提交后由平台自动校验并批准:
+    "The platform validates and approves the request automatically",
   "计算环境状态暂时不可用。":
     "Compute environment status is temporarily unavailable.",
   "开发容器、计算租约和作业入口":

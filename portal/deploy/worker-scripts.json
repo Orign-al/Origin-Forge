@@ -1,6 +1,7 @@
 {
-  "h100-platform-common": "1b2d6acc7b2ea4a7d55bd889834f4a9358224bde3e13b0cef7ea6884df9e2bf1",
-  "h100-provision-stage": "c3656c1ae06ab93b75b48ac1e26d1b2ca1c05bbe39ca18d36662ada1cb166425",
+  "h100-platform-common": "8965ea2e43ff649ac8913cb048de561212452dd7e13dacbc334bd0fb8af1e8a1",
+  "h100-provision-stage": "764702dc807559bd1d32eac409bc8d465c38302345bf9655801347ea5ffaf74b",
+  "h100-container-sudo-enable": "9a69a879c2ec87f488207b10850319a549c3a5016ea134384e2e65ada339325f",
   "h100-workspace-alias": "8d09a8362b06cda292b57b8db3d9c64af80260994d2aec8170c8e500ed39ea11",
   "h100-home-alias": "1d79d3a6e59c6c142c8a9cf2dab6c3e2d055fe1c2b2941c3f03258f8c83774e0",
   "h100-cli": "358d4b6f784168679fd88fcab971715d911e799ec4104efe640bd3aa8adb8749",

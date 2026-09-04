@@ -13,6 +13,7 @@ import {
   me,
   reauthenticate,
   retryLeaseRecycle,
+  updateLeaseRenewalPolicy,
 } from "../lib/api";
 
 function localTime(value?: string | null) {
@@ -60,6 +61,9 @@ export function LeaseLifecyclePanel({ user }: { user: User }) {
   const queryClient = useQueryClient();
   const current = useQuery({ queryKey: ["me"], queryFn: me, retry: false });
   const isPlatformOwner = current.data?.role === "platform_owner";
+  const canManageRenewalPolicy = ["platform_owner", "platform_admin"].includes(
+    current.data?.role ?? "",
+  );
   const incidentQuery = useQuery({
     queryKey: ["admin-lease-recovery-incidents"],
     queryFn: adminLeaseRecoveryIncidents,
@@ -83,6 +87,7 @@ export function LeaseLifecyclePanel({ user }: { user: User }) {
   const [safeReason, setSafeReason] = useState("");
   const [password, setPassword] = useState("");
   const [message, setMessage] = useState<string | null>(null);
+  const [policyMessage, setPolicyMessage] = useState<string | null>(null);
   const [operation, setOperation] =
     useState<LeaseRecoveryOperationResult | null>(null);
 
@@ -161,12 +166,73 @@ export function LeaseLifecyclePanel({ user }: { user: User }) {
     },
   });
 
+  const renewalPolicy = useMutation({
+    mutationFn: (approvalRequired: boolean) =>
+      updateLeaseRenewalPolicy(user.id, approvalRequired),
+    onSuccess: async (result) => {
+      setPolicyMessage(
+        result.policy.approval_required
+          ? "该用户后续续期申请需要管理员审批。"
+          : "该用户后续续期申请将在服务端校验后自动批准。",
+      );
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["user", user.id] }),
+        queryClient.invalidateQueries({ queryKey: ["users"] }),
+      ]);
+    },
+    onError: (reason) => {
+      setPolicyMessage(
+        reason instanceof ApiError
+          ? `${reason.code}：${reason.message}`
+          : "续期审批策略未更新。",
+      );
+    },
+  });
+
+  const approvalRequired = lifecycle?.renewal_approval_required ?? true;
+  const policyPanel = (
+    <section className="lease-renewal-policy" aria-label="续期审批策略">
+      <div>
+        <h3>续期审批策略</h3>
+        <p className="muted">策略只影响后续新申请；已有待审批申请保持不变。</p>
+      </div>
+      <label className="lease-renewal-policy-toggle">
+        <input
+          type="checkbox"
+          checked={approvalRequired}
+          disabled={!canManageRenewalPolicy || renewalPolicy.isPending}
+          onChange={(event) => {
+            setPolicyMessage(null);
+            renewalPolicy.mutate(event.target.checked);
+          }}
+        />
+        <span>续期需要管理员审批</span>
+      </label>
+      {!approvalRequired ? (
+        <div className="notice" role="status">
+          自动批准仍由后端执行续期窗口、时长上限、Lease 锁和资源策略校验。
+        </div>
+      ) : null}
+      {policyMessage ? (
+        <div
+          className={renewalPolicy.isError ? "error-box" : "notice"}
+          role={renewalPolicy.isError ? "alert" : "status"}
+        >
+          {policyMessage}
+        </div>
+      ) : null}
+    </section>
+  );
+
   if (!lifecycle?.has_lease && !incident) {
     return (
-      <div className="empty-plan">
-        <div>
-          <h2>尚无 Lease</h2>
-          <p className="muted">当前真实资源模型没有返回计算租约。</p>
+      <div className="lease-lifecycle-panel">
+        {policyPanel}
+        <div className="empty-plan">
+          <div>
+            <h2>尚无 Lease</h2>
+            <p className="muted">当前真实资源模型没有返回计算租约。</p>
+          </div>
         </div>
       </div>
     );
@@ -186,6 +252,8 @@ export function LeaseLifecyclePanel({ user }: { user: User }) {
           ) : null}
         </div>
       </div>
+
+      {policyPanel}
 
       {anomaly ? (
         <div className="error-box lifecycle-critical" role="alert">

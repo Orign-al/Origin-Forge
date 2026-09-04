@@ -48,6 +48,26 @@ capability 或 `scontrol` 参数。子进程一律 `shell=False`，使用固定�
 密码不读取或修改 Linux shadow，不修改 SSH 密码、管理账号 shell、sudo 或
 `authorized_keys`。
 
+## Development Container sudo 边界
+
+Development Container 内的受管普通用户可以获得该容器 namespace 内的 root，但这不等于
+宿主 root。策略文件按用户生成于 root-only container-data 目录，必须是 `root:root 0440`
+的普通文件、只有精确一行 `<user> ALL=(ALL:ALL) NOPASSWD: ALL`，并通过 `visudo -cf`；容器
+只读挂载到 `/etc/sudoers.d/90-h100-dev-user`。不得挂载宿主 `/etc/sudoers`，也不得让容器
+修改该策略文件。
+
+允许容器 sudo 的前提是宿主同名账号继续使用 `/usr/sbin/nologin`、密码锁定、没有 Host
+`authorized_keys`，且不属于 `sudo`、`docker`、`video`、`render`、`gpu-platform-admin`、
+`adm` 或 `systemd-journal`。容器必须保持非 privileged、非 host network/PID/IPC/cgroup
+namespace、默认受限 AppArmor/seccomp、无额外 capability、无 GPU DeviceRequest，并且不挂载
+Docker socket、Worker socket、MUNGE 或非白名单宿主路径。容器 root 可以管理个人 Home、
+Workspace 与 Shared 内容；这些数据原本就归该用户所有，不能借此读取其他用户或管理宿主。
+
+既有容器只能通过 `h100-container-sudo-enable USER --confirm=USER` 的显式单用户迁移启用。
+工具先验证上述边界和 canonical Home/Workspace alias，再保留原镜像并创建回滚点，使用
+`--force-recreate --no-build` 受控重建；失败时自动恢复原 Compose。该操作会造成该用户容器
+短暂中断，不是热更新，也不能通过 Root Worker HTTP API 触发。
+
 ## 密码和邀请
 
 - 密码长度 14–128 字符，保留用户输入的 Unicode 与前后空格，不执行 trim。

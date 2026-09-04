@@ -373,6 +373,11 @@ function LeaseAction({ lease }: { lease: ComputeLease }) {
       >
         {t("申请续期")}
       </Button>
+      <div className="muted compact-help">
+        {lease.renewal_approval_required
+          ? t("提交后需要管理员审批")
+          : t("提交后由平台自动校验并批准")}
+      </div>
       {!lease.renewal_available ? (
         <div className="muted compact-help">
           {t("将在到期前24小时开放续期")}

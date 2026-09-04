@@ -182,6 +182,18 @@ sudo h100-container-rebuild USER
 
 创建后用 `docker inspect` 验证：无 GPU DeviceRequest/Devices、Privileged=false、非 host network/PID/IPC、8 CPU、32GiB、4096 PIDs、端口只绑定 `10.82.36.1`、只挂个人目录和持久 host-key 目录、无 Docker/MUNGE socket 或宿主敏感目录。用户本人用对应私钥验证两个入口；管理员不得用私钥冒充。
 
+为既有 Development Container 开启容器内用户 sudo 是一次会重建该用户容器的独立变更，
+必须先取得该用户中断授权并逐个执行：
+
+```bash
+sudo h100-container-sudo-enable USER --confirm=USER
+```
+
+不得批量启用。工具要求宿主账号 nologin、密码锁定、无 Host `authorized_keys`、无高权组，
+并验证容器非 privileged、非 host namespace、受限 AppArmor/seccomp、无 GPU、Docker/Worker/
+MUNGE socket 或非白名单挂载；原镜像不重建，失败自动回滚。完成后复核容器内
+`sudo -n id -u` 为 `0`、sudoers 只读、镜像 digest 未变及宿主登录面仍关闭。
+
 容器删除默认保留数据：
 
 ```bash

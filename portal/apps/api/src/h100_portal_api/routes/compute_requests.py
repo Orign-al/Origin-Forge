@@ -3550,6 +3550,7 @@ def provision_reserved_compute_environment(
             "host_ipc": False,
             "docker_socket": False,
             "munge": False,
+            "container_sudo": "CONTAINER_ROOT_NOPASSWD",
             "authorized_keys": "ABSENT",
             "host_authorized_keys": "ABSENT",
             "container_authorized_keys": "ABSENT",

@@ -76,6 +76,7 @@ function lease(state: Portal4aState) {
     gpu_count: 1,
     max_duration_seconds: 345600,
     renewal_window_seconds: 86400,
+    renewal_approval_required: true,
     auto_renew: false,
     restore_required: !active,
     pending_renewal_id: state.renewalPending

@@ -778,6 +778,7 @@ def create_renewal(
         owner_id=managed.id,
         duration_seconds=body.duration_seconds,
         idempotency_key=str(body.idempotency_key),
+        approval_required=managed.lease_renewal_approval_required,
     )
     _audit(
         db,
@@ -786,10 +787,66 @@ def create_renewal(
         event_type="LEASE_RENEWAL_REQUESTED",
         object_type="lease_renewal_request",
         object_id=str(renewal.id),
-        metadata={"duration_seconds": renewal.requested_duration_seconds},
+        metadata={
+            "duration_seconds": renewal.requested_duration_seconds,
+            "approval_required": renewal.approval_required,
+        },
     )
+    successor = (
+        db.get(PortalComputeLease, renewal.resulting_lease_id)
+        if renewal.resulting_lease_id is not None
+        else None
+    )
+    if not renewal.approval_required and renewal.state == "REQUESTED":
+        try:
+            renewal, successor = decide_renewal(
+                db,
+                request_id=renewal.id,
+                decision="APPROVE",
+                decided_by=None,
+                comment="AUTO_APPROVED_BY_USER_RENEWAL_POLICY",
+            )
+        except RenewalLeaseExpiredError:
+            _audit(
+                db,
+                request,
+                context,
+                event_type="LEASE_RENEWAL_CANCELLED",
+                object_type="lease_renewal_request",
+                object_id=str(renewal.id),
+                result="DENIED",
+                metadata={
+                    "reason": "LEASE_EXPIRED_RESTORE_REQUIRED",
+                    "approval_required": False,
+                    "policy_source": "portal_managed_user",
+                },
+            )
+            db.commit()
+            raise _error(
+                409,
+                "LEASE_EXPIRED_RESTORE_REQUIRED",
+                "租约已过期，请申请恢复",
+            ) from None
+        _audit(
+            db,
+            request,
+            context,
+            event_type="LEASE_RENEWAL_AUTO_APPROVED",
+            object_type="lease_renewal_request",
+            object_id=str(renewal.id),
+            metadata={
+                "approval_required": False,
+                "policy_source": "portal_managed_user",
+                "resulting_lease_id": str(successor.id) if successor else None,
+            },
+        )
     db.commit()
-    return {"status": "REQUESTED", "renewal_request_id": str(renewal.id)}
+    return {
+        "status": renewal.state,
+        "renewal_request_id": str(renewal.id),
+        "resulting_lease_id": str(successor.id) if successor else None,
+        "approval_required": renewal.approval_required,
+    }
 
 
 @router.get("/self/container")
@@ -2029,6 +2086,7 @@ def admin_renewals(
                 "owner_managed_user_id": str(row.owner_managed_user_id),
                 "lease_id": str(row.lease_id),
                 "state": row.state,
+                "approval_required": row.approval_required,
                 "duration_seconds": row.requested_duration_seconds,
                 "requested_at": ensure_utc(row.requested_at).isoformat(),
             }

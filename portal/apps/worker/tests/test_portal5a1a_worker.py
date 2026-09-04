@@ -752,6 +752,29 @@ def test_stage_image_gate_builds_from_local_oci_before_any_compute_write() -> No
     assert "docker pull" not in source
 
 
+def test_compute_stage_sudo_policy_requires_root_owned_exact_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    username = "fixture-user"
+    policy = tmp_path / username / "sudoers/90-h100-dev-user"
+    policy.parent.mkdir(parents=True)
+    policy.write_text(f"{username} ALL=(ALL:ALL) NOPASSWD: ALL\n", encoding="ascii")
+    policy.chmod(0o440)
+    monkeypatch.setattr(handlers, "CONTAINER_DATA_ROOT", tmp_path)
+    monkeypatch.setattr(
+        handlers,
+        "run_fixed",
+        lambda name, argv, **_kwargs: {"ok": name == "visudo" and argv == ["-cf", str(policy)]},
+    )
+
+    assert handlers._compute_stage_sudo_policy_valid(username) is True
+    policy.chmod(0o644)
+    assert handlers._compute_stage_sudo_policy_valid(username) is False
+    policy.chmod(0o440)
+    policy.write_text("root ALL=(ALL:ALL) NOPASSWD: ALL\n", encoding="ascii")
+    assert handlers._compute_stage_sudo_policy_valid(username) is False
+
+
 def test_stage_rollback_evidence_parser_preserves_idempotent_group_cleanup() -> None:
     stderr = "\n".join(
         [
@@ -920,10 +943,11 @@ def test_compute_stage_mount_contract_matches_transactional_script_bind_sources(
     sources = handlers._compute_stage_expected_mount_sources(payload)
 
     assert sources == {
-        str(user_root / "home"),
+        f"/storage/homes/{payload['uid']}",
         str(handlers.workspace_path(int(payload["uid"]))),
         str(user_root / "shared"),
         f"/srv/gpu-platform/container-data/{username}/ssh-host-keys",
+        f"/srv/gpu-platform/container-data/{username}/sudoers/90-h100-dev-user",
     }
 
 

@@ -65,6 +65,7 @@ local_base_context=
 expected_local_image_identity=
 derived_image=
 state_file=
+sudo_policy_file=
 isolation_marker_one=
 isolation_marker_two=
 current_step=SCRIPT_ARGUMENT_COUNT
@@ -412,6 +413,7 @@ derived_image="h100-local/dev-container:ubuntu24.04-${username}-${plan_id}"
 compose_dir="${COMPOSE_ROOT}/${username}"
 compose_file="${compose_dir}/compose.yml"
 state_file="${STATE_DIR}/${username}.state"
+sudo_policy_file="$(h100_container_sudo_policy_file "${username}")"
 
 getent passwd "${username}" >/dev/null && fail 'Linux user already exists'
 getent group "${username}" >/dev/null && fail 'Linux group already exists'
@@ -557,6 +559,7 @@ install -d -o root -g root -m 0700 \
   "${CONTAINER_DATA_ROOT}/${username}" \
   "${CONTAINER_DATA_ROOT}/${username}/ssh-host-keys"
 created_container_data=1
+h100_prepare_container_sudo_policy "${username}"
 [[ ! -e "${user_root}/home/.ssh/authorized_keys" ]] || fail 'container authorized_keys exists'
 
 # Verify real OS-level isolation using disposable, non-sensitive markers. The
@@ -647,10 +650,11 @@ services:
         host_ip: ${CONTAINER_LEGACY_PUBLISH_HOST}
         protocol: tcp
     volumes:
-      - {type: bind, source: ${user_root}/home, target: /home/${username}, bind: {propagation: rprivate}}
+      - {type: bind, source: ${home_alias_root}, target: /home/${username}, bind: {propagation: rprivate}}
       - {type: bind, source: ${workspace_root}, target: /workspace, bind: {propagation: rprivate}}
       - {type: bind, source: ${user_root}/shared, target: /shared, bind: {propagation: rprivate}}
       - {type: bind, source: ${CONTAINER_DATA_ROOT}/${username}/ssh-host-keys, target: /etc/ssh/persistent, bind: {propagation: rprivate}}
+      - {type: bind, source: ${sudo_policy_file}, target: /etc/sudoers.d/90-h100-dev-user, read_only: true, bind: {propagation: rprivate}}
     environment:
       TZ: Asia/Shanghai
     cpus: 8.0
@@ -671,12 +675,17 @@ docker inspect "${container_name}" | jq -e \
   --arg legacy_host_ip "${CONTAINER_LEGACY_PUBLISH_HOST}" \
   --arg port "${ssh_port}" \
   --arg workspace "${workspace_root}" \
+  --arg sudo_policy "${sudo_policy_file}" \
   '.[0].HostConfig.Privileged == false
    and .[0].HostConfig.NetworkMode != "host"
    and .[0].HostConfig.PidMode != "host"
    and .[0].HostConfig.IpcMode != "host"
+   and .[0].HostConfig.CgroupnsMode != "host"
+   and (.[0].AppArmorProfile | type == "string" and . != "" and . != "unconfined")
    and .[0].HostConfig.ReadonlyRootfs == false
    and ((.[0].HostConfig.CapAdd // []) | length == 0)
+   and ((.[0].HostConfig.SecurityOpt // []) | map(ascii_downcase)
+     | all(. != "apparmor=unconfined" and . != "seccomp=unconfined"))
    and ((.[0].HostConfig.DeviceRequests // []) | length == 0)
    and ((.[0].HostConfig.Devices // []) | length == 0)
    and .[0].HostConfig.NanoCpus == 8000000000
@@ -688,7 +697,8 @@ docker inspect "${container_name}" | jq -e \
    and ((.[0].Mounts // []) | map(.Destination) | index("/var/run/docker.sock") | not)
    and ((.[0].Mounts // []) | map(.Destination) | index("/run/munge") | not)
    and ((.[0].Mounts // []) | map(.Source) | index("/") | not)
-   and ((.[0].Mounts // []) | map(select(.Source == $workspace and .Destination == "/workspace" and .RW == true)) | length == 1)' \
+   and ((.[0].Mounts // []) | map(select(.Source == $workspace and .Destination == "/workspace" and .RW == true)) | length == 1)
+   and ((.[0].Mounts // []) | map(select(.Source == $sudo_policy and .Destination == "/etc/sudoers.d/90-h100-dev-user" and .RW == false)) | length == 1)' \
   >/dev/null || fail 'staged container security validation failed'
 ss -H -lnt "sport = :${ssh_port}" | grep -q . && fail 'staged SSH port unexpectedly listens'
 

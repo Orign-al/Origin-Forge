@@ -12,6 +12,7 @@ export type ComputeLifecycleSummary = {
   expires_at?: string;
   time_expired?: boolean;
   lease_state?: string;
+  renewal_approval_required?: boolean;
 };
 
 export type AdminLeaseRecoveryIncident = {
@@ -283,6 +284,7 @@ export type ComputeLease = {
   gpu_count?: number;
   max_duration_seconds: number;
   renewal_window_seconds: number;
+  renewal_approval_required: boolean;
   auto_renew: false;
   restore_required?: boolean;
   pending_renewal_id?: string | null;
@@ -550,6 +552,20 @@ export const createPortalUser = (payload: {
   }>("/users", { method: "POST", body: JSON.stringify(payload) });
 export const userDetail = (id: string) =>
   apiFetch<{ status: string; user: User }>(`/users/${encodeURIComponent(id)}`);
+export const updateLeaseRenewalPolicy = (
+  id: string,
+  approvalRequired: boolean,
+) =>
+  apiFetch<{
+    status: "UPDATED" | "UNCHANGED";
+    policy: {
+      approval_required: boolean;
+      pending_requests_changed: false;
+    };
+  }>(`/users/${encodeURIComponent(id)}/lease-renewal-policy`, {
+    method: "PUT",
+    body: JSON.stringify({ approval_required: approvalRequired }),
+  });
 export const passwordActionTokens = (id: string) =>
   apiFetch<{ status: string; tokens: PasswordActionMetadata[]; count: number }>(
     `/users/${encodeURIComponent(id)}/password-action-tokens`,
@@ -892,13 +908,15 @@ export const requestLeaseRenewal = (payload: {
   duration_seconds: number;
   idempotency_key: string;
 }) =>
-  apiFetch<{ status: string; renewal_request_id: string }>(
-    "/self/lease/renewals",
-    {
-      method: "POST",
-      body: JSON.stringify(payload),
-    },
-  );
+  apiFetch<{
+    status: "REQUESTED" | "APPROVED";
+    renewal_request_id: string;
+    resulting_lease_id: string | null;
+    approval_required: boolean;
+  }>("/self/lease/renewals", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 export const selfContainer = () =>
   apiFetch<{ status: string; container: SelfEnvironment["container"] }>(
     "/self/container",

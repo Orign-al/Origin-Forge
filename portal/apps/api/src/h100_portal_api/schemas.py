@@ -75,6 +75,10 @@ class PortalUserCreateRequest(ApiModel):
         return normalized or None
 
 
+class LeaseRenewalPolicyUpdateRequest(ApiModel):
+    approval_required: bool
+
+
 class ComputeResourceRequestCreate(ApiModel):
     """Closed ordinary-user contract for the standard first compute profile."""
 
