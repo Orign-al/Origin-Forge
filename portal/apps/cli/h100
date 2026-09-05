@@ -42,6 +42,7 @@ TERMINAL_STATES = {
     "OUT_OF_MEMORY",
     "PREEMPTED",
     "REVOKED",
+    "REJECTED",
     "TIMEOUT",
 }
 
@@ -573,6 +574,28 @@ def _job_submit(args: argparse.Namespace) -> int:
         "source_path": script.as_posix(),
         "idempotency_key": str(uuid.uuid4()),
     }
+    if int(body["gpu_count"]) >= 2:
+        details = {
+            "model_name": args.model_name,
+            "model_architecture": args.model_architecture,
+            "framework": args.framework,
+            "framework_version": args.framework_version,
+            "parameter_count": args.parameter_count,
+            "workload_description": args.workload_description,
+            "dataset_description": args.dataset_description,
+            "parallel_strategy": args.parallel_strategy,
+            "scaling_justification": args.scaling_justification,
+        }
+        missing = [key.replace("_", "-") for key, value in details.items() if not value]
+        if missing:
+            raise CliError(
+                "Multi-GPU requests require complete approval details: " + ", ".join(missing),
+                exit_code=EXIT_USAGE,
+                code="MULTI_GPU_DETAILS_REQUIRED",
+            )
+        body["multi_gpu_request"] = details
+    else:
+        body["multi_gpu_request"] = None
     result = _api("POST", "/self/jobs", body=body, timeout=60)
     job = result.get("job", {})
     output = {
@@ -584,7 +607,10 @@ def _job_submit(args: argparse.Namespace) -> int:
     if args.json:
         _json(output)
     else:
-        print("Job submitted successfully.")
+        if result.get("status") == "APPROVAL_PENDING":
+            print("Multi-GPU request submitted for administrator approval.")
+        else:
+            print("Job submitted successfully.")
         print()
         print(f"Portal Job ID: {job.get('id')}")
         print(f"Slurm Job ID: {job.get('slurm_job_id')}")
@@ -802,7 +828,16 @@ def _add_submit(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--name", help="job name (1-64 safe characters)")
     parser.add_argument("--cpus", type=int, help="CPU count (1-8; default fetched from Portal)")
     parser.add_argument("--memory", type=_memory_mb, help="memory, e.g. 4096M or 32G (256M-32G)")
-    parser.add_argument("--gpus", type=int, help="H100 count (0-1; default fetched from Portal)")
+    parser.add_argument("--gpus", type=int, help="H100 count (0-4; 2-4 require approval)")
+    parser.add_argument("--model-name", help="model name (required for 2-4 GPUs)")
+    parser.add_argument("--model-architecture", help="model architecture (required for 2-4 GPUs)")
+    parser.add_argument("--framework", help="framework name (required for 2-4 GPUs)")
+    parser.add_argument("--framework-version", help="framework version (required for 2-4 GPUs)")
+    parser.add_argument("--parameter-count", help="model scale/parameter count (required for 2-4 GPUs)")
+    parser.add_argument("--workload-description", help="training/inference workload (required for 2-4 GPUs)")
+    parser.add_argument("--dataset-description", help="dataset description (required for 2-4 GPUs)")
+    parser.add_argument("--parallel-strategy", help="data/model parallel strategy (required for 2-4 GPUs)")
+    parser.add_argument("--scaling-justification", help="expected scaling benefit (required for 2-4 GPUs)")
     parser.add_argument(
         "--time", type=_duration_seconds, help="time [D-]HH:MM:SS (00:01:00-4-00:00:00)"
     )

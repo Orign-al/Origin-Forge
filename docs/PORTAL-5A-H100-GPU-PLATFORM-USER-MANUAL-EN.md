@@ -9,9 +9,9 @@ Audience: ordinary users
 The H100 GPU Platform provides self-service development containers, private persistent storage, a web terminal, container SSH, and Slurm CPU/GPU jobs.
 
 - `CPU Development / STANDARD_8CPU_32GB` is the default profile: 8 CPUs, 32 GiB memory, and no GPU device in the development container.
-- `GPU Development / GPU_1_8CPU_32GB` must be selected explicitly: 8 CPUs, 32 GiB memory, and permission to run Slurm jobs with at most one H100.
+- `GPU Development / GPU_1_8CPU_32GB` must be selected explicitly: 8 CPUs, 32 GiB memory, and permission to run H100 Slurm jobs.
 - Development containers are persistent and GPU-less. An H100 is assigned only while a GPU job runs and is released automatically when the job finishes.
-- A user can hold at most one GPU at a time. GPU=2 is rejected before Worker or Slurm resource creation.
+- One GPU can be submitted directly. Requests for 2, 3, or 4 GPUs require complete model and scaling details plus administrator approval. A user can hold at most four GPUs concurrently.
 - Each user has 300 GiB of private persistent storage. Both `/workspace` and `/home/<username>` belong to the same quota.
 - A lease lasts 96 hours. On expiry, the environment enters a recoverable recycle flow and persistent data is retained.
 - Host SSH is disabled. Users connect only to their own development container.
@@ -52,7 +52,7 @@ Enter your username and password at the production entry point. An ordinary user
 2. Select a profile:
 
    - `STANDARD_8CPU_32GB`: the default CPU Development profile.
-   - `GPU_1_8CPU_32GB`: explicit GPU Development selection that permits single-H100 jobs.
+   - `GPU_1_8CPU_32GB`: explicit GPU Development selection; single-H100 jobs are direct and multi-GPU jobs use a separate approval flow.
 
 3. Enter the purpose and submit.
 4. If approval is required, wait for one normal administrator approval. The system automatically performs the Attempt, Reservation, Plan, Dry-run, Stage, and safe rollback checks.
@@ -86,7 +86,7 @@ H100 · NOT ALLOCATED
 No GPU device; H100 jobs are scheduled on demand
 ```
 
-It does not indicate a provisioning failure. Submit a job with GPU=`1` from the Jobs page when GPU compute is needed. Slurm selects one H100 and releases it automatically after the job completes, is cancelled, or times out.
+It does not indicate a provisioning failure. Submit GPU=`1` directly from the Jobs page. Requests for 2-4 GPUs require complete details and approval. Slurm assigns only the approved number of H100s while the job runs and releases them after completion, cancellation, or timeout.
 
 Stopping the development container does not delete `/workspace` or `/home/<username>` and does not end the lease early.
 
@@ -177,11 +177,11 @@ Open **Jobs** → **New Job** and enter:
 - script;
 - CPU count;
 - memory;
-- GPU count: `0` or `1`;
+- GPU count: `0`, `1`, `2`, `3`, or `4`; counts from `2` through `4` require approval;
 - time limit;
 - an approved runtime image.
 
-The Portal creates an immutable script snapshot and submits it to Slurm as your ordinary Linux identity. You can see only your own jobs and logs. Cancel a non-terminal job through the Portal.
+For GPU=`0` or `1`, the Portal creates an immutable script snapshot and submits it directly to Slurm as your ordinary Linux identity. For GPU=`2` through `4`, you must also provide the model name, architecture, framework and version, parameter count, training or inference workload, dataset, parallel strategy, and scaling justification. The request first enters **Awaiting Approval** and does not call Worker, create a Slurm job, allocate a GPU, or produce runtime logs. A platform owner or administrator can approve the requested count, approve a lower count, or reject it with a comment. You can see only your own jobs and logs and may cancel your own request before approval.
 
 The first import of a large CUDA/Enroot image needs extra memory. If a low-memory job reaches `OUT_OF_MEMORY` during a cold image import, retry with at least 8 GiB. Do not bypass the Portal with host commands.
 
@@ -234,7 +234,22 @@ h100 job submit train.sh
 
 Relative and absolute paths are accepted, but the resolved script must be under `/workspace/...` or `/home/<your-username>/...`. `/etc`, `/root`, `/proc`, `/sys`, another user's Home, and arbitrary host paths are rejected. The CLI reads the content and the Portal still creates an immutable script snapshot. Editing the original file later cannot change the submitted job's audit content.
 
-When resource options are omitted, the CLI fetches the same production defaults used by the Web form; it does not hard-code client defaults. GPU accepts only `--gpus 0` or `--gpus 1`. The API rejects `--gpus 2` with HTTP 422 before Worker is called and before any Slurm job is created.
+When resource options are omitted, the CLI fetches the same production defaults used by the Web form; it does not hard-code client defaults. `--gpus 0` and `--gpus 1` are submitted directly. A request from `--gpus 2` through `--gpus 4` must include all approval details, for example:
+
+```bash
+h100 job submit train.sh --gpus 4 \
+  --model-name 'Llama 3.1' \
+  --model-architecture 'decoder-only transformer' \
+  --framework PyTorch \
+  --framework-version 2.6.0 \
+  --parameter-count 70B \
+  --workload-description 'full-parameter fine-tuning' \
+  --dataset-description 'curated 2 TB training corpus' \
+  --parallel-strategy 'FSDP full shard' \
+  --scaling-justification 'model and optimizer state do not fit on one GPU'
+```
+
+The CLI rejects missing details locally and the backend validates them independently. A complete request returns `APPROVAL_PENDING`; no Slurm job or logs exist yet. An administrator can approve any count from 1 through the requested count, but cannot increase it.
 
 CLI v1 rejects scripts containing resource-changing `#SBATCH` directives. Use `--cpus`, `--memory`, `--gpus`, and `--time`; the Portal backend performs authoritative policy validation again.
 
@@ -318,12 +333,12 @@ Expected behavior:
 
 ## 14. Job status, logs, and results
 
-**My Jobs** displays Pending, Running, Completed, Failed, Cancelled, Timeout, or Out of Memory states.
+**My Jobs** displays Awaiting Approval, Rejected, Pending, Running, Completed, Failed, Cancelled, Timeout, or Out of Memory states.
 
 - `stdout` and `stderr` are visible only to the job owner.
 - Write results under `/workspace` or `/home/<your-username>` for persistence.
 - A running development container sees job results immediately, with no synchronization.
-- If a GPU job is pending because of the per-user GPU limit, wait for the current GPU job to finish or cancel it in the Portal.
+- If a submitted GPU job is pending because the aggregate four-GPU user limit is reached, wait for a current GPU job to finish or cancel it in the Portal.
 
 ## 15. Lease, recycle, and restore
 
@@ -339,7 +354,7 @@ After restore, verify the files and permissions in both persistent paths before 
 
 ### The page says H100 / NOT ALLOCATED. Is something broken?
 
-No. Resident containers and GPU allocations are decoupled. Submit a Slurm job with GPU=`1`; the GPU is visible only while that job runs.
+No. Resident containers and GPU allocations are decoupled. Submit one GPU directly or request 2-4 GPUs for approval; GPUs are visible only while the job runs.
 
 ### I downloaded tens of GiB, but Storage shows very little usage.
 
@@ -347,11 +362,11 @@ Confirm that the files are under `/workspace` or `/home/<your-username>`. This r
 
 ### Why is my GPU job pending?
 
-A user can hold only one GPU at a time. A second GPU=1 job remains pending or is rejected and never receives another GPU.
+A user's direct and approved jobs can hold at most four GPUs in aggregate. A submitted job stays Pending with the authoritative Slurm reason when resources are unavailable, the aggregate limit is reached, or another scheduling condition is unmet.
 
-### Why is GPU=2 rejected?
+### Why did a GPU=2 through GPU=4 request not start immediately?
 
-The product currently accepts only zero or one GPU. GPU=2 is rejected by the API before Worker, Slurm, or container creation.
+Multi-GPU requests require approval. Provide the model, framework and version, parameter count, workload, dataset, parallel strategy, and scaling benefit. While approval is pending, Worker is not called, no Slurm job is created, and no GPU is allocated. An administrator may approve fewer GPUs or reject the request with a reason.
 
 ### SSH reports Connection refused.
 

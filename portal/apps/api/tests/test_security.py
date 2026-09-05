@@ -122,3 +122,6 @@ def test_recursive_redaction() -> None:
     }
     cli_token = f"h100_cli_{'A' * 64}"
     assert safe_metadata({"path": f"/workspace/{cli_token}/train.sh"}) == {"path": "[REDACTED]"}
+    assert safe_metadata(
+        {"script": "echo secret", "nested": {"script_content": "echo secret too"}}
+    ) == {"script": "[REDACTED]", "nested": {"script_content": "[REDACTED]"}}

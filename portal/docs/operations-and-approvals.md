@@ -148,6 +148,28 @@ Lease 到期后，原 `REQUESTED` 续期不再可执行。周期性到期服务�
 管理员页面只把该记录显示为“已失效”历史。管理员不得在到期后批准旧续期，用户必须走
 正式恢复流程。
 
+## 多 GPU Job 审批
+
+普通用户的 GPU Development 权限允许直接提交 GPU 0 或 1 的 Job。GPU 2、3、4 必须同时
+提供模型名称、模型架构、框架与版本、参数量、训练或推理任务、数据集、并行策略以及可衡量
+或预期的多卡扩展收益。Backend 在创建请求时锁定 owner/Lease，保存不可变脚本内容及
+SHA-256，并将 Job 和 Operation 分别置为 `APPROVAL_PENDING` 与 `PENDING_APPROVAL`。
+这一阶段不调用 Worker，不创建 Slurm Job，不分配 GPU，也没有运行日志。
+
+`jobs.gpu_approval.read` 和 `jobs.gpu_approval.review` 只授予 `platform_owner` 与
+`platform_admin`。审核接口仍要求 Session、CSRF 和最近重新认证；operator、auditor 与
+普通 user 的直接 API 调用由 Backend 拒绝，不能依赖前端隐藏。审核人必须填写意见，可以
+批准 1 至用户申请数量之间的 GPU，或驳回；不得增加用户申请数量。审批时 Backend 在行锁内
+重新验证 owner、活动 Lease、剩余时间、GPU entitlement、脚本 hash 与审批状态，再把包含
+审批 ID、申请/批准数量、审核人和审核时间的不可变 contract 交给 Worker。Worker 独立拒绝
+无审批、字段不全、脚本 hash 不符、数量不符或 QoS 不符的多卡请求。
+
+直接 Job 始终使用单卡 `general` 调度策略。批准 2 至 4 张的 Job 使用专用受控调度策略；
+association 的单 Job 上限、单用户聚合上限和 QoS 上限共同约束单用户最多同时占用 4 张
+H100。该策略只调和 `/etc/h100-platform/users/*.state` 代表的受管 Portal 用户，不自动授权
+无生命周期记录的其他 Slurm 用户。用户可在审批前取消自己的申请，此操作只更新 Portal
+状态，不调用 Worker 或 `scancel`。
+
 ## Portal-3C 执行边界
 
 唯一 DRAFT 依次进入 `PENDING_APPROVAL → APPROVED → QUEUED → RUNNING`。API 只有在

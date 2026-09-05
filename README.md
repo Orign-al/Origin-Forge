@@ -4,7 +4,7 @@
 长期开发容器、Slurm 作业、GPU 隔离、配额、审计和受控运维操作整合到一个私有 Portal，
 同时保持宿主机与内部控制面不向普通用户开放。
 
-当前生产形态为 **single-node / multi-user / 1-GPU-per-user**，适配 Lenovo SR675 V3、
+当前生产形态为 **single-node / multi-user / approval-gated multi-GPU**，适配 Lenovo SR675 V3、
 4 × NVIDIA H100 PCIe 80GB 与 Slurm 25.11.7。
 
 ## 生产入口
@@ -49,8 +49,9 @@ flowchart LR
 - 普通用户不能登录宿主机；Linux shell 为 `/usr/sbin/nologin`，密码锁定且没有宿主
   `authorized_keys`。
 - 长期开发容器没有 GPU、Docker Socket、MUNGE、特权模式或 host namespace。
-- GPU 计算只能通过 Slurm；每个用户最多申请 1 张 GPU，并使用 per-UID systemd device
-  policy 隔离设备。
+- GPU 计算只能通过 Slurm；1 张 GPU 可直接提交，2 至 4 张必须提交完整的模型、框架、
+  数据集、并行策略与扩展收益说明并经管理员审批。管理员可降低批准数量，单用户并发占用
+  总量仍不超过 4 张，并使用 per-UID systemd device policy 隔离设备。
 - PostgreSQL、MariaDB、SlurmDBD、Docker API、MUNGE 与监控内部接口不作为用户入口。
 
 完整设计见 [Portal 架构](portal/docs/architecture.md) 与

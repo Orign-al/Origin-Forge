@@ -1,9 +1,9 @@
 [Unit]
 Description=Origin Forge management API
 Documentation=file:/opt/h100-portal/docs/architecture.md
-Requires=h100-portal-worker.socket
+Requires=h100-portal-worker.socket h100-multigpu-qos-policy.service
 Wants=postgresql.service
-After=network.target postgresql.service h100-portal-worker.socket
+After=network.target postgresql.service h100-portal-worker.socket h100-multigpu-qos-policy.service
 
 [Service]
 Type=exec

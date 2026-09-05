@@ -32,6 +32,7 @@ from h100_portal_api.models import (
     PortalComputeLease,
     PortalContainer,
     PortalJob,
+    PortalJobGpuApproval,
     PortalLeaseRenewalRequest,
     PortalManagedUser,
     PortalOperation,
@@ -58,6 +59,18 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.exc import StaleDataError
 
 PASSWORD = "Portal ordinary user test passphrase 2026"
+
+MULTI_GPU_DETAILS = {
+    "model_name": "Llama fixture",
+    "model_architecture": "decoder-only transformer with 80 layers",
+    "framework": "PyTorch",
+    "framework_version": "2.8.0",
+    "parameter_count": "70B",
+    "workload_description": "full-parameter supervised fine tuning",
+    "dataset_description": "owned 2 TB tokenized training corpus",
+    "parallel_strategy": "four-way FSDP full shard with activation checkpointing",
+    "scaling_justification": "single GPU cannot hold optimizer state; four GPUs avoid offload",
+}
 
 
 def _identity(
@@ -1498,7 +1511,7 @@ def test_cli_token_is_hash_only_scoped_revocable_and_never_reaches_worker(
         json={**job_body, "gpu_count": 2, "idempotency_key": str(uuid.uuid4())},
     )
     assert gpu_two.status_code == 422
-    assert gpu_two.json()["detail"]["code"] == "GPU_LIMIT_EXCEEDED"
+    assert gpu_two.json()["detail"]["code"] == "MULTI_GPU_DETAILS_REQUIRED"
     assert len(calls) == before_gpu_two
 
     listed = client.get("/api/v1/auth/cli-tokens")
@@ -1738,6 +1751,288 @@ def test_expired_timestamp_denies_new_access_even_when_database_state_is_active(
     assert logs.json()["detail"]["code"] == "LEASE_INACTIVE"
     assert renewal.status_code == 409
     assert renewal.json()["detail"]["code"] == "LEASE_EXPIRED_RESTORE_REQUIRED"
+
+
+def _role_user(database: Session, role_name: str, suffix: str) -> PortalUser:
+    role = database.scalar(select(PortalRole).where(PortalRole.name == role_name))
+    login = f"{role_name.replace('_', '-')}-{suffix}"
+    user = PortalUser(
+        login_name=login,
+        normalized_login=login,
+        display_name=f"{role_name} fixture",
+        account_state=AccountState.ACTIVE,
+        password_state=PasswordState.SET,
+        resource_onboarding_state=OnboardingState.NOT_ENROLLED,
+        activated_at=utcnow(),
+        roles=[role],
+    )
+    database.add(user)
+    database.flush()
+    database.add(
+        PortalPasswordCredential(
+            user_id=user.id,
+            password_hash=hash_password(PASSWORD),
+            password_changed_at=utcnow(),
+        )
+    )
+    database.commit()
+    return user
+
+
+def test_multigpu_requires_complete_details_and_never_calls_worker_before_review(
+    client: TestClient,
+    database: Session,
+    origin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = _identity(
+        database,
+        login="multi-owner",
+        username="multi-owner",
+        uid=20101,
+        port=22101,
+    )
+    headers = _login(client, origin_headers, identity.user.normalized_login)
+    calls: list[dict[str, object]] = []
+
+    def worker(operation_type: str, **kwargs: object) -> dict[str, object]:
+        calls.append({"operation_type": operation_type, **kwargs})
+        return {
+            "status": "SUCCEEDED",
+            "request_id": str(uuid.uuid4()),
+            "slurm_job_id": 9101,
+            "slurm_user": identity.managed.unix_username,
+        }
+
+    monkeypatch.setattr("h100_portal_api.routes.self_service.call_worker", worker)
+    body = {
+        "name": "four-gpu-review",
+        "script": "set -eu\npython train.py\n",
+        "cpus": 8,
+        "memory_mb": 32768,
+        "gpu_count": 4,
+        "time_limit_seconds": 3600,
+        "image_ref": None,
+        "source_path": "/workspace/projects/multigpu/train.sh",
+        "idempotency_key": str(uuid.uuid4()),
+    }
+    missing = client.post("/api/v1/self/jobs", headers=headers, json=body)
+    assert missing.status_code == 422
+    assert missing.json()["detail"]["code"] == "MULTI_GPU_DETAILS_REQUIRED"
+    assert calls == []
+
+    requested = client.post(
+        "/api/v1/self/jobs",
+        headers=headers,
+        json={**body, "multi_gpu_request": MULTI_GPU_DETAILS},
+    )
+    assert requested.status_code == 200
+    request_view = requested.json()
+    assert request_view["status"] == "APPROVAL_PENDING"
+    assert request_view["job"]["state"] == "APPROVAL_PENDING"
+    assert request_view["job"]["slurm_job_id"] is None
+    assert request_view["job"]["gpu_approval"]["requested_gpu_count"] == 4
+    assert calls == []
+
+    replayed_request = client.post(
+        "/api/v1/self/jobs",
+        headers=headers,
+        json={**body, "multi_gpu_request": MULTI_GPU_DETAILS},
+    )
+    assert replayed_request.status_code == 200
+    assert replayed_request.json()["status"] == "APPROVAL_PENDING"
+    assert replayed_request.json()["job"]["id"] == request_view["job"]["id"]
+    assert calls == []
+
+    approval_id = uuid.UUID(request_view["job"]["gpu_approval"]["id"])
+    approval = database.get(PortalJobGpuApproval, approval_id)
+    assert approval is not None
+    assert approval.script_content.startswith("#!/bin/bash\n")
+    job = database.get(PortalJob, uuid.UUID(request_view["job"]["id"]))
+    assert job is not None
+    operation = database.get(PortalOperation, job.operation_id)
+    assert operation is not None
+    assert operation.status == OperationStatus.PENDING_APPROVAL
+    assert "script_content" not in json.dumps(operation.validated_payload)
+
+    logs = client.get(f"/api/v1/self/jobs/{job.id}/logs", headers=headers)
+    assert logs.status_code == 409
+    assert logs.json()["detail"]["code"] == "JOB_NOT_SUBMITTED"
+    assert calls == []
+
+    owner = _admin(database)
+    owner_headers = _login(client, origin_headers, owner.normalized_login)
+    listed = client.get("/api/v1/admin/job-gpu-approvals", headers=owner_headers)
+    assert listed.status_code == 200
+    assert listed.json()["approvals"][0]["owner"]["login_name"] == "multi-owner"
+    decision_key = str(uuid.uuid4())
+    decision_body = {
+        "decision": "APPROVE",
+        "approved_gpu_count": 3,
+        "comment": "Architecture supports three-way FSDP; four GPUs are not justified.",
+        "idempotency_key": decision_key,
+    }
+    needs_reauth = client.post(
+        f"/api/v1/admin/job-gpu-approvals/{approval_id}/decision",
+        headers=owner_headers,
+        json=decision_body,
+    )
+    assert needs_reauth.status_code == 428
+    assert calls == []
+    reauthenticated = client.post(
+        "/api/v1/auth/reauthenticate",
+        headers=owner_headers,
+        json={"password": PASSWORD},
+    )
+    assert reauthenticated.status_code == 200
+    approved = client.post(
+        f"/api/v1/admin/job-gpu-approvals/{approval_id}/decision",
+        headers=owner_headers,
+        json=decision_body,
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "APPROVED"
+    assert approved.json()["approval"]["requested_gpu_count"] == 4
+    assert approved.json()["approval"]["approved_gpu_count"] == 3
+    assert len(calls) == 1
+    payload = calls[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["gpu_count"] == 3
+    assert payload["max_gpu"] == 1
+    assert payload["slurm_qos"] == "portal-approved-multigpu"
+    approval_contract = payload["gpu_approval"]
+    assert isinstance(approval_contract, dict)
+    assert approval_contract["approval_id"] == str(approval_id)
+    assert approval_contract["requested_gpu_count"] == 4
+    assert approval_contract["approved_gpu_count"] == 3
+    assert approval_contract["script_sha256"] == approval.script_sha256
+    assert approval_contract["reviewed_by"] == str(owner.id)
+    assert isinstance(approval_contract["reviewed_at"], str)
+
+    replay = client.post(
+        f"/api/v1/admin/job-gpu-approvals/{approval_id}/decision",
+        headers=owner_headers,
+        json=decision_body,
+    )
+    assert replay.status_code == 200
+    assert replay.json()["idempotent_replay"] is True
+    assert len(calls) == 1
+    conflicting = client.post(
+        f"/api/v1/admin/job-gpu-approvals/{approval_id}/decision",
+        headers=owner_headers,
+        json={**decision_body, "approved_gpu_count": 2, "idempotency_key": str(uuid.uuid4())},
+    )
+    assert conflicting.status_code == 409
+    assert len(calls) == 1
+
+
+def test_multigpu_reject_cancel_and_review_rbac_do_not_reach_worker(
+    client: TestClient,
+    database: Session,
+    origin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = _identity(
+        database,
+        login="multi-rbac",
+        username="multi-rbac",
+        uid=20102,
+        port=22102,
+    )
+    headers = _login(client, origin_headers, identity.user.normalized_login)
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "h100_portal_api.routes.self_service.call_worker",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    def request_job(name: str) -> dict[str, object]:
+        response = client.post(
+            "/api/v1/self/jobs",
+            headers=headers,
+            json={
+                "name": name,
+                "script": "set -eu\ntrue\n",
+                "cpus": 4,
+                "memory_mb": 8192,
+                "gpu_count": 2,
+                "time_limit_seconds": 600,
+                "image_ref": None,
+                "multi_gpu_request": MULTI_GPU_DETAILS,
+                "idempotency_key": str(uuid.uuid4()),
+            },
+        )
+        assert response.status_code == 200
+        return response.json()["job"]
+
+    cancelled = request_job("cancel-before-review")
+    cancel = client.post(
+        f"/api/v1/self/jobs/{cancelled['id']}/cancel",
+        headers=headers,
+        json={"idempotency_key": str(uuid.uuid4())},
+    )
+    assert cancel.status_code == 200
+    assert cancel.json()["job"]["state"] == "CANCELLED"
+    assert calls == []
+
+    pending = request_job("reject-after-review")
+    approval_id = pending["gpu_approval"]["id"]
+    for role_name in ("operator", "auditor"):
+        role_user = _role_user(database, role_name, "gpu-review")
+        role_headers = _login(client, origin_headers, role_user.normalized_login)
+        assert (
+            client.get("/api/v1/admin/job-gpu-approvals", headers=role_headers).status_code == 403
+        )
+        denied = client.post(
+            f"/api/v1/admin/job-gpu-approvals/{approval_id}/decision",
+            headers=role_headers,
+            json={
+                "decision": "REJECT",
+                "approved_gpu_count": None,
+                "comment": "denied role must not decide",
+                "idempotency_key": str(uuid.uuid4()),
+            },
+        )
+        assert denied.status_code == 403
+    user_headers = _login(client, origin_headers, identity.user.normalized_login)
+    assert client.get("/api/v1/admin/job-gpu-approvals", headers=user_headers).status_code == 403
+    user_denied = client.post(
+        f"/api/v1/admin/job-gpu-approvals/{approval_id}/decision",
+        headers=user_headers,
+        json={
+            "decision": "REJECT",
+            "approved_gpu_count": None,
+            "comment": "ordinary users must not decide approvals",
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    assert user_denied.status_code == 403
+
+    platform_admin = _role_user(database, "platform_admin", "gpu-review")
+    admin_headers = _login(client, origin_headers, platform_admin.normalized_login)
+    assert client.get("/api/v1/admin/job-gpu-approvals", headers=admin_headers).status_code == 200
+    assert (
+        client.post(
+            "/api/v1/auth/reauthenticate",
+            headers=admin_headers,
+            json={"password": PASSWORD},
+        ).status_code
+        == 200
+    )
+    rejected = client.post(
+        f"/api/v1/admin/job-gpu-approvals/{approval_id}/decision",
+        headers=admin_headers,
+        json={
+            "decision": "REJECT",
+            "approved_gpu_count": None,
+            "comment": "No measured scaling benefit was provided.",
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    assert rejected.status_code == 200
+    assert rejected.json()["approval"]["state"] == "REJECTED"
+    assert rejected.json()["approval"]["job"]["slurm_job_id"] is None
+    assert calls == []
 
 
 def test_container_connection_reports_only_a_live_slurm_gpu_allocation(

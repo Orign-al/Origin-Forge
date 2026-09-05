@@ -10,6 +10,7 @@ readonly PILOT_UID_MAX=60000
 readonly PROJECT_ID_MIN=30000
 readonly PROJECT_ID_MAX=39999
 readonly STATE_DIR=/etc/h100-platform/users
+readonly MULTIGPU_QOS=portal-approved-multigpu
 readonly ISOLATION_TOOL=/usr/local/sbin/h100-user-gpu-isolation
 readonly GUARD_TIMER=h100-gpu-bypass-guard.timer
 readonly GUARD_SERVICE=h100-gpu-bypass-guard.service
@@ -138,6 +139,7 @@ write_state() {
     printf 'SSH_PORT=%s\n' "${ssh_port}"
     printf 'SLURM_ACCOUNT=%s\n' "${slurm_account}"
     printf 'SLURM_QOS=%s\n' "${slurm_qos}"
+    printf 'MAX_GPUS=1\n'
     printf 'SSH_KEY_STATE=%s\n' "${ssh_key_state}"
     printf 'KEY_SHA256=%s\n' "${state_key_hash}"
     printf 'KEY_FINGERPRINTS=%s\n' "${state_key_fingerprints}"
@@ -495,6 +497,10 @@ validate_new_user_plan() {
     <<<"${qos_record}" || h100_fail 'approved Slurm QOS does not exist'
   grep -Eq "^${slurm_qos}\|.*gres/gpu=1" <<<"${qos_record}" \
     || h100_fail 'Pilot QOS must enforce MaxTRESPerUser gres/gpu=1'
+  sacctmgr -nP show qos "${MULTIGPU_QOS}" format=Name,MaxTRESPerUser \
+    | awk -F'|' -v qos="${MULTIGPU_QOS}" \
+        '$1 == qos && $2 ~ /gres\/gpu=4/ {found=1} END {exit !found}' \
+    || h100_fail 'approved multi-GPU QOS is unavailable'
   if sacctmgr -nP show assoc where User="${user_name}" format=User,Account \
     | awk -F'|' -v user="${user_name}" '$1 == user {found=1} END {exit found ? 0 : 1}'; then
     h100_fail 'Slurm association already exists for username'
@@ -740,14 +746,20 @@ run_stage() {
   sacctmgr -i add user "${user_name}" \
     Account="${slurm_account}" \
     DefaultAccount="${slurm_account}" \
-    QOS="${slurm_qos}" \
+    QOS="${slurm_qos},${MULTIGPU_QOS}" \
     DefaultQOS="${slurm_qos}" >/dev/null
+  sacctmgr -i modify user where Name="${user_name}" Account="${slurm_account}" \
+    set MaxTRES=gres/gpu=4 GrpTRES=gres/gpu=4 >/dev/null
   association_created=1
   sacctmgr -nP show assoc where \
     User="${user_name}" Account="${slurm_account}" \
-    format=User,Account,QOS,DefaultQOS \
+    format=User,Account,QOS,DefaultQOS,MaxTRES,GrpTRES \
     | awk -F'|' -v user="${user_name}" -v account="${slurm_account}" \
-      '$1 == user && $2 == account {found=1} END {exit found ? 0 : 1}' \
+      -v multi="${MULTIGPU_QOS}" \
+      '$1 == user && $2 == account && $3 ~ /general/ && $3 ~ multi \
+       && $4 == "general" && $5 ~ /(^|,)gres\/gpu=4(,|$)/ \
+       && $6 ~ /(^|,)gres\/gpu=4(,|$)/ \
+       {found=1} END {exit found ? 0 : 1}' \
     || h100_fail 'Slurm association validation failed'
 
   h100-container-create "${user_name}" "${ssh_port}"
@@ -830,14 +842,22 @@ validate_staged_resources() {
     || h100_fail 'staged 300GB project quota validation failed'
   sacctmgr -nP show assoc where \
     User="${user_name}" Account="${slurm_account}" \
-    format=User,Account,QOS,DefaultQOS \
+    format=User,Account,QOS,DefaultQOS,MaxTRES,GrpTRES \
     | awk -F'|' -v user="${user_name}" -v account="${slurm_account}" \
-      '$1 == user && $2 == account {found=1} END {exit found ? 0 : 1}' \
+      -v multi="${MULTIGPU_QOS}" \
+      '$1 == user && $2 == account && $3 ~ /general/ && $3 ~ multi \
+       && $4 == "general" && $5 ~ /(^|,)gres\/gpu=4(,|$)/ \
+       && $6 ~ /(^|,)gres\/gpu=4(,|$)/ \
+       {found=1} END {exit found ? 0 : 1}' \
     || h100_fail 'staged Slurm association validation failed'
   local qos_record
   qos_record="$(sacctmgr -nP show qos "${slurm_qos}" format=Name,MaxTRESPerUser)"
   grep -Eq "^${slurm_qos}\\|.*gres/gpu=1" <<<"${qos_record}" \
     || h100_fail 'staged Slurm QOS GPU limit validation failed'
+  sacctmgr -nP show qos "${MULTIGPU_QOS}" format=Name,MaxTRESPerUser \
+    | awk -F'|' -v qos="${MULTIGPU_QOS}" \
+        '$1 == qos && $2 ~ /gres\/gpu=4/ {found=1} END {exit !found}' \
+    || h100_fail 'staged approved multi-GPU QOS validation failed'
   validate_container_security
   assert_container_stopped
   [[ ! -e "/home/${user_name}/.ssh/authorized_keys" ]] \

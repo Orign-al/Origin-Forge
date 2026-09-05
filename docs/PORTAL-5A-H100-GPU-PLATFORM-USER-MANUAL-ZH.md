@@ -9,9 +9,9 @@
 H100 GPU Platform 提供普通用户自助的开发容器、私有持久化存储、网页终端、容器 SSH 和 Slurm CPU/GPU 作业。
 
 - `CPU Development / STANDARD_8CPU_32GB` 是默认 Profile：8 CPU、32 GiB 内存，开发容器无 GPU Device。
-- `GPU Development / GPU_1_8CPU_32GB` 必须显式选择：8 CPU、32 GiB 内存，并获得最多 1 张 H100 的 Slurm Job 权限。
+- `GPU Development / GPU_1_8CPU_32GB` 必须显式选择：8 CPU、32 GiB 内存，并获得 H100 Slurm Job 权限。
 - 开发容器是常驻、无 GPU 的环境；H100 只在 GPU Job 运行期间由 Slurm 分配，并在 Job 结束后自动释放。
-- 每个用户同时最多占用 1 张 GPU；GPU=2 请求会在进入 Worker 和 Slurm 前被拒绝。
+- 1 张 GPU 可直接提交；2、3、4 张 GPU 必须提供完整的模型与扩展说明并等待管理员审批。单用户同时最多占用 4 张 GPU。
 - 每个用户有 300 GiB 私有持久化存储，`/workspace` 与 `/home/<用户名>` 都属于同一用户配额。
 - Lease 有效期为 96 小时。到期后环境进入可恢复的回收流程，持久化数据不会立即删除。
 - Host SSH 关闭；用户只连接自己的开发容器。
@@ -52,7 +52,7 @@ curl -I http://20.10.10.3:18080/
 2. 选择 Profile：
 
    - `STANDARD_8CPU_32GB`：默认 CPU Development。
-   - `GPU_1_8CPU_32GB`：显式选择 GPU Development，允许提交单 H100 Job。
+   - `GPU_1_8CPU_32GB`：显式选择 GPU Development；单 H100 Job 可直接提交，多 GPU Job 使用独立审批。
 
 3. 填写用途说明并提交。
 4. 如果平台要求审批，等待管理员正常批准一次。系统会自动完成 Attempt、Reservation、Plan、Dry-run、Stage 和安全回滚检查。
@@ -86,7 +86,7 @@ H100 · NOT ALLOCATED
 无 GPU Device；H100 作业按需调度
 ```
 
-这不是 Provision 故障。需要 GPU 时，从“作业”页面提交 GPU=`1` 的 Job；Slurm 会自动选择一张 H100，Job 结束、取消或超时后自动回收。
+这不是 Provision 故障。需要 GPU 时，从“作业”页面提交 GPU=`1` 的 Job；2 至 4 张 GPU 需附完整资料并等待审批。Slurm 只在 Job 运行期间分配获批数量的 H100，Job 结束、取消或超时后自动回收。
 
 停止开发容器不会删除 `/workspace` 或 `/home/<用户名>` 中的数据，也不会提前结束 Lease。
 
@@ -177,11 +177,11 @@ ssh -o IdentitiesOnly=yes -i ~/.ssh/h100_portal \
 - 执行脚本；
 - CPU 数量；
 - 内存；
-- GPU：`0` 或 `1`；
+- GPU：`0`、`1`、`2`、`3` 或 `4`；其中 `2` 至 `4` 需要审批；
 - 最长运行时间；
 - 平台允许的运行镜像。
 
-提交后，平台以当前普通用户身份生成不可变脚本快照并提交到 Slurm。用户只能查看自己的 Job 和日志。非终态 Job 可以通过 Portal 正式取消。
+GPU=`0` 或 `1` 时，平台以当前普通用户身份生成不可变脚本快照并直接提交到 Slurm。GPU=`2` 至 `4` 时，还必须填写模型名称、模型架构、框架及版本、参数量、训练或推理任务、数据集、并行策略和多卡扩展收益；申请先进入“等待审批”，不会调用 Worker、创建 Slurm Job、占用 GPU 或产生运行日志。平台所有者或平台管理员可按申请数量批准、降低 GPU 数量后批准，或附意见驳回。用户只能查看自己的 Job 和日志，且可在审批前取消自己的申请。
 
 首次导入较大的 CUDA/Enroot 镜像会占用额外内存；如低内存 Job 在镜像冷导入期间出现 `OUT_OF_MEMORY`，建议使用至少 8 GiB 后重试。不要通过宿主命令绕过 Portal。
 
@@ -234,7 +234,22 @@ h100 job submit train.sh
 
 相对路径和绝对路径都可用，但解析后的脚本必须位于 `/workspace/...` 或 `/home/<你的用户名>/...`。`/etc`、`/root`、`/proc`、`/sys`、其他用户 Home 和任意宿主路径会被拒绝。CLI 读取脚本内容后，Portal 仍创建不可变脚本快照；之后修改原文件不会改变已提交 Job 的审计内容。
 
-省略资源选项时，CLI 从 Portal 获取与 Web 表单相同的正式默认值，不在客户端硬编码默认参数。GPU 只允许 `--gpus 0` 或 `--gpus 1`；`--gpus 2` 会由 API 以 422 拒绝，Worker 不会被调用，也不会创建 Slurm Job。
+省略资源选项时，CLI 从 Portal 获取与 Web 表单相同的正式默认值，不在客户端硬编码默认参数。`--gpus 0` 或 `--gpus 1` 直接提交。`--gpus 2` 至 `--gpus 4` 必须同时提供完整审批资料，例如：
+
+```bash
+h100 job submit train.sh --gpus 4 \
+  --model-name 'Llama 3.1' \
+  --model-architecture 'decoder-only transformer' \
+  --framework PyTorch \
+  --framework-version 2.6.0 \
+  --parameter-count 70B \
+  --workload-description '全参数微调' \
+  --dataset-description '已清洗的 2 TB 训练语料' \
+  --parallel-strategy 'FSDP full shard' \
+  --scaling-justification '模型与优化器状态无法装入单卡，预期四卡扩展'
+```
+
+资料缺失时 CLI 在本地拒绝；Backend 仍会独立校验。完整申请返回 `APPROVAL_PENDING`，此时没有 Slurm Job 或日志。管理员可批准 1 至申请数量之间的任意数量，不能增加用户申请数量。
 
 CLI v1 拒绝包含资源变更 `#SBATCH` directive 的脚本。请用 `--cpus`、`--memory`、`--gpus` 和 `--time`，由 Portal backend 再次执行 authoritative policy validation。
 
@@ -318,12 +333,12 @@ date -Is > "$output"
 
 ## 14. Job 状态、日志和结果
 
-“我的作业”显示 Pending、Running、Completed、Failed、Cancelled、Timeout 或 Out of Memory 等状态。
+“我的作业”显示 Awaiting Approval、Rejected、Pending、Running、Completed、Failed、Cancelled、Timeout 或 Out of Memory 等状态。
 
 - `stdout` 和 `stderr` 只对作业所有者可见。
 - 结果必须写入 `/workspace` 或 `/home/<你的用户名>` 才会持久化。
 - Job 写回后，正在运行的开发容器无需同步即可立即读取。
-- GPU Job 处于 Pending 且原因与每用户 GPU 上限有关时，等待当前 GPU Job 结束或在 Portal 中取消它。
+- 已提交 Slurm 的 GPU Job 因单用户 4 卡并发总上限而 Pending 时，等待当前 GPU Job 结束或在 Portal 中取消它。
 
 ## 15. Lease、回收和恢复
 
@@ -339,7 +354,7 @@ date -Is > "$output"
 
 ### 页面显示 H100 / NOT ALLOCATED，是否故障？
 
-不是。常驻开发容器与 GPU allocation 已解耦。请提交 GPU=`1` 的 Slurm Job；GPU 只在 Job 运行期间可见。
+不是。常驻开发容器与 GPU allocation 已解耦。1 张 GPU 可直接提交，2 至 4 张需审批；GPU 只在 Job 运行期间可见。
 
 ### 下载了几十 GiB，但存储用量很小？
 
@@ -347,11 +362,11 @@ date -Is > "$output"
 
 ### GPU Job 为什么 Pending？
 
-每个用户最多同时占用 1 张 GPU。已有 GPU Job 运行时，第二个 GPU=1 Job 会 Pending 或被拒绝，不会获得第二张卡。
+单用户所有直接提交和获批 Job 合计最多同时占用 4 张 GPU。资源不足、总量达到 4 张或其他 Slurm 调度条件未满足时，已提交的 Job 会保持 Pending，并显示权威 Slurm 原因。
 
-### 为什么不能申请 GPU=2？
+### 为什么 GPU=2 至 GPU=4 没有立即运行？
 
-产品当前只允许 0 或 1 张 GPU。GPU=2 在 API 层直接拒绝，不会创建 Worker、Slurm 或容器资源。
+多 GPU 请求必须经过审批。请完整填写模型、框架和版本、参数量、任务、数据集、并行策略与扩展收益。等待审批期间不会调用 Worker、创建 Slurm Job 或占用 GPU；管理员可以降低 GPU 数量后批准，也可以说明理由后驳回。
 
 ### SSH Connection refused
 

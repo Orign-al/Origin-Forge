@@ -137,7 +137,9 @@ describe("ordinary-user GPU Development visibility", () => {
     ]);
 
     expect(screen.getByText("NONE")).toBeInTheDocument();
-    expect(screen.getByText("H100 × 1 · 按需调度")).toBeInTheDocument();
+    expect(
+      screen.getByText("H100 × 1 直接提交；2至4张需审批"),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/NOT ALLOCATED/)).toBeNull();
   });
 
@@ -183,7 +185,9 @@ describe("ordinary-user GPU Development visibility", () => {
     expect(
       screen.getByText("开发容器 · 无 GPU Device；H100 作业按需调度"),
     ).toBeInTheDocument();
-    expect(screen.getByText("H100 × 1 · 按需调度")).toBeInTheDocument();
+    expect(
+      screen.getByText("H100 × 1 直接提交；2至4张需审批"),
+    ).toBeInTheDocument();
     first.unmount();
 
     renderWithCache(<OrdinaryContainer />, [

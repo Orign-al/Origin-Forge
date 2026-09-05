@@ -1369,6 +1369,7 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
         "slurm_account",
         "slurm_qos",
         "max_gpu",
+        "gpu_approval",
         "image_ref",
     }
     if set(payload) != fields:
@@ -1429,14 +1430,60 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
     ):
         raise PayloadValidationError("JOB_SPEC_REJECTED", "memory request is invalid")
     max_gpu = payload.get("max_gpu")
-    if (
-        isinstance(max_gpu, bool)
-        or isinstance(gpu_count, bool)
-        or max_gpu not in {0, 1}
-        or gpu_count not in {0, 1}
-        or gpu_count > max_gpu
-    ):
-        raise PayloadValidationError("GPU_LIMIT_EXCEEDED", "GPU request must be 0 or 1")
+    gpu_approval = payload.get("gpu_approval")
+    if isinstance(max_gpu, bool) or isinstance(gpu_count, bool) or max_gpu not in {0, 1}:
+        raise PayloadValidationError("GPU_LIMIT_EXCEEDED", "GPU entitlement is invalid")
+    if gpu_approval is None:
+        if gpu_count not in {0, 1} or gpu_count > max_gpu:
+            raise PayloadValidationError(
+                "GPU_LIMIT_EXCEEDED", "unapproved GPU request must be 0 or 1"
+            )
+        normalized_approval = None
+    else:
+        if not isinstance(gpu_approval, dict) or set(gpu_approval) != {
+            "approval_id",
+            "requested_gpu_count",
+            "approved_gpu_count",
+            "script_sha256",
+            "reviewed_by",
+            "reviewed_at",
+        }:
+            raise PayloadValidationError(
+                "GPU_APPROVAL_REJECTED", "GPU approval contract is invalid"
+            )
+        requested_gpu_count = gpu_approval.get("requested_gpu_count")
+        approved_gpu_count = gpu_approval.get("approved_gpu_count")
+        approval_script_sha256 = gpu_approval.get("script_sha256")
+        reviewed_at = gpu_approval.get("reviewed_at")
+        try:
+            parsed_reviewed_at = datetime.fromisoformat(str(reviewed_at).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise PayloadValidationError(
+                "GPU_APPROVAL_REJECTED", "GPU approval timestamp is invalid"
+            ) from exc
+        if (
+            max_gpu != 1
+            or isinstance(requested_gpu_count, bool)
+            or isinstance(approved_gpu_count, bool)
+            or requested_gpu_count not in {2, 3, 4}
+            or not isinstance(approved_gpu_count, int)
+            or not 1 <= approved_gpu_count <= requested_gpu_count
+            or gpu_count != approved_gpu_count
+            or approval_script_sha256 != payload.get("script_sha256")
+            or parsed_reviewed_at.tzinfo is None
+            or parsed_reviewed_at.astimezone(UTC) > datetime.now(UTC) + timedelta(minutes=1)
+        ):
+            raise PayloadValidationError(
+                "GPU_APPROVAL_REJECTED", "GPU request differs from the approved contract"
+            )
+        normalized_approval = {
+            "approval_id": _canonical_uuid(gpu_approval.get("approval_id"), "GPU approval ID"),
+            "requested_gpu_count": requested_gpu_count,
+            "approved_gpu_count": approved_gpu_count,
+            "script_sha256": approval_script_sha256,
+            "reviewed_by": _canonical_uuid(gpu_approval.get("reviewed_by"), "GPU reviewer ID"),
+            "reviewed_at": parsed_reviewed_at.astimezone(UTC).isoformat(),
+        }
     if (
         not isinstance(time_limit, int)
         or isinstance(time_limit, bool)
@@ -1477,7 +1524,12 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
     workdir = "." if workdir_value == "." else _relative_user_path(workdir_value, "workdir")
     slurm_account = payload.get("slurm_account")
     slurm_qos = payload.get("slurm_qos")
-    if slurm_account != "company" or slurm_qos != "general":
+    expected_qos = (
+        "portal-approved-multigpu"
+        if normalized_approval is not None and gpu_count > 1
+        else "general"
+    )
+    if slurm_account != "company" or slurm_qos != expected_qos:
         raise PayloadValidationError(
             "SLURM_ASSOCIATION_REJECTED", "job account and QoS differ from platform policy"
         )
@@ -1508,6 +1560,7 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
             "slurm_account": slurm_account,
             "slurm_qos": slurm_qos,
             "max_gpu": max_gpu,
+            "gpu_approval": normalized_approval,
             "image_ref": image_ref,
         }
     )

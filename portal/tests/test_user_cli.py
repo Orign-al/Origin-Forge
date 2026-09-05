@@ -126,16 +126,19 @@ class PortalHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         if self.path == "/api/v1/self/jobs":
             self.server.submit_requests.append(body)
-            if body.get("gpu_count") == 2:
-                self._json(
-                    422,
-                    {
-                        "detail": {
-                            "code": "GPU_LIMIT_EXCEEDED",
-                            "message": "GPU request must be 0 or 1",
-                        }
-                    },
-                )
+            if int(body.get("gpu_count", 0)) >= 2:
+                self.server.job = {
+                    **self.server.job,
+                    "slurm_job_id": None,
+                    "name": body["name"],
+                    "state": "APPROVAL_PENDING",
+                    "reason": "Administrator approval required",
+                    "gpu_count": body["gpu_count"],
+                    "cpus": body["cpus"],
+                    "memory_mb": body["memory_mb"],
+                    "source_path": body["source_path"],
+                }
+                self._json(200, {"status": "APPROVAL_PENDING", "job": self.server.job})
                 return
             self.server.worker_calls += 1
             self.server.job = {
@@ -320,10 +323,57 @@ def test_cli_exit_codes_policy_rejection_paths_and_directives(portal, tmp_path: 
 
     script = portal.server.workspace / "gpu-test.sh"
     script.write_text("set -euo pipefail\nnvidia-smi -L\n")
-    rejected = _run(portal, config, "job", "submit", str(script), "--gpus", "2", "--json")
-    assert rejected.returncode == 5
-    assert json.loads(rejected.stdout)["error"]["http_status"] == 422
-    assert "at most one H100" in rejected.stderr
+    missing_details = _run(portal, config, "job", "submit", str(script), "--gpus", "2", "--json")
+    assert missing_details.returncode == 2
+    assert json.loads(missing_details.stdout)["error"]["code"] == "MULTI_GPU_DETAILS_REQUIRED"
+    assert portal.server.submit_requests == []
+    assert portal.server.worker_calls == 0
+
+    pending = _run(
+        portal,
+        config,
+        "job",
+        "submit",
+        str(script),
+        "--gpus",
+        "4",
+        "--model-name",
+        "Llama 3.1",
+        "--model-architecture",
+        "decoder-only transformer",
+        "--framework",
+        "PyTorch",
+        "--framework-version",
+        "2.6.0",
+        "--parameter-count",
+        "70B",
+        "--workload-description",
+        "full-parameter supervised fine-tuning",
+        "--dataset-description",
+        "curated 2 TB training corpus",
+        "--parallel-strategy",
+        "FSDP full shard across four GPUs",
+        "--scaling-justification",
+        "model and optimizer state do not fit on one GPU",
+        "--json",
+    )
+    assert pending.returncode == 0
+    pending_json = json.loads(pending.stdout)
+    assert pending_json["job"]["state"] == "APPROVAL_PENDING"
+    assert pending_json["job"]["slurm_job_id"] is None
+    submitted_body = portal.server.submit_requests[-1]
+    assert submitted_body["gpu_count"] == 4
+    assert submitted_body["multi_gpu_request"] == {
+        "model_name": "Llama 3.1",
+        "model_architecture": "decoder-only transformer",
+        "framework": "PyTorch",
+        "framework_version": "2.6.0",
+        "parameter_count": "70B",
+        "workload_description": "full-parameter supervised fine-tuning",
+        "dataset_description": "curated 2 TB training corpus",
+        "parallel_strategy": "FSDP full shard across four GPUs",
+        "scaling_justification": "model and optimizer state do not fit on one GPU",
+    }
     assert portal.server.worker_calls == 0
 
     outside = tmp_path / "outside.sh"

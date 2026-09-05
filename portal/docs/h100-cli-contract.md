@@ -75,7 +75,7 @@ Logout removes only the local credential file. Portal revocation is required to 
 
 ```text
 h100 job submit SCRIPT [--name NAME] [--cpus N] [--memory SIZE]
-                         [--gpus 0|1] [--time [D-]HH:MM:SS] [--json]
+                         [--gpus 0|1|2|3|4] [--time [D-]HH:MM:SS] [--json]
 ```
 
 - `SCRIPT` can be relative or absolute. The CLI resolves symlinks and requires the final regular path to be inside `/workspace` or `/home/<authenticated-unix-user>`.
@@ -87,7 +87,11 @@ h100 job submit SCRIPT [--name NAME] [--cpus N] [--memory SIZE]
 - CLI v1 rejects every line whose left-trimmed form begins with `#SBATCH`. Resource-changing directives are not forwarded to Slurm.
 - Omitted resource values come from `GET /self/jobs/config`; the CLI does not own default resource policy.
 - API and Worker both enforce CPU, memory, time, Lease, approved image, account/QoS, and GPU policy.
-- `gpu_count=2` reaches the API schema but is rejected by the route with HTTP 422 before any Worker call or Slurm Job.
+- GPU 0 or 1 is submitted directly after normal backend validation.
+- GPU 2, 3, or 4 requires every multi-GPU request field: model name, model architecture, framework and version, parameter count, workload, dataset, parallel strategy, and measured or expected scaling justification. The CLI flags are `--model-name`, `--model-architecture`, `--framework`, `--framework-version`, `--parameter-count`, `--workload-description`, `--dataset-description`, `--parallel-strategy`, and `--scaling-justification`.
+- A complete 2-4 GPU request is persisted as `APPROVAL_PENDING`; Worker is not called and no Slurm Job exists yet. A platform owner or platform administrator may approve from 1 up to the requested count, or reject with a review comment, after recent password reauthentication.
+- The backend revalidates the owner, active Lease, remaining time, script hash, approval state, and GPU entitlement while holding the approval rows. An approved request is sent to Worker with an immutable approval contract. Worker independently rejects an absent, malformed, or count-mismatched approval.
+- The dedicated approved multi-GPU scheduling policy permits at most 4 H100s for one Job and caps the user's aggregate concurrent GPU allocation at 4 across direct and approved Jobs. The default direct-submission policy remains limited to 1 H100.
 
 Human success output reports the distinct Portal and Slurm IDs, state, GPU count, and source script. It never assumes those IDs are equal.
 
@@ -161,8 +165,8 @@ Errors use:
   "schema_version": "h100.cli.v1",
   "ok": false,
   "error": {
-    "code": "GPU_LIMIT_EXCEEDED",
-    "message": "GPU request must be 0 or 1",
+    "code": "MULTI_GPU_DETAILS_REQUIRED",
+    "message": "Multi-GPU requests require complete approval details",
     "http_status": 422
   }
 }
@@ -185,15 +189,16 @@ Cross-owner Job access deliberately maps to the same resource-not-found behavior
 
 ## State contract
 
-Recognized terminal states are `BOOT_FAIL`, `CANCELLED`, `COMPLETED`, `DEADLINE`, `FAILED`, `NODE_FAIL`, `OUT_OF_MEMORY`, `PREEMPTED`, `REVOKED`, and `TIMEOUT`. Follow/wait terminate on any of these states. Portal persists reason, start, finish, elapsed seconds, and exit code from Worker's live `scontrol` or terminal `sacct` projection.
+Recognized terminal states are `BOOT_FAIL`, `CANCELLED`, `COMPLETED`, `DEADLINE`, `FAILED`, `NODE_FAIL`, `OUT_OF_MEMORY`, `PREEMPTED`, `REJECTED`, `REVOKED`, and `TIMEOUT`. Follow/wait terminate on any of these states. `APPROVAL_PENDING` has no Slurm ID or logs and can be cancelled by its owner without a Worker call. Portal persists reason, start, finish, elapsed seconds, and exit code from Worker's live `scontrol` or terminal `sacct` projection after submission.
 
 ## Security invariants
 
 CLI deployment does not change these release properties:
 
 - Development Containers have no GPU device; GPUs are Slurm Job only.
-- Maximum GPU allocation per ordinary user remains one.
-- GPU=2 is rejected before Worker.
+- GPU 0 or 1 is submitted directly; GPU 2-4 always requires complete details and owner/admin approval.
+- A pending or rejected approval never reaches Worker or Slurm.
+- Backend, Worker, dedicated QoS, per-Job `MaxTRES`, and aggregate association `GrpTRES` independently limit approved use to at most 4 H100s per user.
 - Containers remain unprivileged, without Docker socket, MUNGE, Worker socket, host network/PID/IPC, or `SYS_ADMIN`.
 - Host SSH remains unavailable to ordinary users.
 - Job, log, and storage operations remain owner-bound.

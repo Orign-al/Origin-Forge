@@ -1,0 +1,29 @@
+[Unit]
+Description=H100 Portal approved multi-GPU Slurm QoS policy
+Requires=slurmdbd.service slurmctld.service
+After=slurmdbd.service slurmctld.service
+Before=h100-portal-api.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/h100-multigpu-qos-policy apply
+ExecStartPost=/usr/local/sbin/h100-multigpu-qos-policy verify
+RemainAfterExit=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/h100-portal
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

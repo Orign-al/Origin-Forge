@@ -283,9 +283,35 @@ async function installPortal4aApi(
       if (request.method() === "POST") {
         const body = request.postDataJSON() as Record<string, unknown>;
         state.jobBodies.push(body);
-        const job = submittedJob(body);
+        const details = body.multi_gpu_request as
+          Record<string, string> | undefined;
+        const requestedGpu = Number(body.gpu_count ?? 0);
+        const job =
+          requestedGpu >= 2
+            ? {
+                ...submittedJob(body),
+                slurm_job_id: null,
+                state: "APPROVAL_PENDING",
+                reason: "Administrator approval required",
+                gpu_approval: {
+                  id: "00000000-0000-4000-8000-000000000048",
+                  state: "PENDING",
+                  requested_gpu_count: requestedGpu,
+                  approved_gpu_count: null,
+                  script_sha256: "a".repeat(64),
+                  requested_at: "2026-08-09T21:00:00Z",
+                  reviewed_at: null,
+                  reviewed_by: null,
+                  decision_comment: null,
+                  ...details,
+                },
+              }
+            : submittedJob(body);
         state.jobs = [job];
-        await json(route, { status: "SUBMITTED", job });
+        await json(route, {
+          status: requestedGpu >= 2 ? "APPROVAL_PENDING" : "SUBMITTED",
+          job,
+        });
         return;
       }
       await json(route, {
@@ -418,6 +444,7 @@ for (const viewport of [
   test(`Portal-4A-R ordinary user visual acceptance ${viewport.label}`, async ({
     page,
   }) => {
+    test.setTimeout(60_000);
     mkdirSync(OUTPUT_DIRECTORY, { recursive: true });
     await page.setViewportSize(viewport);
     const state: Portal4aState = {
@@ -502,6 +529,39 @@ for (const viewport of [
     expect(state.jobBodies[0]?.image_ref).toBeNull();
     expect(state.jobBodies[0]).not.toHaveProperty("script_path");
     expect(state.jobBodies[0]).not.toHaveProperty("workdir");
+
+    await page.getByLabel("GPU").selectOption("4");
+    await expect(page.getByText(/多GPU作业不会立即进入Slurm/u)).toBeVisible();
+    const approvalDetails: Array<[string, string]> = [
+      ["模型名称", "Llama 3.1"],
+      ["模型架构", "decoder-only transformer"],
+      ["框架", "PyTorch"],
+      ["框架版本", "2.6.0"],
+      ["模型规模 / 参数量", "70B"],
+      ["训练/推理任务说明", "full-parameter fine-tuning"],
+      ["数据集说明", "curated 2 TB corpus"],
+      ["并行策略", "FSDP full shard"],
+      ["多卡扩展收益与合理性", "optimizer state exceeds one GPU"],
+    ];
+    for (const [label, value] of approvalDetails) {
+      await page.getByLabel(label, { exact: true }).fill(value);
+    }
+    await expect(page.getByRole("button", { name: "提交作业" })).toBeEnabled();
+    await page.getByRole("button", { name: "提交作业" }).click();
+    await expect(page.getByText("等待审批", { exact: true })).toBeVisible();
+    expect(state.jobBodies).toHaveLength(2);
+    expect(state.jobBodies[1]?.gpu_count).toBe(4);
+    expect(state.jobBodies[1]?.multi_gpu_request).toEqual({
+      model_name: "Llama 3.1",
+      model_architecture: "decoder-only transformer",
+      framework: "PyTorch",
+      framework_version: "2.6.0",
+      parameter_count: "70B",
+      workload_description: "full-parameter fine-tuning",
+      dataset_description: "curated 2 TB corpus",
+      parallel_strategy: "FSDP full shard",
+      scaling_justification: "optimizer state exceeds one GPU",
+    });
 
     await page.goto("/containers");
     await expect(

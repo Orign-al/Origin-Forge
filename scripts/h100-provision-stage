@@ -4,6 +4,7 @@ set -euo pipefail
 source /usr/local/lib/h100-platform/h100-platform-common.sh
 
 readonly STATE_DIR=/etc/h100-platform/users
+readonly MULTIGPU_QOS=portal-approved-multigpu
 readonly GPU_ISOLATION_TOOL=/usr/local/sbin/h100-user-gpu-isolation
 readonly PROJECTS_FILE=/etc/projects
 readonly PROJID_FILE=/etc/projid
@@ -444,6 +445,10 @@ sacctmgr -nP show account company format=Account \
 sacctmgr -nP show qos general format=Name,MaxTRESPerUser \
   | awk -F'|' '$1 == "general" && $2 ~ /gres\/gpu=1/ {found=1} END {exit found ? 0 : 1}' \
   || fail 'general QOS does not enforce one GPU per user'
+sacctmgr -nP show qos "${MULTIGPU_QOS}" format=Name,MaxTRESPerUser \
+  | awk -F'|' -v qos="${MULTIGPU_QOS}" \
+      '$1 == qos && $2 ~ /gres\/gpu=4/ {found=1} END {exit found ? 0 : 1}' \
+  || fail 'approved multi-GPU QOS does not enforce four GPUs per user'
 xfs_quota -x -c state "${H100_DATA_ROOT}" | grep -A8 'Project quota state' \
   | grep -q 'Enforcement: ON' || fail 'XFS project quota enforcement is unavailable'
 systemctl is-active --quiet docker.service || fail 'Docker service is unavailable'
@@ -616,15 +621,17 @@ xfs_quota -x -c 'report -p -b -n' "${H100_DATA_ROOT}" \
 last_successful_step=XFS_PROJECT_QUOTA
 current_step=SLURM_ASSOCIATION
 sacctmgr -i add user "${username}" Cluster=h100 Account=company \
-  DefaultAccount=company QOS=general DefaultQOS=general >/dev/null
+  DefaultAccount=company QOS="general,${MULTIGPU_QOS}" DefaultQOS=general >/dev/null
 created_association=1
 sacctmgr -i modify user where Name="${username}" Account=company \
-  set MaxTRES="gres/gpu=${max_gpus}" >/dev/null
+  set MaxTRES=gres/gpu=4 GrpTRES=gres/gpu=4 >/dev/null
 sacctmgr -nP show assoc where User="${username}" Account=company \
-  format=User,Account,QOS,DefaultQOS,MaxTRES \
-  | awk -F'|' -v user="${username}" -v gpu="${max_gpus}" \
-      '$1 == user && $2 == "company" && $3 ~ /general/ && $4 == "general" \
-       && $5 ~ ("(^|,)gres/gpu=" gpu "(,|$)") {found=1} END {exit found ? 0 : 1}' \
+  format=User,Account,QOS,DefaultQOS,MaxTRES,GrpTRES \
+  | awk -F'|' -v user="${username}" -v multi="${MULTIGPU_QOS}" \
+      '$1 == user && $2 == "company" && $3 ~ /general/ && $3 ~ multi \
+       && $4 == "general" && $5 ~ /(^|,)gres\/gpu=4(,|$)/ \
+       && $6 ~ /(^|,)gres\/gpu=4(,|$)/ \
+       {found=1} END {exit found ? 0 : 1}' \
   || fail 'Slurm association validation failed'
 
 last_successful_step=SLURM_ASSOCIATION

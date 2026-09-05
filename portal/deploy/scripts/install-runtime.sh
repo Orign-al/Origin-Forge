@@ -21,6 +21,7 @@ readonly CONTAINER_START_SOURCE="${PLATFORM_DIR}/scripts/h100-container-start"
 readonly CONTAINER_STOP_SOURCE="${PLATFORM_DIR}/scripts/h100-container-stop"
 readonly CONTAINER_REBUILD_SOURCE="${PLATFORM_DIR}/scripts/h100-container-rebuild"
 readonly CONTAINER_SUDO_ENABLE_SOURCE="${PLATFORM_DIR}/scripts/h100-container-sudo-enable"
+readonly MULTIGPU_QOS_POLICY_SOURCE="${PLATFORM_DIR}/scripts/h100-multigpu-qos-policy"
 readonly CONTAINER_DELETE_SOURCE="${PLATFORM_DIR}/scripts/h100-container-delete"
 readonly CONTAINER_STATUS_SOURCE="${PLATFORM_DIR}/scripts/h100-container-status"
 readonly QUOTA_SHOW_SOURCE="${PLATFORM_DIR}/scripts/h100-quota-show"
@@ -75,6 +76,8 @@ done
   || { echo "required deployment input missing: $CONTAINER_REBUILD_SOURCE" >&2; exit 1; }
 [[ -f "$CONTAINER_SUDO_ENABLE_SOURCE" && ! -L "$CONTAINER_SUDO_ENABLE_SOURCE" ]] \
   || { echo "required deployment input missing: $CONTAINER_SUDO_ENABLE_SOURCE" >&2; exit 1; }
+[[ -f "$MULTIGPU_QOS_POLICY_SOURCE" && ! -L "$MULTIGPU_QOS_POLICY_SOURCE" ]] \
+  || { echo "required deployment input missing: $MULTIGPU_QOS_POLICY_SOURCE" >&2; exit 1; }
 [[ -f "$CONTAINER_DELETE_SOURCE" && ! -L "$CONTAINER_DELETE_SOURCE" ]] \
   || { echo "required deployment input missing: $CONTAINER_DELETE_SOURCE" >&2; exit 1; }
 [[ -f "$CONTAINER_STATUS_SOURCE" && ! -L "$CONTAINER_STATUS_SOURCE" ]] \
@@ -217,6 +220,9 @@ install -o root -g gpu-platform-admin -m 0750 \
 install -o root -g gpu-platform-admin -m 0750 \
   "$CONTAINER_SUDO_ENABLE_SOURCE" \
   /usr/local/sbin/h100-container-sudo-enable
+install -o root -g root -m 0750 \
+  "$MULTIGPU_QOS_POLICY_SOURCE" \
+  /usr/local/sbin/h100-multigpu-qos-policy
 install -o root -g gpu-platform-admin -m 0750 \
   "$CONTAINER_DELETE_SOURCE" \
   /usr/local/sbin/h100-container-delete
@@ -279,6 +285,7 @@ for unit in \
   h100-portal-lease-expiry.timer \
   h100-portal-provision-reconcile.service \
   h100-portal-provision-reconcile.timer \
+  h100-multigpu-qos-policy.service \
   h100-easytier-legacy-ingress.service \
   h100-reconcile-dual-easytier-ingress.service \
   h100-reconcile-dual-easytier-ingress.timer \

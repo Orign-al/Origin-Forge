@@ -74,6 +74,8 @@ const EN_US: Record<string, string> = {
   "Host SSH 已禁用": "Host SSH disabled",
   "Container STOPPED · Lease 未开始": "Container STOPPED · Lease not started",
   "GPU 上限 1 · 租约受控": "GPU limit 1 · Managed lease",
+  "单卡直提 · 多卡审批 · 租约受控":
+    "Single GPU direct · Multi-GPU approval · Managed lease",
   "单节点 · 单受管用户": "Single node · Managed users",
   "H100 单节点环境": "H100 single-node environment",
   全局模块搜索: "Search all modules",
@@ -319,7 +321,10 @@ const EN_US: Record<string, string> = {
   "容器 GPU": "Container GPU",
   "GPU 作业": "GPU Job",
   "H100 × 1 · 按需调度": "H100 × 1 · On-demand scheduling",
+  "H100 × 1 直接提交；2至4张需审批":
+    "Submit 1 H100 directly; 2-4 require approval",
   GPU任务上限: "GPU Job Limit",
+  GPU直接提交上限: "Direct GPU Submission Limit",
   通过作业页面提交: "Submit through the Jobs page",
   可用空间: "Available Space",
   正在计算: "Calculating",
@@ -332,15 +337,20 @@ const EN_US: Record<string, string> = {
   查看SSH连接: "View SSH Access",
   提交计算任务: "Submit a Compute Job",
   "CPU 或最多1张GPU": "CPU or up to 1 GPU",
+  "CPU 或1至4张GPU；2至4张需审批": "CPU or 1-4 GPUs; 2-4 require approval",
   "选择工作区中的脚本，通过Portal提交到Slurm。":
     "Select a script in your workspace and submit it to Slurm through the Portal.",
   自己的长期开发容器: "Your long-running development container",
   "开发容器始终不挂载 GPU；GPU Development 开通最多 1 张 H100 的按需作业额度。":
     "Development containers never mount a GPU. GPU Development enables an on-demand job entitlement of up to one H100.",
+  "开发容器始终不挂载 GPU；GPU Development 可直接提交1张H100，2至4张需提交完整资料并等待审批。":
+    "Development containers never mount a GPU. GPU Development can submit one H100 directly; requests for 2-4 must include complete details and await approval.",
   "GPU Development 开通 H100 作业额度；常驻开发容器仍不挂载 GPU。":
     "GPU Development enables the H100 job entitlement; the resident development container still has no GPU mounted.",
   "GPU Development 将作业上限固定为 1；H100 仅在作业运行期间分配并在结束后自动释放。":
     "GPU Development fixes the job limit at one. An H100 is allocated only while a job runs and is released automatically afterward.",
+  "GPU Development 允许直接提交1张H100；2至4张须按作业提交完整资料并审批。H100仅在作业运行期间分配。":
+    "GPU Development permits direct one-H100 submissions. Jobs requesting 2-4 must provide complete details and receive approval. H100s are allocated only while a job runs.",
   认证: "Authentication",
   "用户密钥 Fingerprint": "User Key Fingerprint",
   未安装: "Not installed",
@@ -372,19 +382,36 @@ const EN_US: Record<string, string> = {
     "Development container status is temporarily unavailable.",
   还没有Portal作业: "No Portal jobs yet",
   从上方创建CPU或单GPU作业: "Create a CPU or single-GPU job above",
+  "从上方创建CPU或GPU作业；2至4张GPU需要管理员审批":
+    "Create a CPU or GPU job above; 2-4 GPUs require administrator approval",
   名称: "Name",
   时限: "Time Limit",
   "{minutes} 分钟": "{minutes} minutes",
   提交中: "Submitting",
+  等待审批: "Awaiting approval",
   日志: "Logs",
   "通过Portal提交CPU或单GPU Slurm任务":
     "Submit CPU or single-GPU Slurm jobs through the Portal",
+  通过Portal提交CPU或1至4张GPU的Slurm任务:
+    "Submit CPU or 1-4 GPU Slurm jobs through the Portal",
+  "2-4 GPU 需审批": "2-4 GPUs require approval",
   "脚本由Portal保存为自己的不可变作业快照，并以当前Linux用户提交":
     "The Portal saves the script as your immutable job snapshot and submits it as your current Linux user",
   作业名称: "Job Name",
   执行脚本: "Execution Script",
   "内存 MB": "Memory (MB)",
   "最长运行（分钟）": "Maximum Runtime (minutes)",
+  "多GPU作业不会立即进入Slurm。请完整说明模型、框架、数据集和并行收益；管理员可降低GPU数量后批准，或驳回不合理申请。":
+    "Multi-GPU jobs do not enter Slurm immediately. Describe the model, framework, dataset, and scaling benefit completely; an administrator may approve fewer GPUs or reject an unjustified request.",
+  模型名称: "Model Name",
+  模型架构: "Model Architecture",
+  框架: "Framework",
+  框架版本: "Framework Version",
+  "模型规模 / 参数量": "Model Scale / Parameter Count",
+  "训练/推理任务说明": "Training / Inference Workload",
+  数据集说明: "Dataset Details",
+  并行策略: "Parallel Strategy",
+  多卡扩展收益与合理性: "Multi-GPU Scaling Benefit and Justification",
   运行环境: "Runtime Environment",
   "标准 Slurm": "Standard Slurm",
   "已批准 CUDA 容器": "Approved CUDA Container",
@@ -396,6 +423,31 @@ const EN_US: Record<string, string> = {
   "{name} · 日志": "{name} · Logs",
   关闭: "Close",
   取消作业: "Cancel Job",
+  多GPU审批: "Multi-GPU Approval",
+  "申请 {count} 张": "Requested {count}",
+  "批准 {count} 张": "Approved {count}",
+  "审批完成并提交Slurm后才会产生运行日志。":
+    "Runtime logs become available after approval and Slurm submission.",
+  申请GPU: "Requested GPUs",
+  模型: "Model",
+  架构: "Architecture",
+  参数量: "Parameter Count",
+  最长运行: "Maximum Runtime",
+  任务说明: "Workload Details",
+  多卡收益与合理性: "Multi-GPU Benefit and Justification",
+  批准GPU数量: "Approved GPU Count",
+  审批意见: "Review Comment",
+  "管理员密码（最近认证）": "Administrator Password (Recent Authentication)",
+  按所选GPU数量批准: "Approve Selected GPU Count",
+  驳回: "Reject",
+  审批失败: "Review failed",
+  "2至4张GPU申请必须审批；可以降低GPU数量后批准":
+    "Requests for 2-4 GPUs require approval; reviewers may approve a lower count",
+  没有待审批的多GPU作业: "No Pending Multi-GPU Jobs",
+  新的申请会显示在这里: "New requests appear here",
+  审批状态: "Approval Status",
+  批准GPU: "Approved GPUs",
+  暂无历史多GPU审批: "No multi-GPU approval history",
   暂无输出: "No output yet",
   暂无错误输出: "No error output",
   自己的私有工作区和配额: "Your private workspace and quota",
@@ -590,6 +642,8 @@ const EN_US: Record<string, string> = {
   "GPU 最大数量": "Maximum GPU Count",
   "GPU 任务通过 Portal 作业页面提交，最多 1 张。":
     "GPU jobs are submitted through the Portal Jobs page, with a maximum of 1 GPU.",
+  "CPU Development 不具备GPU作业权限。":
+    "CPU Development does not include GPU job entitlement.",
   标准开发环境: "Standard Development Environment",
   规格不可由普通用户修改: "Ordinary users cannot modify this profile",
   申请说明: "Request Details",

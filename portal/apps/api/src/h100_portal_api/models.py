@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -893,15 +895,18 @@ class PortalLeaseRenewalRequest(Base):
 class PortalJob(Base):
     __tablename__ = "portal_jobs"
     __table_args__ = (
-        CheckConstraint("gpu_count BETWEEN 0 AND 1", name="ck_portal_job_gpu_count"),
+        CheckConstraint("gpu_count BETWEEN 0 AND 4", name="ck_portal_job_gpu_count"),
         CheckConstraint("requested_cpus BETWEEN 1 AND 32", name="ck_portal_job_cpus"),
         CheckConstraint("memory_mb BETWEEN 256 AND 32768", name="ck_portal_job_memory"),
         CheckConstraint(
             "time_limit_seconds BETWEEN 60 AND 345600", name="ck_portal_job_time_limit"
         ),
         CheckConstraint(
-            "state IN ('SUBMITTING', 'PENDING', 'RUNNING', 'COMPLETING', 'COMPLETED', "
-            "'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY', 'UNKNOWN')",
+            "state IN ('APPROVAL_PENDING', 'REJECTED', 'SUBMITTING', 'PENDING', "
+            "'CONFIGURING', 'RUNNING', 'SUSPENDED', 'STOPPED', 'COMPLETING', "
+            "'REQUEUED', 'RESIZING', 'BOOT_FAIL', 'CANCELLED', 'COMPLETED', "
+            "'DEADLINE', 'FAILED', 'NODE_FAIL', 'OUT_OF_MEMORY', 'PREEMPTED', "
+            "'REVOKED', 'TIMEOUT', 'UNKNOWN')",
             name="ck_portal_job_state",
         ),
     )
@@ -937,6 +942,64 @@ class PortalJob(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     elapsed_seconds: Mapped[int | None] = mapped_column(Integer)
     exit_code: Mapped[str | None] = mapped_column(String(32))
+
+    gpu_approval: Mapped[PortalJobGpuApproval | None] = relationship(
+        "PortalJobGpuApproval", uselist=False, lazy="selectin"
+    )
+
+
+class PortalJobGpuApproval(Base):
+    __tablename__ = "portal_job_gpu_approvals"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('PENDING', 'APPROVED', 'REJECTED', 'CANCELLED')",
+            name="ck_job_gpu_approval_state",
+        ),
+        CheckConstraint(
+            "requested_gpu_count BETWEEN 2 AND 4",
+            name="ck_job_gpu_approval_requested_count",
+        ),
+        CheckConstraint(
+            "approved_gpu_count IS NULL OR approved_gpu_count BETWEEN 1 AND requested_gpu_count",
+            name="ck_job_gpu_approval_approved_count",
+        ),
+        CheckConstraint(
+            "(state = 'APPROVED' AND approved_gpu_count IS NOT NULL "
+            "AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL) OR "
+            "(state IN ('REJECTED') AND approved_gpu_count IS NULL "
+            "AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL) OR "
+            "(state IN ('PENDING', 'CANCELLED') AND approved_gpu_count IS NULL)",
+            name="ck_job_gpu_approval_decision",
+        ),
+        CheckConstraint("length(script_sha256) = 64", name="ck_job_gpu_approval_script_sha256"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    portal_job_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("portal_jobs.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
+    )
+    state: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    requested_gpu_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    approved_gpu_count: Mapped[int | None] = mapped_column(Integer)
+    model_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    model_architecture: Mapped[str] = mapped_column(String(500), nullable=False)
+    framework: Mapped[str] = mapped_column(String(100), nullable=False)
+    framework_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    parameter_count: Mapped[str] = mapped_column(String(100), nullable=False)
+    workload_description: Mapped[str] = mapped_column(Text, nullable=False)
+    dataset_description: Mapped[str] = mapped_column(Text, nullable=False)
+    parallel_strategy: Mapped[str] = mapped_column(Text, nullable=False)
+    scaling_justification: Mapped[str] = mapped_column(Text, nullable=False)
+    script_content: Mapped[str] = mapped_column(Text, nullable=False)
+    script_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("portal_users.id"))
+    decision_comment: Mapped[str | None] = mapped_column(String(1000))
+    decision_idempotency_key: Mapped[str | None] = mapped_column(String(128), unique=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    __mapper_args__: dict[str, Any] = {"version_id_col": version}  # noqa: RUF012
 
 
 class PortalStorageResource(Base):

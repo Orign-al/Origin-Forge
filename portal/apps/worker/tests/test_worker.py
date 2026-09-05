@@ -2631,8 +2631,26 @@ def managed_job_payload(*, username: str = "origin-pilot", uid: int = 20001) -> 
         "slurm_account": "company",
         "slurm_qos": "general",
         "max_gpu": 1,
+        "gpu_approval": None,
         "image_ref": APPROVED_JOB_IMAGE,
     }
+
+
+def approved_multigpu_job_payload(
+    *, approved_gpu_count: int, requested_gpu_count: int = 4
+) -> dict[str, object]:
+    payload = managed_job_payload()
+    payload["gpu_count"] = approved_gpu_count
+    payload["slurm_qos"] = "portal-approved-multigpu" if approved_gpu_count > 1 else "general"
+    payload["gpu_approval"] = {
+        "approval_id": str(uuid.uuid4()),
+        "requested_gpu_count": requested_gpu_count,
+        "approved_gpu_count": approved_gpu_count,
+        "script_sha256": payload["script_sha256"],
+        "reviewed_by": str(uuid.uuid4()),
+        "reviewed_at": datetime.now(UTC).isoformat(),
+    }
+    return payload
 
 
 def managed_terminal_payload(
@@ -2683,6 +2701,108 @@ def test_portal4a_worker_schema_fixes_job_outputs_and_gpu_limit() -> None:
     ):
         with pytest.raises(ValueError):
             validate_payload("self.job.submit", {**payload, **changed})
+
+
+def test_worker_requires_bound_approval_for_two_to_four_gpus() -> None:
+    for gpu_count in (2, 3, 4):
+        payload = approved_multigpu_job_payload(approved_gpu_count=gpu_count)
+        validated = validate_payload("self.job.submit", payload)
+        assert validated["gpu_count"] == gpu_count
+        assert validated["slurm_qos"] == "portal-approved-multigpu"
+        assert validated["gpu_approval"]["approved_gpu_count"] == gpu_count
+
+    adjusted = validate_payload(
+        "self.job.submit", approved_multigpu_job_payload(approved_gpu_count=1)
+    )
+    assert adjusted["slurm_qos"] == "general"
+    assert adjusted["gpu_approval"]["requested_gpu_count"] == 4
+    for changed in (
+        {"gpu_approval": None},
+        {"slurm_qos": "general"},
+        {
+            "gpu_count": 4,
+            "gpu_approval": {**approved_multigpu_job_payload(approved_gpu_count=3)["gpu_approval"]},
+        },
+    ):
+        payload = approved_multigpu_job_payload(approved_gpu_count=3)
+        with pytest.raises(ValueError):
+            validate_payload("self.job.submit", {**payload, **changed})
+
+
+def test_multigpu_sbatch_uses_exact_approved_count_and_dedicated_qos() -> None:
+    payload = approved_multigpu_job_payload(approved_gpu_count=3)
+    workspace = Path(str(payload["workspace_path"]))
+    argv = handlers._managed_sbatch_argv(
+        payload,
+        workdir=workspace / "projects",
+        stdout=workspace / "outputs/job.out",
+        stderr=workspace / "outputs/job.err",
+        staged_descriptor=9,
+    )
+    assert "--qos=portal-approved-multigpu" in argv
+    assert "--gres=gpu:h100:3" in argv
+    assert not any(item == "--gres=gpu:h100:4" for item in argv)
+
+
+def test_multigpu_worker_preflight_requires_dedicated_qos_and_association_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = validate_payload(
+        "self.job.submit", approved_multigpu_job_payload(approved_gpu_count=3)
+    )
+    monkeypatch.setattr(
+        handlers,
+        "_managed_account",
+        lambda _payload: SimpleNamespace(pw_shell="/usr/sbin/nologin"),
+    )
+    monkeypatch.setattr(
+        handlers,
+        "script_integrity",
+        lambda: {"h100-user-gpu-isolation": {"integrity_ok": True}},
+    )
+    monkeypatch.setattr(
+        handlers,
+        "run_allowlisted_script",
+        lambda *_args, **_kwargs: {"ok": True},
+    )
+
+    def fixed(_binary: str, argv: list[str], **_kwargs: object) -> dict[str, object]:
+        if "assoc" in argv:
+            return {
+                "ok": True,
+                "stdout": (
+                    "origin-pilot|company|general,portal-approved-multigpu|"
+                    "general|gres/gpu=4|gres/gpu=4|\n"
+                ),
+            }
+        return {"ok": True, "stdout": "portal-approved-multigpu|gres/gpu=4|\n"}
+
+    monkeypatch.setattr(handlers, "run_fixed", fixed)
+    handlers._managed_slurm_security_preflight(payload)
+
+    def weak_qos(_binary: str, argv: list[str], **_kwargs: object) -> dict[str, object]:
+        result = fixed(_binary, argv, **_kwargs)
+        if "qos" in argv:
+            result["stdout"] = "portal-approved-multigpu|gres/gpu=1|\n"
+        return result
+
+    monkeypatch.setattr(handlers, "run_fixed", weak_qos)
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._managed_slurm_security_preflight(payload)
+    assert rejected.value.code == "GPU_LIMIT_REJECTED"
+
+    def weak_aggregate(_binary: str, argv: list[str], **_kwargs: object) -> dict[str, object]:
+        result = fixed(_binary, argv, **_kwargs)
+        if "assoc" in argv:
+            result["stdout"] = (
+                "origin-pilot|company|general,portal-approved-multigpu|general|gres/gpu=4||\n"
+            )
+        return result
+
+    monkeypatch.setattr(handlers, "run_fixed", weak_aggregate)
+    with pytest.raises(handlers.LifecycleValidationError) as rejected:
+        handlers._managed_slurm_security_preflight(payload)
+    assert rejected.value.code == "SLURM_ASSOCIATION_REJECTED"
 
 
 def managed_job_target_payload(

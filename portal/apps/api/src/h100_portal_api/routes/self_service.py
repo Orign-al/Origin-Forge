@@ -48,6 +48,7 @@ from h100_portal_api.models import (
     PortalComputeLease,
     PortalContainer,
     PortalJob,
+    PortalJobGpuApproval,
     PortalLeaseRenewalRequest,
     PortalManagedUser,
     PortalOperation,
@@ -61,6 +62,7 @@ from h100_portal_api.models import (
 )
 from h100_portal_api.rbac import highest_role
 from h100_portal_api.schemas import (
+    JobGpuApprovalDecisionRequest,
     LeaseDecisionRequest,
     LeaseRecoveryApplyRequest,
     LeaseRenewalCreateRequest,
@@ -95,7 +97,7 @@ JOB_DEFAULTS = {"cpus": 2, "memory_mb": 4096, "gpu_count": 0, "time_limit_second
 JOB_LIMITS = {
     "cpus": {"minimum": 1, "maximum": 8},
     "memory_mb": {"minimum": 256, "maximum": 32768},
-    "gpu_count": {"minimum": 0, "maximum": 1},
+    "gpu_count": {"minimum": 0, "maximum": 4, "approval_required_from": 2},
     "time_limit_seconds": {"minimum": 60, "maximum": 345600},
     "script_bytes": {"maximum": 8192},
 }
@@ -110,11 +112,13 @@ JOB_TERMINAL_STATES = frozenset(
         "OUT_OF_MEMORY",
         "PREEMPTED",
         "REVOKED",
+        "REJECTED",
         "TIMEOUT",
     }
 )
 JOB_STATES = frozenset(
     {
+        "APPROVAL_PENDING",
         "SUBMITTING",
         "PENDING",
         "CONFIGURING",
@@ -329,6 +333,7 @@ def _new_operation(
     payload: dict[str, Any],
     idempotency_key: str,
     risk_level: RiskLevel = RiskLevel.MEDIUM,
+    status_value: OperationStatus = OperationStatus.RUNNING,
 ) -> PortalOperation:
     actor = context.actor
     validated_payload = dict(payload)
@@ -345,14 +350,14 @@ def _new_operation(
         target_id=target_id,
         requested_by=actor.id,
         owner_managed_user_id=owner_id,
-        approved_by=actor.id,
+        approved_by=actor.id if status_value != OperationStatus.PENDING_APPROVAL else None,
         request_summary=summary,
         validated_payload=validated_payload,
         idempotency_key=idempotency_key,
         risk_level=risk_level,
-        status=OperationStatus.RUNNING,
-        approved_at=utcnow(),
-        started_at=utcnow(),
+        status=status_value,
+        approved_at=utcnow() if status_value != OperationStatus.PENDING_APPROVAL else None,
+        started_at=utcnow() if status_value != OperationStatus.PENDING_APPROVAL else None,
     )
     db.add(operation)
     db.flush()
@@ -1408,6 +1413,33 @@ def _validated_cli_source_path(
     return source_path, parent.as_posix(), scope, "." if relative == "." else relative
 
 
+def _gpu_approval_view(approval: PortalJobGpuApproval | None) -> dict[str, Any] | None:
+    if approval is None:
+        return None
+    return {
+        "id": str(approval.id),
+        "state": approval.state,
+        "requested_gpu_count": approval.requested_gpu_count,
+        "approved_gpu_count": approval.approved_gpu_count,
+        "model_name": approval.model_name,
+        "model_architecture": approval.model_architecture,
+        "framework": approval.framework,
+        "framework_version": approval.framework_version,
+        "parameter_count": approval.parameter_count,
+        "workload_description": approval.workload_description,
+        "dataset_description": approval.dataset_description,
+        "parallel_strategy": approval.parallel_strategy,
+        "scaling_justification": approval.scaling_justification,
+        "script_sha256": approval.script_sha256,
+        "requested_at": ensure_utc(approval.requested_at).isoformat(),
+        "reviewed_at": (
+            ensure_utc(approval.reviewed_at).isoformat() if approval.reviewed_at else None
+        ),
+        "reviewed_by": str(approval.reviewed_by) if approval.reviewed_by else None,
+        "decision_comment": approval.decision_comment,
+    }
+
+
 def _job_view(job: PortalJob, *, authoritative: bool = True) -> dict[str, Any]:
     workdir = job.workdir_relative_path
     if not workdir.startswith("/"):
@@ -1421,6 +1453,7 @@ def _job_view(job: PortalJob, *, authoritative: bool = True) -> dict[str, Any]:
         "cpus": job.requested_cpus,
         "memory_mb": job.memory_mb,
         "gpu_count": job.gpu_count,
+        "gpu_approval": _gpu_approval_view(job.gpu_approval),
         "time_limit_seconds": job.time_limit_seconds,
         "script_path": job.script_relative_path,
         "script_snapshot_path": f"/workspace/{job.script_relative_path}",
@@ -1556,6 +1589,71 @@ def self_job_config(
     }
 
 
+def _job_worker_payload(
+    resources: SelfResourceContext,
+    job: PortalJob,
+    *,
+    script_content: str,
+    script_sha256: str,
+    approval: PortalJobGpuApproval | None,
+) -> dict[str, Any]:
+    managed = resources.managed
+    binding = workspace_binding(managed.unix_username, managed.uid, managed.gid)
+    _source, _logical, workdir_scope, workdir_relative = _validated_cli_source_path(
+        job.source_path, managed.unix_username
+    )
+    if approval is None:
+        slurm_qos = managed.slurm_qos
+        approval_contract = None
+    else:
+        if (
+            approval.state != "PENDING"
+            or approval.approved_gpu_count is not None
+            or approval.script_sha256 != script_sha256
+            or approval.reviewed_by is None
+            or approval.reviewed_at is None
+        ):
+            raise _error(409, "GPU_APPROVAL_STATE_INVALID", "多GPU审批状态无效")
+        slurm_qos = "portal-approved-multigpu" if job.gpu_count > 1 else managed.slurm_qos
+        approval_contract = {
+            "approval_id": str(approval.id),
+            "requested_gpu_count": approval.requested_gpu_count,
+            "approved_gpu_count": job.gpu_count,
+            "script_sha256": approval.script_sha256,
+            "reviewed_by": str(approval.reviewed_by),
+            "reviewed_at": ensure_utc(approval.reviewed_at).isoformat(),
+        }
+    return {
+        **resources.worker_identity(),
+        "workspace_path": resources.workspace,
+        "quota_root": str(binding.quota_root),
+        "home_source": str(binding.canonical_home),
+        "home_path": str(binding.compute_home),
+        "project_id": managed.project_id,
+        "quota_bytes": resources.storage.quota_bytes,
+        "portal_job_id": str(job.id),
+        "lease_id": str(job.lease_id),
+        "name": job.name,
+        "script_relative_path": job.script_relative_path,
+        "script_content": script_content,
+        "script_sha256": script_sha256,
+        "workdir_scope": workdir_scope,
+        "workdir_relative_path": workdir_relative,
+        "stdout_relative_path": job.stdout_relative_path,
+        "stderr_relative_path": job.stderr_relative_path,
+        "cpus": job.requested_cpus,
+        "memory_mb": job.memory_mb,
+        "gpu_count": job.gpu_count,
+        "time_limit_seconds": job.time_limit_seconds,
+        "lease_deadline_at": ensure_utc(job.lease_deadline_at).isoformat(),
+        "slurm_account": managed.slurm_account,
+        "slurm_qos": slurm_qos,
+        "max_gpu": resources.max_gpu,
+        "gpu_approval": approval_contract,
+        "image_ref": job.image_ref,
+    }
+
+
 @router.get("/self/jobs")
 def self_jobs(
     limit: int = Query(default=20, ge=1, le=200),
@@ -1592,24 +1690,32 @@ def submit_self_job(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     require_session_csrf(request, context)
-    if body.gpu_count not in {0, 1}:
-        raise _error(422, "GPU_LIMIT_EXCEEDED", "GPU request must be 0 or 1")
+    approval_required = body.gpu_count >= 2
+    if approval_required and body.multi_gpu_request is None:
+        raise _error(
+            422,
+            "MULTI_GPU_DETAILS_REQUIRED",
+            "申请2至4张GPU必须提交完整的模型、框架、数据与并行策略说明",
+        )
+    if not approval_required and body.multi_gpu_request is not None:
+        raise _error(422, "MULTI_GPU_DETAILS_UNEXPECTED", "0或1张GPU作业不接受多GPU审批资料")
     if body.image_ref is not None and body.image_ref not in APPROVED_IMAGE_REFS:
         raise _error(422, "IMAGE_NOT_APPROVED", "镜像不在管理员批准清单中")
     resources = resolve_self_compute_context(db, context.user, lock=True)
     managed = resources.managed
-    source_path, logical_workdir, workdir_scope, workdir_relative = _validated_cli_source_path(
+    source_path, logical_workdir, _workdir_scope, _workdir_relative = _validated_cli_source_path(
         body.source_path, managed.unix_username
     )
-    binding = workspace_binding(managed.unix_username, managed.uid, managed.gid)
     active = resources.active_lease
     terminal = resources.terminal_lease
     now = utcnow()
     remaining = int((ensure_utc(terminal.expires_at) - now).total_seconds())
     if body.time_limit_seconds > remaining:
         raise _error(422, "JOB_EXCEEDS_LEASE", "作业时限不能超过租约剩余时间")
-    if body.gpu_count > resources.max_gpu:
+    if body.gpu_count == 1 and resources.max_gpu < 1:
         raise _error(422, "GPU_LIMIT_EXCEEDED", "当前用户最多申请1张GPU")
+    if approval_required and resources.max_gpu < 1:
+        raise _error(422, "GPU_ENTITLEMENT_REQUIRED", "多GPU审批仅面向已有GPU作业权限的用户")
     operation_key = f"self-job-submit:{managed.id}:{body.idempotency_key}"
     existing = db.scalar(
         select(PortalOperation).where(
@@ -1621,7 +1727,12 @@ def submit_self_job(
         job = db.scalar(select(PortalJob).where(PortalJob.operation_id == existing.id))
         if job is None:
             raise _error(409, "IDEMPOTENCY_CONFLICT", "幂等操作缺少作业记录")
-        return {"status": existing.status, "job": _job_view(job)}
+        replay_status: str | OperationStatus = existing.status
+        if job.state == "APPROVAL_PENDING":
+            replay_status = "APPROVAL_PENDING"
+        elif existing.status == OperationStatus.SUCCEEDED and job.slurm_job_id is not None:
+            replay_status = "SUBMITTED"
+        return {"status": replay_status, "job": _job_view(job)}
     job_id = uuid.uuid4()
     script_content = body.script
     if not script_content.startswith("#!"):
@@ -1634,36 +1745,32 @@ def submit_self_job(
     stdout = f"outputs/{job_id}.out"
     stderr = f"outputs/{job_id}.err"
     image_ref = body.image_ref or APPROVED_JOB_IMAGE
-    payload = {
+    operation_payload = {
         **resources.worker_identity(),
-        "workspace_path": resources.workspace,
-        "quota_root": str(binding.quota_root),
-        "home_source": str(binding.canonical_home),
-        "home_path": str(binding.compute_home),
-        "project_id": managed.project_id,
-        "quota_bytes": resources.storage.quota_bytes,
         "portal_job_id": str(job_id),
         "lease_id": str(active.id),
         "name": body.name,
         "script_relative_path": script_path,
-        "script_content": script_content,
         "script_sha256": script_sha256,
-        "workdir_scope": workdir_scope,
-        "workdir_relative_path": workdir_relative,
-        "stdout_relative_path": stdout,
-        "stderr_relative_path": stderr,
+        "script_bytes": len(script_bytes),
+        "source_path": source_path,
         "cpus": body.cpus,
         "memory_mb": body.memory_mb,
         "gpu_count": body.gpu_count,
         "time_limit_seconds": body.time_limit_seconds,
         "lease_deadline_at": ensure_utc(terminal.expires_at).isoformat(),
-        "slurm_account": managed.slurm_account,
-        "slurm_qos": managed.slurm_qos,
         "max_gpu": resources.max_gpu,
         "image_ref": image_ref,
+        "gpu_approval_required": approval_required,
     }
-    operation_payload = {key: value for key, value in payload.items() if key != "script_content"}
-    operation_payload["script_bytes"] = len(script_bytes)
+    if body.multi_gpu_request is not None:
+        operation_payload.update(
+            {
+                "model_name": body.multi_gpu_request.model_name,
+                "framework": body.multi_gpu_request.framework,
+                "framework_version": body.multi_gpu_request.framework_version,
+            }
+        )
     operation = _new_operation(
         db,
         context,
@@ -1671,9 +1778,17 @@ def submit_self_job(
         operation_type="self.job.submit",
         target_type="slurm_job",
         target_id=str(job_id),
-        summary="用户通过Portal提交自己的Slurm作业",
+        summary=(
+            "用户申请多GPU Slurm作业，等待管理员审批"
+            if approval_required
+            else "用户通过Portal提交自己的Slurm作业"
+        ),
         payload=operation_payload,
         idempotency_key=operation_key,
+        risk_level=RiskLevel.HIGH if approval_required else RiskLevel.MEDIUM,
+        status_value=(
+            OperationStatus.PENDING_APPROVAL if approval_required else OperationStatus.RUNNING
+        ),
     )
     job = PortalJob(
         id=job_id,
@@ -1681,7 +1796,7 @@ def submit_self_job(
         lease_id=active.id,
         operation_id=operation.id,
         name=body.name,
-        state="SUBMITTING",
+        state="APPROVAL_PENDING" if approval_required else "SUBMITTING",
         script_relative_path=script_path,
         source_path=source_path,
         workdir_relative_path=logical_workdir,
@@ -1696,6 +1811,50 @@ def submit_self_job(
     )
     db.add(job)
     db.flush()
+    if body.multi_gpu_request is not None:
+        approval = PortalJobGpuApproval(
+            portal_job_id=job.id,
+            state="PENDING",
+            requested_gpu_count=body.gpu_count,
+            model_name=body.multi_gpu_request.model_name,
+            model_architecture=body.multi_gpu_request.model_architecture,
+            framework=body.multi_gpu_request.framework,
+            framework_version=body.multi_gpu_request.framework_version,
+            parameter_count=body.multi_gpu_request.parameter_count,
+            workload_description=body.multi_gpu_request.workload_description,
+            dataset_description=body.multi_gpu_request.dataset_description,
+            parallel_strategy=body.multi_gpu_request.parallel_strategy,
+            scaling_justification=body.multi_gpu_request.scaling_justification,
+            script_content=script_content,
+            script_sha256=script_sha256,
+        )
+        db.add(approval)
+        job.gpu_approval = approval
+        _audit(
+            db,
+            request,
+            context,
+            event_type="JOB_GPU_APPROVAL_REQUESTED",
+            object_type="portal_job",
+            object_id=str(job.id),
+            metadata={
+                "requested_gpu_count": body.gpu_count,
+                "model_name": body.multi_gpu_request.model_name,
+                "framework": body.multi_gpu_request.framework,
+                "script_sha256": script_sha256,
+                "worker_called": False,
+            },
+        )
+        db.commit()
+        return {"status": "APPROVAL_PENDING", "job": _job_view(job)}
+
+    payload = _job_worker_payload(
+        resources,
+        job,
+        script_content=script_content,
+        script_sha256=script_sha256,
+        approval=None,
+    )
     try:
         result = _worker(
             "self.job.submit",
@@ -1791,6 +1950,12 @@ def self_job_logs(
     resources, job = _owned_job(db, context, job_id)
     _refresh_job(context, resources, job, required=True)
     db.commit()
+    if job.slurm_job_id is None:
+        raise _error(
+            409,
+            "JOB_NOT_SUBMITTED",
+            "作业尚未通过审批并提交到Slurm，暂时没有运行日志",
+        )
     managed = resources.managed
     result = _worker(
         "self.job.logs.read",
@@ -1844,6 +2009,29 @@ def cancel_self_job(
     _refresh_job(context, resources, job, required=True)
     if job.state in JOB_TERMINAL_STATES:
         raise _error(409, "JOB_ALREADY_TERMINAL", "只能取消非终态Job")
+    if job.state == "APPROVAL_PENDING" and job.slurm_job_id is None:
+        approval = job.gpu_approval
+        if approval is None or approval.state != "PENDING":
+            raise _error(409, "GPU_APPROVAL_STATE_INVALID", "多GPU审批记录状态无效")
+        approval.state = "CANCELLED"
+        job.state = "CANCELLED"
+        job.state_reason = "USER_CANCELLED_BEFORE_APPROVAL"
+        job.finished_at = utcnow()
+        operation = db.get(PortalOperation, job.operation_id)
+        if operation is not None:
+            operation.status = OperationStatus.CANCELLED
+            operation.finished_at = utcnow()
+        _audit(
+            db,
+            request,
+            context,
+            event_type="JOB_GPU_APPROVAL_CANCELLED",
+            object_type="portal_job",
+            object_id=str(job.id),
+            metadata={"worker_called": False, "slurm_job_created": False},
+        )
+        db.commit()
+        return {"status": "CANCELLED", "job": _job_view(job)}
     if job.slurm_job_id is None:
         raise _error(409, "JOB_NOT_SUBMITTED", "作业尚未提交到Slurm")
     key = f"self-job-cancel:{job.id}:{body.idempotency_key}"
@@ -1880,6 +2068,220 @@ def cancel_self_job(
     return {
         "status": "CANCELLATION_REQUESTED",
         "job": _job_view(job, authoritative=authoritative),
+    }
+
+
+def _admin_gpu_approval_view(
+    approval: PortalJobGpuApproval,
+    job: PortalJob,
+    managed: PortalManagedUser,
+    owner: PortalUser,
+) -> dict[str, Any]:
+    return {
+        **(_gpu_approval_view(approval) or {}),
+        "portal_job_id": str(job.id),
+        "owner": {
+            "portal_user_id": str(owner.id),
+            "login_name": owner.login_name,
+            "display_name": owner.display_name,
+            "managed_user_id": str(managed.id),
+            "unix_username": managed.unix_username,
+        },
+        "job": _job_view(job, authoritative=job.slurm_job_id is not None),
+    }
+
+
+@router.get("/admin/job-gpu-approvals")
+def admin_job_gpu_approvals(
+    state: str | None = Query(default=None, max_length=16),
+    context: AuthContext = Depends(permission_dependency("jobs.gpu_approval.read")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    normalized = state.upper() if state else None
+    if normalized is not None and normalized not in {
+        "PENDING",
+        "APPROVED",
+        "REJECTED",
+        "CANCELLED",
+    }:
+        raise _error(422, "GPU_APPROVAL_STATE_INVALID", "多GPU审批状态过滤值无效")
+    query = select(PortalJobGpuApproval).order_by(PortalJobGpuApproval.requested_at.desc())
+    if normalized is not None:
+        query = query.where(PortalJobGpuApproval.state == normalized)
+    rows = db.scalars(query.limit(200)).all()
+    views: list[dict[str, Any]] = []
+    for approval in rows:
+        job = db.get(PortalJob, approval.portal_job_id)
+        if job is None:
+            continue
+        managed = db.get(PortalManagedUser, job.owner_managed_user_id)
+        owner = db.get(PortalUser, managed.portal_user_id) if managed is not None else None
+        if managed is None or owner is None:
+            continue
+        views.append(_admin_gpu_approval_view(approval, job, managed, owner))
+    return {"status": "OK", "approvals": views, "count": len(views)}
+
+
+@router.post("/admin/job-gpu-approvals/{approval_id}/decision")
+def decide_job_gpu_approval(
+    approval_id: uuid.UUID,
+    body: JobGpuApprovalDecisionRequest,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("jobs.gpu_approval.review")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_session_csrf(request, context)
+    require_recent_reauthentication(context)
+    initial = db.get(PortalJobGpuApproval, approval_id)
+    initial_job = db.get(PortalJob, initial.portal_job_id) if initial is not None else None
+    if initial is None or initial_job is None:
+        raise _error(404, "GPU_APPROVAL_NOT_FOUND", "多GPU审批申请不存在")
+    managed = db.get(PortalManagedUser, initial_job.owner_managed_user_id)
+    owner = db.get(PortalUser, managed.portal_user_id) if managed is not None else None
+    if managed is None or owner is None:
+        raise _error(409, "GPU_APPROVAL_OWNER_INVALID", "审批申请缺少有效的资源所有者")
+
+    # Lock the owner resources before the request rows. Submission uses the same
+    # owner-first order, avoiding a review/Lease deadlock.
+    resources = resolve_self_compute_context(db, owner, lock=True)
+    approval = db.scalar(
+        select(PortalJobGpuApproval).where(PortalJobGpuApproval.id == approval_id).with_for_update()
+    )
+    job = db.scalar(select(PortalJob).where(PortalJob.id == initial_job.id).with_for_update())
+    if approval is None or job is None:
+        raise _error(404, "GPU_APPROVAL_NOT_FOUND", "多GPU审批申请不存在")
+    decision_key = f"{approval.id}:{body.idempotency_key}"
+    if approval.decision_idempotency_key == decision_key:
+        return {
+            "status": approval.state,
+            "idempotent_replay": True,
+            "approval": _admin_gpu_approval_view(approval, job, managed, owner),
+        }
+    if approval.state != "PENDING" or job.state != "APPROVAL_PENDING":
+        raise _error(409, "GPU_APPROVAL_ALREADY_DECIDED", "多GPU审批申请已被处理")
+    if job.slurm_job_id is not None:
+        raise _error(409, "GPU_APPROVAL_SLURM_CONFLICT", "待审批作业不应存在Slurm Job")
+
+    now = utcnow()
+    operation = db.get(PortalOperation, job.operation_id)
+    if body.decision == "REJECT":
+        if body.approved_gpu_count is not None:
+            raise _error(422, "GPU_APPROVAL_COUNT_UNEXPECTED", "驳回时不得填写批准GPU数量")
+        approval.state = "REJECTED"
+        approval.reviewed_at = now
+        approval.reviewed_by = context.actor.id
+        approval.decision_comment = body.comment
+        approval.decision_idempotency_key = decision_key
+        job.state = "REJECTED"
+        job.state_reason = body.comment[:512]
+        job.finished_at = now
+        if operation is not None:
+            operation.status = OperationStatus.CANCELLED
+            operation.finished_at = now
+            operation.result_summary = "多GPU作业申请被管理员驳回"
+        _audit(
+            db,
+            request,
+            context,
+            event_type="JOB_GPU_APPROVAL_REJECTED",
+            object_type="portal_job",
+            object_id=str(job.id),
+            metadata={
+                "approval_id": str(approval.id),
+                "requested_gpu_count": approval.requested_gpu_count,
+                "owner": owner.normalized_login,
+                "worker_called": False,
+                "slurm_job_created": False,
+            },
+        )
+        db.commit()
+        return {
+            "status": "REJECTED",
+            "idempotent_replay": False,
+            "approval": _admin_gpu_approval_view(approval, job, managed, owner),
+        }
+
+    approved_count = body.approved_gpu_count
+    if approved_count is None:
+        raise _error(422, "GPU_APPROVED_COUNT_REQUIRED", "通过审批时必须填写批准GPU数量")
+    if approved_count > approval.requested_gpu_count:
+        raise _error(422, "GPU_APPROVED_COUNT_EXCEEDS_REQUEST", "批准GPU数量不能高于用户申请数量")
+    if resources.max_gpu < 1:
+        raise _error(409, "GPU_ENTITLEMENT_REQUIRED", "用户当前已不具备GPU作业权限")
+    if resources.active_lease.id != job.lease_id:
+        raise _error(409, "GPU_APPROVAL_LEASE_CHANGED", "原申请租约已变化，请用户重新提交")
+    remaining = int((ensure_utc(resources.terminal_lease.expires_at) - now).total_seconds())
+    if job.time_limit_seconds > remaining:
+        raise _error(409, "JOB_EXCEEDS_LEASE", "审批时租约剩余时间已不足，请用户重新提交")
+    script_bytes = approval.script_content.encode("utf-8")
+    if hashlib.sha256(script_bytes).hexdigest() != approval.script_sha256:
+        raise _error(409, "JOB_SCRIPT_INTEGRITY_FAILED", "待审批脚本快照完整性校验失败")
+
+    approval.reviewed_at = now
+    approval.reviewed_by = context.actor.id
+    approval.decision_comment = body.comment
+    approval.decision_idempotency_key = decision_key
+    job.gpu_count = approved_count
+    job.state = "SUBMITTING"
+    job.state_reason = None
+    payload = _job_worker_payload(
+        resources,
+        job,
+        script_content=approval.script_content,
+        script_sha256=approval.script_sha256,
+        approval=approval,
+    )
+    result = _worker(
+        "self.job.submit",
+        payload=payload,
+        context=context,
+        idempotency_key=f"gpu-approval-submit:{approval.id}",
+        timeout_seconds=45,
+    )
+    slurm_job_id = result.get("slurm_job_id")
+    if not isinstance(slurm_job_id, int) or result.get("slurm_user") != managed.unix_username:
+        raise _error(409, "JOB_OWNER_POSTCONDITION_FAILED", "Slurm作业所有者验证失败")
+
+    approval.state = "APPROVED"
+    approval.approved_gpu_count = approved_count
+    job.slurm_job_id = slurm_job_id
+    job.state = "PENDING"
+    job.submitted_at = now
+    if operation is not None:
+        operation.status = OperationStatus.SUCCEEDED
+        operation.approved_by = context.actor.id
+        operation.approved_at = now
+        operation.started_at = now
+        operation.finished_at = now
+        operation.worker_execution_id = str(result.get("request_id", ""))[:64] or None
+        operation.result_summary = f"管理员批准{approved_count}张GPU并提交Slurm Job {slurm_job_id}"
+        operation.validated_payload = {
+            **operation.validated_payload,
+            "gpu_approval_id": str(approval.id),
+            "approved_gpu_count": approved_count,
+            "reviewed_by": str(context.actor.id),
+        }
+    _audit(
+        db,
+        request,
+        context,
+        event_type="JOB_GPU_APPROVAL_APPROVED",
+        object_type="portal_job",
+        object_id=str(job.id),
+        metadata={
+            "approval_id": str(approval.id),
+            "requested_gpu_count": approval.requested_gpu_count,
+            "approved_gpu_count": approved_count,
+            "owner": owner.normalized_login,
+            "slurm_job_id": slurm_job_id,
+            "script_sha256": approval.script_sha256,
+        },
+    )
+    db.commit()
+    return {
+        "status": "APPROVED",
+        "idempotent_replay": False,
+        "approval": _admin_gpu_approval_view(approval, job, managed, owner),
     }
 
 

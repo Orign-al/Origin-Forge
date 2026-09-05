@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly QOS_NAME=portal-approved-multigpu
+readonly ACCOUNT_NAME=company
+readonly STATE_DIR=${H100_MULTIGPU_POLICY_STATE_DIR:-/var/lib/h100-portal}
+readonly SNAPSHOT=${STATE_DIR}/multigpu-qos-policy.snapshot
+readonly USER_STATE_DIR=${H100_MULTIGPU_POLICY_USER_STATE_DIR:-/etc/h100-platform/users}
+readonly SACCTMGR=${H100_MULTIGPU_POLICY_SACCTMGR:-sacctmgr}
+readonly SQUEUE=${H100_MULTIGPU_POLICY_SQUEUE:-squeue}
+declare -a MANAGED_USERS=()
+
+fail() {
+  printf 'h100-multigpu-qos-policy: %s\n' "$*" >&2
+  exit 1
+}
+
+contains_qos() {
+  local values=$1
+  [[ ",${values}," == *",${QOS_NAME},"* ]]
+}
+
+qos_line() {
+  "${SACCTMGR}" -nP show qos where Name="${QOS_NAME}" format=Name,MaxTRESPerUser \
+    | awk -F'|' -v qos="${QOS_NAME}" '$1 == qos {print $1 "|" $2}'
+}
+
+state_value() {
+  local state=$1 key=$2
+  awk -F= -v key="${key}" \
+    '$1 == key {value=substr($0, length(key) + 2); count++}
+     END {if (count != 1) exit 1; print value}' "${state}"
+}
+
+load_managed_users() {
+  local state user recorded account default_qos max_gpus
+  MANAGED_USERS=()
+  shopt -s nullglob
+  for state in "${USER_STATE_DIR}"/*.state; do
+    [[ -f ${state} && ! -L ${state} ]] || fail "unsafe managed user state: ${state}"
+    user=${state##*/}
+    user=${user%.state}
+    [[ ${user} =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || fail 'unsafe managed username'
+    recorded=$(state_value "${state}" USERNAME) || fail "missing USERNAME for ${user}"
+    account=$(state_value "${state}" SLURM_ACCOUNT) \
+      || fail "missing SLURM_ACCOUNT for ${user}"
+    default_qos=$(state_value "${state}" SLURM_QOS) \
+      || fail "missing SLURM_QOS for ${user}"
+    max_gpus=$(state_value "${state}" MAX_GPUS) || max_gpus=LEGACY_UNSPECIFIED
+    [[ ${recorded} == "${user}" ]] || fail "state identity mismatch for ${user}"
+    [[ ${account} == "${ACCOUNT_NAME}" ]] || fail "unexpected Slurm account for ${user}"
+    [[ ${default_qos} == general ]] || fail "unexpected default QoS for ${user}"
+    [[ ${max_gpus} == 0 || ${max_gpus} == 1 || ${max_gpus} == LEGACY_UNSPECIFIED ]] \
+      || fail "invalid MAX_GPUS for ${user}"
+    MANAGED_USERS+=("${user}")
+  done
+  shopt -u nullglob
+}
+
+association_line() {
+  local user=$1
+  "${SACCTMGR}" -nP show assoc where User="${user}" Account="${ACCOUNT_NAME}" \
+    format=User,Account,QOS,DefaultQOS,MaxTRES,GrpTRES \
+    | awk -F'|' -v user="${user}" -v account="${ACCOUNT_NAME}" \
+        '$1 == user && $2 == account \
+         {print $1 "|" $2 "|" $3 "|" $4 "|" $5 "|" $6}'
+}
+
+validate_snapshot() {
+  local record user account qos default_qos max_tres group_tres extra
+  local version_count=0 user_count=0
+  declare -A snapshotted=()
+  while IFS='|' read -r record user account qos default_qos max_tres group_tres extra; do
+    case ${record} in
+      VERSION)
+        [[ ${user} == 1 && -z ${account}${qos}${default_qos}${max_tres}${group_tres}${extra} ]] \
+          || fail 'owned rollback snapshot version is invalid'
+        version_count=$((version_count + 1))
+        ;;
+      USER)
+        (( version_count == 1 )) || fail 'rollback snapshot user precedes its version'
+        [[ ${user} =~ ^[a-z_][a-z0-9_-]{0,31}$ && ${account} == "${ACCOUNT_NAME}" ]] \
+          || fail 'invalid rollback snapshot identity'
+        [[ ${qos} =~ ^[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*$ ]] \
+          || fail "invalid original QoS list for ${user}"
+        contains_qos "${qos}" && fail "rollback snapshot already grants dedicated QoS to ${user}"
+        [[ ${default_qos} == general ]] || fail "unexpected original default QoS for ${user}"
+        [[ -z ${max_tres} || ${max_tres} =~ ^gres/gpu=[01]$ ]] \
+          || fail "unexpected original GPU ceiling for ${user}"
+        [[ -z ${group_tres} || ${group_tres} =~ ^gres/gpu=[01]$ ]] \
+          || fail "unexpected original aggregate GPU ceiling for ${user}"
+        [[ -z ${extra} && -z ${snapshotted[${user}]:-} ]] \
+          || fail "duplicate or malformed rollback snapshot record for ${user}"
+        snapshotted["${user}"]=1
+        user_count=$((user_count + 1))
+        ;;
+      *) fail 'invalid rollback snapshot record' ;;
+    esac
+  done <"${SNAPSHOT}"
+  (( version_count == 1 && user_count > 0 )) \
+    || fail 'rollback snapshot is incomplete'
+}
+
+verify() {
+  load_managed_users
+  [[ $(qos_line) == "${QOS_NAME}|gres/gpu=4" ]] \
+    || fail 'dedicated QoS is absent or does not enforce gres/gpu=4'
+  "${SACCTMGR}" -nP show qos where Name=general format=Name,MaxTRESPerUser \
+    | awk -F'|' '$1 == "general" && $2 ~ /(^|,)gres\/gpu=1(,|$)/ {found=1} END {exit !found}' \
+    || fail 'general QoS no longer enforces gres/gpu=1'
+  local account_seen=0 user_count=0 user association assoc_user group_tres
+  declare -A expected_users=()
+  for user in "${MANAGED_USERS[@]}"; do
+    expected_users["${user}"]=1
+    association=$(association_line "${user}")
+    [[ -n ${association} && $(wc -l <<<"${association}") -eq 1 ]] \
+      || fail "${user} does not have exactly one company association"
+    IFS='|' read -r assoc_user account qos default_qos max_tres group_tres \
+      <<<"${association}"
+    [[ ${assoc_user} == "${user}" && ${account} == "${ACCOUNT_NAME}" ]] \
+      || fail "${user} association identity differs"
+    contains_qos "${qos}" || fail "${user} association does not allow dedicated QoS"
+    [[ ${default_qos} == general ]] || fail "${user} default QoS is not general"
+    [[ ",${max_tres}," == *",gres/gpu=4,"* ]] \
+      || fail "${user} association GPU ceiling is not four"
+    [[ ",${group_tres}," == *",gres/gpu=4,"* ]] \
+      || fail "${user} aggregate GPU ceiling is not four"
+    user_count=$((user_count + 1))
+  done
+
+  local account qos default_qos max_tres _rest
+  while IFS='|' read -r account user qos default_qos max_tres group_tres _rest; do
+    [[ ${account} == "${ACCOUNT_NAME}" ]] || continue
+    if [[ -z ${user} ]]; then
+      contains_qos "${qos}" || fail 'company account does not allow dedicated QoS'
+      account_seen=1
+      continue
+    fi
+    [[ ${user} =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || fail 'unsafe Slurm username in association'
+    if contains_qos "${qos}" && [[ -z ${expected_users[${user}]:-} ]]; then
+      fail "unmanaged Slurm user ${user} unexpectedly has dedicated QoS"
+    fi
+  done < <("${SACCTMGR}" -nP show assoc where Account="${ACCOUNT_NAME}" \
+    format=Account,User,QOS,DefaultQOS,MaxTRES,GrpTRES)
+  (( account_seen == 1 )) || fail 'company account association is missing'
+  printf 'MULTIGPU_QOS_POLICY=PASS USERS=%s QOS=%s\n' "${user_count}" "${QOS_NAME}"
+}
+
+apply_policy() {
+  local user association temporary
+  load_managed_users
+  install -d -o root -g root -m 0700 "${STATE_DIR}"
+  if [[ -f ${SNAPSHOT} && ! -L ${SNAPSHOT} ]]; then
+    validate_snapshot
+  else
+    [[ ! -e ${SNAPSHOT} ]] || fail 'unsafe policy snapshot path'
+    [[ -z $(qos_line) ]] || fail 'dedicated QoS already exists without owned rollback state'
+    temporary=$(mktemp "${STATE_DIR}/.multigpu-qos-policy.XXXXXX")
+    trap 'rm -f -- "${temporary}"' EXIT
+    printf 'VERSION|1\n' >"${temporary}"
+    for user in "${MANAGED_USERS[@]}"; do
+      association=$(association_line "${user}")
+      [[ -n ${association} && $(wc -l <<<"${association}") -eq 1 ]] \
+        || fail "${user} does not have exactly one company association"
+      printf 'USER|%s\n' "${association}" >>"${temporary}"
+    done
+    [[ -s ${temporary} ]] || fail 'refusing to apply without an association snapshot'
+    chmod 0600 "${temporary}"
+    chown root:root "${temporary}"
+    mv -T -- "${temporary}" "${SNAPSHOT}"
+    trap - EXIT
+    validate_snapshot
+  fi
+
+  if [[ -z $(qos_line) ]]; then
+    "${SACCTMGR}" -i add qos "${QOS_NAME}" MaxTRESPU=gres/gpu=4 >/dev/null
+  fi
+  "${SACCTMGR}" -i modify qos where Name="${QOS_NAME}" \
+    set MaxTRESPU=gres/gpu=4 >/dev/null
+  "${SACCTMGR}" -i modify account where Name="${ACCOUNT_NAME}" \
+    set QOS+="${QOS_NAME}" >/dev/null
+  for user in "${MANAGED_USERS[@]}"; do
+    "${SACCTMGR}" -i modify user where Name="${user}" Account="${ACCOUNT_NAME}" \
+      set QOS+="${QOS_NAME}" MaxTRES=gres/gpu=4 GrpTRES=gres/gpu=4 >/dev/null
+  done
+  verify
+}
+
+state_gpu_max() {
+  local user=$1 state=${USER_STATE_DIR}/${user}.state value
+  [[ -f ${state} && ! -L ${state} ]] || fail "missing lifecycle state for new user ${user}"
+  value=$(awk -F= '$1 == "MAX_GPUS" {print $2; found=1} END {exit !found}' "${state}") \
+    || fail "missing MAX_GPUS for new user ${user}"
+  [[ ${value} == 0 || ${value} == 1 ]] || fail "invalid MAX_GPUS for new user ${user}"
+  printf '%s\n' "${value}"
+}
+
+rollback_policy() {
+  [[ -f ${SNAPSHOT} && ! -L ${SNAPSHOT} ]] || fail 'owned rollback snapshot is unavailable'
+  validate_snapshot
+  if "${SQUEUE}" -h -o '%q' | grep -Fxq "${QOS_NAME}"; then
+    fail 'cannot rollback while a dedicated multi-GPU QoS Job is active'
+  fi
+  load_managed_users
+  declare -A snapshotted=()
+  local record user account qos default_qos max_tres group_tres
+  local restore_max_tres restore_group_tres _rest
+  while IFS='|' read -r record user account qos default_qos max_tres group_tres _rest; do
+    [[ ${record} == VERSION ]] && continue
+    [[ ${record} == USER && ${account} == "${ACCOUNT_NAME}" ]] \
+      || fail 'invalid rollback snapshot record'
+    [[ ${user} =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || fail 'unsafe username in rollback snapshot'
+    [[ ${default_qos} == general ]] || fail "unexpected original default QoS for ${user}"
+    [[ -z ${max_tres} || ${max_tres} =~ ^gres/gpu=[01]$ ]] \
+      || fail "unexpected original GPU ceiling for ${user}"
+    [[ -z ${group_tres} || ${group_tres} =~ ^gres/gpu=[01]$ ]] \
+      || fail "unexpected original aggregate GPU ceiling for ${user}"
+    snapshotted["${user}"]=1
+    restore_max_tres=${max_tres:-gres/gpu=-1}
+    restore_group_tres=${group_tres:-gres/gpu=-1}
+    "${SACCTMGR}" -i modify user where Name="${user}" Account="${ACCOUNT_NAME}" \
+      set QOS="${qos}" DefaultQOS="${default_qos}" MaxTRES="${restore_max_tres}" \
+      GrpTRES="${restore_group_tres}" >/dev/null
+  done <"${SNAPSHOT}"
+
+  for user in "${MANAGED_USERS[@]}"; do
+    [[ -n ${snapshotted[${user}]:-} ]] && continue
+    local gpu_max
+    gpu_max=$(state_gpu_max "${user}")
+    "${SACCTMGR}" -i modify user where Name="${user}" Account="${ACCOUNT_NAME}" \
+      set QOS=general DefaultQOS=general MaxTRES="gres/gpu=${gpu_max}" \
+      GrpTRES=gres/gpu=-1 >/dev/null
+  done
+
+  "${SACCTMGR}" -i modify account where Name="${ACCOUNT_NAME}" \
+    set QOS-="${QOS_NAME}" >/dev/null
+  "${SACCTMGR}" -i delete qos where Name="${QOS_NAME}" >/dev/null
+  [[ -z $(qos_line) ]] || fail 'dedicated QoS still exists after rollback'
+  rm -f -- "${SNAPSHOT}"
+  printf 'MULTIGPU_QOS_POLICY=ROLLED_BACK\n'
+}
+
+[[ ${EUID} -eq 0 ]] || fail 'must run as root'
+case ${1:-} in
+  apply) apply_policy ;;
+  verify) verify ;;
+  rollback) rollback_policy ;;
+  *) fail 'usage: h100-multigpu-qos-policy apply|verify|rollback' ;;
+esac

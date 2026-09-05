@@ -1,25 +1,29 @@
 "use client";
 
 import Link from "next/link";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 
 import { ACCESS_MODE_STATUS, TRANSPORT_TLS_STATUS } from "@h100-portal/config";
 import { Button, Card, EmptyState, Input, StatusBadge } from "@h100-portal/ui";
 import {
   ApiError,
+  adminJobGpuApprovals,
   alerts,
   approveOperation,
   audit,
   containers,
   createOperation,
+  decideJobGpuApproval,
   gpus,
   gpuHealth,
   imageInventory,
   monitoring,
+  me,
   operations,
   productionPilot,
   quotas,
+  reauthenticate,
   registries,
   slurmAccounts,
   slurmHistory,
@@ -27,6 +31,7 @@ import {
   slurmNodes,
   storage,
   submitOperation,
+  type AdminJobGpuApproval,
 } from "../lib/api";
 import {
   ErrorBlock,
@@ -407,7 +412,155 @@ export function SlurmModule() {
   );
 }
 
+function GpuApprovalCard({ approval }: { approval: AdminJobGpuApproval }) {
+  const queryClient = useQueryClient();
+  const { t } = useI18n();
+  const [approvedCount, setApprovedCount] = useState<1 | 2 | 3 | 4>(
+    approval.requested_gpu_count,
+  );
+  const [comment, setComment] = useState("");
+  const [password, setPassword] = useState("");
+  const review = useMutation({
+    mutationFn: async (decision: "APPROVE" | "REJECT") => {
+      await reauthenticate(password);
+      return decideJobGpuApproval(approval.id, {
+        decision,
+        approved_gpu_count: decision === "APPROVE" ? approvedCount : null,
+        comment,
+      });
+    },
+    onSuccess: async () => {
+      setPassword("");
+      await queryClient.invalidateQueries({ queryKey: ["job-gpu-approvals"] });
+    },
+  });
+  return (
+    <div className="gpu-approval-review">
+      <div className="section-card-header">
+        <div>
+          <div className="section-card-title">
+            {approval.job.name} · {approval.owner.display_name}
+          </div>
+          <div className="section-card-subtitle">
+            {approval.owner.login_name} / {approval.owner.unix_username}
+          </div>
+        </div>
+      </div>
+      <dl className="kv-grid">
+        <div className="kv">
+          <dt>{t("申请GPU")}</dt>
+          <dd>{approval.requested_gpu_count}</dd>
+        </div>
+        <div className="kv">
+          <dt>{t("模型")}</dt>
+          <dd>{approval.model_name}</dd>
+        </div>
+        <div className="kv">
+          <dt>{t("架构")}</dt>
+          <dd>{approval.model_architecture}</dd>
+        </div>
+        <div className="kv">
+          <dt>{t("框架")}</dt>
+          <dd>
+            {approval.framework} {approval.framework_version}
+          </dd>
+        </div>
+        <div className="kv">
+          <dt>{t("参数量")}</dt>
+          <dd>{approval.parameter_count}</dd>
+        </div>
+        <div className="kv">
+          <dt>{t("最长运行")}</dt>
+          <dd>{Math.ceil(approval.job.time_limit_seconds / 60)} min</dd>
+        </div>
+      </dl>
+      <h3>{t("任务说明")}</h3>
+      <p>{approval.workload_description}</p>
+      <h3>{t("数据集说明")}</h3>
+      <p>{approval.dataset_description}</p>
+      <h3>{t("并行策略")}</h3>
+      <p>{approval.parallel_strategy}</p>
+      <h3>{t("多卡收益与合理性")}</h3>
+      <p>{approval.scaling_justification}</p>
+      <div className="mono muted">Script SHA-256: {approval.script_sha256}</div>
+      <div className="job-form-grid">
+        <label>
+          {t("批准GPU数量")}
+          <select
+            className="ui-input"
+            value={approvedCount}
+            onChange={(event) =>
+              setApprovedCount(Number(event.target.value) as 1 | 2 | 3 | 4)
+            }
+          >
+            {Array.from(
+              { length: approval.requested_gpu_count },
+              (_, index) => index + 1,
+            ).map((count) => (
+              <option key={count} value={count}>
+                {count}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="job-script-field">
+          {t("审批意见")}
+          <textarea
+            className="ui-textarea"
+            value={comment}
+            onChange={(event) => setComment(event.target.value)}
+            rows={3}
+            maxLength={1000}
+            required
+          />
+        </label>
+        <label>
+          {t("管理员密码（最近认证）")}
+          <Input
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            autoComplete="current-password"
+          />
+        </label>
+      </div>
+      <div className="button-row">
+        <Button
+          tone="primary"
+          disabled={review.isPending || !comment.trim() || !password}
+          onClick={() => review.mutate("APPROVE")}
+        >
+          {t("按所选GPU数量批准")}
+        </Button>
+        <Button
+          tone="danger"
+          disabled={review.isPending || !comment.trim() || !password}
+          onClick={() => review.mutate("REJECT")}
+        >
+          {t("驳回")}
+        </Button>
+      </div>
+      {review.isError ? (
+        <div className="error-box" role="alert">
+          {review.error instanceof Error ? review.error.message : t("审批失败")}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function JobsModule() {
+  const current = useQuery({ queryKey: ["me"], queryFn: me, retry: false });
+  const canReview = ["platform_owner", "platform_admin"].includes(
+    current.data?.role ?? "",
+  );
+  const approvals = useQuery({
+    queryKey: ["job-gpu-approvals"],
+    queryFn: adminJobGpuApprovals,
+    enabled: canReview,
+    retry: false,
+    refetchInterval: 15_000,
+  });
   const query = useQuery({
     queryKey: ["slurm-jobs-history"],
     queryFn: async () => {
@@ -425,6 +578,42 @@ export function JobsModule() {
       description="当前队列与最近完成/失败作业"
       query={query}
     >
+      {canReview ? (
+        <SectionCard
+          title="多GPU审批"
+          subtitle="2至4张GPU申请必须审批；可以降低GPU数量后批准"
+        >
+          {approvals.isPending ? <LoadingBlock /> : null}
+          {approvals.isError ? <ErrorBlock /> : null}
+          {approvals.data?.approvals.filter((item) => item.state === "PENDING")
+            .length === 0 ? (
+            <EmptyState
+              title="没有待审批的多GPU作业"
+              detail="新的申请会显示在这里"
+            />
+          ) : null}
+          {approvals.data?.approvals
+            .filter((item) => item.state === "PENDING")
+            .map((approval) => (
+              <GpuApprovalCard key={approval.id} approval={approval} />
+            ))}
+          {approvals.data ? (
+            <Table
+              rows={approvals.data.approvals.filter(
+                (item) => item.state !== "PENDING",
+              )}
+              columns={[
+                ["state", "审批状态"],
+                ["model_name", "模型"],
+                ["requested_gpu_count", "申请GPU"],
+                ["approved_gpu_count", "批准GPU"],
+                ["decision_comment", "审批意见"],
+              ]}
+              empty="暂无历史多GPU审批"
+            />
+          ) : null}
+        </SectionCard>
+      ) : null}
       <Card>
         <Table
           rows={rowsAt(query.data?.current, "jobs")}

@@ -364,6 +364,31 @@ def test_container_sudo_is_user_scoped_read_only_and_keeps_host_isolation() -> N
     assert "h100-container-sudo-enable" in installer
 
 
+def test_multigpu_qos_policy_is_integrity_bound_and_gates_api_startup() -> None:
+    policy = PLATFORM_ROOT / "scripts/h100-multigpu-qos-policy"
+    installer = (PORTAL_ROOT / "deploy/scripts/install-runtime.sh").read_text()
+    manifest = json.loads((PORTAL_ROOT / "deploy/worker-scripts.json").read_text())
+    unit = (PORTAL_ROOT / "deploy/systemd/h100-multigpu-qos-policy.service").read_text()
+    api_unit = (PORTAL_ROOT / "deploy/systemd/h100-portal-api.service").read_text()
+
+    assert policy.is_file() and policy.stat().st_mode & 0o111
+    assert manifest["h100-multigpu-qos-policy"] == hashlib.sha256(policy.read_bytes()).hexdigest()
+    assert 'MULTIGPU_QOS_POLICY_SOURCE="${PLATFORM_DIR}/scripts/' in installer
+    assert "/usr/local/sbin/h100-multigpu-qos-policy" in installer
+    assert "h100-multigpu-qos-policy.service" in installer
+
+    assert "ExecStart=/usr/local/sbin/h100-multigpu-qos-policy apply" in unit.splitlines()
+    assert "ExecStartPost=/usr/local/sbin/h100-multigpu-qos-policy verify" in unit.splitlines()
+    assert "ExecStop=" not in unit
+    assert "NoNewPrivileges=yes" in unit.splitlines()
+    assert "ProtectSystem=strict" in unit.splitlines()
+    assert "ReadWritePaths=/var/lib/h100-portal" in unit.splitlines()
+    assert "Requires=slurmdbd.service slurmctld.service" in unit.splitlines()
+    assert "Requires=h100-portal-worker.socket h100-multigpu-qos-policy.service" in api_unit
+    assert "After=network.target postgresql.service h100-portal-worker.socket " in api_unit
+    assert "h100-multigpu-qos-policy.service" in api_unit
+
+
 def test_legacy_easytier_ingress_and_compose_reconciliation_are_installed() -> None:
     installer = (PORTAL_ROOT / "deploy/scripts/install-runtime.sh").read_text()
     ingress = (PLATFORM_ROOT / "scripts/h100-easytier-legacy-ingress").read_text()

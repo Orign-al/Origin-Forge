@@ -1086,6 +1086,15 @@ button {
 .job-form-grid .job-script-field {
   grid-column: 1 / -1;
 }
+.gpu-approval-review {
+  margin-bottom: 18px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--line);
+}
+.gpu-approval-review .section-card-header {
+  margin-bottom: 14px;
+  padding: 0 0 12px;
+}
 .job-submit-row {
   display: flex;
   align-items: flex-end;

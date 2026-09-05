@@ -228,7 +228,7 @@ export default function ComputeRequestPage() {
             </SectionCard>
             <SectionCard
               title="GPU需求"
-              subtitle="Slurm 总额度；GPU Profile 固定为 1"
+              subtitle="单卡直接提交权限；2至4张按作业审批"
             >
               <label className="form-field" htmlFor="compute-gpu">
                 <span>{t("GPU 最大数量")}</span>
@@ -248,9 +248,9 @@ export default function ComputeRequestPage() {
               <p className="muted">
                 {profile === "GPU_1_8CPU_32GB"
                   ? t(
-                      "GPU Development 将作业上限固定为 1；H100 仅在作业运行期间分配并在结束后自动释放。",
+                      "GPU Development 允许直接提交1张H100；2至4张须按作业提交完整资料并审批。H100仅在作业运行期间分配。",
                     )
-                  : t("GPU 任务通过 Portal 作业页面提交，最多 1 张。")}
+                  : t("CPU Development 不具备GPU作业权限。")}
               </p>
             </SectionCard>
             <SectionCard title="标准开发环境" subtitle="规格不可由普通用户修改">

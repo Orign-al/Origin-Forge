@@ -325,7 +325,8 @@ export type SelfJob = {
   reason: string | null;
   cpus: number;
   memory_mb: number;
-  gpu_count: 0 | 1;
+  gpu_count: 0 | 1 | 2 | 3 | 4;
+  gpu_approval: JobGpuApproval | null;
   time_limit_seconds: number;
   script_path: string;
   script_snapshot_path: string;
@@ -341,6 +342,42 @@ export type SelfJob = {
   elapsed_seconds: number | null;
   exit_code: string | null;
   authoritative: boolean;
+};
+
+export type MultiGpuRequestDetails = {
+  model_name: string;
+  model_architecture: string;
+  framework: string;
+  framework_version: string;
+  parameter_count: string;
+  workload_description: string;
+  dataset_description: string;
+  parallel_strategy: string;
+  scaling_justification: string;
+};
+
+export type JobGpuApproval = MultiGpuRequestDetails & {
+  id: string;
+  state: "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED";
+  requested_gpu_count: 2 | 3 | 4;
+  approved_gpu_count: 1 | 2 | 3 | 4 | null;
+  script_sha256: string;
+  requested_at: string;
+  reviewed_at: string | null;
+  reviewed_by: string | null;
+  decision_comment: string | null;
+};
+
+export type AdminJobGpuApproval = JobGpuApproval & {
+  portal_job_id: string;
+  owner: {
+    portal_user_id: string;
+    login_name: string;
+    display_name: string;
+    managed_user_id: string;
+    unix_username: string;
+  };
+  job: SelfJob;
 };
 
 export type SelfTerminal = {
@@ -1040,15 +1077,38 @@ export const submitSelfJob = (payload: {
   script: string;
   cpus: number;
   memory_mb: number;
-  gpu_count: 0 | 1;
+  gpu_count: 0 | 1 | 2 | 3 | 4;
   time_limit_seconds: number;
   image_ref: string | null;
   source_path?: string | null;
+  multi_gpu_request?: MultiGpuRequestDetails | null;
   idempotency_key: string;
 }) =>
   apiFetch<{ status: string; job: SelfJob }>("/self/jobs", {
     method: "POST",
     body: JSON.stringify(payload),
+  });
+export const adminJobGpuApprovals = () =>
+  apiFetch<{
+    status: string;
+    approvals: AdminJobGpuApproval[];
+    count: number;
+  }>("/admin/job-gpu-approvals");
+export const decideJobGpuApproval = (
+  id: string,
+  payload: {
+    decision: "APPROVE" | "REJECT";
+    approved_gpu_count: 1 | 2 | 3 | 4 | null;
+    comment: string;
+  },
+) =>
+  apiFetch<{
+    status: string;
+    idempotent_replay: boolean;
+    approval: AdminJobGpuApproval;
+  }>(`/admin/job-gpu-approvals/${encodeURIComponent(id)}/decision`, {
+    method: "POST",
+    body: JSON.stringify({ ...payload, idempotency_key: randomUuid() }),
   });
 export const selfJobLogs = (id: string) =>
   apiFetch<{ status: string; stdout: string; stderr: string; job: SelfJob }>(

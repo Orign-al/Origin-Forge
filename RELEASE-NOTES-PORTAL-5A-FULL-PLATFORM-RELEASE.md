@@ -4,6 +4,19 @@ Release: `PORTAL-5A-FULL-PLATFORM-RELEASE`
 Status: `PASS`
 Acceptance date: 2026-08-30 UTC
 
+## Multi-GPU approval candidate addendum — not yet deployed
+
+Candidate scope: `PORTAL-5A-USER-MULTIGPU-APPROVAL-1`
+Status: `CANDIDATE VALIDATION IN PROGRESS / NOT PRODUCTION`
+
+- GPU 0 or 1 remains a direct ordinary-user submission; GPU 2, 3, or 4 requires complete model, architecture, framework/version, parameter-count, workload, dataset, parallel-strategy, and scaling-justification fields.
+- A complete multi-GPU request is persisted as `APPROVAL_PENDING` without calling Worker, creating a Slurm Job, allocating a GPU, or exposing runtime logs.
+- Only `platform_owner` and `platform_admin` can review. They must recently reauthenticate and may approve 1 through the requested number of GPUs or reject with a comment; operators, auditors, and ordinary users cannot review.
+- Worker requires an immutable approval contract and submits the exact approved count. Direct jobs use the existing one-GPU policy; approved 2-4 GPU jobs use a dedicated scheduling policy.
+- Slurm association and QoS controls cap one Job and the user's aggregate concurrent allocation at four H100s. Unrelated Slurm users are excluded from the dedicated policy.
+- Development containers remain GPU-less and unprivileged. GPU access remains limited to the exact Slurm Job allocation.
+- This addendum describes the candidate only. The production behavior recorded in the release sections below remains authoritative until a separate deployment and acceptance phase passes.
+
 ## Ordinary-user CLI Job addendum
 
 Addendum: `PORTAL-5A-USER-CLI-JOBS-1`

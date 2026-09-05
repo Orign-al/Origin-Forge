@@ -23,6 +23,7 @@ import {
   selfStorage,
   submitSelfJob,
   type ComputeLease,
+  type MultiGpuRequestDetails,
   type SelfJob,
   type User,
 } from "../lib/api";
@@ -474,7 +475,7 @@ export function OrdinaryDashboard() {
           </div>
         </Card>
         <Card className="stat-panel">
-          <div className="stat-label">{t("GPU任务上限")}</div>
+          <div className="stat-label">{t("GPU直接提交上限")}</div>
           <div className="stat-value">{environment.gpu_max}</div>
           <div className="stat-detail">{t("通过作业页面提交")}</div>
         </Card>
@@ -508,7 +509,10 @@ export function OrdinaryDashboard() {
             </Link>
           </div>
         </SectionCard>
-        <SectionCard title="提交计算任务" subtitle="CPU 或最多1张GPU">
+        <SectionCard
+          title="提交计算任务"
+          subtitle="CPU 或1至4张GPU；2至4张需审批"
+        >
           <p>{t("选择工作区中的脚本，通过Portal提交到Slurm。")}</p>
           <Link className="ui-button ui-button-primary" href="/jobs">
             {t("新建作业")}
@@ -578,7 +582,7 @@ export function OrdinaryConnection() {
           {gpuProfile ? (
             <div className="kv">
               <dt>{t("GPU 作业")}</dt>
-              <dd>{t("H100 × 1 · 按需调度")}</dd>
+              <dd>{t("H100 × 1 直接提交；2至4张需审批")}</dd>
             </div>
           ) : null}
           <div className="kv">
@@ -698,7 +702,7 @@ export function OrdinaryContainer() {
           {gpuProfile ? (
             <div className="kv">
               <dt>{t("GPU 作业")}</dt>
-              <dd>{t("H100 × 1 · 按需调度")}</dd>
+              <dd>{t("H100 × 1 直接提交；2至4张需审批")}</dd>
             </div>
           ) : null}
           <div className="kv">
@@ -757,7 +761,7 @@ function JobRows({
     return (
       <EmptyState
         title={t("还没有Portal作业")}
-        detail={t("从上方创建CPU或单GPU作业")}
+        detail={t("从上方创建CPU或GPU作业；2至4张GPU需要管理员审批")}
       />
     );
   return (
@@ -777,7 +781,12 @@ function JobRows({
         <tbody>
           {jobs.map((job) => (
             <tr key={job.id}>
-              <td>{job.slurm_job_id ?? t("提交中")}</td>
+              <td>
+                {job.slurm_job_id ??
+                  (job.state === "APPROVAL_PENDING"
+                    ? t("等待审批")
+                    : t("提交中"))}
+              </td>
               <td>{job.name}</td>
               <td>
                 <StatusBadge value={job.state} />
@@ -812,13 +821,25 @@ export function OrdinaryJobs() {
   const [script, setScript] = useState(DEFAULT_JOB_SCRIPT);
   const [cpus, setCpus] = useState(2);
   const [memory, setMemory] = useState(4096);
-  const [gpu, setGpu] = useState<0 | 1>(0);
+  const [gpu, setGpu] = useState<0 | 1 | 2 | 3 | 4>(0);
+  const [multiGpuRequest, setMultiGpuRequest] =
+    useState<MultiGpuRequestDetails>({
+      model_name: "",
+      model_architecture: "",
+      framework: "",
+      framework_version: "",
+      parameter_count: "",
+      workload_description: "",
+      dataset_description: "",
+      parallel_strategy: "",
+      scaling_justification: "",
+    });
   const [minutes, setMinutes] = useState(30);
   const [selected, setSelected] = useState<SelfJob | null>(null);
   const logs = useQuery({
     queryKey: ["self-job-logs", selected?.id],
     queryFn: () => selfJobLogs(selected?.id ?? ""),
-    enabled: Boolean(selected),
+    enabled: Boolean(selected?.slurm_job_id),
     refetchInterval:
       selected && !["COMPLETED", "FAILED", "CANCELLED"].includes(selected.state)
         ? 5000
@@ -834,6 +855,7 @@ export function OrdinaryJobs() {
         gpu_count: gpu,
         time_limit_seconds: minutes * 60,
         image_ref: null,
+        multi_gpu_request: gpu >= 2 ? multiGpuRequest : null,
         idempotency_key: randomUuid(),
       }),
     onSuccess: async () =>
@@ -848,12 +870,21 @@ export function OrdinaryJobs() {
     event.preventDefault();
     submit.mutate();
   }
+  const multiGpuDetailsComplete = Object.values(multiGpuRequest).every(
+    (value) => value.trim().length > 0,
+  );
+  function updateMultiGpuRequest(
+    field: keyof MultiGpuRequestDetails,
+    value: string,
+  ) {
+    setMultiGpuRequest((current) => ({ ...current, [field]: value }));
+  }
   return (
     <>
       <PageHeading
         title="作业"
-        description="通过Portal提交CPU或单GPU Slurm任务"
-        action={<StatusBadge value="MAX 1 GPU" />}
+        description="通过Portal提交CPU或1至4张GPU的Slurm任务"
+        action={<StatusBadge value="2-4 GPU 需审批" />}
       />
       <SectionCard
         title="新建作业"
@@ -901,10 +932,15 @@ export function OrdinaryJobs() {
             <select
               className="ui-input"
               value={gpu}
-              onChange={(e) => setGpu(Number(e.target.value) as 0 | 1)}
+              onChange={(e) =>
+                setGpu(Number(e.target.value) as 0 | 1 | 2 | 3 | 4)
+              }
             >
               <option value={0}>0</option>
               <option value={1}>1</option>
+              <option value={2}>2（需审批）</option>
+              <option value={3}>3（需审批）</option>
+              <option value={4}>4（需审批）</option>
             </select>
           </label>
           <label>
@@ -917,11 +953,114 @@ export function OrdinaryJobs() {
               onChange={(e) => setMinutes(Number(e.target.value))}
             />
           </label>
+          {gpu >= 2 ? (
+            <div className="job-script-field">
+              <div className="notice" role="status">
+                {t(
+                  "多GPU作业不会立即进入Slurm。请完整说明模型、框架、数据集和并行收益；管理员可降低GPU数量后批准，或驳回不合理申请。",
+                )}
+              </div>
+              <div className="job-form-grid">
+                <label>
+                  {t("模型名称")}
+                  <Input
+                    value={multiGpuRequest.model_name}
+                    onChange={(event) =>
+                      updateMultiGpuRequest("model_name", event.target.value)
+                    }
+                    maxLength={200}
+                    required
+                  />
+                </label>
+                <label>
+                  {t("模型架构")}
+                  <Input
+                    value={multiGpuRequest.model_architecture}
+                    onChange={(event) =>
+                      updateMultiGpuRequest(
+                        "model_architecture",
+                        event.target.value,
+                      )
+                    }
+                    maxLength={500}
+                    required
+                  />
+                </label>
+                <label>
+                  {t("框架")}
+                  <Input
+                    value={multiGpuRequest.framework}
+                    onChange={(event) =>
+                      updateMultiGpuRequest("framework", event.target.value)
+                    }
+                    maxLength={100}
+                    placeholder="PyTorch / JAX / TensorFlow"
+                    required
+                  />
+                </label>
+                <label>
+                  {t("框架版本")}
+                  <Input
+                    value={multiGpuRequest.framework_version}
+                    onChange={(event) =>
+                      updateMultiGpuRequest(
+                        "framework_version",
+                        event.target.value,
+                      )
+                    }
+                    maxLength={100}
+                    required
+                  />
+                </label>
+                <label>
+                  {t("模型规模 / 参数量")}
+                  <Input
+                    value={multiGpuRequest.parameter_count}
+                    onChange={(event) =>
+                      updateMultiGpuRequest(
+                        "parameter_count",
+                        event.target.value,
+                      )
+                    }
+                    maxLength={100}
+                    placeholder="例如 70B"
+                    required
+                  />
+                </label>
+                {(
+                  [
+                    ["workload_description", "训练/推理任务说明"],
+                    ["dataset_description", "数据集说明"],
+                    ["parallel_strategy", "并行策略"],
+                    ["scaling_justification", "多卡扩展收益与合理性"],
+                  ] as Array<[keyof MultiGpuRequestDetails, string]>
+                ).map(([field, label]) => (
+                  <label className="job-script-field" key={field}>
+                    {t(label)}
+                    <textarea
+                      className="ui-textarea"
+                      value={multiGpuRequest[field]}
+                      onChange={(event) =>
+                        updateMultiGpuRequest(field, event.target.value)
+                      }
+                      rows={3}
+                      maxLength={field === "parallel_strategy" ? 1000 : 2000}
+                      required
+                    />
+                  </label>
+                ))}
+              </div>
+            </div>
+          ) : null}
           <div className="job-submit-row">
             <Button
               tone="primary"
               type="submit"
-              disabled={submit.isPending || script.length === 0}
+              disabled={
+                submit.isPending ||
+                script.length === 0 ||
+                (gpu >= 2 && !multiGpuDetailsComplete)
+              }
             >
               {t("提交作业")}
             </Button>
@@ -959,12 +1098,37 @@ export function OrdinaryJobs() {
               </Button>
             ) : null}
           </div>
-          <h3>stdout</h3>
-          <pre className="job-log">{logs.data?.stdout || t("暂无输出")}</pre>
-          <h3>stderr</h3>
-          <pre className="job-log">
-            {logs.data?.stderr || t("暂无错误输出")}
-          </pre>
+          {selected.gpu_approval ? (
+            <div className="notice">
+              <strong>{t("多GPU审批")}: </strong>
+              {selected.gpu_approval.state} ·{" "}
+              {t("申请 {count} 张", {
+                count: selected.gpu_approval.requested_gpu_count,
+              })}
+              {selected.gpu_approval.approved_gpu_count
+                ? ` · ${t("批准 {count} 张", { count: selected.gpu_approval.approved_gpu_count })}`
+                : ""}
+              {selected.gpu_approval.decision_comment
+                ? ` · ${selected.gpu_approval.decision_comment}`
+                : ""}
+            </div>
+          ) : null}
+          {selected.slurm_job_id ? (
+            <>
+              <h3>stdout</h3>
+              <pre className="job-log">
+                {logs.data?.stdout || t("暂无输出")}
+              </pre>
+              <h3>stderr</h3>
+              <pre className="job-log">
+                {logs.data?.stderr || t("暂无错误输出")}
+              </pre>
+            </>
+          ) : (
+            <div className="notice">
+              {t("审批完成并提交Slurm后才会产生运行日志。")}
+            </div>
+          )}
         </SectionCard>
       ) : null}
     </>
@@ -1226,7 +1390,7 @@ export function OrdinaryHelp() {
         <SectionCard title="开发容器">
           <p>
             {t(
-              "开发容器始终不挂载 GPU；GPU Development 开通最多 1 张 H100 的按需作业额度。",
+              "开发容器始终不挂载 GPU；GPU Development 可直接提交1张H100，2至4张需提交完整资料并等待审批。",
             )}
           </p>
           <Link className="table-link" href="/access">
@@ -1234,7 +1398,7 @@ export function OrdinaryHelp() {
           </Link>
         </SectionCard>
         <SectionCard title="GPU任务">
-          <p>{t("通过作业页面提交，当前最多使用1张GPU。")}</p>
+          <p>{t("通过作业页面提交；1张GPU直接提交，2至4张需管理员审批。")}</p>
           <Link className="table-link" href="/jobs">
             {t("进入作业页面")}
           </Link>

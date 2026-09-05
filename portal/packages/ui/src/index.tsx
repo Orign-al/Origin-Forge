@@ -83,11 +83,14 @@ export function StatusBadge({
           "IDLE+DRAIN",
           "DEFERRED",
           "PENDING",
+          "APPROVAL_PENDING",
           "UNKNOWN",
           "PARTIAL",
         ].includes(normalized)
       ? "warning"
-      : ["FAILED", "DENIED", "BLOCKED", "ERROR", "LOCKED"].includes(normalized)
+      : ["FAILED", "DENIED", "BLOCKED", "ERROR", "LOCKED", "REJECTED"].includes(
+            normalized,
+          )
         ? "danger"
         : "info";
   return <Badge label={value ?? "UNKNOWN"} tone={tone} />;

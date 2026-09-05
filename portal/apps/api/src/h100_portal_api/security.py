@@ -127,6 +127,8 @@ def safe_metadata(data: object, sensitive_keys: Iterable[str] | None = None) -> 
         "public_key_file",
         "public_key_path",
         "authorized_keys",
+        "script",
+        "script_content",
         "database_url",
         "munge_key",
     }

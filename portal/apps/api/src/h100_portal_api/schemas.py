@@ -383,15 +383,36 @@ class SelfTerminalResizeRequest(ApiModel):
     rows: int = Field(ge=5, le=120)
 
 
+class MultiGpuRequestDetails(ApiModel):
+    model_name: str = Field(min_length=1, max_length=200)
+    model_architecture: str = Field(min_length=1, max_length=500)
+    framework: str = Field(min_length=1, max_length=100)
+    framework_version: str = Field(min_length=1, max_length=100)
+    parameter_count: str = Field(min_length=1, max_length=100)
+    workload_description: str = Field(min_length=1, max_length=2000)
+    dataset_description: str = Field(min_length=1, max_length=2000)
+    parallel_strategy: str = Field(min_length=1, max_length=1000)
+    scaling_justification: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("*")
+    @classmethod
+    def normalize_multigpu_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("multi-GPU request details must not be blank")
+        return normalized
+
+
 class SelfJobSubmitRequest(ApiModel):
     name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
     script: str = Field(min_length=1, max_length=8192)
     cpus: int = Field(ge=1, le=8)
     memory_mb: int = Field(ge=256, le=32768)
-    gpu_count: int = Field(ge=0, le=32)
+    gpu_count: int = Field(ge=0, le=4)
     time_limit_seconds: int = Field(ge=60, le=345600)
     image_ref: str | None = Field(default=None, max_length=512)
     source_path: str | None = Field(default=None, min_length=1, max_length=512)
+    multi_gpu_request: MultiGpuRequestDetails | None = None
     idempotency_key: uuid.UUID
 
     @field_validator("script")
@@ -403,6 +424,21 @@ class SelfJobSubmitRequest(ApiModel):
         if any(line.lstrip().startswith("#SBATCH") for line in value.splitlines()):
             raise ValueError("#SBATCH directives are not accepted; use Portal resource fields")
         return value
+
+
+class JobGpuApprovalDecisionRequest(ApiModel):
+    decision: Literal["APPROVE", "REJECT"]
+    approved_gpu_count: int | None = Field(default=None, ge=1, le=4)
+    comment: str = Field(min_length=1, max_length=1000)
+    idempotency_key: uuid.UUID
+
+    @field_validator("comment")
+    @classmethod
+    def normalize_gpu_decision_comment(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("review comment must not be blank")
+        return normalized
 
 
 class LeaseRenewalCreateRequest(ApiModel):

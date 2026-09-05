@@ -197,7 +197,7 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
                 ? t("Portal Identity Only")
                 : user.resource_onboarding_state === "STAGED"
                   ? t("Container STOPPED · Lease 未开始")
-                  : t("GPU 上限 1 · 租约受控")}
+                  : t("单卡直提 · 多卡审批 · 租约受控")}
             </>
           ) : (
             <>

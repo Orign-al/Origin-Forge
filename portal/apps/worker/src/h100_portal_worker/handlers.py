@@ -120,6 +120,9 @@ INTEGRITY_FILE_ALLOWLIST = {
     # Existing containers receive sudo only through this explicit, audited,
     # user-confirmed migration tool; it is not callable through the Worker API.
     "h100-container-sudo-enable": "/usr/local/sbin/h100-container-sudo-enable",
+    # The dedicated multi-GPU QoS is installed as a root-owned systemd policy
+    # gate and cannot be invoked through the Worker API.
+    "h100-multigpu-qos-policy": "/usr/local/sbin/h100-multigpu-qos-policy",
 }
 SCRIPT_HASH_CONFIG = Path("/etc/h100-portal/worker-scripts.json")
 GPU_ISOLATED_USERS = Path("/etc/h100-platform/gpu-isolated-users")
@@ -3810,21 +3813,23 @@ def _compute_stage_postconditions(payload: dict[str, Any]) -> dict[str, Any]:
             "where",
             f"User={username}",
             f"Account={payload['slurm_account']}",
-            "format=User,Account,QOS,DefaultQOS,MaxTRES",
+            "format=User,Account,QOS,DefaultQOS,MaxTRES,GrpTRES",
         ],
         timeout=20,
     )
     association_matches = False
-    expected_max_tres = f"gres/gpu={payload['gpu_max']}"
+    expected_max_tres = "gres/gpu=4"
     if association.get("ok"):
         for line in str(association.get("stdout", "")).splitlines():
             fields = line.split("|")
             if (
-                len(fields) >= 5
+                len(fields) >= 6
                 and fields[:2] == [username, payload["slurm_account"]]
                 and payload["slurm_qos"] in fields[2].split(",")
+                and "portal-approved-multigpu" in fields[2].split(",")
                 and fields[3] == payload["slurm_qos"]
                 and expected_max_tres in fields[4].split(",")
+                and expected_max_tres in fields[5].split(",")
             ):
                 association_matches = True
                 break
@@ -8592,14 +8597,16 @@ def _managed_slurm_security_preflight(payload: dict[str, Any]) -> None:
             "where",
             f"User={username}",
             f"Account={slurm_account}",
-            "format=User,Account,QOS,DefaultQOS",
+            "format=User,Account,QOS,DefaultQOS,MaxTRES,GrpTRES",
         ],
         timeout=20,
     )
     if not association.get("ok") or not any(
-        len(values) >= 4
+        len(values) >= 6
         and values[:2] == [username, slurm_account]
         and (slurm_qos in values[2].split(",") or values[3] == slurm_qos)
+        and "gres/gpu=4" in values[4].split(",")
+        and "gres/gpu=4" in values[5].split(",")
         for values in (line.split("|") for line in str(association.get("stdout", "")).splitlines())
     ):
         raise LifecycleValidationError(
@@ -8610,11 +8617,14 @@ def _managed_slurm_security_preflight(payload: dict[str, Any]) -> None:
         ["-n", "-P", "show", "qos", slurm_qos, "format=Name,MaxTRESPerUser"],
         timeout=20,
     )
+    expected_qos_limit = 4 if int(payload["gpu_count"]) > 1 else 1
     if not qos.get("ok") or not any(
-        line.startswith(f"{slurm_qos}|") and "gres/gpu=1" in line
+        line.startswith(f"{slurm_qos}|") and f"gres/gpu={expected_qos_limit}" in line
         for line in str(qos.get("stdout", "")).splitlines()
     ):
-        raise LifecycleValidationError("GPU_LIMIT_REJECTED", "Slurm GPU limit is not one")
+        raise LifecycleValidationError(
+            "GPU_LIMIT_REJECTED", "Slurm QoS differs from the approved GPU limit"
+        )
 
 
 def _managed_relative_parts(relative: str) -> tuple[str, ...]:
@@ -9183,8 +9193,8 @@ def _managed_sbatch_argv(
         f"--output={stdout}",
         f"--error={stderr}",
     ]
-    if int(payload["gpu_count"]) == 1:
-        argv.append("--gres=gpu:h100:1")
+    if int(payload["gpu_count"]) > 0:
+        argv.append(f"--gres=gpu:h100:{payload['gpu_count']}")
     owned_root = Path(str(payload["workspace_path"]))
     home_source = Path(str(payload["home_source"]))
     home_path = Path(str(payload["home_path"]))
