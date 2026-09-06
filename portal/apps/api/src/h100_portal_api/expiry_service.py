@@ -14,6 +14,7 @@ from h100_portal_api.models import (
     PortalComputeLease,
     PortalContainer,
     PortalJob,
+    PortalLeaseRenewalRequest,
     PortalManagedUser,
     PortalOperation,
     PortalOperationEvent,
@@ -30,6 +31,54 @@ RECYCLE_EVIDENCE_VERSION = "lease-recycle-cleanup-v1"
 MAX_AUTOMATIC_ATTEMPTS = 3
 AUTOMATIC_RETRY_DELAYS_SECONDS = (60, 300)
 CleanupMode = Literal["AUTOMATIC", "PLATFORM_OWNER_RECOVERY"]
+
+
+def reconcile_expired_renewal_requests(
+    db: Session, *, now: datetime | None = None, limit: int = 128
+) -> int:
+    """Close renewal requests that can no longer be approved.
+
+    Lease expiry is authoritative even when resource cleanup is retried or the
+    resource was restored later. Keeping the request in REQUESTED would make an
+    expired approval appear actionable forever.
+    """
+
+    trusted_now = ensure_utc(now or utcnow())
+    rows = db.scalars(
+        select(PortalLeaseRenewalRequest)
+        .join(
+            PortalComputeLease,
+            PortalComputeLease.id == PortalLeaseRenewalRequest.lease_id,
+        )
+        .where(
+            PortalLeaseRenewalRequest.state == "REQUESTED",
+            PortalComputeLease.expires_at <= trusted_now,
+        )
+        .order_by(PortalLeaseRenewalRequest.requested_at)
+        .limit(limit)
+        .with_for_update(of=PortalLeaseRenewalRequest)
+    ).all()
+    for renewal in rows:
+        renewal.state = "CANCELLED"
+        renewal.decided_at = trusted_now
+        renewal.decided_by = None
+        renewal.decision_comment = "LEASE_EXPIRED_RESTORE_REQUIRED"
+        record_audit(
+            db,
+            event_type="LEASE_RENEWAL_CANCELLED",
+            actor="portal-lease-worker",
+            actor_role="system",
+            source_ip="local-worker-socket",
+            user_agent="h100-portal-lease-expiry",
+            object_type="lease_renewal_request",
+            object_id=str(renewal.id),
+            metadata={
+                "reason": "LEASE_EXPIRED_RESTORE_REQUIRED",
+                "lease_id": str(renewal.lease_id),
+                "automatic_reconciliation": True,
+            },
+        )
+    return len(rows)
 
 
 def _due_predicate(now: Any) -> Any:
@@ -690,6 +739,8 @@ def process_due_leases(limit: int = 32) -> tuple[int, int]:
     processed = 0
     recycled = 0
     with SessionLocal() as db:
+        reconcile_expired_renewal_requests(db, limit=max(limit, 128))
+        db.commit()
         due_ids = db.scalars(
             select(PortalComputeLease.id)
             .where(*_due_predicate(utcnow()))

@@ -286,6 +286,7 @@ const EN_US: Record<string, string> = {
     "You cannot start the container, open the web terminal, or submit jobs yet. Host SSH remains disabled.",
   申请恢复: "Request Restore",
   续期申请待审批: "Renewal request pending approval",
+  续期审批: "Renewal Approvals",
   申请续期: "Request Renewal",
   将在到期前24小时开放续期: "Renewal opens 24 hours before expiry",
   续期申请未提交: "The renewal request was not submitted",

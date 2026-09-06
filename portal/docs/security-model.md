@@ -100,6 +100,11 @@ SameSite Cookie 不是唯一防线。登录使用统一错误文案，按 IP 与
 权限，不能依赖前端隐藏按钮。高风险操作进入 `PENDING_APPROVAL`，需要审批记录、
 对象名确认及最近重新认证。`slurm.resume` 在 Portal-0/1 即使获得审批也只能 dry-run。
 
+Lease 续期使用专用权限：`platform_owner` 与 `platform_admin` 可读、可审批，`auditor`
+只读，`operator` 和普通用户均无权访问管理员续期列表。审批 POST 同时要求 Session CSRF
+与最近重新认证；浏览器中的导航或按钮隐藏不是授权证据。到期服务仅将已经失效的待审请求
+收敛为 `CANCELLED`，不得把已经回收或恢复的 Lease 状态倒退回 `EXPIRED`。
+
 ## 审计与脱敏
 
 审计记录 actor、role、来源 IP、User-Agent 摘要、对象、operation、结果、时间及严格

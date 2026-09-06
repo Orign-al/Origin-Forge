@@ -30,6 +30,8 @@ PERMISSIONS: dict[str, set[str]] = {
         "compute_requests.review",
         "compute_requests.plan",
         "compute_requests.reconcile",
+        "lease.renewals.read",
+        "lease.renewals.review",
         "lease.recovery",
     },
     "platform_admin": {
@@ -53,6 +55,8 @@ PERMISSIONS: dict[str, set[str]] = {
         "compute_requests.read",
         "compute_requests.review",
         "compute_requests.plan",
+        "lease.renewals.read",
+        "lease.renewals.review",
     },
     "operator": {
         "platform.read",
@@ -79,6 +83,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "monitoring.read",
         "operations.read",
         "audit.read",
+        "lease.renewals.read",
     },
     "user": {
         "self.compute.activate",

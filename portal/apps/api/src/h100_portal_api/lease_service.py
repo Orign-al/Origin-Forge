@@ -343,8 +343,12 @@ def decide_renewal(
     if lease is None:
         raise _error(409, "LEASE_NOT_FOUND", "续期对应租约不存在")
     if ensure_utc(lease.expires_at) <= trusted_now:
-        lease.state = "EXPIRED"
-        lease.expired_at = trusted_now
+        # A delayed administrator request may race with normal expiry cleanup
+        # or a later restore. Only close the obsolete approval request here;
+        # never move an already recycled resource backwards to EXPIRED.
+        if lease.state in ACTIVE_LEASE_STATES:
+            lease.state = "EXPIRED"
+            lease.expired_at = lease.expired_at or trusted_now
         request.state = "CANCELLED"
         request.decided_at = trusted_now
         request.decided_by = decided_by

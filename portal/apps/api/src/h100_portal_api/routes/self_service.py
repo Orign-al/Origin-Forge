@@ -55,6 +55,7 @@ from h100_portal_api.models import (
     PortalResourceRestoreRequest,
     PortalSshKey,
     PortalStorageResource,
+    PortalUser,
     ensure_utc,
     utcnow,
 )
@@ -2072,26 +2073,70 @@ def create_restore_request(
 
 @router.get("/admin/lease-renewals")
 def admin_renewals(
-    context: AuthContext = Depends(permission_dependency("users.read")),
+    context: AuthContext = Depends(permission_dependency("lease.renewals.read")),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    rows = db.scalars(
-        select(PortalLeaseRenewalRequest).order_by(PortalLeaseRenewalRequest.requested_at.desc())
+    now = utcnow()
+    rows = db.execute(
+        select(
+            PortalLeaseRenewalRequest,
+            PortalComputeLease,
+            PortalManagedUser,
+            PortalUser,
+        )
+        .join(PortalComputeLease, PortalComputeLease.id == PortalLeaseRenewalRequest.lease_id)
+        .join(
+            PortalManagedUser,
+            PortalManagedUser.id == PortalLeaseRenewalRequest.owner_managed_user_id,
+        )
+        .join(PortalUser, PortalUser.id == PortalManagedUser.portal_user_id)
+        .order_by(PortalLeaseRenewalRequest.requested_at.desc())
     ).all()
+    requests: list[dict[str, Any]] = []
+    for renewal, lease, _managed, owner in rows:
+        lease_expires_at = ensure_utc(lease.expires_at)
+        actionable = (
+            renewal.state == "REQUESTED"
+            and lease_expires_at > now
+            and lease.state in {"ACTIVE", "RENEWAL_WINDOW", "RENEWAL_PENDING"}
+        )
+        requests.append(
+            {
+                "id": str(renewal.id),
+                "owner_managed_user_id": str(renewal.owner_managed_user_id),
+                "username": owner.normalized_login,
+                "display_name": owner.display_name,
+                "lease_id": str(renewal.lease_id),
+                "lease_state": lease.state,
+                "lease_expires_at": lease_expires_at.isoformat(),
+                "state": renewal.state,
+                "approval_required": renewal.approval_required,
+                "duration_seconds": renewal.requested_duration_seconds,
+                "requested_at": ensure_utc(renewal.requested_at).isoformat(),
+                "decided_at": (
+                    ensure_utc(renewal.decided_at).isoformat()
+                    if renewal.decided_at is not None
+                    else None
+                ),
+                "decision_comment": renewal.decision_comment,
+                "resulting_lease_id": (
+                    str(renewal.resulting_lease_id)
+                    if renewal.resulting_lease_id is not None
+                    else None
+                ),
+                "actionable": actionable,
+                "closed_reason": (
+                    "LEASE_EXPIRED_RESTORE_REQUIRED"
+                    if renewal.state == "REQUESTED" and not actionable
+                    else None
+                ),
+            }
+        )
     return {
         "status": "OK",
-        "requests": [
-            {
-                "id": str(row.id),
-                "owner_managed_user_id": str(row.owner_managed_user_id),
-                "lease_id": str(row.lease_id),
-                "state": row.state,
-                "approval_required": row.approval_required,
-                "duration_seconds": row.requested_duration_seconds,
-                "requested_at": ensure_utc(row.requested_at).isoformat(),
-            }
-            for row in rows
-        ],
+        "requests": requests,
+        "count": len(requests),
+        "pending_count": sum(bool(row["actionable"]) for row in requests),
     }
 
 
@@ -2100,10 +2145,11 @@ def admin_decide_renewal(
     request_id: uuid.UUID,
     body: LeaseDecisionRequest,
     request: Request,
-    context: AuthContext = Depends(permission_dependency("users.write")),
+    context: AuthContext = Depends(permission_dependency("lease.renewals.review")),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     require_session_csrf(request, context)
+    require_recent_reauthentication(context)
     try:
         renewal, successor = decide_renewal(
             db,

@@ -917,6 +917,44 @@ export const requestLeaseRenewal = (payload: {
     method: "POST",
     body: JSON.stringify(payload),
   });
+export type AdminLeaseRenewalRequest = {
+  id: string;
+  owner_managed_user_id: string;
+  username: string;
+  display_name: string;
+  lease_id: string;
+  lease_state: string;
+  lease_expires_at: string;
+  state: "REQUESTED" | "APPROVED" | "REJECTED" | "CANCELLED";
+  approval_required: boolean;
+  duration_seconds: number;
+  requested_at: string;
+  decided_at: string | null;
+  decision_comment: string | null;
+  resulting_lease_id: string | null;
+  actionable: boolean;
+  closed_reason: string | null;
+};
+export const adminLeaseRenewals = () =>
+  apiFetch<{
+    status: "OK";
+    requests: AdminLeaseRenewalRequest[];
+    count: number;
+    pending_count: number;
+  }>("/admin/lease-renewals");
+export const decideLeaseRenewal = (
+  requestId: string,
+  decision: "APPROVE" | "REJECT",
+  comment: string | null,
+) =>
+  apiFetch<{
+    status: "APPROVED" | "REJECTED";
+    renewal_request_id: string;
+    resulting_lease_id: string | null;
+  }>(`/admin/lease-renewals/${encodeURIComponent(requestId)}/decision`, {
+    method: "POST",
+    body: JSON.stringify({ decision, comment }),
+  });
 export const selfContainer = () =>
   apiFetch<{ status: string; container: SelfEnvironment["container"] }>(
     "/self/container",

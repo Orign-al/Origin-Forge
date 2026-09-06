@@ -126,6 +126,17 @@ idempotency key；旧 Plan 保持 `FAILED`，旧 Reservations 保持 `RELEASED`�
 Lease。自动批准记录 `LEASE_RENEWAL_AUTO_APPROVED`，`decided_by` 保持 `NULL`，从而不会伪造
 管理员审批人。策略开启时保持现有人工审批流程。普通用户不能读取或修改其他用户策略。
 
+人工续期审批使用管理 Portal 的独立“续期审批”页面，而不是到期后的“恢复申请”页面。
+`platform_owner` 与 `platform_admin` 拥有 `lease.renewals.read` 和
+`lease.renewals.review`，可以查看并在 CSRF 与最近重新认证通过后批准或拒绝；`auditor` 只有
+`lease.renewals.read`，只能查看；`operator` 与普通用户均无权读取或处理。前端导航按同一
+角色边界展示，但后端权限是最终授权依据。
+
+Lease 到期后，原 `REQUESTED` 续期不再可执行。周期性到期服务将其幂等收敛为
+`CANCELLED`，记录 `LEASE_RENEWAL_CANCELLED`，并保留已经进入回收或后来恢复的资源状态；
+管理员页面只把该记录显示为“已失效”历史。管理员不得在到期后批准旧续期，用户必须走
+正式恢复流程。
+
 ## Portal-3C 执行边界
 
 唯一 DRAFT 依次进入 `PENDING_APPROVAL → APPROVED → QUEUED → RUNNING`。API 只有在

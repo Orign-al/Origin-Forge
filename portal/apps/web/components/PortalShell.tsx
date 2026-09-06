@@ -129,6 +129,11 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
   }
   const user = current.data.user;
   const role = current.data.role;
+  const canReadLeaseRenewals = [
+    "platform_owner",
+    "platform_admin",
+    "auditor",
+  ].includes(role);
   const activeNavigation =
     role === "user"
       ? user.resource_onboarding_state === "NOT_ENROLLED"
@@ -136,7 +141,9 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
         : user.resource_onboarding_state === "STAGED"
           ? STAGED_USER_NAVIGATION
           : USER_NAVIGATION
-      : navigation;
+      : navigation.filter(
+          ([, href]) => href !== "/lease-renewals" || canReadLeaseRenewals,
+        );
   const alertData = alertQuery.data as { count?: unknown } | undefined;
   const alertCount =
     typeof alertData?.count === "number" ? alertData.count : "—";

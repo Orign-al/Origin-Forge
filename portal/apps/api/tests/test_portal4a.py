@@ -198,13 +198,18 @@ def _identity(
     return SimpleNamespace(user=user, managed=managed, container=container, lease=lease, key=key)
 
 
-def _admin(db: Session) -> PortalUser:
-    role = db.scalar(select(PortalRole).where(PortalRole.name == "platform_owner"))
+def _admin(
+    db: Session,
+    *,
+    role_name: str = "platform_owner",
+    login: str = "origin-al",
+) -> PortalUser:
+    role = db.scalar(select(PortalRole).where(PortalRole.name == role_name))
     user = PortalUser(
-        login_name="origin-al",
-        normalized_login="origin-al",
-        display_name="Origin-al",
-        unix_username="origin-al",
+        login_name=login,
+        normalized_login=login,
+        display_name=login,
+        unix_username=login,
         account_state=AccountState.ACTIVE,
         password_state=PasswordState.SET,
         resource_onboarding_state=OnboardingState.NOT_ENROLLED,
@@ -555,6 +560,14 @@ def test_admin_boundary_response_commits_expired_and_cancelled(
     identity.lease.expires_at = utcnow() - timedelta(seconds=1)
     database.commit()
     headers = _login(client, origin_headers, "origin-al")
+    assert (
+        client.post(
+            "/api/v1/auth/reauthenticate",
+            headers=headers,
+            json={"password": PASSWORD},
+        ).status_code
+        == 200
+    )
     response = client.post(
         f"/api/v1/admin/lease-renewals/{renewal.id}/decision",
         headers=headers,
@@ -565,6 +578,186 @@ def test_admin_boundary_response_commits_expired_and_cancelled(
     database.expire_all()
     assert database.get(PortalComputeLease, identity.lease.id).state == "EXPIRED"
     assert database.get(PortalLeaseRenewalRequest, renewal.id).state == "CANCELLED"
+
+
+def test_admin_renewal_list_is_actionable_and_decision_requires_recent_reauthentication(
+    client, database: Session, origin_headers: dict[str, str]
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(
+        database,
+        login="renewal-owner",
+        username="renewal-owner",
+        uid=20002,
+        remaining_hours=12,
+    )
+    renewal = request_renewal(
+        database,
+        owner_id=identity.managed.id,
+        duration_seconds=MAX_LEASE_DURATION_SECONDS,
+        idempotency_key="visible-admin-renewal",
+    )
+    database.commit()
+    _admin(database)
+    headers = _login(client, origin_headers, "origin-al")
+
+    listing = client.get("/api/v1/admin/lease-renewals")
+
+    assert listing.status_code == 200
+    assert listing.json()["pending_count"] == 1
+    row = listing.json()["requests"][0]
+    assert row["id"] == str(renewal.id)
+    assert row["username"] == "renewal-owner"
+    assert row["display_name"] == "renewal-owner"
+    assert row["lease_id"] == str(identity.lease.id)
+    assert row["lease_state"] == "RENEWAL_PENDING"
+    assert row["lease_expires_at"] == ensure_utc(identity.lease.expires_at).isoformat()
+    assert row["actionable"] is True
+    assert row["closed_reason"] is None
+
+    denied = client.post(
+        f"/api/v1/admin/lease-renewals/{renewal.id}/decision",
+        headers=headers,
+        json={"decision": "APPROVE", "comment": "reviewed"},
+    )
+    assert denied.status_code == 428
+    assert denied.json()["detail"]["code"] == "REAUTH_REQUIRED"
+    reauthenticated = client.post(
+        "/api/v1/auth/reauthenticate",
+        headers=headers,
+        json={"password": PASSWORD},
+    )
+    assert reauthenticated.status_code == 200
+
+    approved = client.post(
+        f"/api/v1/admin/lease-renewals/{renewal.id}/decision",
+        headers=headers,
+        json={"decision": "APPROVE", "comment": "reviewed"},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "APPROVED"
+    assert approved.json()["resulting_lease_id"] is not None
+
+
+@pytest.mark.parametrize(
+    ("role_name", "list_status", "decision_status"),
+    [
+        ("platform_admin", 200, 428),
+        ("auditor", 200, 403),
+        ("operator", 403, 403),
+    ],
+)
+def test_renewal_approval_rbac_is_backend_authoritative(
+    client,
+    database: Session,
+    origin_headers: dict[str, str],
+    role_name: str,
+    list_status: int,
+    decision_status: int,
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(database, remaining_hours=12)
+    renewal = request_renewal(
+        database,
+        owner_id=identity.managed.id,
+        duration_seconds=3600,
+        idempotency_key=f"rbac-{role_name}",
+    )
+    reviewer = _admin(
+        database,
+        role_name=role_name,
+        login=f"reviewer-{role_name.replace('_', '-')}",
+    )
+    headers = _login(client, origin_headers, reviewer.normalized_login)
+
+    assert client.get("/api/v1/admin/lease-renewals").status_code == list_status
+    response = client.post(
+        f"/api/v1/admin/lease-renewals/{renewal.id}/decision",
+        headers=headers,
+        json={"decision": "APPROVE", "comment": "rbac probe"},
+    )
+    assert response.status_code == decision_status
+    database.refresh(renewal)
+    assert renewal.state == "REQUESTED"
+
+
+def test_expiry_reconciles_stale_renewal_without_reopening_restored_resource(
+    database: Session,
+) -> None:
+    identity = _identity(database, remaining_hours=12)
+    renewal = request_renewal(
+        database,
+        owner_id=identity.managed.id,
+        duration_seconds=MAX_LEASE_DURATION_SECONDS,
+        idempotency_key="stale-after-expiry",
+    )
+    reconciled_at = utcnow()
+    identity.lease.expires_at = reconciled_at - timedelta(seconds=1)
+    identity.lease.state = "RECYCLE_BIN"
+    identity.lease.expired_at = reconciled_at - timedelta(seconds=1)
+    identity.lease.recycled_at = reconciled_at
+    database.commit()
+
+    assert expiry_service.reconcile_expired_renewal_requests(database, now=reconciled_at) == 1
+    database.commit()
+    database.refresh(renewal)
+    assert renewal.state == "CANCELLED"
+    assert renewal.decided_at is not None
+    assert ensure_utc(renewal.decided_at) == reconciled_at
+    assert renewal.decided_by is None
+    assert renewal.decision_comment == "LEASE_EXPIRED_RESTORE_REQUIRED"
+    assert identity.lease.state == "RECYCLE_BIN"
+    event = database.scalar(
+        select(PortalAuditEvent).where(
+            PortalAuditEvent.event_type == "LEASE_RENEWAL_CANCELLED",
+            PortalAuditEvent.object_id == str(renewal.id),
+        )
+    )
+    assert event is not None
+    assert event.actor == "portal-lease-worker"
+    assert event.safe_metadata["automatic_reconciliation"] is True
+
+    assert (
+        expiry_service.reconcile_expired_renewal_requests(
+            database, now=reconciled_at + timedelta(seconds=1)
+        )
+        == 0
+    )
+
+
+def test_delayed_admin_decision_does_not_move_recycled_lease_backwards(
+    database: Session,
+) -> None:
+    identity = _identity(database, remaining_hours=12)
+    renewal = request_renewal(
+        database,
+        owner_id=identity.managed.id,
+        duration_seconds=MAX_LEASE_DURATION_SECONDS,
+        idempotency_key="stale-admin-decision-after-expiry",
+    )
+    expired_at = utcnow() - timedelta(seconds=10)
+    identity.lease.expires_at = expired_at
+    identity.lease.expired_at = expired_at
+    identity.lease.recycled_at = expired_at + timedelta(seconds=1)
+    identity.lease.state = "RECYCLE_BIN"
+    database.commit()
+
+    with pytest.raises(RenewalLeaseExpiredError):
+        decide_renewal(
+            database,
+            request_id=renewal.id,
+            decision="APPROVE",
+            decided_by=identity.user.id,
+            comment="arrived after restore flow became authoritative",
+            now=expired_at + timedelta(seconds=5),
+        )
+    database.commit()
+    database.expire_all()
+
+    preserved = database.get(PortalComputeLease, identity.lease.id)
+    cancelled = database.get(PortalLeaseRenewalRequest, renewal.id)
+    assert preserved.state == "RECYCLE_BIN"
+    assert ensure_utc(preserved.expired_at) == expired_at
+    assert ensure_utc(preserved.recycled_at) == expired_at + timedelta(seconds=1)
+    assert cancelled.state == "CANCELLED"
 
 
 def test_expiry_skips_superseded_lease_and_retries_cleanup_failure_fail_safe(
