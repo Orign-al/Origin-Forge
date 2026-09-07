@@ -4,8 +4,21 @@
 长期开发容器、Slurm 作业、GPU 隔离、配额、审计和受控运维操作整合到一个私有 Portal，
 同时保持宿主机与内部控制面不向普通用户开放。
 
-当前生产形态为 **single-node / multi-user / approval-gated multi-GPU**，适配 Lenovo SR675 V3、
-4 × NVIDIA H100 PCIe 80GB 与 Slurm 25.11.7。
+当前生产形态为 **single-node / multi-user / approval-gated multi-GPU and high-memory**，适配
+Lenovo SR675 V3、4 × NVIDIA H100 PCIe 80GB 与 Slurm 25.11.7。
+
+## 当前生产版本
+
+| 项目 | 当前值 |
+| --- | --- |
+| Git | `81baffd2e0d029d00c36072d6c4bb66a37f69e07` |
+| Tree | `88d5575ec6672f6611d0b992c914c4210f34e41e` |
+| Database | `f5a6b7c8d9e0` |
+| Web build | `5zLWuQkUmjlfxeuN88Iop` |
+| CLI | `h100 1.0.0` |
+
+该版本已于 2026-09-07 完成生产部署和回归验收。详细证据见
+[高内存审批生产部署报告](PORTAL-5A-USER-JOB-MEMORY-APPROVAL-PRODUCTION-DEPLOY-1.md)。
 
 ## 生产入口
 
@@ -36,14 +49,18 @@ ssh -p 22024 origin-pilot2@20.10.10.3
 flowchart LR
     U[EasyTier 用户] -->|TCP 18080| W[Origin Forge Web]
     W -->|loopback 18081| A[FastAPI]
+    C[Development Container] -->|平台管理的私有 CLI 连接| I[Private CLI Ingress]
+    I -->|loopback 18081| A
     A -->|Unix socket| R[Allowlisted Root Worker]
     R --> S[Slurm]
     R --> D[受管 Docker 容器]
     S --> G[H100 GPU]
 ```
 
-- Web 是唯一 Portal 用户入口，监听 `0.0.0.0:18080`，并由 systemd 网络策略限制来源网段。
+- Web 是唯一浏览器用户入口，只绑定受管 EasyTier 地址的 TCP 18080。
 - API 只监听 `127.0.0.1:18081`，不能通过 EasyTier 直接访问。
+- 开发容器中的 `h100` CLI 使用平台下发的只读配置连接私有入口；用户不需要配置网关或 API
+  地址，私有入口不会暴露管理 API。
 - Root Worker 只使用 `/run/h100-portal/worker.sock`，执行固定 handler 与固定 argv，禁止
   任意 root shell。
 - 普通用户不能登录宿主机；Linux shell 为 `/usr/sbin/nologin`，密码锁定且没有宿主
@@ -52,6 +69,13 @@ flowchart LR
 - GPU 计算只能通过 Slurm；1 张 GPU 可直接提交，2 至 4 张必须提交完整的模型、框架、
   数据集、并行策略与扩展收益说明并经管理员审批。管理员可降低批准数量，单用户并发占用
   总量仍不超过 4 张，并使用 per-UID systemd device policy 隔离设备。
+- Job 内存不超过 32 GiB 时直接提交；更高内存必须提交任务说明、预计内存拆分和必要性说明。
+  管理员可以降低批准值但不能超过用户申请，单节点上限为 486377 MiB。
+- 每个用户有独立的续期审批策略，续期和回收站恢复都遵循该策略。自动批准仍执行 Lease
+  窗口、时长、锁和资源限制，不是绕过审核边界。
+- 受控免密 sudo 只能由管理员按用户启用。已有容器仅重建被选中的用户，保留
+  `/workspace`、`/home/<user>`、Lease、SSH 和配额；sudo 只取得容器内 root，不提供宿主、
+  Docker Socket、MUNGE、Worker Socket 或 GPU 访问。
 - PostgreSQL、MariaDB、SlurmDBD、Docker API、MUNGE 与监控内部接口不作为用户入口。
 
 完整设计见 [Portal 架构](portal/docs/architecture.md) 与
@@ -169,6 +193,9 @@ sudo systemd-analyze verify \
 - [Portal 安全模型](portal/docs/security-model.md)
 - [Root Worker API](portal/docs/root-worker-api.md)
 - [SSH 与容器访问用户指南](portal/docs/ssh-access-user-guide.md)
+- [中文用户手册](docs/PORTAL-5A-H100-GPU-PLATFORM-USER-MANUAL-ZH.md)
+- [English User Manual](docs/PORTAL-5A-H100-GPU-PLATFORM-USER-MANUAL-EN.md)
+- [发布说明](RELEASE-NOTES-PORTAL-5A-FULL-PLATFORM-RELEASE.md)
 - [平台管理员手册](docs/pilot-admin-runbook.md)
 - [平台用户指南](docs/pilot-user-guide.md)
 - [Mellanox 物理链路手册](docs/mellanox-physical-link-field-runbook.md)

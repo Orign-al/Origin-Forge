@@ -1,6 +1,6 @@
 # H100 GPU Platform User Manual
 
-Version: `PORTAL-5A-FULL-PLATFORM-RELEASE + PORTAL-5A-USER-CLI-JOBS-1`
+Version: `PORTAL-5A-FULL-PLATFORM-RELEASE + RENEWAL/RESTORE POLICY + MULTI-GPU/HIGH-MEMORY APPROVAL`
 Production entry point: <http://20.10.10.3:18080/>
 Audience: ordinary users
 
@@ -12,8 +12,10 @@ The H100 GPU Platform provides self-service development containers, private pers
 - `GPU Development / GPU_1_8CPU_32GB` must be selected explicitly: 8 CPUs, 32 GiB memory, and permission to run H100 Slurm jobs.
 - Development containers are persistent and GPU-less. An H100 is assigned only while a GPU job runs and is released automatically when the job finishes.
 - One GPU can be submitted directly. Requests for 2, 3, or 4 GPUs require complete model and scaling details plus administrator approval. A user can hold at most four GPUs concurrently.
+- Job memory through 32 GiB is submitted directly. A larger request requires workload, estimated memory-breakdown, and necessity details plus administrator approval.
 - Each user has 300 GiB of private persistent storage. Both `/workspace` and `/home/<username>` belong to the same quota.
-- A lease lasts 96 hours. On expiry, the environment enters a recoverable recycle flow and persistent data is retained.
+- A lease lasts 96 hours. Renewal and Recycle Bin restore both follow the independent approval policy selected for that user; expiry does not immediately delete persistent data.
+- Administrators can enable controlled passwordless sudo per user. It is not enabled globally and grants neither host nor GPU access.
 - Host SSH is disabled. Users connect only to their own development container.
 
 ## 2. EasyTier access
@@ -89,6 +91,11 @@ No GPU device; H100 jobs are scheduled on demand
 It does not indicate a provisioning failure. Submit GPU=`1` directly from the Jobs page. Requests for 2-4 GPUs require complete details and approval. Slurm assigns only the approved number of H100s while the job runs and releases them after completion, cancellation, or timeout.
 
 Stopping the development container does not delete `/workspace` or `/home/<username>` and does not end the lease early.
+
+Administrators can enable controlled passwordless sudo per user. An existing container requires one rebuild of
+only that user's container and a brief interruption. `/workspace`, `/home/<username>`, the Lease, SSH access,
+and the 300 GiB quota are preserved. After enablement, `sudo -n id -u` should print `0`. Sudo grants root only
+inside the container; it does not expose host root, Docker, MUNGE, the Worker socket, host namespaces, or extra GPUs.
 
 ## 7. Unified private storage and zero copy
 
@@ -182,6 +189,11 @@ Open **Jobs** → **New Job** and enter:
 - an approved runtime image.
 
 For GPU=`0` or `1`, the Portal creates an immutable script snapshot and submits it directly to Slurm as your ordinary Linux identity. For GPU=`2` through `4`, you must also provide the model name, architecture, framework and version, parameter count, training or inference workload, dataset, parallel strategy, and scaling justification. The request first enters **Awaiting Approval** and does not call Worker, create a Slurm job, allocate a GPU, or produce runtime logs. A platform owner or administrator can approve the requested count, approve a lower count, or reject it with a comment. You can see only your own jobs and logs and may cancel your own request before approval.
+
+Job memory through 32 GiB needs no additional request. Higher memory requires the workload, estimated memory
+breakdown, and necessity. Worker and Slurm are not called before approval. An administrator may approve less
+memory but cannot exceed the requested amount. The single-node maximum is 486377 MiB. When one Job requests
+both multiple GPUs and high memory, one Slurm Job is created only after both approvals pass.
 
 The first import of a large CUDA/Enroot image needs extra memory. If a low-memory job reaches `OUT_OF_MEMORY` during a cold image import, retry with at least 8 GiB. Do not bypass the Portal with host commands.
 
@@ -358,10 +370,17 @@ Expected behavior:
 ## 15. Lease, recycle, and restore
 
 - Lease duration: 96 hours.
+- Renewal window: **Request renewal** becomes available under **My Environment** during the final 24 hours.
+- Renewal policy: the page states whether this user's request needs administrator review or automatic approval after complete backend validation.
+- Recycle Bin restore follows the same per-user policy. When review is required, submitting a restore request does not automatically restore the container.
+- Automatic approval still enforces renewal/restore timing, Lease locks, duplicate-request checks, and resource policy.
 - Container Stop/Start: retains data and is not the same as lease recycle.
 - Lease expiry: the system stops the environment and enters a recoverable recycle state.
 - Data retention: persistent data under both `/workspace` and `/home/<username>` remains preserved.
 - Restore: use the formal Portal restore flow. Do not manually start an old container or copy the data.
+
+After the Lease expires, any unresolved old renewal becomes expired history and cannot be approved. Submit a
+formal request from **Recycle Bin**; it is then reviewed or automatically processed under the user's current policy.
 
 After restore, verify the files and permissions in both persistent paths before submitting new jobs.
 
@@ -382,6 +401,12 @@ A user's direct and approved jobs can hold at most four GPUs in aggregate. A sub
 ### Why did a GPU=2 through GPU=4 request not start immediately?
 
 Multi-GPU requests require approval. Provide the model, framework and version, parameter count, workload, dataset, parallel strategy, and scaling benefit. While approval is pending, Worker is not called, no Slurm job is created, and no GPU is allocated. An administrator may approve fewer GPUs or reject the request with a reason.
+
+### Why does sudo ask for a password?
+
+The container has not received platform-controlled sudo. Do not set, request, or share a container password;
+ask an administrator to enable sudo specifically for your account. An existing container is briefly interrupted
+and rebuilt once. Afterward, `sudo -n id -u` should print `0`.
 
 ### SSH reports Connection refused.
 
