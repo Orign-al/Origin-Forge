@@ -115,6 +115,7 @@ done
 rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
   --exclude=/node_modules/ \
   --exclude=/apps/web/node_modules/ \
+  --exclude=/apps/web/.next/ \
   --exclude=/packages/*/node_modules/ \
   --exclude=venv \
   --exclude=/build/ \
@@ -124,6 +125,22 @@ rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w \
   --exclude=playwright-report \
   --exclude=test-results \
   "$SOURCE_DIR/" "$RUNTIME_DIR/"
+
+readonly RUNTIME_WEB_NEXT="$RUNTIME_DIR/apps/web/.next"
+if [[ -e "$RUNTIME_WEB_NEXT" || -L "$RUNTIME_WEB_NEXT" ]]; then
+  [[ -d "$RUNTIME_WEB_NEXT" && ! -L "$RUNTIME_WEB_NEXT" ]] \
+    || { echo "runtime Web .next target must be a real directory" >&2; exit 1; }
+else
+  install -d -o root -g root -m 0755 "$RUNTIME_WEB_NEXT"
+fi
+
+# Deterministic archives normalize mtimes. Synchronize the Web runtime by
+# content and delete release-specific files that do not exist in the candidate.
+rsync -a --checksum --delete --chown=root:root --chmod=Fgo-w,Dgo-w \
+  "$SOURCE_DIR/apps/web/.next/" \
+  "$RUNTIME_WEB_NEXT/"
+/usr/bin/python3 "$WEB_ARTIFACT_AUDITOR" \
+  audit-tree "$RUNTIME_WEB_NEXT" --quiet
 
 deployment_version="$(
   git -c safe.directory="$PLATFORM_DIR" \

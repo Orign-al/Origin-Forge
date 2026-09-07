@@ -221,10 +221,17 @@ def test_runtime_installer_audits_web_tree_before_first_rsync() -> None:
     installer = RUNTIME_INSTALLER.read_text()
     audit = 'audit-tree "$SOURCE_DIR/apps/web/.next" --quiet'
     first_rsync = "rsync -a --chown=root:root --chmod=Fgo-w,Dgo-w"
+    web_sync = "rsync -a --checksum --delete --chown=root:root --chmod=Fgo-w,Dgo-w"
+    runtime_audit = 'audit-tree "$RUNTIME_WEB_NEXT" --quiet'
 
     assert audit in installer
     assert installer.index(audit) < installer.index(first_rsync)
     assert '&& ! -L "$SOURCE_DIR/apps/web/.next/standalone/node_modules"' in installer
+    assert "--exclude=/apps/web/.next/" in installer
+    assert web_sync in installer
+    assert runtime_audit in installer
+    assert installer.index(web_sync) < installer.index(runtime_audit)
+    assert '[[ -d "$RUNTIME_WEB_NEXT" && ! -L "$RUNTIME_WEB_NEXT" ]]' in installer
 
 
 def test_web_installer_rejects_symlinked_target_tree(tmp_path: Path) -> None:
