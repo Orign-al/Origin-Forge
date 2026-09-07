@@ -1087,7 +1087,10 @@ export const selfRecycleBin = () =>
       data_preserved: boolean;
       auto_permanent_delete: false;
       container: "STOPPED";
+      restore_request_id: string | null;
+      approval_required: boolean;
     }>;
+    approval_required: boolean;
     auto_permanent_delete: false;
   }>("/self/recycle-bin");
 export const requestRestore = (itemId: string, durationSeconds = 345600) =>
@@ -1095,6 +1098,7 @@ export const requestRestore = (itemId: string, durationSeconds = 345600) =>
     status: string;
     restore_request_id: string;
     lease_id: string | null;
+    approval_required: boolean;
   }>(`/self/recycle-bin/${encodeURIComponent(itemId)}/restore-requests`, {
     method: "POST",
     body: JSON.stringify({
@@ -1107,6 +1111,7 @@ export type AdminRestoreRequest = {
   username: string;
   resource_name: string;
   state: string;
+  approval_required: boolean;
   duration_seconds: number;
   requested_at: string;
   decided_at: string | null;

@@ -153,6 +153,8 @@ function recycleItems(state: Portal4aState) {
       data_preserved: true,
       auto_permanent_delete: false,
       container: "STOPPED",
+      restore_request_id: null,
+      approval_required: false,
     },
   ];
 }
@@ -323,6 +325,7 @@ async function installPortal4aApi(
       await json(route, {
         status: "OK",
         items: recycleItems(state),
+        approval_required: false,
         auto_permanent_delete: false,
       });
       return;
@@ -337,6 +340,7 @@ async function installPortal4aApi(
         status: "RESTORED",
         restore_request_id: "00000000-0000-4000-8000-000000000048",
         lease_id: "00000000-0000-4000-8000-000000000049",
+        approval_required: false,
       });
       return;
     }

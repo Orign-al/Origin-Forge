@@ -142,7 +142,9 @@ export function PortalShell({ children }: { children: React.ReactNode }) {
           ? STAGED_USER_NAVIGATION
           : USER_NAVIGATION
       : navigation.filter(
-          ([, href]) => href !== "/lease-renewals" || canReadLeaseRenewals,
+          ([, href]) =>
+            !["/lease-renewals", "/restore-requests"].includes(href) ||
+            canReadLeaseRenewals,
         );
   const alertData = alertQuery.data as { count?: unknown } | undefined;
   const alertCount =

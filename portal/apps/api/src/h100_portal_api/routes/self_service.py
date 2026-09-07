@@ -1957,6 +1957,15 @@ def self_recycle_bin(
         )
         .order_by(PortalResourceRecycleItem.recycled_at.desc())
     ).all()
+    pending_by_item = {
+        restore.recycle_item_id: restore
+        for restore in db.scalars(
+            select(PortalResourceRestoreRequest).where(
+                PortalResourceRestoreRequest.owner_managed_user_id == managed.id,
+                PortalResourceRestoreRequest.state == "REQUESTED",
+            )
+        ).all()
+    }
     return {
         "status": "OK",
         "items": [
@@ -1969,9 +1978,18 @@ def self_recycle_bin(
                 "data_preserved": row.data_preserved,
                 "auto_permanent_delete": row.auto_permanent_delete,
                 "container": "STOPPED",
+                "restore_request_id": (
+                    str(pending_by_item[row.id].id) if row.id in pending_by_item else None
+                ),
+                "approval_required": (
+                    pending_by_item[row.id].approval_required
+                    if row.id in pending_by_item
+                    else managed.lease_renewal_approval_required
+                ),
             }
             for row in rows
         ],
+        "approval_required": managed.lease_renewal_approval_required,
         "auto_permanent_delete": False,
     }
 
@@ -2005,6 +2023,7 @@ def create_restore_request(
                 "lease_id": str(existing.restored_lease_id)
                 if existing.restored_lease_id is not None
                 else None,
+                "approval_required": existing.approval_required,
             }
     item = db.scalar(
         select(PortalResourceRecycleItem)
@@ -2018,24 +2037,36 @@ def create_restore_request(
     if item is None:
         raise _error(404, "RECYCLE_ITEM_NOT_FOUND", "回收资源不存在")
     if existing is None:
-        legacy_pending = db.scalars(
+        pending = db.scalar(
             select(PortalResourceRestoreRequest)
             .where(
                 PortalResourceRestoreRequest.owner_managed_user_id == managed.id,
                 PortalResourceRestoreRequest.recycle_item_id == item.id,
                 PortalResourceRestoreRequest.state == "REQUESTED",
             )
+            .order_by(PortalResourceRestoreRequest.requested_at.desc())
+            .limit(1)
             .with_for_update()
-        ).all()
-        for pending in legacy_pending:
-            pending.state = "CANCELLED"
-            pending.decided_at = utcnow()
-            pending.decided_by = context.user.id
-            pending.decision_comment = "Superseded by owner self-service restore"
+        )
+        if pending is not None:
+            if pending.requested_duration_seconds != body.duration_seconds:
+                raise _error(
+                    409,
+                    "RESTORE_ALREADY_PENDING",
+                    "已有不同期限的恢复申请等待管理员审批",
+                )
+            return {
+                "status": "REQUESTED",
+                "restore_request_id": str(pending.id),
+                "lease_id": None,
+                "approval_required": pending.approval_required,
+            }
+        approval_required = managed.lease_renewal_approval_required
         restore = PortalResourceRestoreRequest(
             owner_managed_user_id=managed.id,
             recycle_item_id=item.id,
             state="REQUESTED",
+            approval_required=approval_required,
             requested_duration_seconds=body.duration_seconds,
             idempotency_key=str(body.idempotency_key),
         )
@@ -2050,16 +2081,39 @@ def create_restore_request(
             object_id=str(restore.id),
             metadata={
                 "duration_seconds": body.duration_seconds,
-                "approval_required": False,
+                "approval_required": approval_required,
                 "initiator": "OWNER",
+                "policy_source": "portal_managed_user",
             },
         )
     else:
         restore = existing
+    if restore.approval_required:
+        item.state = "RESTORE_PENDING"
+        managed.compute_environment_state = "RESTORE_PENDING"
+        db.commit()
+        return {
+            "status": "REQUESTED",
+            "restore_request_id": str(restore.id),
+            "lease_id": None,
+            "approval_required": True,
+        }
     restore.decided_at = utcnow()
     restore.decided_by = context.user.id
-    restore.decision_comment = "Owner self-service restore; administrator approval not required"
-    return _execute_restore(
+    restore.decision_comment = "AUTO_APPROVED_BY_USER_RENEWAL_POLICY"
+    _audit(
+        db,
+        request,
+        context,
+        event_type="RESOURCE_RESTORE_AUTO_APPROVED",
+        object_type="resource_restore_request",
+        object_id=str(restore.id),
+        metadata={
+            "approval_required": False,
+            "policy_source": "portal_managed_user",
+        },
+    )
+    result = _execute_restore(
         db,
         request,
         context,
@@ -2069,6 +2123,8 @@ def create_restore_request(
         worker_operation_type="self.resource.restore",
         operation_summary="资源所有者自助恢复可回收计算环境",
     )
+    result["approval_required"] = False
+    return result
 
 
 @router.get("/admin/lease-renewals")
@@ -2424,7 +2480,7 @@ def admin_retry_lease_recycle(
 
 @router.get("/admin/restore-requests")
 def admin_restore_requests(
-    context: AuthContext = Depends(permission_dependency("users.read")),
+    context: AuthContext = Depends(permission_dependency("lease.renewals.read")),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     rows = db.execute(
@@ -2447,6 +2503,7 @@ def admin_restore_requests(
                 "username": managed.unix_username,
                 "resource_name": item.resource_name,
                 "state": restore.state,
+                "approval_required": restore.approval_required,
                 "duration_seconds": restore.requested_duration_seconds,
                 "requested_at": ensure_utc(restore.requested_at).isoformat(),
                 "decided_at": (
@@ -2466,10 +2523,11 @@ def admin_decide_restore(
     request_id: uuid.UUID,
     body: RestoreDecisionRequest,
     request: Request,
-    context: AuthContext = Depends(permission_dependency("users.write")),
+    context: AuthContext = Depends(permission_dependency("lease.renewals.review")),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     require_session_csrf(request, context)
+    require_recent_reauthentication(context)
     restore = db.scalar(
         select(PortalResourceRestoreRequest)
         .where(PortalResourceRestoreRequest.id == request_id)
@@ -2524,5 +2582,5 @@ def admin_decide_restore(
         item=item,
         managed=managed,
         worker_operation_type="resource.restore",
-        operation_summary="管理员批准恢复用户的历史待审批计算环境",
+        operation_summary="管理员批准恢复用户的待审批计算环境",
     )

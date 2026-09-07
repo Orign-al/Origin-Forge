@@ -1021,6 +1021,7 @@ class PortalResourceRestoreRequest(Base):
         index=True,
     )
     state: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    approval_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     requested_duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

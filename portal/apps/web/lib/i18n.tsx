@@ -287,6 +287,7 @@ const EN_US: Record<string, string> = {
   申请恢复: "Request Restore",
   续期申请待审批: "Renewal request pending approval",
   续期审批: "Renewal Approvals",
+  恢复审批: "Restore Approvals",
   申请续期: "Request Renewal",
   将在到期前24小时开放续期: "Renewal opens 24 hours before expiry",
   续期申请未提交: "The renewal request was not submitted",
@@ -413,9 +414,16 @@ const EN_US: Record<string, string> = {
   回收站为空: "Recycle Bin Empty",
   当前没有过期的计算资源: "There are no expired compute resources",
   恢复申请待审批: "Restore request pending approval",
+  "恢复申请已提交，等待管理员审批。":
+    "Restore request submitted and pending administrator approval.",
+  "恢复申请需要管理员审批；批准前不会启动容器或创建新 Lease":
+    "Restore requests require administrator approval; no container is started and no new lease is created before approval",
+  恢复申请由平台完成所有权和安全校验后自动批准:
+    "Restore requests are automatically approved after platform ownership and security validation",
   历史恢复申请待处理: "Legacy restore request pending",
   恢复容器: "Restore Container",
   正在恢复: "Restoring",
+  正在提交: "Submitting",
   恢复失败: "Restore Failed",
   "恢复失败，未启动容器。": "Restore failed; the container was not started.",
   "恢复完成，新的 96 小时 Lease 已创建。":

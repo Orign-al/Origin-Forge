@@ -145,7 +145,7 @@ afterEach(() => {
 });
 
 describe("administrator Lease lifecycle UI", () => {
-  it("updates the per-user renewal approval policy without implying pending changes", async () => {
+  it("updates the per-user renewal and restore approval policy without changing pending requests", async () => {
     vi.mocked(updateLeaseRenewalPolicy).mockResolvedValue({
       status: "UPDATED",
       policy: {
@@ -156,7 +156,7 @@ describe("administrator Lease lifecycle UI", () => {
     renderPanel("platform_owner", []);
 
     const toggle = await screen.findByRole("checkbox", {
-      name: "续期需要管理员审批",
+      name: "续期与恢复需要管理员审批",
     });
     expect(toggle).toBeChecked();
     fireEvent.click(toggle);
@@ -165,17 +165,21 @@ describe("administrator Lease lifecycle UI", () => {
       expect(updateLeaseRenewalPolicy).toHaveBeenCalledWith(USER_ID, false);
     });
     expect(
-      await screen.findByText("该用户后续续期申请将在服务端校验后自动批准。"),
+      await screen.findByText(
+        "该用户后续续期与恢复申请将在服务端校验后自动批准。",
+      ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("策略只影响后续新申请；已有待审批申请保持不变。"),
+      screen.getByText(
+        "同时控制到期前续期和回收站恢复；只影响后续新申请，已有待审批申请保持不变。",
+      ),
     ).toBeInTheDocument();
   });
 
   it("does not let an ordinary user change another policy", async () => {
     renderPanel("user", []);
     const toggle = await screen.findByRole("checkbox", {
-      name: "续期需要管理员审批",
+      name: "续期与恢复需要管理员审批",
     });
     expect(toggle).toBeDisabled();
     fireEvent.click(toggle);

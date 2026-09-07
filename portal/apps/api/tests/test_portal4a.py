@@ -47,7 +47,7 @@ from h100_portal_api.models import (
     utcnow,
 )
 from h100_portal_api.routes import self_service
-from h100_portal_api.schemas import RestoreCreateRequest
+from h100_portal_api.schemas import RestoreCreateRequest, RestoreDecisionRequest
 from h100_portal_api.security import digest_secret, hash_password
 from h100_portal_api.terminal_service import TerminalServiceError
 from h100_portal_api.worker_client import WorkerClientError
@@ -405,6 +405,32 @@ def test_admin_can_disable_renewal_approval_without_changing_pending_request(
         duration_seconds=MAX_LEASE_DURATION_SECONDS,
         idempotency_key="pending-before-policy-change",
     )
+    recycle = PortalResourceRecycleItem(
+        owner_managed_user_id=identity.managed.id,
+        lease_id=identity.lease.id,
+        container_id=identity.container.id,
+        state="RESTORE_PENDING",
+        resource_name=identity.container.name,
+        image_digest=identity.container.image_digest,
+        retained_spec=identity.container.safe_spec,
+        connection_state="DISABLED",
+        data_preserved=True,
+        auto_permanent_delete=False,
+        expires_at=identity.lease.expires_at,
+        recycled_at=utcnow(),
+    )
+    database.add(recycle)
+    database.flush()
+    pending_restore = PortalResourceRestoreRequest(
+        owner_managed_user_id=identity.managed.id,
+        recycle_item_id=recycle.id,
+        state="REQUESTED",
+        approval_required=True,
+        requested_duration_seconds=MAX_LEASE_DURATION_SECONDS,
+        idempotency_key="pending-restore-before-policy-change",
+    )
+    database.add(pending_restore)
+    database.commit()
     admin = _admin(database)
     headers = _login(client, origin_headers, admin.normalized_login)
 
@@ -421,10 +447,14 @@ def test_admin_can_disable_renewal_approval_without_changing_pending_request(
     }
     database.refresh(identity.managed)
     database.refresh(pending)
+    database.refresh(pending_restore)
     assert identity.managed.lease_renewal_approval_required is False
     assert pending.state == "REQUESTED"
     assert pending.approval_required is True
     assert pending.decided_at is None
+    assert pending_restore.state == "REQUESTED"
+    assert pending_restore.approval_required is True
+    assert pending_restore.decided_at is None
     event = database.scalar(
         select(PortalAuditEvent).where(
             PortalAuditEvent.event_type == "LEASE_RENEWAL_POLICY_UPDATED",
@@ -438,7 +468,10 @@ def test_admin_can_disable_renewal_approval_without_changing_pending_request(
         "previous_approval_required": True,
         "approval_required": False,
         "pending_requests_unchanged": True,
-        "pending_request_count": 1,
+        "policy_scope": "LEASE_RENEWAL_AND_RESOURCE_RESTORE",
+        "pending_request_count": 2,
+        "pending_renewal_request_count": 1,
+        "pending_restore_request_count": 1,
     }
 
 
@@ -677,6 +710,38 @@ def test_renewal_approval_rbac_is_backend_authoritative(
     assert response.status_code == decision_status
     database.refresh(renewal)
     assert renewal.state == "REQUESTED"
+
+
+@pytest.mark.parametrize(
+    ("role_name", "list_status", "decision_status"),
+    [
+        ("platform_admin", 200, 428),
+        ("auditor", 200, 403),
+        ("operator", 403, 403),
+    ],
+)
+def test_restore_approval_uses_the_same_backend_rbac_and_reauth_boundary(
+    client,
+    database: Session,
+    origin_headers: dict[str, str],
+    role_name: str,
+    list_status: int,
+    decision_status: int,
+) -> None:  # type: ignore[no-untyped-def]
+    reviewer = _admin(
+        database,
+        role_name=role_name,
+        login=f"restore-reviewer-{role_name.replace('_', '-')}",
+    )
+    headers = _login(client, origin_headers, reviewer.normalized_login)
+
+    assert client.get("/api/v1/admin/restore-requests").status_code == list_status
+    response = client.post(
+        f"/api/v1/admin/restore-requests/{uuid.uuid4()}/decision",
+        headers=headers,
+        json={"decision": "APPROVE", "comment": "rbac probe"},
+    )
+    assert response.status_code == decision_status
 
 
 def test_expiry_reconciles_stale_renewal_without_reopening_restored_resource(
@@ -2131,11 +2196,153 @@ def test_web_terminal_refuses_host_access_regression_and_expired_lease(
     assert expired.json()["detail"]["code"] == "LEASE_INACTIVE"
 
 
-def test_owner_restore_is_idempotent_and_reactivates_all_resources_without_admin(
+def test_policy_required_restore_waits_for_admin_and_never_calls_worker_before_approval(
+    database: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = _identity(database, remaining_hours=0)
+    identity.lease.state = "RECYCLE_BIN"
+    identity.lease.expired_at = utcnow()
+    identity.lease.recycled_at = utcnow()
+    identity.managed.compute_environment_state = "RECYCLED"
+    identity.container.desired_state = "STOPPED"
+    identity.container.observed_state = "STOPPED"
+    identity.key.container_install_state = "SUSPENDED_BY_RECYCLE"
+    storage = database.scalar(
+        select(PortalStorageResource).where(
+            PortalStorageResource.owner_managed_user_id == identity.managed.id
+        )
+    )
+    assert storage is not None
+    storage.state = "PRESERVED"
+    item = PortalResourceRecycleItem(
+        owner_managed_user_id=identity.managed.id,
+        lease_id=identity.lease.id,
+        container_id=identity.container.id,
+        state="RECYCLE_BIN",
+        resource_name=identity.container.name,
+        image_digest=identity.container.image_digest,
+        retained_spec=identity.container.safe_spec,
+        connection_state="DISABLED",
+        data_preserved=True,
+        auto_permanent_delete=False,
+        expires_at=identity.lease.expires_at,
+        recycled_at=utcnow(),
+    )
+    database.add(item)
+    database.commit()
+    monkeypatch.setattr(self_service, "require_session_csrf", lambda *_args: None)
+    worker_calls: list[str] = []
+
+    def restore_worker(operation_type: str, **_kwargs):  # type: ignore[no-untyped-def]
+        worker_calls.append(operation_type)
+        assert operation_type == "resource.restore"
+        return {
+            "status": "SUCCEEDED",
+            "request_id": str(uuid.uuid4()),
+            "container_state": "RUNNING",
+            "container_gpu": "NONE",
+            "container_key_state": "INSTALLED",
+            "container_key_fingerprints": [identity.key.fingerprint_sha256],
+        }
+
+    monkeypatch.setattr(self_service, "call_worker", restore_worker)
+    user_context = AuthContext(identity.user, None, "")
+    first = self_service.create_restore_request(
+        item.id,
+        RestoreCreateRequest(
+            duration_seconds=MAX_LEASE_DURATION_SECONDS,
+            idempotency_key=uuid.uuid4(),
+        ),
+        _restore_http_request(item.id),
+        user_context,
+        database,
+    )
+    identity.managed.lease_renewal_approval_required = False
+    database.commit()
+    repeated = self_service.create_restore_request(
+        item.id,
+        RestoreCreateRequest(
+            duration_seconds=MAX_LEASE_DURATION_SECONDS,
+            idempotency_key=uuid.uuid4(),
+        ),
+        _restore_http_request(item.id),
+        user_context,
+        database,
+    )
+    with pytest.raises(HTTPException) as duration_conflict:
+        self_service.create_restore_request(
+            item.id,
+            RestoreCreateRequest(
+                duration_seconds=3600,
+                idempotency_key=uuid.uuid4(),
+            ),
+            _restore_http_request(item.id),
+            user_context,
+            database,
+        )
+    assert first == repeated
+    assert duration_conflict.value.status_code == 409
+    assert duration_conflict.value.detail["code"] == "RESTORE_ALREADY_PENDING"
+    assert first["status"] == "REQUESTED"
+    assert first["approval_required"] is True
+    assert worker_calls == []
+    database.expire_all()
+    restore = database.get(PortalResourceRestoreRequest, uuid.UUID(first["restore_request_id"]))
+    assert restore is not None
+    assert restore.state == "REQUESTED"
+    assert restore.approval_required is True
+    assert restore.decided_at is None
+    assert database.get(PortalResourceRecycleItem, item.id).state == "RESTORE_PENDING"
+    assert database.get(PortalManagedUser, identity.managed.id).compute_environment_state == (
+        "RESTORE_PENDING"
+    )
+    assert not database.scalars(
+        select(PortalOperation).where(
+            PortalOperation.owner_managed_user_id == identity.managed.id,
+            PortalOperation.operation_type.in_({"self.resource.restore", "resource.restore"}),
+        )
+    ).all()
+
+    admin = _admin(database)
+    admin_context = AuthContext(admin, None, "")
+    with pytest.raises(HTTPException) as reauth_required:
+        self_service.admin_decide_restore(
+            restore.id,
+            RestoreDecisionRequest(decision="APPROVE", comment="reviewed"),
+            _restore_http_request(item.id),
+            admin_context,
+            database,
+        )
+    assert reauth_required.value.status_code == 428
+    assert worker_calls == []
+
+    monkeypatch.setattr(self_service, "require_recent_reauthentication", lambda *_args: None)
+    approved = self_service.admin_decide_restore(
+        restore.id,
+        RestoreDecisionRequest(decision="APPROVE", comment="reviewed"),
+        _restore_http_request(item.id),
+        admin_context,
+        database,
+    )
+    assert approved["status"] == "RESTORED"
+    assert worker_calls == ["resource.restore"]
+    database.expire_all()
+    restored = database.get(PortalResourceRestoreRequest, restore.id)
+    assert restored is not None
+    assert restored.state == "RESTORED"
+    assert restored.approval_required is True
+    assert restored.decided_by == admin.id
+    assert restored.decision_comment == "reviewed"
+    assert database.get(PortalComputeLease, restored.restored_lease_id).state == "ACTIVE"
+
+
+def test_policy_auto_restore_is_idempotent_and_reactivates_all_resources_without_admin(
     database: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # type: ignore[no-untyped-def]
     identity = _identity(database, remaining_hours=0)
+    identity.managed.lease_renewal_approval_required = False
     identity.lease.state = "RECYCLE_BIN"
     identity.lease.expired_at = utcnow()
     identity.lease.recycled_at = utcnow()
@@ -2165,14 +2372,6 @@ def test_owner_restore_is_idempotent_and_reactivates_all_resources_without_admin
     )
     database.add(item)
     database.flush()
-    legacy_restore = PortalResourceRestoreRequest(
-        owner_managed_user_id=identity.managed.id,
-        recycle_item_id=item.id,
-        state="REQUESTED",
-        requested_duration_seconds=MAX_LEASE_DURATION_SECONDS,
-        idempotency_key=str(uuid.uuid4()),
-    )
-    database.add(legacy_restore)
     database.commit()
 
     calls: list[dict[str, object]] = []
@@ -2234,6 +2433,16 @@ def test_owner_restore_is_idempotent_and_reactivates_all_resources_without_admin
     assert [event.object_id for event in requested_audits] == [first["restore_request_id"]]
     assert requested_audits[0].actor == "origin-pilot"
     assert requested_audits[0].safe_metadata["approval_required"] is False
+    auto_approved_audits = database.scalars(
+        select(PortalAuditEvent).where(
+            PortalAuditEvent.event_type == "RESOURCE_RESTORE_AUTO_APPROVED"
+        )
+    ).all()
+    assert [event.object_id for event in auto_approved_audits] == [first["restore_request_id"]]
+    assert auto_approved_audits[0].safe_metadata == {
+        "approval_required": False,
+        "policy_source": "portal_managed_user",
+    }
     database.expire_all()
     restored = database.get(PortalResourceRestoreRequest, uuid.UUID(first["restore_request_id"]))
     successor = database.get(PortalComputeLease, restored.restored_lease_id)
@@ -2245,7 +2454,8 @@ def test_owner_restore_is_idempotent_and_reactivates_all_resources_without_admin
     )
     assert len(calls) == 1
     assert restored.state == "RESTORED"
-    assert database.get(PortalResourceRestoreRequest, legacy_restore.id).state == "CANCELLED"
+    assert restored.approval_required is False
+    assert restored.decision_comment == "AUTO_APPROVED_BY_USER_RENEWAL_POLICY"
     assert successor.state == "ACTIVE"
     assert successor.duration_seconds == MAX_LEASE_DURATION_SECONDS
     assert identity.managed.compute_environment_state == "ACTIVE"
@@ -2266,6 +2476,7 @@ def test_owner_restore_failure_with_verified_rollback_remains_self_retryable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # type: ignore[no-untyped-def]
     identity = _identity(database, remaining_hours=0)
+    identity.managed.lease_renewal_approval_required = False
     identity.lease.state = "RECYCLE_BIN"
     identity.lease.expired_at = utcnow()
     identity.lease.recycled_at = utcnow()

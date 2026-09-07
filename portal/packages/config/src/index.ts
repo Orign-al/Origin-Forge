@@ -11,7 +11,7 @@ export const navigation = [
   ["用户", "/users"],
   ["资源申请", "/compute-requests"],
   ["续期审批", "/lease-renewals"],
-  ["恢复申请", "/restore-requests"],
+  ["恢复审批", "/restore-requests"],
   ["连接", "/access"],
   ["容器", "/containers"],
   ["Slurm", "/slurm"],

@@ -38,6 +38,7 @@ from h100_portal_api.models import (
     PortalOperationEvent,
     PortalPasswordCredential,
     PortalPasswordSetupToken,
+    PortalResourceRestoreRequest,
     PortalRole,
     PortalUser,
     ensure_utc,
@@ -573,11 +574,19 @@ def update_lease_renewal_policy(
         )
     previous = managed.lease_renewal_approval_required
     managed.lease_renewal_approval_required = body.approval_required
-    pending_count = len(
+    pending_renewal_count = len(
         db.scalars(
             select(PortalLeaseRenewalRequest.id).where(
                 PortalLeaseRenewalRequest.owner_managed_user_id == managed.id,
                 PortalLeaseRenewalRequest.state == "REQUESTED",
+            )
+        ).all()
+    )
+    pending_restore_count = len(
+        db.scalars(
+            select(PortalResourceRestoreRequest.id).where(
+                PortalResourceRestoreRequest.owner_managed_user_id == managed.id,
+                PortalResourceRestoreRequest.state == "REQUESTED",
             )
         ).all()
     )
@@ -595,7 +604,10 @@ def update_lease_renewal_policy(
             "previous_approval_required": previous,
             "approval_required": body.approval_required,
             "pending_requests_unchanged": True,
-            "pending_request_count": pending_count,
+            "policy_scope": "LEASE_RENEWAL_AND_RESOURCE_RESTORE",
+            "pending_request_count": pending_renewal_count + pending_restore_count,
+            "pending_renewal_request_count": pending_renewal_count,
+            "pending_restore_request_count": pending_restore_count,
         },
     )
     db.commit()

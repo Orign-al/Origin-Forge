@@ -202,3 +202,8 @@ ssh -L 18080:20.10.10.3:18080 h100-codex
 失败时先停止 Web/API/Worker，保留 PostgreSQL 数据、日志和审计；恢复本轮备份的 unit、
 配置和前一版 `/opt/h100-portal`，执行 `daemon-reload` 后只启动已验证版本。回滚不得
 RESUME Slurm、删除用户数据、修改 GPU 隔离、MIG、驱动、Kernel 或防火墙。
+
+从恢复审批策略版本降级前，先只读确认不存在 `state='REQUESTED'` 且
+`approval_required=true` 的恢复申请。迁移会在存在此类申请时 fail closed，因为旧运行时
+无法保证继续执行申请时的审批策略快照。必须先通过正式管理员审批或拒绝流程关闭申请，
+再按审核过的数据库、运行时和 Web 顺序回滚；不得直接修改申请行。

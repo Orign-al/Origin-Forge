@@ -172,8 +172,8 @@ export function LeaseLifecyclePanel({ user }: { user: User }) {
     onSuccess: async (result) => {
       setPolicyMessage(
         result.policy.approval_required
-          ? "该用户后续续期申请需要管理员审批。"
-          : "该用户后续续期申请将在服务端校验后自动批准。",
+          ? "该用户后续续期与恢复申请需要管理员审批。"
+          : "该用户后续续期与恢复申请将在服务端校验后自动批准。",
       );
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["user", user.id] }),
@@ -184,17 +184,19 @@ export function LeaseLifecyclePanel({ user }: { user: User }) {
       setPolicyMessage(
         reason instanceof ApiError
           ? `${reason.code}：${reason.message}`
-          : "续期审批策略未更新。",
+          : "续期与恢复审批策略未更新。",
       );
     },
   });
 
   const approvalRequired = lifecycle?.renewal_approval_required ?? true;
   const policyPanel = (
-    <section className="lease-renewal-policy" aria-label="续期审批策略">
+    <section className="lease-renewal-policy" aria-label="续期与恢复审批策略">
       <div>
-        <h3>续期审批策略</h3>
-        <p className="muted">策略只影响后续新申请；已有待审批申请保持不变。</p>
+        <h3>续期与恢复审批策略</h3>
+        <p className="muted">
+          同时控制到期前续期和回收站恢复；只影响后续新申请，已有待审批申请保持不变。
+        </p>
       </div>
       <label className="lease-renewal-policy-toggle">
         <input
@@ -206,11 +208,11 @@ export function LeaseLifecyclePanel({ user }: { user: User }) {
             renewalPolicy.mutate(event.target.checked);
           }}
         />
-        <span>续期需要管理员审批</span>
+        <span>续期与恢复需要管理员审批</span>
       </label>
       {!approvalRequired ? (
         <div className="notice" role="status">
-          自动批准仍由后端执行续期窗口、时长上限、Lease 锁和资源策略校验。
+          自动批准仍由后端执行时长上限、Lease 锁、资源所有权和安全策略校验。
         </div>
       ) : null}
       {policyMessage ? (

@@ -105,6 +105,12 @@ Lease 续期使用专用权限：`platform_owner` 与 `platform_admin` 可读、
 与最近重新认证；浏览器中的导航或按钮隐藏不是授权证据。到期服务仅将已经失效的待审请求
 收敛为 `CANCELLED`，不得把已经回收或恢复的 Lease 状态倒退回 `EXPIRED`。
 
+回收站恢复与同一用户级审批策略绑定。需要审批时，用户请求仅改变 Portal 投影为
+`RESTORE_PENDING`；批准前 Worker 调用、新 Lease、容器启动和 SSH key 恢复都必须为零。
+审批使用 owner/admin 权限、CSRF 和最近密码重新认证，策略快照随请求持久化，防止申请后
+切换策略造成静默执行。关闭审批仍只允许 owner 恢复自己的资源，并保留 Worker 后置条件、
+失败回滚、无宿主访问、无常驻 GPU 和审计边界。
+
 ## 审计与脱敏
 
 审计记录 actor、role、来源 IP、User-Agent 摘要、对象、operation、结果、时间及严格

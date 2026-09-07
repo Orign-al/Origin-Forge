@@ -1031,7 +1031,9 @@ export function OrdinaryRecycleBin() {
       setRestoreMessage(
         result.status === "RESTORED"
           ? t("恢复完成，新的 96 小时 Lease 已创建。")
-          : t("恢复状态：{status}", { status: result.status }),
+          : result.status === "REQUESTED" && result.approval_required
+            ? t("恢复申请已提交，等待管理员审批。")
+            : t("恢复状态：{status}", { status: result.status }),
       );
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["self-recycle-bin"] }),
@@ -1049,7 +1051,11 @@ export function OrdinaryRecycleBin() {
     <>
       <PageHeading
         title="回收站"
-        description="资源所有者可自助恢复过期容器，无需管理员审批"
+        description={
+          query.data.approval_required
+            ? "恢复申请需要管理员审批；批准前不会启动容器或创建新 Lease"
+            : "恢复申请由平台完成所有权和安全校验后自动批准"
+        }
       />
       {restoreMessage ? (
         <div className="notice" role="status">
@@ -1079,7 +1085,7 @@ export function OrdinaryRecycleBin() {
               <StatusBadge
                 value={
                   item.state === "RESTORE_PENDING"
-                    ? t("历史恢复申请待处理")
+                    ? t("恢复申请待审批")
                     : item.state === "RESTORING"
                       ? t("正在恢复")
                       : item.state === "FAILED"
@@ -1112,13 +1118,15 @@ export function OrdinaryRecycleBin() {
                 tone="primary"
                 disabled={
                   restore.isPending ||
-                  !["RECYCLE_BIN", "RESTORE_PENDING", "FAILED"].includes(
-                    item.state,
-                  )
+                  !["RECYCLE_BIN", "FAILED"].includes(item.state)
                 }
                 onClick={() => restore.mutate(item.id)}
               >
-                {restore.isPending ? t("正在恢复") : t("恢复容器")}
+                {item.state === "RESTORE_PENDING"
+                  ? t("恢复申请待审批")
+                  : restore.isPending
+                    ? t("正在提交")
+                    : t("恢复容器")}
               </Button>
             </div>
           </SectionCard>
