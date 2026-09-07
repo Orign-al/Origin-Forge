@@ -23,6 +23,7 @@ import {
   selfStorage,
   submitSelfJob,
   type ComputeLease,
+  type HighMemoryRequestDetails,
   type MultiGpuRequestDetails,
   type SelfJob,
   type User,
@@ -834,6 +835,12 @@ export function OrdinaryJobs() {
       parallel_strategy: "",
       scaling_justification: "",
     });
+  const [highMemoryRequest, setHighMemoryRequest] =
+    useState<HighMemoryRequestDetails>({
+      workload_description: "",
+      memory_breakdown: "",
+      memory_justification: "",
+    });
   const [minutes, setMinutes] = useState(30);
   const [selected, setSelected] = useState<SelfJob | null>(null);
   const logs = useQuery({
@@ -856,6 +863,7 @@ export function OrdinaryJobs() {
         time_limit_seconds: minutes * 60,
         image_ref: null,
         multi_gpu_request: gpu >= 2 ? multiGpuRequest : null,
+        high_memory_request: memory > 32768 ? highMemoryRequest : null,
         idempotency_key: randomUuid(),
       }),
     onSuccess: async () =>
@@ -873,18 +881,32 @@ export function OrdinaryJobs() {
   const multiGpuDetailsComplete = Object.values(multiGpuRequest).every(
     (value) => value.trim().length > 0,
   );
+  const highMemoryDetailsComplete = Object.values(highMemoryRequest).every(
+    (value) => value.trim().length > 0,
+  );
   function updateMultiGpuRequest(
     field: keyof MultiGpuRequestDetails,
     value: string,
   ) {
     setMultiGpuRequest((current) => ({ ...current, [field]: value }));
   }
+  function updateHighMemoryRequest(
+    field: keyof HighMemoryRequestDetails,
+    value: string,
+  ) {
+    setHighMemoryRequest((current) => ({ ...current, [field]: value }));
+  }
   return (
     <>
       <PageHeading
         title="作业"
         description="通过Portal提交CPU或1至4张GPU的Slurm任务"
-        action={<StatusBadge value="2-4 GPU 需审批" />}
+        action={
+          <div className="button-row">
+            <StatusBadge value="2-4 GPU 需审批" />
+            <StatusBadge value="内存 >32 GiB 需审批" />
+          </div>
+        }
       />
       <SectionCard
         title="新建作业"
@@ -918,14 +940,18 @@ export function OrdinaryJobs() {
             />
           </label>
           <label>
-            {t("内存 MB")}
+            {t("内存 MiB")}
             <Input
               type="number"
               min={256}
-              max={32768}
+              max={486377}
+              step={256}
               value={memory}
               onChange={(e) => setMemory(Number(e.target.value))}
             />
+            <span className="muted">
+              {t("32 GiB（32768 MiB）以内无需审批")}
+            </span>
           </label>
           <label>
             GPU
@@ -1052,6 +1078,38 @@ export function OrdinaryJobs() {
               </div>
             </div>
           ) : null}
+          {memory > 32768 ? (
+            <div className="job-script-field">
+              <div className="notice" role="status">
+                {t(
+                  "超过32 GiB的作业不会立即进入Slurm。请说明任务、内存用量拆分与高内存必要性；管理员可降低批准内存或驳回申请。",
+                )}
+              </div>
+              <div className="job-form-grid">
+                {(
+                  [
+                    ["workload_description", "高内存任务说明"],
+                    ["memory_breakdown", "内存用量拆分"],
+                    ["memory_justification", "高内存必要性"],
+                  ] as Array<[keyof HighMemoryRequestDetails, string]>
+                ).map(([field, label]) => (
+                  <label className="job-script-field" key={field}>
+                    {t(label)}
+                    <textarea
+                      className="ui-textarea"
+                      value={highMemoryRequest[field]}
+                      onChange={(event) =>
+                        updateHighMemoryRequest(field, event.target.value)
+                      }
+                      rows={3}
+                      maxLength={2000}
+                      required
+                    />
+                  </label>
+                ))}
+              </div>
+            </div>
+          ) : null}
           <div className="job-submit-row">
             <Button
               tone="primary"
@@ -1059,7 +1117,8 @@ export function OrdinaryJobs() {
               disabled={
                 submit.isPending ||
                 script.length === 0 ||
-                (gpu >= 2 && !multiGpuDetailsComplete)
+                (gpu >= 2 && !multiGpuDetailsComplete) ||
+                (memory > 32768 && !highMemoryDetailsComplete)
               }
             >
               {t("提交作业")}
@@ -1110,6 +1169,21 @@ export function OrdinaryJobs() {
                 : ""}
               {selected.gpu_approval.decision_comment
                 ? ` · ${selected.gpu_approval.decision_comment}`
+                : ""}
+            </div>
+          ) : null}
+          {selected.memory_approval ? (
+            <div className="notice">
+              <strong>{t("内存审批")}: </strong>
+              {selected.memory_approval.state} ·{" "}
+              {t("申请 {memory} MiB", {
+                memory: selected.memory_approval.requested_memory_mb,
+              })}
+              {selected.memory_approval.approved_memory_mb
+                ? ` · ${t("批准 {memory} MiB", { memory: selected.memory_approval.approved_memory_mb })}`
+                : ""}
+              {selected.memory_approval.decision_comment
+                ? ` · ${selected.memory_approval.decision_comment}`
                 : ""}
             </div>
           ) : null}

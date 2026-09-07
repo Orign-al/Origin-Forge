@@ -327,6 +327,7 @@ export type SelfJob = {
   memory_mb: number;
   gpu_count: 0 | 1 | 2 | 3 | 4;
   gpu_approval: JobGpuApproval | null;
+  memory_approval: JobMemoryApproval | null;
   time_limit_seconds: number;
   script_path: string;
   script_snapshot_path: string;
@@ -356,6 +357,12 @@ export type MultiGpuRequestDetails = {
   scaling_justification: string;
 };
 
+export type HighMemoryRequestDetails = {
+  workload_description: string;
+  memory_breakdown: string;
+  memory_justification: string;
+};
+
 export type JobGpuApproval = MultiGpuRequestDetails & {
   id: string;
   state: "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED";
@@ -377,6 +384,24 @@ export type AdminJobGpuApproval = JobGpuApproval & {
     managed_user_id: string;
     unix_username: string;
   };
+  job: SelfJob;
+};
+
+export type JobMemoryApproval = HighMemoryRequestDetails & {
+  id: string;
+  state: "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED";
+  requested_memory_mb: number;
+  approved_memory_mb: number | null;
+  script_sha256: string;
+  requested_at: string;
+  reviewed_at: string | null;
+  reviewed_by: string | null;
+  decision_comment: string | null;
+};
+
+export type AdminJobMemoryApproval = JobMemoryApproval & {
+  portal_job_id: string;
+  owner: AdminJobGpuApproval["owner"];
   job: SelfJob;
 };
 
@@ -1082,6 +1107,7 @@ export const submitSelfJob = (payload: {
   image_ref: string | null;
   source_path?: string | null;
   multi_gpu_request?: MultiGpuRequestDetails | null;
+  high_memory_request?: HighMemoryRequestDetails | null;
   idempotency_key: string;
 }) =>
   apiFetch<{ status: string; job: SelfJob }>("/self/jobs", {
@@ -1107,6 +1133,28 @@ export const decideJobGpuApproval = (
     idempotent_replay: boolean;
     approval: AdminJobGpuApproval;
   }>(`/admin/job-gpu-approvals/${encodeURIComponent(id)}/decision`, {
+    method: "POST",
+    body: JSON.stringify({ ...payload, idempotency_key: randomUuid() }),
+  });
+export const adminJobMemoryApprovals = () =>
+  apiFetch<{
+    status: string;
+    approvals: AdminJobMemoryApproval[];
+    count: number;
+  }>("/admin/job-memory-approvals");
+export const decideJobMemoryApproval = (
+  id: string,
+  payload: {
+    decision: "APPROVE" | "REJECT";
+    approved_memory_mb: number | null;
+    comment: string;
+  },
+) =>
+  apiFetch<{
+    status: string;
+    idempotent_replay: boolean;
+    approval: AdminJobMemoryApproval;
+  }>(`/admin/job-memory-approvals/${encodeURIComponent(id)}/decision`, {
     method: "POST",
     body: JSON.stringify({ ...payload, idempotency_key: randomUuid() }),
   });

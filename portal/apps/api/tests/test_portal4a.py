@@ -33,6 +33,7 @@ from h100_portal_api.models import (
     PortalContainer,
     PortalJob,
     PortalJobGpuApproval,
+    PortalJobMemoryApproval,
     PortalLeaseRenewalRequest,
     PortalManagedUser,
     PortalOperation,
@@ -70,6 +71,12 @@ MULTI_GPU_DETAILS = {
     "dataset_description": "owned 2 TB tokenized training corpus",
     "parallel_strategy": "four-way FSDP full shard with activation checkpointing",
     "scaling_justification": "single GPU cannot hold optimizer state; four GPUs avoid offload",
+}
+
+HIGH_MEMORY_DETAILS = {
+    "workload_description": "CPU preprocessing of a large in-memory training shard",
+    "memory_breakdown": "72 GiB dataset index, 32 GiB cache, 8 GiB runtime overhead",
+    "memory_justification": "Memory mapping is not supported by the upstream data pipeline",
 }
 
 
@@ -2033,6 +2040,354 @@ def test_multigpu_reject_cancel_and_review_rbac_do_not_reach_worker(
     assert rejected.json()["approval"]["state"] == "REJECTED"
     assert rejected.json()["approval"]["job"]["slurm_job_id"] is None
     assert calls == []
+
+
+def test_high_memory_requires_details_and_admin_may_reduce_before_single_submit(
+    client: TestClient,
+    database: Session,
+    origin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = _identity(
+        database,
+        login="memory-owner",
+        username="memory-owner",
+        uid=20103,
+        port=22103,
+    )
+    headers = _login(client, origin_headers, identity.user.normalized_login)
+    calls: list[dict[str, object]] = []
+
+    def worker(operation_type: str, **kwargs: object) -> dict[str, object]:
+        calls.append({"operation_type": operation_type, **kwargs})
+        return {
+            "status": "SUCCEEDED",
+            "request_id": str(uuid.uuid4()),
+            "slurm_job_id": 9201,
+            "slurm_user": identity.managed.unix_username,
+        }
+
+    monkeypatch.setattr("h100_portal_api.routes.self_service.call_worker", worker)
+    body = {
+        "name": "high-memory-review",
+        "script": "set -eu\npython preprocess.py\n",
+        "cpus": 8,
+        "memory_mb": 131072,
+        "gpu_count": 0,
+        "time_limit_seconds": 3600,
+        "image_ref": None,
+        "source_path": "/workspace/projects/memory/preprocess.sh",
+        "idempotency_key": str(uuid.uuid4()),
+    }
+    missing = client.post("/api/v1/self/jobs", headers=headers, json=body)
+    assert missing.status_code == 422
+    assert missing.json()["detail"]["code"] == "HIGH_MEMORY_DETAILS_REQUIRED"
+    assert calls == []
+
+    requested = client.post(
+        "/api/v1/self/jobs",
+        headers=headers,
+        json={**body, "high_memory_request": HIGH_MEMORY_DETAILS},
+    )
+    assert requested.status_code == 200
+    job_view = requested.json()["job"]
+    assert requested.json()["status"] == "APPROVAL_PENDING"
+    assert job_view["slurm_job_id"] is None
+    assert job_view["memory_approval"]["requested_memory_mb"] == 131072
+    assert job_view["gpu_approval"] is None
+    assert calls == []
+
+    approval = database.get(PortalJobMemoryApproval, uuid.UUID(job_view["memory_approval"]["id"]))
+    assert approval is not None
+    job = database.get(PortalJob, uuid.UUID(job_view["id"]))
+    assert job is not None
+    operation = database.get(PortalOperation, job.operation_id)
+    assert operation is not None
+    assert operation.status == OperationStatus.PENDING_APPROVAL
+    assert "memory_breakdown" not in json.dumps(operation.validated_payload)
+
+    for role_name in ("operator", "auditor"):
+        role_user = _role_user(database, role_name, "memory-review")
+        role_headers = _login(client, origin_headers, role_user.normalized_login)
+        assert (
+            client.get("/api/v1/admin/job-memory-approvals", headers=role_headers).status_code
+            == 403
+        )
+    user_headers = _login(client, origin_headers, identity.user.normalized_login)
+    assert client.get("/api/v1/admin/job-memory-approvals", headers=user_headers).status_code == 403
+
+    platform_admin = _role_user(database, "platform_admin", "memory-review")
+    admin_headers = _login(client, origin_headers, platform_admin.normalized_login)
+    assert (
+        client.get("/api/v1/admin/job-memory-approvals", headers=admin_headers).status_code == 200
+    )
+
+    owner = _admin(database)
+    owner_headers = _login(client, origin_headers, owner.normalized_login)
+    assert (
+        client.get("/api/v1/admin/job-memory-approvals", headers=owner_headers).status_code == 200
+    )
+    assert (
+        client.post(
+            "/api/v1/auth/reauthenticate",
+            headers=owner_headers,
+            json={"password": PASSWORD},
+        ).status_code
+        == 200
+    )
+    exceeds_request = client.post(
+        f"/api/v1/admin/job-memory-approvals/{approval.id}/decision",
+        headers=owner_headers,
+        json={
+            "decision": "APPROVE",
+            "approved_memory_mb": 131073,
+            "comment": "Must not increase the user's request.",
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    assert exceeds_request.status_code == 422
+    assert calls == []
+    approved = client.post(
+        f"/api/v1/admin/job-memory-approvals/{approval.id}/decision",
+        headers=owner_headers,
+        json={
+            "decision": "APPROVE",
+            "approved_memory_mb": 98304,
+            "comment": "96 GiB is sufficient based on the submitted breakdown.",
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "APPROVED"
+    assert approved.json()["approval"]["approved_memory_mb"] == 98304
+    assert len(calls) == 1
+    payload = calls[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["memory_mb"] == 98304
+    assert payload["gpu_approval"] is None
+    assert payload["memory_approval"]["requested_memory_mb"] == 131072
+    assert payload["memory_approval"]["approved_memory_mb"] == 98304
+    assert "memory_breakdown" not in payload
+
+
+def test_memory_threshold_is_direct_and_node_limit_is_rejected_before_worker(
+    client: TestClient,
+    database: Session,
+    origin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = _identity(
+        database,
+        login="memory-boundary",
+        username="memory-boundary",
+        uid=20105,
+        port=22105,
+    )
+    headers = _login(client, origin_headers, identity.user.normalized_login)
+    calls: list[dict[str, object]] = []
+
+    def worker(operation_type: str, **kwargs: object) -> dict[str, object]:
+        calls.append({"operation_type": operation_type, **kwargs})
+        return {
+            "status": "SUCCEEDED",
+            "request_id": str(uuid.uuid4()),
+            "slurm_job_id": 9203,
+            "slurm_user": identity.managed.unix_username,
+        }
+
+    monkeypatch.setattr("h100_portal_api.routes.self_service.call_worker", worker)
+    body = {
+        "name": "memory-boundary",
+        "script": "set -eu\ntrue\n",
+        "cpus": 8,
+        "memory_mb": 32768,
+        "gpu_count": 0,
+        "time_limit_seconds": 600,
+        "image_ref": None,
+        "source_path": "/workspace/projects/memory/boundary.sh",
+        "idempotency_key": str(uuid.uuid4()),
+    }
+    direct = client.post("/api/v1/self/jobs", headers=headers, json=body)
+    assert direct.status_code == 200
+    assert direct.json()["status"] == "SUBMITTED"
+    assert direct.json()["job"]["memory_approval"] is None
+    assert len(calls) == 1
+    assert calls[0]["payload"]["memory_mb"] == 32768
+    assert calls[0]["payload"]["memory_approval"] is None
+
+    unexpected_details = client.post(
+        "/api/v1/self/jobs",
+        headers=headers,
+        json={
+            **body,
+            "high_memory_request": HIGH_MEMORY_DETAILS,
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    assert unexpected_details.status_code == 422
+    assert unexpected_details.json()["detail"]["code"] == "HIGH_MEMORY_DETAILS_UNEXPECTED"
+    assert len(calls) == 1
+
+    above_node = client.post(
+        "/api/v1/self/jobs",
+        headers=headers,
+        json={
+            **body,
+            "memory_mb": 486378,
+            "high_memory_request": HIGH_MEMORY_DETAILS,
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    assert above_node.status_code == 422
+    assert len(calls) == 1
+
+
+def test_joint_gpu_and_memory_approval_waits_for_both_and_submits_once(
+    client: TestClient,
+    database: Session,
+    origin_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = _identity(
+        database,
+        login="joint-resource-owner",
+        username="joint-resource-owner",
+        uid=20104,
+        port=22104,
+    )
+    user_headers = _login(client, origin_headers, identity.user.normalized_login)
+    calls: list[dict[str, object]] = []
+
+    def worker(operation_type: str, **kwargs: object) -> dict[str, object]:
+        calls.append({"operation_type": operation_type, **kwargs})
+        return {
+            "status": "SUCCEEDED",
+            "request_id": str(uuid.uuid4()),
+            "slurm_job_id": 9202,
+            "slurm_user": identity.managed.unix_username,
+        }
+
+    monkeypatch.setattr("h100_portal_api.routes.self_service.call_worker", worker)
+    response = client.post(
+        "/api/v1/self/jobs",
+        headers=user_headers,
+        json={
+            "name": "joint-resource-review",
+            "script": "set -eu\npython train.py\n",
+            "cpus": 8,
+            "memory_mb": 196608,
+            "gpu_count": 4,
+            "time_limit_seconds": 3600,
+            "image_ref": None,
+            "source_path": "/workspace/projects/joint/train.sh",
+            "multi_gpu_request": MULTI_GPU_DETAILS,
+            "high_memory_request": HIGH_MEMORY_DETAILS,
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    assert response.status_code == 200
+    view = response.json()["job"]
+    assert view["gpu_approval"]["state"] == "PENDING"
+    assert view["memory_approval"]["state"] == "PENDING"
+    assert calls == []
+
+    owner = _admin(database)
+    headers = _login(client, origin_headers, owner.normalized_login)
+    assert (
+        client.post(
+            "/api/v1/auth/reauthenticate", headers=headers, json={"password": PASSWORD}
+        ).status_code
+        == 200
+    )
+    gpu_decision = client.post(
+        f"/api/v1/admin/job-gpu-approvals/{view['gpu_approval']['id']}/decision",
+        headers=headers,
+        json={
+            "decision": "APPROVE",
+            "approved_gpu_count": 3,
+            "comment": "Three GPUs are sufficient.",
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    assert gpu_decision.status_code == 200
+    assert gpu_decision.json()["approval"]["job"]["state"] == "APPROVAL_PENDING"
+    assert calls == []
+
+    memory_decision = client.post(
+        f"/api/v1/admin/job-memory-approvals/{view['memory_approval']['id']}/decision",
+        headers=headers,
+        json={
+            "decision": "APPROVE",
+            "approved_memory_mb": 131072,
+            "comment": "128 GiB is sufficient.",
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    assert memory_decision.status_code == 200
+    assert memory_decision.json()["approval"]["job"]["state"] == "PENDING"
+    assert len(calls) == 1
+    payload = calls[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["gpu_count"] == 3
+    assert payload["memory_mb"] == 131072
+    assert payload["gpu_approval"]["approved_gpu_count"] == 3
+    assert payload["memory_approval"]["approved_memory_mb"] == 131072
+
+    user_headers = _login(client, origin_headers, identity.user.normalized_login)
+    rejected_response = client.post(
+        "/api/v1/self/jobs",
+        headers=user_headers,
+        json={
+            "name": "joint-resource-reject",
+            "script": "set -eu\npython train.py\n",
+            "cpus": 8,
+            "memory_mb": 131072,
+            "gpu_count": 2,
+            "time_limit_seconds": 3600,
+            "image_ref": None,
+            "source_path": "/workspace/projects/joint/train.sh",
+            "multi_gpu_request": MULTI_GPU_DETAILS,
+            "high_memory_request": HIGH_MEMORY_DETAILS,
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    assert rejected_response.status_code == 200
+    rejected_view = rejected_response.json()["job"]
+    assert len(calls) == 1
+    headers = _login(client, origin_headers, owner.normalized_login)
+    assert (
+        client.post(
+            "/api/v1/auth/reauthenticate", headers=headers, json={"password": PASSWORD}
+        ).status_code
+        == 200
+    )
+    memory_first = client.post(
+        f"/api/v1/admin/job-memory-approvals/{rejected_view['memory_approval']['id']}/decision",
+        headers=headers,
+        json={
+            "decision": "APPROVE",
+            "approved_memory_mb": 65536,
+            "comment": "64 GiB is sufficient.",
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    assert memory_first.status_code == 200
+    assert memory_first.json()["approval"]["job"]["state"] == "APPROVAL_PENDING"
+    assert len(calls) == 1
+    gpu_rejected = client.post(
+        f"/api/v1/admin/job-gpu-approvals/{rejected_view['gpu_approval']['id']}/decision",
+        headers=headers,
+        json={
+            "decision": "REJECT",
+            "approved_gpu_count": None,
+            "comment": "The multi-GPU request is not justified.",
+            "idempotency_key": str(uuid.uuid4()),
+        },
+    )
+    assert gpu_rejected.status_code == 200
+    assert gpu_rejected.json()["approval"]["job"]["state"] == "REJECTED"
+    assert gpu_rejected.json()["approval"]["job"]["slurm_job_id"] is None
+    assert len(calls) == 1
 
 
 def test_container_connection_reports_only_a_live_slurm_gpu_allocation(

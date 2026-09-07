@@ -897,7 +897,7 @@ class PortalJob(Base):
     __table_args__ = (
         CheckConstraint("gpu_count BETWEEN 0 AND 4", name="ck_portal_job_gpu_count"),
         CheckConstraint("requested_cpus BETWEEN 1 AND 32", name="ck_portal_job_cpus"),
-        CheckConstraint("memory_mb BETWEEN 256 AND 32768", name="ck_portal_job_memory"),
+        CheckConstraint("memory_mb BETWEEN 256 AND 486377", name="ck_portal_job_memory"),
         CheckConstraint(
             "time_limit_seconds BETWEEN 60 AND 345600", name="ck_portal_job_time_limit"
         ),
@@ -946,6 +946,9 @@ class PortalJob(Base):
     gpu_approval: Mapped[PortalJobGpuApproval | None] = relationship(
         "PortalJobGpuApproval", uselist=False, lazy="selectin"
     )
+    memory_approval: Mapped[PortalJobMemoryApproval | None] = relationship(
+        "PortalJobMemoryApproval", uselist=False, lazy="selectin"
+    )
 
 
 class PortalJobGpuApproval(Base):
@@ -990,6 +993,54 @@ class PortalJobGpuApproval(Base):
     dataset_description: Mapped[str] = mapped_column(Text, nullable=False)
     parallel_strategy: Mapped[str] = mapped_column(Text, nullable=False)
     scaling_justification: Mapped[str] = mapped_column(Text, nullable=False)
+    script_content: Mapped[str] = mapped_column(Text, nullable=False)
+    script_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("portal_users.id"))
+    decision_comment: Mapped[str | None] = mapped_column(String(1000))
+    decision_idempotency_key: Mapped[str | None] = mapped_column(String(128), unique=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    __mapper_args__: dict[str, Any] = {"version_id_col": version}  # noqa: RUF012
+
+
+class PortalJobMemoryApproval(Base):
+    __tablename__ = "portal_job_memory_approvals"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('PENDING', 'APPROVED', 'REJECTED', 'CANCELLED')",
+            name="ck_job_memory_approval_state",
+        ),
+        CheckConstraint(
+            "requested_memory_mb BETWEEN 32769 AND 486377",
+            name="ck_job_memory_approval_requested_memory",
+        ),
+        CheckConstraint(
+            "approved_memory_mb IS NULL OR approved_memory_mb BETWEEN 256 AND requested_memory_mb",
+            name="ck_job_memory_approval_approved_memory",
+        ),
+        CheckConstraint(
+            "(state = 'APPROVED' AND approved_memory_mb IS NOT NULL "
+            "AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL) OR "
+            "(state = 'REJECTED' AND approved_memory_mb IS NULL "
+            "AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL) OR "
+            "(state IN ('PENDING', 'CANCELLED') AND approved_memory_mb IS NULL)",
+            name="ck_job_memory_approval_decision",
+        ),
+        CheckConstraint("length(script_sha256) = 64", name="ck_job_memory_approval_script_sha256"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    portal_job_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("portal_jobs.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
+    )
+    state: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    requested_memory_mb: Mapped[int] = mapped_column(Integer, nullable=False)
+    approved_memory_mb: Mapped[int | None] = mapped_column(Integer)
+    workload_description: Mapped[str] = mapped_column(Text, nullable=False)
+    memory_breakdown: Mapped[str] = mapped_column(Text, nullable=False)
+    memory_justification: Mapped[str] = mapped_column(Text, nullable=False)
     script_content: Mapped[str] = mapped_column(Text, nullable=False)
     script_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

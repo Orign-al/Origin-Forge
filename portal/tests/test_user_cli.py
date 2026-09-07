@@ -87,7 +87,14 @@ class PortalHandler(BaseHTTPRequestHandler):
                         "gpu_count": 0,
                         "time_limit_seconds": 1800,
                     },
-                    "limits": {"script_bytes": {"maximum": 8192}},
+                    "limits": {
+                        "script_bytes": {"maximum": 8192},
+                        "memory_mb": {
+                            "minimum": 256,
+                            "maximum": 486377,
+                            "approval_required_above": 32768,
+                        },
+                    },
                     "allowed_script_roots": [str(self.server.workspace), str(self.server.home)],
                     "username": "cli-user",
                     "cli_version": "1.0.0",
@@ -126,7 +133,7 @@ class PortalHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         if self.path == "/api/v1/self/jobs":
             self.server.submit_requests.append(body)
-            if int(body.get("gpu_count", 0)) >= 2:
+            if int(body.get("gpu_count", 0)) >= 2 or int(body.get("memory_mb", 0)) > 32768:
                 self.server.job = {
                     **self.server.job,
                     "slurm_job_id": None,
@@ -327,6 +334,43 @@ def test_cli_exit_codes_policy_rejection_paths_and_directives(portal, tmp_path: 
     assert missing_details.returncode == 2
     assert json.loads(missing_details.stdout)["error"]["code"] == "MULTI_GPU_DETAILS_REQUIRED"
     assert portal.server.submit_requests == []
+    assert portal.server.worker_calls == 0
+
+    requests_before_memory = len(portal.server.submit_requests)
+    missing_memory_details = _run(
+        portal, config, "job", "submit", str(script), "--memory", "128G", "--json"
+    )
+    assert missing_memory_details.returncode == 2
+    assert (
+        json.loads(missing_memory_details.stdout)["error"]["code"] == "HIGH_MEMORY_DETAILS_REQUIRED"
+    )
+    assert len(portal.server.submit_requests) == requests_before_memory
+
+    memory_pending = _run(
+        portal,
+        config,
+        "job",
+        "submit",
+        str(script),
+        "--memory",
+        "128G",
+        "--memory-workload-description",
+        "large CPU preprocessing",
+        "--memory-breakdown",
+        "96 GiB index and 32 GiB runtime",
+        "--memory-justification",
+        "the pipeline cannot stream its index",
+        "--json",
+    )
+    assert memory_pending.returncode == 0
+    assert json.loads(memory_pending.stdout)["job"]["state"] == "APPROVAL_PENDING"
+    memory_body = portal.server.submit_requests[-1]
+    assert memory_body["memory_mb"] == 131072
+    assert memory_body["high_memory_request"] == {
+        "workload_description": "large CPU preprocessing",
+        "memory_breakdown": "96 GiB index and 32 GiB runtime",
+        "memory_justification": "the pipeline cannot stream its index",
+    }
     assert portal.server.worker_calls == 0
 
     pending = _run(

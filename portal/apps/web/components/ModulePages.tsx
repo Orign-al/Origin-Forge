@@ -9,12 +9,14 @@ import { Button, Card, EmptyState, Input, StatusBadge } from "@h100-portal/ui";
 import {
   ApiError,
   adminJobGpuApprovals,
+  adminJobMemoryApprovals,
   alerts,
   approveOperation,
   audit,
   containers,
   createOperation,
   decideJobGpuApproval,
+  decideJobMemoryApproval,
   gpus,
   gpuHealth,
   imageInventory,
@@ -32,6 +34,7 @@ import {
   storage,
   submitOperation,
   type AdminJobGpuApproval,
+  type AdminJobMemoryApproval,
 } from "../lib/api";
 import {
   ErrorBlock,
@@ -549,6 +552,140 @@ function GpuApprovalCard({ approval }: { approval: AdminJobGpuApproval }) {
   );
 }
 
+function memoryLabel(memoryMb: number) {
+  const gib = memoryMb / 1024;
+  return `${Number.isInteger(gib) ? gib : gib.toFixed(2)} GiB (${memoryMb} MiB)`;
+}
+
+function MemoryApprovalCard({
+  approval,
+}: {
+  approval: AdminJobMemoryApproval;
+}) {
+  const queryClient = useQueryClient();
+  const { t } = useI18n();
+  const [approvedMemoryMb, setApprovedMemoryMb] = useState(
+    approval.requested_memory_mb,
+  );
+  const [comment, setComment] = useState("");
+  const [password, setPassword] = useState("");
+  const review = useMutation({
+    mutationFn: async (decision: "APPROVE" | "REJECT") => {
+      await reauthenticate(password);
+      return decideJobMemoryApproval(approval.id, {
+        decision,
+        approved_memory_mb: decision === "APPROVE" ? approvedMemoryMb : null,
+        comment,
+      });
+    },
+    onSuccess: async () => {
+      setPassword("");
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["job-memory-approvals"] }),
+        queryClient.invalidateQueries({ queryKey: ["job-gpu-approvals"] }),
+      ]);
+    },
+  });
+  const invalidMemory =
+    !Number.isInteger(approvedMemoryMb) ||
+    approvedMemoryMb < 256 ||
+    approvedMemoryMb > approval.requested_memory_mb;
+  return (
+    <div className="gpu-approval-review">
+      <div className="section-card-header">
+        <div>
+          <div className="section-card-title">
+            {approval.job.name} · {approval.owner.display_name}
+          </div>
+          <div className="section-card-subtitle">
+            {approval.owner.login_name} / {approval.owner.unix_username}
+          </div>
+        </div>
+      </div>
+      <dl className="kv-grid">
+        <div className="kv">
+          <dt>{t("申请内存")}</dt>
+          <dd>{memoryLabel(approval.requested_memory_mb)}</dd>
+        </div>
+        <div className="kv">
+          <dt>GPU</dt>
+          <dd>{approval.job.gpu_count}</dd>
+        </div>
+        <div className="kv">
+          <dt>{t("最长运行")}</dt>
+          <dd>{Math.ceil(approval.job.time_limit_seconds / 60)} min</dd>
+        </div>
+      </dl>
+      <h3>{t("任务说明")}</h3>
+      <p>{approval.workload_description}</p>
+      <h3>{t("内存用量拆分")}</h3>
+      <p>{approval.memory_breakdown}</p>
+      <h3>{t("高内存必要性")}</h3>
+      <p>{approval.memory_justification}</p>
+      <div className="mono muted">Script SHA-256: {approval.script_sha256}</div>
+      <div className="job-form-grid">
+        <label>
+          {t("批准内存 MiB")}
+          <Input
+            type="number"
+            min={256}
+            max={approval.requested_memory_mb}
+            step={256}
+            value={approvedMemoryMb}
+            onChange={(event) =>
+              setApprovedMemoryMb(Number(event.target.value))
+            }
+          />
+          <span className="muted">{memoryLabel(approvedMemoryMb || 0)}</span>
+        </label>
+        <label className="job-script-field">
+          {t("审批意见")}
+          <textarea
+            className="ui-textarea"
+            value={comment}
+            onChange={(event) => setComment(event.target.value)}
+            rows={3}
+            maxLength={1000}
+            required
+          />
+        </label>
+        <label>
+          {t("管理员密码（最近认证）")}
+          <Input
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            autoComplete="current-password"
+          />
+        </label>
+      </div>
+      <div className="button-row">
+        <Button
+          tone="primary"
+          disabled={
+            review.isPending || !comment.trim() || !password || invalidMemory
+          }
+          onClick={() => review.mutate("APPROVE")}
+        >
+          {t("按所选内存批准")}
+        </Button>
+        <Button
+          tone="danger"
+          disabled={review.isPending || !comment.trim() || !password}
+          onClick={() => review.mutate("REJECT")}
+        >
+          {t("驳回")}
+        </Button>
+      </div>
+      {review.isError ? (
+        <div className="error-box" role="alert">
+          {review.error instanceof Error ? review.error.message : t("审批失败")}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function JobsModule() {
   const current = useQuery({ queryKey: ["me"], queryFn: me, retry: false });
   const canReview = ["platform_owner", "platform_admin"].includes(
@@ -557,6 +694,13 @@ export function JobsModule() {
   const approvals = useQuery({
     queryKey: ["job-gpu-approvals"],
     queryFn: adminJobGpuApprovals,
+    enabled: canReview,
+    retry: false,
+    refetchInterval: 15_000,
+  });
+  const memoryApprovals = useQuery({
+    queryKey: ["job-memory-approvals"],
+    queryFn: adminJobMemoryApprovals,
     enabled: canReview,
     retry: false,
     refetchInterval: 15_000,
@@ -578,6 +722,42 @@ export function JobsModule() {
       description="当前队列与最近完成/失败作业"
       query={query}
     >
+      {canReview ? (
+        <SectionCard
+          title="内存审批"
+          subtitle="32 GiB以内直接提交；更高内存必须审批且可以降低后批准"
+        >
+          {memoryApprovals.isPending ? <LoadingBlock /> : null}
+          {memoryApprovals.isError ? <ErrorBlock /> : null}
+          {memoryApprovals.data?.approvals.filter(
+            (item) => item.state === "PENDING",
+          ).length === 0 ? (
+            <EmptyState
+              title="没有待审批的高内存作业"
+              detail="新的申请会显示在这里"
+            />
+          ) : null}
+          {memoryApprovals.data?.approvals
+            .filter((item) => item.state === "PENDING")
+            .map((approval) => (
+              <MemoryApprovalCard key={approval.id} approval={approval} />
+            ))}
+          {memoryApprovals.data ? (
+            <Table
+              rows={memoryApprovals.data.approvals.filter(
+                (item) => item.state !== "PENDING",
+              )}
+              columns={[
+                ["state", "审批状态"],
+                ["requested_memory_mb", "申请内存 MiB"],
+                ["approved_memory_mb", "批准内存 MiB"],
+                ["decision_comment", "审批意见"],
+              ]}
+              empty="暂无历史内存审批"
+            />
+          ) : null}
+        </SectionCard>
+      ) : null}
       {canReview ? (
         <SectionCard
           title="多GPU审批"

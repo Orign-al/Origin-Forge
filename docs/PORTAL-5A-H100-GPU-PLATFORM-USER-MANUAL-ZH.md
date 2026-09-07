@@ -251,6 +251,19 @@ h100 job submit train.sh --gpus 4 \
 
 资料缺失时 CLI 在本地拒绝；Backend 仍会独立校验。完整申请返回 `APPROVAL_PENDING`，此时没有 Slurm Job 或日志。管理员可批准 1 至申请数量之间的任意数量，不能增加用户申请数量。
 
+Job 内存不超过 `32G` 时无需额外审批。申请更高内存时必须说明任务、内存用量拆分和必要性：
+
+```bash
+h100 job submit preprocess.sh --memory 128G \
+  --memory-workload-description '大规模数据预处理' \
+  --memory-breakdown '96 GiB 数据索引，32 GiB 运行时与缓存' \
+  --memory-justification '上游流程当前不能流式读取索引'
+```
+
+高内存申请也返回 `APPROVAL_PENDING`。管理员可降低批准内存，但不能提高到用户申请以上。
+内存审批与多 GPU 审批相互独立；一个 Job 同时触发两项时，必须全部通过后才创建唯一的
+Slurm Job。任一项仍待审时不会调用 Worker，任一项驳回则不创建 Slurm Job。
+
 CLI v1 拒绝包含资源变更 `#SBATCH` directive 的脚本。请用 `--cpus`、`--memory`、`--gpus` 和 `--time`，由 Portal backend 再次执行 authoritative policy validation。
 
 ### 11.3 列表、状态、日志和取消

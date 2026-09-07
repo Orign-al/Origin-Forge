@@ -251,6 +251,21 @@ h100 job submit train.sh --gpus 4 \
 
 The CLI rejects missing details locally and the backend validates them independently. A complete request returns `APPROVAL_PENDING`; no Slurm job or logs exist yet. An administrator can approve any count from 1 through the requested count, but cannot increase it.
 
+Job memory up to and including `32G` needs no additional approval. A larger request must describe
+the workload, estimated memory breakdown, and necessity:
+
+```bash
+h100 job submit preprocess.sh --memory 128G \
+  --memory-workload-description 'large-scale data preprocessing' \
+  --memory-breakdown '96 GiB dataset index, 32 GiB runtime and cache' \
+  --memory-justification 'the upstream pipeline cannot stream its index'
+```
+
+A high-memory request also returns `APPROVAL_PENDING`. An administrator may approve less memory but
+cannot increase it above the request. Memory and multi-GPU approvals are independent; when a Job
+requires both, every required approval must pass before the Portal creates the single Slurm Job.
+Worker is not called while either decision is pending, and no Slurm Job is created after a rejection.
+
 CLI v1 rejects scripts containing resource-changing `#SBATCH` directives. Use `--cpus`, `--memory`, `--gpus`, and `--time`; the Portal backend performs authoritative policy validation again.
 
 ### 11.3 List, inspect, read logs, and cancel

@@ -170,6 +170,20 @@ H100。该策略只调和 `/etc/h100-platform/users/*.state` 代表的受管 Por
 无生命周期记录的其他 Slurm 用户。用户可在审批前取消自己的申请，此操作只更新 Portal
 状态，不调用 Worker 或 `scancel`。
 
+## 高内存 Job 审批
+
+每个 Job 请求不超过 32 GiB（32768 MiB）时不需要额外内存审批。请求超过 32 GiB 时，
+用户必须提交任务说明、预估内存用量拆分以及高内存必要性；Backend 保存不可变脚本快照和
+SHA-256，将 Job 保持为 `APPROVAL_PENDING`，审批完成前不调用 Worker、不创建 Slurm Job。
+实际最大值由当前单节点 Slurm `RealMemory=486377 MiB` 合约约束，API、Worker 与数据库均
+执行同一上限验证。
+
+内存审批与多 GPU 审批是独立维度。一个 Job 同时触发两种审批时，两项都通过后只提交一次；
+任一项仍待审批时不调用 Worker，任一项驳回则 Job 终止且另一待审项取消。管理员可以把批准
+内存降低到不高于用户申请且不超过调度上限的值，不能提高用户申请。只有 platform_owner 与
+platform_admin 可以读取和审批；审核要求 CSRF 与最近密码重新认证。审批材料只保存在 Portal，
+不会传给 Worker、Slurm 环境或作业日志。
+
 ## Portal-3C 执行边界
 
 唯一 DRAFT 依次进入 `PENDING_APPROVAL → APPROVED → QUEUED → RUNNING`。API 只有在

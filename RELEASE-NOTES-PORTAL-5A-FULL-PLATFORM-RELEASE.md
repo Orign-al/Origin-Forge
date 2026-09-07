@@ -4,6 +4,18 @@ Release: `PORTAL-5A-FULL-PLATFORM-RELEASE`
 Status: `PASS`
 Acceptance date: 2026-08-30 UTC
 
+## High-memory approval candidate addendum — not yet deployed
+
+Candidate scope: `PORTAL-5A-USER-JOB-MEMORY-APPROVAL-1`
+Status: `CANDIDATE VALIDATION IN PROGRESS / NOT PRODUCTION`
+
+- Job memory through 32 GiB remains direct. Requests above 32 GiB require workload, memory-breakdown, and necessity fields and remain `APPROVAL_PENDING` without a Worker call or Slurm Job.
+- The current single-node Slurm `RealMemory=486377 MiB` contract is the maximum accepted value at the Web, CLI, API, database, and Worker boundaries.
+- Only platform owners and platform administrators can review after recent password reauthentication. Reviewers may lower memory but cannot exceed the user's request.
+- Memory and multi-GPU approvals are independent. A combined request makes one Worker call and creates one Slurm Job only after both approvals pass; rejection of either dimension prevents submission.
+- Approval narratives remain in Portal and are not forwarded to Worker, Slurm, or the Job environment.
+- This addendum describes the candidate only. Production remains unchanged until a separately authorized deployment passes.
+
 ## Multi-GPU approval candidate addendum — not yet deployed
 
 Candidate scope: `PORTAL-5A-USER-MULTIGPU-APPROVAL-1`

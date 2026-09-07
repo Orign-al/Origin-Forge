@@ -574,6 +574,18 @@ def _job_submit(args: argparse.Namespace) -> int:
         "source_path": script.as_posix(),
         "idempotency_key": str(uuid.uuid4()),
     }
+    memory_limits = config.get("limits", {}).get("memory_mb", {})
+    memory_minimum = int(memory_limits.get("minimum", 256))
+    memory_maximum = int(memory_limits.get("maximum", 486377))
+    memory_approval_threshold = int(
+        memory_limits.get("approval_required_above", 32768)
+    )
+    if not memory_minimum <= int(body["memory_mb"]) <= memory_maximum:
+        raise CliError(
+            f"Memory must be between {memory_minimum} MiB and {memory_maximum} MiB.",
+            exit_code=EXIT_USAGE,
+            code="JOB_MEMORY_INVALID",
+        )
     if int(body["gpu_count"]) >= 2:
         details = {
             "model_name": args.model_name,
@@ -596,6 +608,23 @@ def _job_submit(args: argparse.Namespace) -> int:
         body["multi_gpu_request"] = details
     else:
         body["multi_gpu_request"] = None
+    if int(body["memory_mb"]) > memory_approval_threshold:
+        memory_details = {
+            "workload_description": args.memory_workload_description,
+            "memory_breakdown": args.memory_breakdown,
+            "memory_justification": args.memory_justification,
+        }
+        missing = [key.replace("_", "-") for key, value in memory_details.items() if not value]
+        if missing:
+            raise CliError(
+                "Memory requests above 32 GiB require approval details: "
+                + ", ".join(missing),
+                exit_code=EXIT_USAGE,
+                code="HIGH_MEMORY_DETAILS_REQUIRED",
+            )
+        body["high_memory_request"] = memory_details
+    else:
+        body["high_memory_request"] = None
     result = _api("POST", "/self/jobs", body=body, timeout=60)
     job = result.get("job", {})
     output = {
@@ -608,7 +637,7 @@ def _job_submit(args: argparse.Namespace) -> int:
         _json(output)
     else:
         if result.get("status") == "APPROVAL_PENDING":
-            print("Multi-GPU request submitted for administrator approval.")
+            print("Resource request submitted for administrator approval.")
         else:
             print("Job submitted successfully.")
         print()
@@ -616,6 +645,7 @@ def _job_submit(args: argparse.Namespace) -> int:
         print(f"Slurm Job ID: {job.get('slurm_job_id')}")
         print(f"State: {job.get('state')}")
         print(f"GPU: {job.get('gpu_count')}")
+        print(f"Memory: {job.get('memory_mb')} MiB")
         print(f"Script: {job.get('source_path') or script.as_posix()}")
     return 0
 
@@ -827,7 +857,11 @@ def _add_submit(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("script", help="script under /workspace or your /home")
     parser.add_argument("--name", help="job name (1-64 safe characters)")
     parser.add_argument("--cpus", type=int, help="CPU count (1-8; default fetched from Portal)")
-    parser.add_argument("--memory", type=_memory_mb, help="memory, e.g. 4096M or 32G (256M-32G)")
+    parser.add_argument(
+        "--memory",
+        type=_memory_mb,
+        help="memory, e.g. 4096M or 32G (over 32G requires approval)",
+    )
     parser.add_argument("--gpus", type=int, help="H100 count (0-4; 2-4 require approval)")
     parser.add_argument("--model-name", help="model name (required for 2-4 GPUs)")
     parser.add_argument("--model-architecture", help="model architecture (required for 2-4 GPUs)")
@@ -838,6 +872,18 @@ def _add_submit(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dataset-description", help="dataset description (required for 2-4 GPUs)")
     parser.add_argument("--parallel-strategy", help="data/model parallel strategy (required for 2-4 GPUs)")
     parser.add_argument("--scaling-justification", help="expected scaling benefit (required for 2-4 GPUs)")
+    parser.add_argument(
+        "--memory-workload-description",
+        help="workload description (required above 32 GiB)",
+    )
+    parser.add_argument(
+        "--memory-breakdown",
+        help="estimated memory usage breakdown (required above 32 GiB)",
+    )
+    parser.add_argument(
+        "--memory-justification",
+        help="reason more than 32 GiB is required (required above 32 GiB)",
+    )
     parser.add_argument(
         "--time", type=_duration_seconds, help="time [D-]HH:MM:SS (00:01:00-4-00:00:00)"
     )

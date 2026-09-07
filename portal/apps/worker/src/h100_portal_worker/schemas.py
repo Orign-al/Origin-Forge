@@ -1370,6 +1370,7 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
         "slurm_qos",
         "max_gpu",
         "gpu_approval",
+        "memory_approval",
         "image_ref",
     }
     if set(payload) != fields:
@@ -1426,9 +1427,65 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
     if (
         not isinstance(memory_mb, int)
         or isinstance(memory_mb, bool)
-        or not 256 <= memory_mb <= 32768
+        or not 256 <= memory_mb <= 486377
     ):
         raise PayloadValidationError("JOB_SPEC_REJECTED", "memory request is invalid")
+    memory_approval = payload.get("memory_approval")
+    if memory_approval is None:
+        if memory_mb > 32768:
+            raise PayloadValidationError(
+                "MEMORY_APPROVAL_REJECTED", "memory above 32 GiB requires approval"
+            )
+        normalized_memory_approval = None
+    else:
+        if not isinstance(memory_approval, dict) or set(memory_approval) != {
+            "approval_id",
+            "requested_memory_mb",
+            "approved_memory_mb",
+            "script_sha256",
+            "reviewed_by",
+            "reviewed_at",
+        }:
+            raise PayloadValidationError(
+                "MEMORY_APPROVAL_REJECTED", "memory approval contract is invalid"
+            )
+        requested_memory_mb = memory_approval.get("requested_memory_mb")
+        approved_memory_mb = memory_approval.get("approved_memory_mb")
+        approval_script_sha256 = memory_approval.get("script_sha256")
+        reviewed_at = memory_approval.get("reviewed_at")
+        try:
+            parsed_reviewed_at = datetime.fromisoformat(str(reviewed_at).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise PayloadValidationError(
+                "MEMORY_APPROVAL_REJECTED", "memory approval timestamp is invalid"
+            ) from exc
+        if (
+            isinstance(requested_memory_mb, bool)
+            or isinstance(approved_memory_mb, bool)
+            or not isinstance(requested_memory_mb, int)
+            or not 32769 <= requested_memory_mb <= 486377
+            or not isinstance(approved_memory_mb, int)
+            or not 256 <= approved_memory_mb <= requested_memory_mb
+            or memory_mb != approved_memory_mb
+            or approval_script_sha256 != payload.get("script_sha256")
+            or parsed_reviewed_at.tzinfo is None
+            or parsed_reviewed_at.astimezone(UTC) > datetime.now(UTC) + timedelta(minutes=1)
+        ):
+            raise PayloadValidationError(
+                "MEMORY_APPROVAL_REJECTED", "memory request differs from approved contract"
+            )
+        normalized_memory_approval = {
+            "approval_id": _canonical_uuid(
+                memory_approval.get("approval_id"), "memory approval ID"
+            ),
+            "requested_memory_mb": requested_memory_mb,
+            "approved_memory_mb": approved_memory_mb,
+            "script_sha256": approval_script_sha256,
+            "reviewed_by": _canonical_uuid(
+                memory_approval.get("reviewed_by"), "memory reviewer ID"
+            ),
+            "reviewed_at": parsed_reviewed_at.astimezone(UTC).isoformat(),
+        }
     max_gpu = payload.get("max_gpu")
     gpu_approval = payload.get("gpu_approval")
     if isinstance(max_gpu, bool) or isinstance(gpu_count, bool) or max_gpu not in {0, 1}:
@@ -1561,6 +1618,7 @@ def _validate_self_job_submit(payload: dict[str, Any]) -> dict[str, Any]:
             "slurm_qos": slurm_qos,
             "max_gpu": max_gpu,
             "gpu_approval": normalized_approval,
+            "memory_approval": normalized_memory_approval,
             "image_ref": image_ref,
         }
     )

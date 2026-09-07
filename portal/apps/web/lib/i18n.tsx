@@ -400,6 +400,15 @@ const EN_US: Record<string, string> = {
   作业名称: "Job Name",
   执行脚本: "Execution Script",
   "内存 MB": "Memory (MB)",
+  "内存 MiB": "Memory (MiB)",
+  "内存 >32 GiB 需审批": "Memory above 32 GiB requires approval",
+  "32 GiB（32768 MiB）以内无需审批":
+    "Up to 32 GiB (32768 MiB) does not require approval",
+  "超过32 GiB的作业不会立即进入Slurm。请说明任务、内存用量拆分与高内存必要性；管理员可降低批准内存或驳回申请。":
+    "Jobs above 32 GiB do not enter Slurm immediately. Describe the workload, memory breakdown, and why high memory is necessary; an administrator may approve less memory or reject the request.",
+  高内存任务说明: "High-Memory Workload Details",
+  内存用量拆分: "Memory Usage Breakdown",
+  高内存必要性: "High-Memory Justification",
   "最长运行（分钟）": "Maximum Runtime (minutes)",
   "多GPU作业不会立即进入Slurm。请完整说明模型、框架、数据集和并行收益；管理员可降低GPU数量后批准，或驳回不合理申请。":
     "Multi-GPU jobs do not enter Slurm immediately. Describe the model, framework, dataset, and scaling benefit completely; an administrator may approve fewer GPUs or reject an unjustified request.",
@@ -424,11 +433,17 @@ const EN_US: Record<string, string> = {
   关闭: "Close",
   取消作业: "Cancel Job",
   多GPU审批: "Multi-GPU Approval",
+  内存审批: "Memory Approval",
+  "申请 {memory} MiB": "Requested {memory} MiB",
+  "批准 {memory} MiB": "Approved {memory} MiB",
   "申请 {count} 张": "Requested {count}",
   "批准 {count} 张": "Approved {count}",
   "审批完成并提交Slurm后才会产生运行日志。":
     "Runtime logs become available after approval and Slurm submission.",
   申请GPU: "Requested GPUs",
+  申请内存: "Requested Memory",
+  "批准内存 MiB": "Approved Memory (MiB)",
+  按所选内存批准: "Approve Selected Memory",
   模型: "Model",
   架构: "Architecture",
   参数量: "Parameter Count",

@@ -2632,6 +2632,7 @@ def managed_job_payload(*, username: str = "origin-pilot", uid: int = 20001) -> 
         "slurm_qos": "general",
         "max_gpu": 1,
         "gpu_approval": None,
+        "memory_approval": None,
         "image_ref": APPROVED_JOB_IMAGE,
     }
 
@@ -2646,6 +2647,22 @@ def approved_multigpu_job_payload(
         "approval_id": str(uuid.uuid4()),
         "requested_gpu_count": requested_gpu_count,
         "approved_gpu_count": approved_gpu_count,
+        "script_sha256": payload["script_sha256"],
+        "reviewed_by": str(uuid.uuid4()),
+        "reviewed_at": datetime.now(UTC).isoformat(),
+    }
+    return payload
+
+
+def approved_high_memory_job_payload(
+    *, approved_memory_mb: int, requested_memory_mb: int = 131072
+) -> dict[str, object]:
+    payload = managed_job_payload()
+    payload["memory_mb"] = approved_memory_mb
+    payload["memory_approval"] = {
+        "approval_id": str(uuid.uuid4()),
+        "requested_memory_mb": requested_memory_mb,
+        "approved_memory_mb": approved_memory_mb,
         "script_sha256": payload["script_sha256"],
         "reviewed_by": str(uuid.uuid4()),
         "reviewed_at": datetime.now(UTC).isoformat(),
@@ -2742,6 +2759,42 @@ def test_multigpu_sbatch_uses_exact_approved_count_and_dedicated_qos() -> None:
     assert "--qos=portal-approved-multigpu" in argv
     assert "--gres=gpu:h100:3" in argv
     assert not any(item == "--gres=gpu:h100:4" for item in argv)
+
+
+def test_worker_requires_bound_approval_above_32_gib_memory() -> None:
+    direct = managed_job_payload()
+    direct["memory_mb"] = 32768
+    assert validate_payload("self.job.submit", direct)["memory_approval"] is None
+
+    approved = approved_high_memory_job_payload(approved_memory_mb=98304)
+    validated = validate_payload("self.job.submit", approved)
+    assert validated["memory_mb"] == 98304
+    assert validated["memory_approval"]["requested_memory_mb"] == 131072
+    for changed in (
+        {"memory_approval": None},
+        {"memory_mb": 131073},
+        {
+            "memory_approval": {
+                **approved["memory_approval"],
+                "approved_memory_mb": 131073,
+            }
+        },
+    ):
+        with pytest.raises(ValueError, match="memory"):
+            validate_payload("self.job.submit", {**approved, **changed})
+
+
+def test_worker_accepts_joint_gpu_and_memory_approval_contracts() -> None:
+    payload = approved_multigpu_job_payload(approved_gpu_count=3)
+    memory = approved_high_memory_job_payload(approved_memory_mb=131072)
+    payload["memory_mb"] = memory["memory_mb"]
+    payload["memory_approval"] = {
+        **memory["memory_approval"],
+        "script_sha256": payload["script_sha256"],
+    }
+    validated = validate_payload("self.job.submit", payload)
+    assert validated["gpu_approval"]["approved_gpu_count"] == 3
+    assert validated["memory_approval"]["approved_memory_mb"] == 131072
 
 
 def test_multigpu_worker_preflight_requires_dedicated_qos_and_association_ceiling(

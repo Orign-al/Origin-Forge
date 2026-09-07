@@ -403,16 +403,31 @@ class MultiGpuRequestDetails(ApiModel):
         return normalized
 
 
+class HighMemoryRequestDetails(ApiModel):
+    workload_description: str = Field(min_length=1, max_length=2000)
+    memory_breakdown: str = Field(min_length=1, max_length=2000)
+    memory_justification: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("*")
+    @classmethod
+    def normalize_memory_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("high-memory request details must not be blank")
+        return normalized
+
+
 class SelfJobSubmitRequest(ApiModel):
     name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
     script: str = Field(min_length=1, max_length=8192)
     cpus: int = Field(ge=1, le=8)
-    memory_mb: int = Field(ge=256, le=32768)
+    memory_mb: int = Field(ge=256, le=486377)
     gpu_count: int = Field(ge=0, le=4)
     time_limit_seconds: int = Field(ge=60, le=345600)
     image_ref: str | None = Field(default=None, max_length=512)
     source_path: str | None = Field(default=None, min_length=1, max_length=512)
     multi_gpu_request: MultiGpuRequestDetails | None = None
+    high_memory_request: HighMemoryRequestDetails | None = None
     idempotency_key: uuid.UUID
 
     @field_validator("script")
@@ -435,6 +450,21 @@ class JobGpuApprovalDecisionRequest(ApiModel):
     @field_validator("comment")
     @classmethod
     def normalize_gpu_decision_comment(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("review comment must not be blank")
+        return normalized
+
+
+class JobMemoryApprovalDecisionRequest(ApiModel):
+    decision: Literal["APPROVE", "REJECT"]
+    approved_memory_mb: int | None = Field(default=None, ge=256, le=486377)
+    comment: str = Field(min_length=1, max_length=1000)
+    idempotency_key: uuid.UUID
+
+    @field_validator("comment")
+    @classmethod
+    def normalize_memory_decision_comment(cls, value: str) -> str:
         normalized = value.strip()
         if not normalized:
             raise ValueError("review comment must not be blank")

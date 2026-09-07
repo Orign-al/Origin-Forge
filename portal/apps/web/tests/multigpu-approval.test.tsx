@@ -12,8 +12,11 @@ import { JobsModule } from "../components/ModulePages";
 import { OrdinaryJobs } from "../components/OrdinaryUserPages";
 import {
   type AdminJobGpuApproval,
+  type AdminJobMemoryApproval,
+  adminJobMemoryApprovals,
   adminJobGpuApprovals,
   decideJobGpuApproval,
+  decideJobMemoryApproval,
   me,
   reauthenticate,
   selfJobs,
@@ -32,7 +35,9 @@ vi.mock("../lib/api", async (importOriginal) => {
   return {
     ...actual,
     adminJobGpuApprovals: vi.fn(),
+    adminJobMemoryApprovals: vi.fn(),
     decideJobGpuApproval: vi.fn(),
+    decideJobMemoryApproval: vi.fn(),
     me: vi.fn(),
     reauthenticate: vi.fn(),
     selfJobs: vi.fn(),
@@ -82,6 +87,7 @@ const pendingApproval: AdminJobGpuApproval = {
     memory_mb: 32768,
     gpu_count: 4,
     gpu_approval: null,
+    memory_approval: null,
     time_limit_seconds: 7200,
     script_path: ".portal/job-scripts/fixture.sh",
     script_snapshot_path: "/workspace/.portal/job-scripts/fixture.sh",
@@ -97,6 +103,30 @@ const pendingApproval: AdminJobGpuApproval = {
     elapsed_seconds: null,
     exit_code: null,
     authoritative: true,
+  },
+};
+
+const pendingMemoryApproval: AdminJobMemoryApproval = {
+  id: "20000000-0000-4000-8000-000000000401",
+  state: "PENDING",
+  requested_memory_mb: 131072,
+  approved_memory_mb: null,
+  workload_description: "large CPU data preprocessing",
+  memory_breakdown: "96 GiB index and 32 GiB runtime",
+  memory_justification: "the pipeline cannot stream its index",
+  script_sha256: "b".repeat(64),
+  requested_at: "2026-09-07T10:00:00Z",
+  reviewed_at: null,
+  reviewed_by: null,
+  decision_comment: null,
+  portal_job_id: JOB_ID,
+  owner: pendingApproval.owner,
+  job: {
+    ...pendingApproval.job,
+    memory_mb: 131072,
+    gpu_count: 0,
+    gpu_approval: null,
+    memory_approval: null,
   },
 };
 
@@ -120,6 +150,11 @@ function configureAdmin(role: string, approvals = [pendingApproval]) {
     status: "OK",
     approvals,
     count: approvals.length,
+  });
+  vi.mocked(adminJobMemoryApprovals).mockResolvedValue({
+    status: "OK",
+    approvals: [],
+    count: 0,
   });
   vi.mocked(slurmJobs).mockResolvedValue({ jobs: [] });
   vi.mocked(slurmHistory).mockResolvedValue({ jobs: [] });
@@ -178,6 +213,47 @@ describe("multi-GPU request and review UI", () => {
           scaling_justification: "model state does not fit on one GPU",
         },
         idempotency_key: "10000000-0000-4000-8000-000000000404",
+      }),
+    );
+  });
+
+  it("requires a separate justification above 32 GiB", async () => {
+    vi.mocked(selfJobs).mockResolvedValue({ status: "OK", jobs: [], count: 0 });
+    vi.mocked(submitSelfJob).mockResolvedValue({
+      status: "APPROVAL_PENDING",
+      job: pendingMemoryApproval.job,
+    });
+    renderWithClient(<OrdinaryJobs />);
+
+    fireEvent.change(await screen.findByLabelText(/^内存 MiB/u), {
+      target: { value: "131072" },
+    });
+    expect(
+      screen.getByText(/超过32 GiB的作业不会立即进入Slurm/),
+    ).toBeInTheDocument();
+    const submit = screen.getByRole("button", { name: "提交作业" });
+    expect(submit).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("高内存任务说明"), {
+      target: { value: "large CPU data preprocessing" },
+    });
+    fireEvent.change(screen.getByLabelText("内存用量拆分"), {
+      target: { value: "96 GiB index and 32 GiB runtime" },
+    });
+    fireEvent.change(screen.getByLabelText("高内存必要性"), {
+      target: { value: "the pipeline cannot stream its index" },
+    });
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(submitSelfJob).toHaveBeenCalledTimes(1));
+    expect(submitSelfJob).toHaveBeenCalledWith(
+      expect.objectContaining({
+        memory_mb: 131072,
+        high_memory_request: {
+          workload_description: "large CPU data preprocessing",
+          memory_breakdown: "96 GiB index and 32 GiB runtime",
+          memory_justification: "the pipeline cannot stream its index",
+        },
       }),
     );
   });
@@ -246,6 +322,49 @@ describe("multi-GPU request and review UI", () => {
     });
   });
 
+  it("lets an administrator lower the approved memory", async () => {
+    configureAdmin("platform_admin", []);
+    vi.mocked(adminJobMemoryApprovals).mockResolvedValue({
+      status: "OK",
+      approvals: [pendingMemoryApproval],
+      count: 1,
+    });
+    vi.mocked(reauthenticate).mockResolvedValue({ reauthenticated: true });
+    vi.mocked(decideJobMemoryApproval).mockResolvedValue({
+      status: "APPROVED",
+      idempotent_replay: false,
+      approval: {
+        ...pendingMemoryApproval,
+        state: "APPROVED",
+        approved_memory_mb: 98304,
+      },
+    });
+    renderWithClient(<JobsModule />);
+
+    fireEvent.change(await screen.findByLabelText(/^批准内存 MiB/u), {
+      target: { value: "98304" },
+    });
+    fireEvent.change(screen.getByLabelText("审批意见"), {
+      target: { value: "96 GiB is sufficient" },
+    });
+    fireEvent.change(screen.getByLabelText("管理员密码（最近认证）"), {
+      target: { value: "fixture password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "按所选内存批准" }));
+
+    await waitFor(() =>
+      expect(decideJobMemoryApproval).toHaveBeenCalledTimes(1),
+    );
+    expect(decideJobMemoryApproval).toHaveBeenCalledWith(
+      pendingMemoryApproval.id,
+      {
+        decision: "APPROVE",
+        approved_memory_mb: 98304,
+        comment: "96 GiB is sufficient",
+      },
+    );
+  });
+
   it.each(["operator", "auditor", "user"])(
     "does not expose approval controls to %s",
     async (role) => {
@@ -254,10 +373,12 @@ describe("multi-GPU request and review UI", () => {
 
       await waitFor(() => expect(me).toHaveBeenCalled());
       expect(screen.queryByText("多GPU审批")).not.toBeInTheDocument();
+      expect(screen.queryByText("内存审批")).not.toBeInTheDocument();
       expect(
         screen.queryByRole("button", { name: "按所选GPU数量批准" }),
       ).not.toBeInTheDocument();
       expect(adminJobGpuApprovals).not.toHaveBeenCalled();
+      expect(adminJobMemoryApprovals).not.toHaveBeenCalled();
     },
   );
 });

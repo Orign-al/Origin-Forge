@@ -1,7 +1,7 @@
 """add per-Job multi-GPU approval workflow
 
 Revision ID: e3f4a5b6c7d8
-Revises: d2e3f4a5b6c7
+Revises: e4f5a6b7c8d9
 """
 
 from collections.abc import Sequence
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "e3f4a5b6c7d8"
-down_revision: str | None = "d2e3f4a5b6c7"
+down_revision: str | None = "e4f5a6b7c8d9"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

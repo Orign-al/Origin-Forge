@@ -87,11 +87,13 @@ h100 job submit SCRIPT [--name NAME] [--cpus N] [--memory SIZE]
 - CLI v1 rejects every line whose left-trimmed form begins with `#SBATCH`. Resource-changing directives are not forwarded to Slurm.
 - Omitted resource values come from `GET /self/jobs/config`; the CLI does not own default resource policy.
 - API and Worker both enforce CPU, memory, time, Lease, approved image, account/QoS, and GPU policy.
+- Memory up to and including `32G` needs no separate memory approval. A larger request requires `--memory-workload-description`, `--memory-breakdown`, and `--memory-justification`, and remains Portal-only until an administrator approves it.
 - GPU 0 or 1 is submitted directly after normal backend validation.
 - GPU 2, 3, or 4 requires every multi-GPU request field: model name, model architecture, framework and version, parameter count, workload, dataset, parallel strategy, and measured or expected scaling justification. The CLI flags are `--model-name`, `--model-architecture`, `--framework`, `--framework-version`, `--parameter-count`, `--workload-description`, `--dataset-description`, `--parallel-strategy`, and `--scaling-justification`.
 - A complete 2-4 GPU request is persisted as `APPROVAL_PENDING`; Worker is not called and no Slurm Job exists yet. A platform owner or platform administrator may approve from 1 up to the requested count, or reject with a review comment, after recent password reauthentication.
 - The backend revalidates the owner, active Lease, remaining time, script hash, approval state, and GPU entitlement while holding the approval rows. An approved request is sent to Worker with an immutable approval contract. Worker independently rejects an absent, malformed, or count-mismatched approval.
 - The dedicated approved multi-GPU scheduling policy permits at most 4 H100s for one Job and caps the user's aggregate concurrent GPU allocation at 4 across direct and approved Jobs. The default direct-submission policy remains limited to 1 H100.
+- GPU and memory approvals are independent. If one Job requires both, both decisions must approve before the backend makes its single Worker call and creates its single Slurm Job. A reviewer may lower approved memory but cannot exceed the user's request or the `486377 MiB` Slurm node contract.
 
 Human success output reports the distinct Portal and Slurm IDs, state, GPU count, and source script. It never assumes those IDs are equal.
 

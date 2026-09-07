@@ -49,6 +49,7 @@ from h100_portal_api.models import (
     PortalContainer,
     PortalJob,
     PortalJobGpuApproval,
+    PortalJobMemoryApproval,
     PortalLeaseRenewalRequest,
     PortalManagedUser,
     PortalOperation,
@@ -63,6 +64,7 @@ from h100_portal_api.models import (
 from h100_portal_api.rbac import highest_role
 from h100_portal_api.schemas import (
     JobGpuApprovalDecisionRequest,
+    JobMemoryApprovalDecisionRequest,
     LeaseDecisionRequest,
     LeaseRecoveryApplyRequest,
     LeaseRenewalCreateRequest,
@@ -94,9 +96,15 @@ APPROVED_IMAGE_REFS = {
 }
 APPROVED_JOB_IMAGE = next(iter(APPROVED_IMAGE_REFS))
 JOB_DEFAULTS = {"cpus": 2, "memory_mb": 4096, "gpu_count": 0, "time_limit_seconds": 1800}
+JOB_MEMORY_APPROVAL_THRESHOLD_MB = 32768
+JOB_MEMORY_MAX_MB = 486377
 JOB_LIMITS = {
     "cpus": {"minimum": 1, "maximum": 8},
-    "memory_mb": {"minimum": 256, "maximum": 32768},
+    "memory_mb": {
+        "minimum": 256,
+        "maximum": JOB_MEMORY_MAX_MB,
+        "approval_required_above": JOB_MEMORY_APPROVAL_THRESHOLD_MB,
+    },
     "gpu_count": {"minimum": 0, "maximum": 4, "approval_required_from": 2},
     "time_limit_seconds": {"minimum": 60, "maximum": 345600},
     "script_bytes": {"maximum": 8192},
@@ -1440,6 +1448,29 @@ def _gpu_approval_view(approval: PortalJobGpuApproval | None) -> dict[str, Any] 
     }
 
 
+def _memory_approval_view(
+    approval: PortalJobMemoryApproval | None,
+) -> dict[str, Any] | None:
+    if approval is None:
+        return None
+    return {
+        "id": str(approval.id),
+        "state": approval.state,
+        "requested_memory_mb": approval.requested_memory_mb,
+        "approved_memory_mb": approval.approved_memory_mb,
+        "workload_description": approval.workload_description,
+        "memory_breakdown": approval.memory_breakdown,
+        "memory_justification": approval.memory_justification,
+        "script_sha256": approval.script_sha256,
+        "requested_at": ensure_utc(approval.requested_at).isoformat(),
+        "reviewed_at": (
+            ensure_utc(approval.reviewed_at).isoformat() if approval.reviewed_at else None
+        ),
+        "reviewed_by": str(approval.reviewed_by) if approval.reviewed_by else None,
+        "decision_comment": approval.decision_comment,
+    }
+
+
 def _job_view(job: PortalJob, *, authoritative: bool = True) -> dict[str, Any]:
     workdir = job.workdir_relative_path
     if not workdir.startswith("/"):
@@ -1454,6 +1485,7 @@ def _job_view(job: PortalJob, *, authoritative: bool = True) -> dict[str, Any]:
         "memory_mb": job.memory_mb,
         "gpu_count": job.gpu_count,
         "gpu_approval": _gpu_approval_view(job.gpu_approval),
+        "memory_approval": _memory_approval_view(job.memory_approval),
         "time_limit_seconds": job.time_limit_seconds,
         "script_path": job.script_relative_path,
         "script_snapshot_path": f"/workspace/{job.script_relative_path}",
@@ -1595,33 +1627,53 @@ def _job_worker_payload(
     *,
     script_content: str,
     script_sha256: str,
-    approval: PortalJobGpuApproval | None,
+    gpu_approval: PortalJobGpuApproval | None,
+    memory_approval: PortalJobMemoryApproval | None,
 ) -> dict[str, Any]:
     managed = resources.managed
     binding = workspace_binding(managed.unix_username, managed.uid, managed.gid)
     _source, _logical, workdir_scope, workdir_relative = _validated_cli_source_path(
         job.source_path, managed.unix_username
     )
-    if approval is None:
+    if gpu_approval is None:
         slurm_qos = managed.slurm_qos
-        approval_contract = None
+        gpu_approval_contract = None
     else:
         if (
-            approval.state != "PENDING"
-            or approval.approved_gpu_count is not None
-            or approval.script_sha256 != script_sha256
-            or approval.reviewed_by is None
-            or approval.reviewed_at is None
+            gpu_approval.state != "APPROVED"
+            or gpu_approval.approved_gpu_count != job.gpu_count
+            or gpu_approval.script_sha256 != script_sha256
+            or gpu_approval.reviewed_by is None
+            or gpu_approval.reviewed_at is None
         ):
             raise _error(409, "GPU_APPROVAL_STATE_INVALID", "多GPU审批状态无效")
         slurm_qos = "portal-approved-multigpu" if job.gpu_count > 1 else managed.slurm_qos
-        approval_contract = {
-            "approval_id": str(approval.id),
-            "requested_gpu_count": approval.requested_gpu_count,
+        gpu_approval_contract = {
+            "approval_id": str(gpu_approval.id),
+            "requested_gpu_count": gpu_approval.requested_gpu_count,
             "approved_gpu_count": job.gpu_count,
-            "script_sha256": approval.script_sha256,
-            "reviewed_by": str(approval.reviewed_by),
-            "reviewed_at": ensure_utc(approval.reviewed_at).isoformat(),
+            "script_sha256": gpu_approval.script_sha256,
+            "reviewed_by": str(gpu_approval.reviewed_by),
+            "reviewed_at": ensure_utc(gpu_approval.reviewed_at).isoformat(),
+        }
+    if memory_approval is None:
+        memory_approval_contract = None
+    else:
+        if (
+            memory_approval.state != "APPROVED"
+            or memory_approval.approved_memory_mb != job.memory_mb
+            or memory_approval.script_sha256 != script_sha256
+            or memory_approval.reviewed_by is None
+            or memory_approval.reviewed_at is None
+        ):
+            raise _error(409, "MEMORY_APPROVAL_STATE_INVALID", "高内存审批状态无效")
+        memory_approval_contract = {
+            "approval_id": str(memory_approval.id),
+            "requested_memory_mb": memory_approval.requested_memory_mb,
+            "approved_memory_mb": job.memory_mb,
+            "script_sha256": memory_approval.script_sha256,
+            "reviewed_by": str(memory_approval.reviewed_by),
+            "reviewed_at": ensure_utc(memory_approval.reviewed_at).isoformat(),
         }
     return {
         **resources.worker_identity(),
@@ -1649,7 +1701,8 @@ def _job_worker_payload(
         "slurm_account": managed.slurm_account,
         "slurm_qos": slurm_qos,
         "max_gpu": resources.max_gpu,
-        "gpu_approval": approval_contract,
+        "gpu_approval": gpu_approval_contract,
+        "memory_approval": memory_approval_contract,
         "image_ref": job.image_ref,
     }
 
@@ -1690,15 +1743,25 @@ def submit_self_job(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     require_session_csrf(request, context)
-    approval_required = body.gpu_count >= 2
-    if approval_required and body.multi_gpu_request is None:
+    gpu_approval_required = body.gpu_count >= 2
+    memory_approval_required = body.memory_mb > JOB_MEMORY_APPROVAL_THRESHOLD_MB
+    approval_required = gpu_approval_required or memory_approval_required
+    if gpu_approval_required and body.multi_gpu_request is None:
         raise _error(
             422,
             "MULTI_GPU_DETAILS_REQUIRED",
             "申请2至4张GPU必须提交完整的模型、框架、数据与并行策略说明",
         )
-    if not approval_required and body.multi_gpu_request is not None:
+    if not gpu_approval_required and body.multi_gpu_request is not None:
         raise _error(422, "MULTI_GPU_DETAILS_UNEXPECTED", "0或1张GPU作业不接受多GPU审批资料")
+    if memory_approval_required and body.high_memory_request is None:
+        raise _error(
+            422,
+            "HIGH_MEMORY_DETAILS_REQUIRED",
+            "申请超过32 GiB内存必须提交用途、用量拆分与必要性说明",
+        )
+    if not memory_approval_required and body.high_memory_request is not None:
+        raise _error(422, "HIGH_MEMORY_DETAILS_UNEXPECTED", "32 GiB以内作业不接受高内存审批资料")
     if body.image_ref is not None and body.image_ref not in APPROVED_IMAGE_REFS:
         raise _error(422, "IMAGE_NOT_APPROVED", "镜像不在管理员批准清单中")
     resources = resolve_self_compute_context(db, context.user, lock=True)
@@ -1714,7 +1777,7 @@ def submit_self_job(
         raise _error(422, "JOB_EXCEEDS_LEASE", "作业时限不能超过租约剩余时间")
     if body.gpu_count == 1 and resources.max_gpu < 1:
         raise _error(422, "GPU_LIMIT_EXCEEDED", "当前用户最多申请1张GPU")
-    if approval_required and resources.max_gpu < 1:
+    if gpu_approval_required and resources.max_gpu < 1:
         raise _error(422, "GPU_ENTITLEMENT_REQUIRED", "多GPU审批仅面向已有GPU作业权限的用户")
     operation_key = f"self-job-submit:{managed.id}:{body.idempotency_key}"
     existing = db.scalar(
@@ -1761,7 +1824,8 @@ def submit_self_job(
         "lease_deadline_at": ensure_utc(terminal.expires_at).isoformat(),
         "max_gpu": resources.max_gpu,
         "image_ref": image_ref,
-        "gpu_approval_required": approval_required,
+        "gpu_approval_required": gpu_approval_required,
+        "memory_approval_required": memory_approval_required,
     }
     if body.multi_gpu_request is not None:
         operation_payload.update(
@@ -1779,7 +1843,7 @@ def submit_self_job(
         target_type="slurm_job",
         target_id=str(job_id),
         summary=(
-            "用户申请多GPU Slurm作业，等待管理员审批"
+            "用户申请受控资源Slurm作业，等待管理员审批"
             if approval_required
             else "用户通过Portal提交自己的Slurm作业"
         ),
@@ -1812,7 +1876,7 @@ def submit_self_job(
     db.add(job)
     db.flush()
     if body.multi_gpu_request is not None:
-        approval = PortalJobGpuApproval(
+        gpu_approval = PortalJobGpuApproval(
             portal_job_id=job.id,
             state="PENDING",
             requested_gpu_count=body.gpu_count,
@@ -1828,8 +1892,8 @@ def submit_self_job(
             script_content=script_content,
             script_sha256=script_sha256,
         )
-        db.add(approval)
-        job.gpu_approval = approval
+        db.add(gpu_approval)
+        job.gpu_approval = gpu_approval
         _audit(
             db,
             request,
@@ -1845,6 +1909,33 @@ def submit_self_job(
                 "worker_called": False,
             },
         )
+    if body.high_memory_request is not None:
+        memory_approval = PortalJobMemoryApproval(
+            portal_job_id=job.id,
+            state="PENDING",
+            requested_memory_mb=body.memory_mb,
+            workload_description=body.high_memory_request.workload_description,
+            memory_breakdown=body.high_memory_request.memory_breakdown,
+            memory_justification=body.high_memory_request.memory_justification,
+            script_content=script_content,
+            script_sha256=script_sha256,
+        )
+        db.add(memory_approval)
+        job.memory_approval = memory_approval
+        _audit(
+            db,
+            request,
+            context,
+            event_type="JOB_MEMORY_APPROVAL_REQUESTED",
+            object_type="portal_job",
+            object_id=str(job.id),
+            metadata={
+                "requested_memory_mb": body.memory_mb,
+                "script_sha256": script_sha256,
+                "worker_called": False,
+            },
+        )
+    if approval_required:
         db.commit()
         return {"status": "APPROVAL_PENDING", "job": _job_view(job)}
 
@@ -1853,7 +1944,8 @@ def submit_self_job(
         job,
         script_content=script_content,
         script_sha256=script_sha256,
-        approval=None,
+        gpu_approval=None,
+        memory_approval=None,
     )
     try:
         result = _worker(
@@ -2010,10 +2102,12 @@ def cancel_self_job(
     if job.state in JOB_TERMINAL_STATES:
         raise _error(409, "JOB_ALREADY_TERMINAL", "只能取消非终态Job")
     if job.state == "APPROVAL_PENDING" and job.slurm_job_id is None:
-        approval = job.gpu_approval
-        if approval is None or approval.state != "PENDING":
-            raise _error(409, "GPU_APPROVAL_STATE_INVALID", "多GPU审批记录状态无效")
-        approval.state = "CANCELLED"
+        approvals = [item for item in (job.gpu_approval, job.memory_approval) if item is not None]
+        if not approvals or any(item.state not in {"PENDING", "APPROVED"} for item in approvals):
+            raise _error(409, "JOB_APPROVAL_STATE_INVALID", "作业资源审批记录状态无效")
+        for approval in approvals:
+            if approval.state == "PENDING":
+                approval.state = "CANCELLED"
         job.state = "CANCELLED"
         job.state_reason = "USER_CANCELLED_BEFORE_APPROVAL"
         job.finished_at = utcnow()
@@ -2025,10 +2119,15 @@ def cancel_self_job(
             db,
             request,
             context,
-            event_type="JOB_GPU_APPROVAL_CANCELLED",
+            event_type="JOB_RESOURCE_APPROVAL_CANCELLED",
             object_type="portal_job",
             object_id=str(job.id),
-            metadata={"worker_called": False, "slurm_job_created": False},
+            metadata={
+                "gpu_approval": job.gpu_approval is not None,
+                "memory_approval": job.memory_approval is not None,
+                "worker_called": False,
+                "slurm_job_created": False,
+            },
         )
         db.commit()
         return {"status": "CANCELLED", "job": _job_view(job)}
@@ -2144,11 +2243,18 @@ def decide_job_gpu_approval(
     # Lock the owner resources before the request rows. Submission uses the same
     # owner-first order, avoiding a review/Lease deadlock.
     resources = resolve_self_compute_context(db, owner, lock=True)
+    job = db.scalar(select(PortalJob).where(PortalJob.id == initial_job.id).with_for_update())
+    if job is None:
+        raise _error(404, "GPU_APPROVAL_NOT_FOUND", "多GPU审批申请不存在")
     approval = db.scalar(
         select(PortalJobGpuApproval).where(PortalJobGpuApproval.id == approval_id).with_for_update()
     )
-    job = db.scalar(select(PortalJob).where(PortalJob.id == initial_job.id).with_for_update())
-    if approval is None or job is None:
+    memory_approval = db.scalar(
+        select(PortalJobMemoryApproval)
+        .where(PortalJobMemoryApproval.portal_job_id == job.id)
+        .with_for_update()
+    )
+    if approval is None:
         raise _error(404, "GPU_APPROVAL_NOT_FOUND", "多GPU审批申请不存在")
     decision_key = f"{approval.id}:{body.idempotency_key}"
     if approval.decision_idempotency_key == decision_key:
@@ -2172,6 +2278,8 @@ def decide_job_gpu_approval(
         approval.reviewed_by = context.actor.id
         approval.decision_comment = body.comment
         approval.decision_idempotency_key = decision_key
+        if memory_approval is not None and memory_approval.state == "PENDING":
+            memory_approval.state = "CANCELLED"
         job.state = "REJECTED"
         job.state_reason = body.comment[:512]
         job.finished_at = now
@@ -2221,46 +2329,18 @@ def decide_job_gpu_approval(
     approval.reviewed_by = context.actor.id
     approval.decision_comment = body.comment
     approval.decision_idempotency_key = decision_key
-    job.gpu_count = approved_count
-    job.state = "SUBMITTING"
-    job.state_reason = None
-    payload = _job_worker_payload(
-        resources,
-        job,
-        script_content=approval.script_content,
-        script_sha256=approval.script_sha256,
-        approval=approval,
-    )
-    result = _worker(
-        "self.job.submit",
-        payload=payload,
-        context=context,
-        idempotency_key=f"gpu-approval-submit:{approval.id}",
-        timeout_seconds=45,
-    )
-    slurm_job_id = result.get("slurm_job_id")
-    if not isinstance(slurm_job_id, int) or result.get("slurm_user") != managed.unix_username:
-        raise _error(409, "JOB_OWNER_POSTCONDITION_FAILED", "Slurm作业所有者验证失败")
-
     approval.state = "APPROVED"
     approval.approved_gpu_count = approved_count
-    job.slurm_job_id = slurm_job_id
-    job.state = "PENDING"
-    job.submitted_at = now
-    if operation is not None:
-        operation.status = OperationStatus.SUCCEEDED
-        operation.approved_by = context.actor.id
-        operation.approved_at = now
-        operation.started_at = now
-        operation.finished_at = now
-        operation.worker_execution_id = str(result.get("request_id", ""))[:64] or None
-        operation.result_summary = f"管理员批准{approved_count}张GPU并提交Slurm Job {slurm_job_id}"
-        operation.validated_payload = {
-            **operation.validated_payload,
-            "gpu_approval_id": str(approval.id),
-            "approved_gpu_count": approved_count,
-            "reviewed_by": str(context.actor.id),
-        }
+    job.gpu_count = approved_count
+    slurm_job_id = _submit_job_if_resource_approvals_complete(
+        resources=resources,
+        job=job,
+        gpu_approval=approval,
+        memory_approval=memory_approval,
+        operation=operation,
+        context=context,
+        now=now,
+    )
     _audit(
         db,
         request,
@@ -2275,6 +2355,7 @@ def decide_job_gpu_approval(
             "owner": owner.normalized_login,
             "slurm_job_id": slurm_job_id,
             "script_sha256": approval.script_sha256,
+            "all_approvals_complete": slurm_job_id is not None,
         },
     )
     db.commit()
@@ -2282,6 +2363,276 @@ def decide_job_gpu_approval(
         "status": "APPROVED",
         "idempotent_replay": False,
         "approval": _admin_gpu_approval_view(approval, job, managed, owner),
+    }
+
+
+def _admin_memory_approval_view(
+    approval: PortalJobMemoryApproval,
+    job: PortalJob,
+    managed: PortalManagedUser,
+    owner: PortalUser,
+) -> dict[str, Any]:
+    return {
+        **(_memory_approval_view(approval) or {}),
+        "portal_job_id": str(job.id),
+        "owner": {
+            "portal_user_id": str(owner.id),
+            "login_name": owner.login_name,
+            "display_name": owner.display_name,
+            "managed_user_id": str(managed.id),
+            "unix_username": managed.unix_username,
+        },
+        "job": _job_view(job, authoritative=job.slurm_job_id is not None),
+    }
+
+
+def _submit_job_if_resource_approvals_complete(
+    *,
+    resources: SelfResourceContext,
+    job: PortalJob,
+    gpu_approval: PortalJobGpuApproval | None,
+    memory_approval: PortalJobMemoryApproval | None,
+    operation: PortalOperation | None,
+    context: AuthContext,
+    now: datetime,
+) -> int | None:
+    approvals = [item for item in (gpu_approval, memory_approval) if item is not None]
+    if not approvals:
+        raise _error(409, "JOB_APPROVAL_STATE_INVALID", "待审批作业缺少资源审批记录")
+    if any(item.state == "PENDING" for item in approvals):
+        return None
+    if any(item.state != "APPROVED" for item in approvals):
+        raise _error(409, "JOB_APPROVAL_STATE_INVALID", "作业资源审批状态不允许提交")
+
+    script_content = approvals[0].script_content
+    script_sha256 = approvals[0].script_sha256
+    if any(
+        item.script_content != script_content or item.script_sha256 != script_sha256
+        for item in approvals[1:]
+    ):
+        raise _error(409, "JOB_SCRIPT_INTEGRITY_FAILED", "联合审批的脚本快照不一致")
+    if hashlib.sha256(script_content.encode("utf-8")).hexdigest() != script_sha256:
+        raise _error(409, "JOB_SCRIPT_INTEGRITY_FAILED", "待审批脚本快照完整性校验失败")
+
+    job.state = "SUBMITTING"
+    job.state_reason = None
+    payload = _job_worker_payload(
+        resources,
+        job,
+        script_content=script_content,
+        script_sha256=script_sha256,
+        gpu_approval=gpu_approval,
+        memory_approval=memory_approval,
+    )
+    result = _worker(
+        "self.job.submit",
+        payload=payload,
+        context=context,
+        idempotency_key=f"job-resource-approval-submit:{job.id}",
+        timeout_seconds=45,
+    )
+    slurm_job_id = result.get("slurm_job_id")
+    if (
+        not isinstance(slurm_job_id, int)
+        or result.get("slurm_user") != resources.managed.unix_username
+    ):
+        raise _error(409, "JOB_OWNER_POSTCONDITION_FAILED", "Slurm作业所有者验证失败")
+
+    job.slurm_job_id = slurm_job_id
+    job.state = "PENDING"
+    job.submitted_at = now
+    if operation is not None:
+        operation.status = OperationStatus.SUCCEEDED
+        operation.approved_by = context.actor.id
+        operation.approved_at = now
+        operation.started_at = now
+        operation.finished_at = now
+        operation.worker_execution_id = str(result.get("request_id", ""))[:64] or None
+        operation.result_summary = f"所有必需资源审批完成并提交Slurm Job {slurm_job_id}"
+        operation.validated_payload = {
+            **operation.validated_payload,
+            "gpu_approval_id": str(gpu_approval.id) if gpu_approval else None,
+            "approved_gpu_count": gpu_approval.approved_gpu_count if gpu_approval else None,
+            "memory_approval_id": str(memory_approval.id) if memory_approval else None,
+            "approved_memory_mb": (memory_approval.approved_memory_mb if memory_approval else None),
+            "final_reviewed_by": str(context.actor.id),
+        }
+    return slurm_job_id
+
+
+@router.get("/admin/job-memory-approvals")
+def admin_job_memory_approvals(
+    state: str | None = Query(default=None, max_length=16),
+    context: AuthContext = Depends(permission_dependency("jobs.memory_approval.read")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    normalized = state.upper() if state else None
+    if normalized is not None and normalized not in {
+        "PENDING",
+        "APPROVED",
+        "REJECTED",
+        "CANCELLED",
+    }:
+        raise _error(422, "MEMORY_APPROVAL_STATE_INVALID", "高内存审批状态过滤值无效")
+    query = select(PortalJobMemoryApproval).order_by(PortalJobMemoryApproval.requested_at.desc())
+    if normalized is not None:
+        query = query.where(PortalJobMemoryApproval.state == normalized)
+    rows = db.scalars(query.limit(200)).all()
+    views: list[dict[str, Any]] = []
+    for approval in rows:
+        job = db.get(PortalJob, approval.portal_job_id)
+        if job is None:
+            continue
+        managed = db.get(PortalManagedUser, job.owner_managed_user_id)
+        owner = db.get(PortalUser, managed.portal_user_id) if managed is not None else None
+        if managed is None or owner is None:
+            continue
+        views.append(_admin_memory_approval_view(approval, job, managed, owner))
+    return {"status": "OK", "approvals": views, "count": len(views)}
+
+
+@router.post("/admin/job-memory-approvals/{approval_id}/decision")
+def decide_job_memory_approval(
+    approval_id: uuid.UUID,
+    body: JobMemoryApprovalDecisionRequest,
+    request: Request,
+    context: AuthContext = Depends(permission_dependency("jobs.memory_approval.review")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    require_session_csrf(request, context)
+    require_recent_reauthentication(context)
+    initial = db.get(PortalJobMemoryApproval, approval_id)
+    initial_job = db.get(PortalJob, initial.portal_job_id) if initial is not None else None
+    if initial is None or initial_job is None:
+        raise _error(404, "MEMORY_APPROVAL_NOT_FOUND", "高内存审批申请不存在")
+    managed = db.get(PortalManagedUser, initial_job.owner_managed_user_id)
+    owner = db.get(PortalUser, managed.portal_user_id) if managed is not None else None
+    if managed is None or owner is None:
+        raise _error(409, "MEMORY_APPROVAL_OWNER_INVALID", "审批申请缺少有效的资源所有者")
+
+    resources = resolve_self_compute_context(db, owner, lock=True)
+    job = db.scalar(select(PortalJob).where(PortalJob.id == initial_job.id).with_for_update())
+    if job is None:
+        raise _error(404, "MEMORY_APPROVAL_NOT_FOUND", "高内存审批申请不存在")
+    gpu_approval = db.scalar(
+        select(PortalJobGpuApproval)
+        .where(PortalJobGpuApproval.portal_job_id == job.id)
+        .with_for_update()
+    )
+    approval = db.scalar(
+        select(PortalJobMemoryApproval)
+        .where(PortalJobMemoryApproval.id == approval_id)
+        .with_for_update()
+    )
+    if approval is None:
+        raise _error(404, "MEMORY_APPROVAL_NOT_FOUND", "高内存审批申请不存在")
+    decision_key = f"{approval.id}:{body.idempotency_key}"
+    if approval.decision_idempotency_key == decision_key:
+        return {
+            "status": approval.state,
+            "idempotent_replay": True,
+            "approval": _admin_memory_approval_view(approval, job, managed, owner),
+        }
+    if approval.state != "PENDING" or job.state != "APPROVAL_PENDING":
+        raise _error(409, "MEMORY_APPROVAL_ALREADY_DECIDED", "高内存审批申请已被处理")
+    if job.slurm_job_id is not None:
+        raise _error(409, "MEMORY_APPROVAL_SLURM_CONFLICT", "待审批作业不应存在Slurm Job")
+
+    now = utcnow()
+    operation = db.get(PortalOperation, job.operation_id)
+    if body.decision == "REJECT":
+        if body.approved_memory_mb is not None:
+            raise _error(422, "MEMORY_APPROVAL_VALUE_UNEXPECTED", "驳回时不得填写批准内存")
+        approval.state = "REJECTED"
+        approval.reviewed_at = now
+        approval.reviewed_by = context.actor.id
+        approval.decision_comment = body.comment
+        approval.decision_idempotency_key = decision_key
+        if gpu_approval is not None and gpu_approval.state == "PENDING":
+            gpu_approval.state = "CANCELLED"
+        job.state = "REJECTED"
+        job.state_reason = body.comment[:512]
+        job.finished_at = now
+        if operation is not None:
+            operation.status = OperationStatus.CANCELLED
+            operation.finished_at = now
+            operation.result_summary = "高内存作业申请被管理员驳回"
+        _audit(
+            db,
+            request,
+            context,
+            event_type="JOB_MEMORY_APPROVAL_REJECTED",
+            object_type="portal_job",
+            object_id=str(job.id),
+            metadata={
+                "approval_id": str(approval.id),
+                "requested_memory_mb": approval.requested_memory_mb,
+                "owner": owner.normalized_login,
+                "worker_called": False,
+                "slurm_job_created": False,
+            },
+        )
+        db.commit()
+        return {
+            "status": "REJECTED",
+            "idempotent_replay": False,
+            "approval": _admin_memory_approval_view(approval, job, managed, owner),
+        }
+
+    approved_memory = body.approved_memory_mb
+    if approved_memory is None:
+        raise _error(422, "MEMORY_APPROVED_VALUE_REQUIRED", "通过审批时必须填写批准内存")
+    if approved_memory > approval.requested_memory_mb:
+        raise _error(422, "MEMORY_APPROVED_VALUE_EXCEEDS_REQUEST", "批准内存不能高于用户申请")
+    if resources.active_lease.id != job.lease_id:
+        raise _error(409, "MEMORY_APPROVAL_LEASE_CHANGED", "原申请租约已变化，请用户重新提交")
+    remaining = int((ensure_utc(resources.terminal_lease.expires_at) - now).total_seconds())
+    if job.time_limit_seconds > remaining:
+        raise _error(409, "JOB_EXCEEDS_LEASE", "审批时租约剩余时间已不足，请用户重新提交")
+    if (
+        hashlib.sha256(approval.script_content.encode("utf-8")).hexdigest()
+        != approval.script_sha256
+    ):
+        raise _error(409, "JOB_SCRIPT_INTEGRITY_FAILED", "待审批脚本快照完整性校验失败")
+
+    approval.state = "APPROVED"
+    approval.approved_memory_mb = approved_memory
+    approval.reviewed_at = now
+    approval.reviewed_by = context.actor.id
+    approval.decision_comment = body.comment
+    approval.decision_idempotency_key = decision_key
+    job.memory_mb = approved_memory
+    slurm_job_id = _submit_job_if_resource_approvals_complete(
+        resources=resources,
+        job=job,
+        gpu_approval=gpu_approval,
+        memory_approval=approval,
+        operation=operation,
+        context=context,
+        now=now,
+    )
+    _audit(
+        db,
+        request,
+        context,
+        event_type="JOB_MEMORY_APPROVAL_APPROVED",
+        object_type="portal_job",
+        object_id=str(job.id),
+        metadata={
+            "approval_id": str(approval.id),
+            "requested_memory_mb": approval.requested_memory_mb,
+            "approved_memory_mb": approved_memory,
+            "owner": owner.normalized_login,
+            "slurm_job_id": slurm_job_id,
+            "script_sha256": approval.script_sha256,
+            "all_approvals_complete": slurm_job_id is not None,
+        },
+    )
+    db.commit()
+    return {
+        "status": "APPROVED",
+        "idempotent_replay": False,
+        "approval": _admin_memory_approval_view(approval, job, managed, owner),
     }
 
 
