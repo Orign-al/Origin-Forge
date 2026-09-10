@@ -14,9 +14,9 @@ from h100_portal_contracts.workspace import (
     workspace_binding,
     workspace_path,
 )
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from h100_portal_api import expiry_service
 from h100_portal_api.audit import record_audit
@@ -3018,6 +3018,7 @@ def admin_lease_recovery_incidents(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     now = utcnow()
+    successor = aliased(PortalComputeLease)
     rows = db.execute(
         select(PortalComputeLease, PortalManagedUser, PortalContainer)
         .join(
@@ -3032,6 +3033,9 @@ def admin_lease_recovery_incidents(
             PortalComputeLease.expires_at <= now,
             PortalComputeLease.recycled_at.is_(None),
             PortalComputeLease.state.in_(expiry_service.DUE_STATES),
+            ~exists().where(
+                successor.previous_lease_id == PortalComputeLease.id,
+            ),
         )
         .order_by(PortalComputeLease.expires_at)
     ).all()
@@ -3164,6 +3168,12 @@ def admin_retry_lease_recycle(
         }
     if ensure_utc(lease.expires_at) > utcnow() or lease.recycled_at is not None:
         raise _error(409, "LEASE_RECOVERY_TARGET_INVALID", "租约不是待恢复的过期资源")
+    successor = aliased(PortalComputeLease)
+    if (
+        db.scalar(select(successor.id).where(successor.previous_lease_id == lease.id).limit(1))
+        is not None
+    ):
+        raise _error(409, "LEASE_RECOVERY_SUPERSEDED", "租约已被后继租约替代，不能执行恢复")
     prior = _expiry_operation(db, lease)
     if prior is None or prior.status != OperationStatus.FAILED:
         raise _error(409, "LEASE_RECOVERY_FAILURE_NOT_FOUND", "不存在失败的到期回收记录")

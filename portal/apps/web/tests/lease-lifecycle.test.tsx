@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   LeaseLifecyclePanel,
+  incidentForUser,
   recoveryEligible,
 } from "../components/LeaseLifecyclePanel";
 import {
@@ -145,6 +146,17 @@ afterEach(() => {
 });
 
 describe("administrator Lease lifecycle UI", () => {
+  it("selects only the user's current Lease incident when historical incidents exist", () => {
+    const historical = {
+      ...failedIncident,
+      lease_id: "aaaaaaaa-7b46-4986-bfbd-895f97e0e70f",
+    };
+    expect(incidentForUser([historical, failedIncident], user)).toEqual(
+      failedIncident,
+    );
+    expect(incidentForUser([historical], user)).toBeNull();
+  });
+
   it("updates the per-user renewal and restore approval policy without changing pending requests", async () => {
     vi.mocked(updateLeaseRenewalPolicy).mockResolvedValue({
       status: "UPDATED",

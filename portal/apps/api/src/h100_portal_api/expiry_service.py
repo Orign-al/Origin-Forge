@@ -82,18 +82,23 @@ def reconcile_expired_renewal_requests(
 
 
 def _due_predicate(now: Any) -> Any:
-    active_successor = aliased(PortalComputeLease)
+    successor = aliased(PortalComputeLease)
+    has_successor = exists().where(
+        successor.previous_lease_id == PortalComputeLease.id,
+    )
+    has_activatable_successor = exists().where(
+        successor.previous_lease_id == PortalComputeLease.id,
+        successor.state == "APPROVED",
+        successor.starts_at <= now,
+        successor.expires_at > now,
+    )
     return (
         PortalComputeLease.state.in_(DUE_STATES),
         PortalComputeLease.expires_at <= now,
         PortalComputeLease.recycled_at.is_(None),
         or_(
-            PortalComputeLease.state != "EXPIRED",
-            ~exists().where(
-                active_successor.previous_lease_id == PortalComputeLease.id,
-                active_successor.state == "ACTIVE",
-                active_successor.expires_at > now,
-            ),
+            ~has_successor,
+            has_activatable_successor,
         ),
     )
 

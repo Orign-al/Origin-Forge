@@ -35,13 +35,19 @@ export function incidentForUser(
   user: User,
 ): AdminLeaseRecoveryIncident | null {
   const username = managedUsername(user);
-  return (
-    incidents.find(
-      (incident) =>
-        incident.portal_user_id === user.id ||
-        (username !== null && incident.username === username),
-    ) ?? null
+  const ownedIncidents = incidents.filter(
+    (incident) =>
+      incident.portal_user_id === user.id ||
+      (username !== null && incident.username === username),
   );
+  const currentLeaseId = user.compute_lifecycle?.lease_id;
+  if (currentLeaseId) {
+    return (
+      ownedIncidents.find((incident) => incident.lease_id === currentLeaseId) ??
+      null
+    );
+  }
+  return ownedIncidents[0] ?? null;
 }
 
 export function recoveryEligible(

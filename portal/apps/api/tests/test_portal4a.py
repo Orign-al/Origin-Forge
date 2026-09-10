@@ -981,6 +981,45 @@ def test_expiry_skips_superseded_lease_and_retries_cleanup_failure_fail_safe(
     assert calls == 2
 
 
+def test_expiry_activates_approved_successor_but_only_scans_terminal_lease_afterward(
+    database: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity(database, remaining_hours=0)
+    predecessor_id = identity.lease.id
+    successor = create_lease(
+        managed_user_id=identity.managed.id,
+        starts_at=identity.lease.expires_at,
+        duration_seconds=MAX_LEASE_DURATION_SECONDS,
+        gpu_count=1,
+        approved_by=identity.user.id,
+        state="APPROVED",
+        previous_lease_id=predecessor_id,
+    )
+    database.add(successor)
+    database.commit()
+    factory = sessionmaker(bind=database.get_bind(), autoflush=False, expire_on_commit=False)
+    monkeypatch.setattr(expiry_service, "SessionLocal", factory)
+
+    activation_time = ensure_utc(identity.lease.expires_at) + timedelta(seconds=1)
+    monkeypatch.setattr(expiry_service, "utcnow", lambda: activation_time)
+    monkeypatch.setattr(
+        expiry_service,
+        "call_worker",
+        lambda *_args, **_kwargs: pytest.fail("approved successor must be activated"),
+    )
+    assert expiry_service.process_due_leases() == (1, 0)
+    database.expire_all()
+    assert database.get(PortalComputeLease, predecessor_id).state == "EXPIRED"
+    assert database.get(PortalComputeLease, successor.id).state == "ACTIVE"
+
+    expiry_time = ensure_utc(successor.expires_at) + timedelta(seconds=1)
+    monkeypatch.setattr(expiry_service, "utcnow", lambda: expiry_time)
+    due_ids = database.scalars(
+        select(PortalComputeLease.id).where(*expiry_service._due_predicate(expiry_time))
+    ).all()
+    assert due_ids == [successor.id]
+
+
 def test_legacy_failed_expiry_is_manual_review_and_not_replayed(
     database: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2666,6 +2705,70 @@ def test_admin_recovery_incident_read_model_is_safe_and_owner_only(
     assert lifecycle["lease_id"] == str(identity.lease.id)
     assert lifecycle["time_expired"] is True
     assert lifecycle["lease_state"] == "ACTIVE"
+
+
+def test_recovery_incidents_and_mutation_reject_superseded_lease(
+    client,
+    database: Session,
+    origin_headers: dict[str, str],
+) -> None:  # type: ignore[no-untyped-def]
+    identity = _identity(database, remaining_hours=0)
+    predecessor = identity.lease
+    successor = create_lease(
+        managed_user_id=identity.managed.id,
+        starts_at=predecessor.expires_at,
+        duration_seconds=MAX_LEASE_DURATION_SECONDS,
+        gpu_count=1,
+        approved_by=identity.user.id,
+        state="ACTIVE",
+        previous_lease_id=predecessor.id,
+    )
+    successor.expires_at = utcnow() - timedelta(seconds=1)
+    successor.starts_at = successor.expires_at - timedelta(seconds=MAX_LEASE_DURATION_SECONDS)
+    database.add(successor)
+    database.flush()
+    for lease in (predecessor, successor):
+        lease.state = "EXPIRED" if lease is predecessor else "ACTIVE"
+        database.add(
+            PortalOperation(
+                operation_type="lease.expire",
+                target_type="compute_lease",
+                target_id=str(lease.id),
+                requested_by=identity.user.id,
+                owner_managed_user_id=identity.managed.id,
+                request_summary="failed chained expiry fixture",
+                validated_payload={},
+                idempotency_key=f"lease-expire:{lease.id}",
+                risk_level=RiskLevel.HIGH,
+                status=OperationStatus.FAILED,
+                error_code="CONTAINER_STOP_FAILED",
+            )
+        )
+    admin = _admin(database)
+    database.commit()
+
+    admin_headers = _login(client, origin_headers, admin.normalized_login)
+    response = client.get("/api/v1/admin/lease-recovery-incidents", headers=admin_headers)
+    assert response.status_code == 200
+    assert [row["lease_id"] for row in response.json()["incidents"]] == [str(successor.id)]
+
+    reauthenticated = client.post(
+        "/api/v1/auth/reauthenticate",
+        headers=admin_headers,
+        json={"password": PASSWORD},
+    )
+    assert reauthenticated.status_code == 200
+    rejected = client.post(
+        f"/api/v1/admin/compute-leases/{predecessor.id}/recycle-retry",
+        headers=admin_headers,
+        json={
+            "idempotency_key": str(uuid.uuid4()),
+            "confirmation": str(predecessor.id),
+            "safe_reason": "must reject superseded fixture",
+        },
+    )
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == "LEASE_RECOVERY_SUPERSEDED"
 
 
 def test_web_terminal_is_owner_scoped_lease_gated_and_does_not_audit_input(
